@@ -164,6 +164,51 @@ Hermes Evolution регулярно синхронізується з оригі
 4. Створює proposals для конфліктуючих змін
 5. Інтегрує сумісні зміни
 
+## 🛡️ Гейт безпечної самоеволюції
+
+Агент пише код автономно. Без гейту зламаний або ін'єктований код потрапив би
+в `main`, і авто-апдейт розніс би його на всі інсталяції за 24 год. Тому
+злиття контролює **інфраструктура, а не самооцінка LLM**:
+
+1. **PR-only.** `evolution-implementation` лише створює PR (`gh pr create`) і
+   НЕ робить `git merge` / `git checkout main`. Прямий merge заборонено.
+2. **CI-гейт.** На кожен PR у `main` запускаються `.github/workflows/tests.yml`
+   і `lint.yml`. Червоні тести = merge заблоковано.
+3. **Захист критичних шляхів.** `.github/CODEOWNERS` вимагає рев'ю власника для
+   PR, що чіпають self-update, планувальник, CI чи evolution-skills.
+4. **Авто-апдейт тягне лише CI-захищений `main`** — `auto_update.sh` оновлюється
+   на код, який уже пройшов перевірку.
+
+### Увімкнути branch protection (ОБОВ'ЯЗКОВО)
+
+Без захисту гілки PR-only — лише інструкція, яку LLM може обійти. Enforcement
+вмикає власник репозиторію:
+
+```bash
+gh api -X PUT repos/Lexus2016/hermes-agent-evolution/branches/main/protection \
+  --input - <<'JSON'
+{
+  "required_status_checks": { "strict": true, "contexts": ["Tests"] },
+  "enforce_admins": true,
+  "required_pull_request_reviews": { "require_code_owner_reviews": true,
+    "required_approving_review_count": 0 },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+JSON
+```
+
+- `contexts: ["Tests"]` — назва перевірки з `tests.yml` (`name: Tests`); додай
+  інші (наприклад lint) за фактичними назвами в Actions.
+- `require_code_owner_reviews` + `count: 0` — звичайні PR зливаються на зеленому
+  CI без рев'ю (автономність), а PR на критичні шляхи з `CODEOWNERS` усе одно
+  потребують підтвердження власника.
+- Для повного «людина в циклі» постав `required_approving_review_count: 1`.
+
+> ⚠️ Без цього кроку гейт неповний: skill каже «лише PR», але ніщо технічно не
+> заважає агенту змерджити напряму.
+
 ## 📖 Документація
 
 - [AGENTS.md](AGENTS.md) — документація Hermes Agent (оригінальна)
