@@ -1,20 +1,11 @@
 #!/bin/bash
-# upgrade.sh v1.4 - Automatic Upgrade Script for Hermes Evolution
+# upgrade.sh v1.5 - Automatic Upgrade Script for Hermes Evolution
 # This script does everything automatically - works on any system with Hermes installed
 # Source: https://github.com/Lexus2016/hermes-agent-evolution
-# REAL Automatic Upgrade Script: Hermes Agent → Hermes Evolution
-# This script DOES EVERYTHING automatically - works on any system with Hermes installed
 
 set -e
 
-
-echo "🧬 Hermes Evolution Automatic Upgrade v1.4"
-echo "=========================================="
-echo ""
-
-# Check for updates (prevent cache issues)
-CURRENT_VERSION="v1.4"
-echo "🧬 Automatic Upgrade to Hermes Evolution"
+echo "🧬 Hermes Evolution Automatic Upgrade v1.5"
 echo "=========================================="
 echo ""
 
@@ -76,29 +67,30 @@ HERMES_CRON_DIR="$HERMES_PROJECT/cron"
 echo "✅ Hermes now at: $HERMES_PROJECT"
 echo "📂 Skills directory: $HERMES_SKILLS_DIR"
 
-# Step 5: Install evolution skills with CORRECT structure
+# Step 5: Install evolution skills with CORRECT structure (CATEGORY/SKILL/SKILL.md)
 echo ""
 echo "📚 Step 5/7: Installing evolution skills with correct structure..."
 
-# Install each evolution skill as a separate directory
+# Install each evolution skill as CATEGORY/SKILL/SKILL.md structure
 EVOLUTION_SKILLS="$EVOLUTION_DIR/skills/evolution"
+EVOLUTION_CATEGORY="evolution"
 
 for skill_file in "$EVOLUTION_SKILLS"/*.md; do
     skill_name=$(basename "$skill_file" .md)
     
-    # Create skill directory
-    skill_dir="$HERMES_SKILLS_DIR/evolution-$skill_name"
+    # Create skill directory structure: skills/evolution/evolution-research/SKILL.md
+    skill_dir="$HERMES_SKILLS_DIR/$EVOLUTION_CATEGORY/evolution-$skill_name"
     mkdir -p "$skill_dir"
     
     # Copy skill file as SKILL.md (Hermes expects this)
     cp "$skill_file" "$skill_dir/SKILL.md"
     
-    echo "✅ Installed: evolution-$skill_name"
+    echo "✅ Installed: evolution/evolution-$skill_name"
 done
 
 echo ""
 echo "📋 Installed evolution skills:"
-ls -1 "$HERMES_SKILLS_DIR"/evolution-* 2>/dev/null | while read dir; do
+ls -1 "$HERMES_SKILLS_DIR/$EVOLUTION_CATEGORY"/evolution-* 2>/dev/null | while read dir; do
     echo "   - $(basename $dir)"
 done
 
@@ -109,8 +101,13 @@ EVOLUTION_CRON="$EVOLUTION_DIR/cron/evolution"
 
 if [ -d "$EVOLUTION_CRON" ]; then
     mkdir -p "$HERMES_CRON_DIR"
-    cp -r "$EVOLUTION_CRON" "$HERMES_CRON_DIR/"
-    echo "✅ Evolution cron jobs installed to: $HERMES_CRON_DIR/evolution"
+    # Don't copy if already exists (avoid error)
+    if [ ! -d "$HERMES_CRON_DIR/evolution" ]; then
+        cp -r "$EVOLUTION_CRON" "$HERMES_CRON_DIR/"
+        echo "✅ Evolution cron jobs installed to: $HERMES_CRON_DIR/evolution"
+    else
+        echo "✅ Evolution cron jobs already installed"
+    fi
     
     # List installed cron jobs
     echo "📋 Installed evolution cron jobs:"
