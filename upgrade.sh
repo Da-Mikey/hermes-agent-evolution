@@ -1,5 +1,5 @@
 #!/bin/bash
-# upgrade.sh v2.1 - Automatic Upgrade Script for Hermes Evolution
+# upgrade.sh v2.2 - Automatic Upgrade Script for Hermes Evolution
 # Migrates an existing Hermes Agent install onto the Hermes Evolution fork
 # WITHOUT data loss. Works on any system with `hermes` already installed.
 # Source: https://github.com/Lexus2016/hermes-agent-evolution
@@ -15,15 +15,17 @@
 #   * The running gateway is restarted so it reloads new code + skills
 #     (opt out with --no-restart or HERMES_SKIP_GATEWAY_RESTART=1).
 #
-# Usage: bash upgrade.sh [--no-restart]
+# Usage: bash upgrade.sh [--no-restart] [--with-auto-update]
 
 set -euo pipefail
 
 # --- options ---------------------------------------------------------------
 SKIP_RESTART="${HERMES_SKIP_GATEWAY_RESTART:-0}"
+WITH_AUTO_UPDATE=0
 for arg in "$@"; do
     case "$arg" in
         --no-restart) SKIP_RESTART=1 ;;
+        --with-auto-update) WITH_AUTO_UPDATE=1 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -133,6 +135,14 @@ fi
 echo ""
 echo "📋 Evolution cron jobs:"
 hermes cron list 2>/dev/null | grep -i "evolution" | sed 's/^/   /' || echo "   (run: hermes cron list)"
+
+# Optional: schedule the daily GitHub self-update via SYSTEM cron (opt-in).
+if [ "$WITH_AUTO_UPDATE" = "1" ]; then
+    echo ""
+    echo "🔁 Installing daily self-update (system cron)..."
+    HERMES_EVOLUTION_DIR="$EVOLUTION_DIR" bash "$EVOLUTION_DIR/scripts/install_auto_update.sh" \
+        || echo "⚠️  Could not install auto-update cron (see output above)"
+fi
 
 echo ""
 echo "=========================================="

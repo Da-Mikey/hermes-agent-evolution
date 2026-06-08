@@ -103,6 +103,64 @@ hermes cron list | grep -i evolution
 
 ---
 
+## 🔁 Automatic Self-Update (opt-in)
+
+Hermes Evolution can update itself daily from this GitHub fork: if `main` has
+new commits, it pulls them, re-runs setup, health-checks, and restarts the
+gateway — **rolling back automatically if anything breaks**.
+
+> **Why system cron, not Hermes cron:** the Hermes cron ticker runs as a thread
+> INSIDE the gateway process (`gateway/run.py::_start_cron_ticker`). A
+> self-update job scheduled there would kill itself when it restarts the
+> gateway, mid-update. So the updater runs from **system cron** as an
+> independent process.
+
+### Enable
+
+```bash
+# During the upgrade:
+bash ~/hermes-agent-evolution/upgrade.sh --with-auto-update
+
+# Or any time afterwards:
+bash ~/hermes-agent-evolution/scripts/install_auto_update.sh
+```
+
+Default schedule is daily at ~04:17. Override it:
+
+```bash
+AUTO_UPDATE_SCHEDULE="30 5 * * *" \
+  bash ~/hermes-agent-evolution/scripts/install_auto_update.sh
+```
+
+### What each run does
+
+1. `git fetch` — if `main` is unchanged, exit immediately (no-op).
+2. Fast-forward-only pull (never merges or rewrites local work).
+3. Back up the data dir (keeps the last 3 auto-update backups).
+4. Re-run `setup-hermes.sh` + register evolution cron jobs.
+5. Health-check: `hermes --version` and `hermes cron list`.
+6. On success → restart the gateway. **On ANY failure → roll back code + data.**
+
+### Manage it
+
+```bash
+# Run it now (ignores the "no changes" check):
+~/hermes-agent-evolution/scripts/auto_update.sh --force
+
+# Watch the log:
+tail -f ~/.hermes/logs/auto-update.log
+
+# Disable:
+~/hermes-agent-evolution/scripts/install_auto_update.sh --remove
+```
+
+> **⚠️ Safety:** unattended self-update means a bad commit on `main` reaches your
+> agent without a human in the loop. The backup + health-check + rollback
+> mitigate "bricking", but for production prefer gating merges to `main` behind
+> review/CI before enabling this.
+
+---
+
 ## 🔐 Configure Evolution (GitHub access)
 
 Evolution's research/issue/PR jobs need GitHub access. **Use a dedicated
