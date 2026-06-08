@@ -1,11 +1,11 @@
 #!/bin/bash
-# upgrade.sh v1.5 - Automatic Upgrade Script for Hermes Evolution
+# upgrade.sh v1.6 - Automatic Upgrade Script for Hermes Evolution
 # This script does everything automatically - works on any system with Hermes installed
 # Source: https://github.com/Lexus2016/hermes-agent-evolution
 
 set -e
 
-echo "🧬 Hermes Evolution Automatic Upgrade v1.5"
+echo "🧬 Hermes Evolution Automatic Upgrade v1.6"
 echo "=========================================="
 echo ""
 
@@ -23,11 +23,12 @@ if [ -z "$HERMES_PROJECT" ]; then
 fi
 echo "✅ Hermes installed at: $HERMES_PROJECT"
 
-HERMES_SKILLS_DIR="$HERMES_PROJECT/skills"
-HERMES_CRON_DIR="$HERMES_PROJECT/cron"
+# KEY FIX: Hermes loads skills from ~/.hermes/skills/ NOT from $HERMES_PROJECT/skills/
+HERMES_USER_SKILLS="$HOME/.hermes/skills"
+HERMES_USER_CRON="$HOME/.hermes/cron"
 
-echo "📂 Skills directory: $HERMES_SKILLS_DIR"
-echo "📂 Cron directory: $HERMES_CRON_DIR"
+echo "📂 User skills directory: $HERMES_USER_SKILLS"
+echo "📂 User cron directory: $HERMES_USER_CRON"
 echo ""
 
 # Step 1: Create backup
@@ -58,31 +59,26 @@ else
     exit 1
 fi
 
-# Step 4: Re-detect Hermes path (it may have changed after setup)
+# Step 4: Re-detect Hermes path after setup
 echo ""
 echo "🔍 Step 4/7: Re-detecting Hermes path after setup..."
 HERMES_PROJECT=$(hermes --version 2>/dev/null | grep "Project:" | cut -d' ' -f2 || echo "")
-HERMES_SKILLS_DIR="$HERMES_PROJECT/skills"
-HERMES_CRON_DIR="$HERMES_PROJECT/cron"
 echo "✅ Hermes now at: $HERMES_PROJECT"
-echo "📂 Skills directory: $HERMES_SKILLS_DIR"
 
-# Step 5: Install evolution skills with CORRECT structure (CATEGORY/SKILL/SKILL.md)
+# Step 5: Install evolution skills to ~/.hermes/skills/evolution/SKILL_NAME/SKILL.md
 echo ""
-echo "📚 Step 5/7: Installing evolution skills with correct structure..."
+echo "📚 Step 5/7: Installing evolution skills to: $HERMES_USER_SKILLS"
 
-# Install each evolution skill as CATEGORY/SKILL/SKILL.md structure
 EVOLUTION_SKILLS="$EVOLUTION_DIR/skills/evolution"
-EVOLUTION_CATEGORY="evolution"
 
 for skill_file in "$EVOLUTION_SKILLS"/*.md; do
     skill_name=$(basename "$skill_file" .md)
     
-    # Create skill directory structure: skills/evolution/evolution-research/SKILL.md
-    skill_dir="$HERMES_SKILLS_DIR/$EVOLUTION_CATEGORY/evolution-$skill_name"
+    # Create skill directory: ~/.hermes/skills/evolution/evolution-research/SKILL.md
+    skill_dir="$HERMES_USER_SKILLS/evolution/evolution-$skill_name"
     mkdir -p "$skill_dir"
     
-    # Copy skill file as SKILL.md (Hermes expects this)
+    # Copy skill file as SKILL.md
     cp "$skill_file" "$skill_dir/SKILL.md"
     
     echo "✅ Installed: evolution/evolution-$skill_name"
@@ -90,29 +86,27 @@ done
 
 echo ""
 echo "📋 Installed evolution skills:"
-ls -1 "$HERMES_SKILLS_DIR/$EVOLUTION_CATEGORY"/evolution-* 2>/dev/null | while read dir; do
-    echo "   - $(basename $dir)"
+ls -1d "$HERMES_USER_SKILLS"/evolution/evolution-* 2>/dev/null | while read dir; do
+    echo "   - $(basename "$dir")"
 done
 
-# Step 6: Copy evolution cron jobs TO THE RIGHT PLACE
+# Step 6: Copy evolution cron jobs to ~/.hermes/cron/
 echo ""
-echo "⏰ Step 6/7: Installing evolution cron jobs to: $HERMES_CRON_DIR"
+echo "⏰ Step 6/7: Installing evolution cron jobs to: $HERMES_USER_CRON"
 EVOLUTION_CRON="$EVOLUTION_DIR/cron/evolution"
 
 if [ -d "$EVOLUTION_CRON" ]; then
-    mkdir -p "$HERMES_CRON_DIR"
-    # Don't copy if already exists (avoid error)
-    if [ ! -d "$HERMES_CRON_DIR/evolution" ]; then
-        cp -r "$EVOLUTION_CRON" "$HERMES_CRON_DIR/"
-        echo "✅ Evolution cron jobs installed to: $HERMES_CRON_DIR/evolution"
+    mkdir -p "$HERMES_USER_CRON"
+    if [ ! -d "$HERMES_USER_CRON/evolution" ]; then
+        cp -r "$EVOLUTION_CRON" "$HERMES_USER_CRON/"
+        echo "✅ Evolution cron jobs installed"
     else
         echo "✅ Evolution cron jobs already installed"
     fi
     
-    # List installed cron jobs
     echo "📋 Installed evolution cron jobs:"
     ls -1 "$EVOLUTION_CRON"/*.yaml 2>/dev/null | while read file; do
-        echo "   - $(basename $file .yaml)"
+        echo "   - $(basename "$file" .yaml)"
     done
 else
     echo "❌ Evolution cron jobs not found in repository"
@@ -122,19 +116,17 @@ fi
 echo ""
 echo "✅ Step 7/7: Verifying installation..."
 
-# Check if hermes command exists
 if command -v hermes &> /dev/null; then
     echo "✅ Hermes command available"
     
-    # Check evolution skills
     if hermes skills list 2>/dev/null | grep -q "evolution"; then
-        echo "✅ Evolution skills installed and available"
+        echo "✅ Evolution skills installed and available!"
     else
         echo "⚠️  Evolution skills installed but not yet visible"
-        echo "📋 Try running: hermes skills list"
+        echo "📋 Try: exec bash && hermes skills list | grep evolution"
     fi
 else
-    echo "❌ Hermes command not found - something went wrong"
+    echo "❌ Hermes command not found"
     exit 1
 fi
 
@@ -148,12 +140,11 @@ echo "  • Evolution cron jobs (daily research, analysis, implementation)"
 echo "  • Self-update capabilities"
 echo ""
 echo "🔗 Next steps:"
-echo "  1. Test: hermes --help"
+echo "  1. Reload shell: exec bash"
 echo "  2. Check skills: hermes skills list | grep evolution"
-echo "  3. Read docs: cat $EVOLUTION_DIR/EVOLUTION_README.md"
 echo ""
-echo "📂 Backup location: ~/.hermes.backup.$BACKUP_DATE"
-echo "🔄 Rollback if needed: cp -r ~/.hermes.backup.$BACKUP_DATE ~/.hermes"
+echo "📂 Backup: ~/.hermes.backup.$BACKUP_DATE"
+echo "🔄 Rollback: cp -r ~/.hermes.backup.$BACKUP_DATE ~/.hermes"
 echo ""
 echo "✨ You're now running Hermes Evolution!"
 echo "=========================================="
