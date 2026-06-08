@@ -227,7 +227,7 @@ echo 'export GITHUB_TOKEN=*** echo 'export GITHUB_PRIVATE_TOKEN=***# 2. Enable E
 hermes cron create --name evolution-research \
   --schedule "0 9 * * *" \
   --prompt "$(cat ~/hermes-evolution/cron/evolution/research.yaml)" \
-  --skills evolution/research
+  --skills evolution-research
 ```
 
 **Note:** Evolution cron jobs are optional. You can continue using Hermes Evolution without them.
@@ -482,7 +482,7 @@ If you want to enable autonomous evolution:
 # Add tokens
 export GITHUB_TOKEN=*** Add evolution cron jobs
 hermes cron create --name evolution-research --schedule "0 9 * * *" \
-  --skills evolution/research
+  --skills evolution-research
 ```
 
 ### 3. Continue Using Hermes
@@ -494,7 +494,7 @@ Everything works as before, plus evolution features are available:
 hermes "Help me write code"
 
 # Or use evolution features
-hermes --skill evolution/research
+hermes --skill evolution-research
 ```
 
 ---

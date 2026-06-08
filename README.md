@@ -181,11 +181,11 @@ export GITHUB_TOKEN="*** For PRIVATE Mode (Repository Owner Only)
 ```bash
 export GITHUB_PRIVATE_TOKEN="*** Evolution Skills
 
-- **[evolution/research](skills/evolution/research.md)** — Research agents & papers
-- **[evolution/issues](skills/evolution/issues.md)** — Create GitHub issues/PR
-- **[evolution/analysis](skills/evolution/analysis.md)** — Prioritize improvements
-- **[evolution/implementation](skills/evolution/implementation.md)** — Implement & update
-- **[evolution/upstream-sync](skills/evolution/upstream-sync.md)** — Sync with upstream
+- **[evolution-research](skills/evolution/evolution-research/SKILL.md)** — Research agents & papers
+- **[evolution-issues](skills/evolution/evolution-issues/SKILL.md)** — Create GitHub issues/PR
+- **[evolution-analysis](skills/evolution/evolution-analysis/SKILL.md)** — Prioritize improvements
+- **[evolution-implementation](skills/evolution/evolution-implementation/SKILL.md)** — Implement & update
+- **[evolution-upstream-sync](skills/evolution/evolution-upstream-sync/SKILL.md)** — Sync with upstream
 
 ---
 
@@ -243,9 +243,9 @@ cd hermes-agent-evolution
 export GITHUB_TOKEN="*** For PRIVATE mode (implement + self-update, owner only)
 export GITHUB_PRIVATE_TOKEN="*** the evolution cron jobs:**
 ```bash
-hermes cron create --name evolution-research --schedule "0 9 * * *" \
-  --prompt "$(cat cron/evolution/research.yaml)" \
-  --skills evolution/research
+# Register ALL evolution cron jobs from cron/evolution/*.yaml (idempotent):
+~/hermes-agent-evolution/venv/bin/python \
+  ~/hermes-agent-evolution/scripts/register_evolution_cron.py
 ```
 
 See [EVOLUTION_README.md](EVOLUTION_README.md) for complete setup.
@@ -271,7 +271,7 @@ hermes --skill github-pr-workflow
 
 ```bash
 # Run research manually
-hermes --skill evolution/research
+hermes --skill evolution-research
 
 # Check evolution mode
 python evolution/detect_mode.py

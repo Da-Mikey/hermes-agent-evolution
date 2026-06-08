@@ -1,197 +1,204 @@
-# 🧬 Hermes Evolution — Auto-Upgrade Instructions
+# 🧬 Hermes Evolution — Upgrade & Install Instructions
 
-**Read this file to automatically upgrade from Hermes Agent to Hermes Evolution without data loss.**
+**Upgrade an existing Hermes Agent install to Hermes Evolution without data loss.**
 
 ---
 
 ## 🎯 What This Does
 
-This script upgrades your existing Hermes Agent installation to **Hermes Evolution** — a self-improving version with autonomous research, proposal generation, and self-update capabilities.
+Upgrades your existing Hermes Agent installation to **Hermes Evolution** — a
+self-improving fork with autonomous research, proposal generation, and
+self-update capabilities.
 
-**Zero data loss:** All your profiles, skills, cron jobs, memories, and configurations are preserved.
+**Zero data loss:** profiles, skills, cron jobs, memories, and configuration
+are preserved (a timestamped backup is taken automatically).
 
 ---
 
 ## 📋 Prerequisites
 
-Your system needs:
 - ✅ Python 3.11+
 - ✅ Git installed
 - ✅ Active internet connection
-- ✅ Existing Hermes Agent installation at `~/.hermes/`
+- ✅ Existing Hermes Agent installation (`hermes` on PATH)
 
 ---
 
-## 🚀 Automatic Upgrade Process
-
-### Step 1: Clone Hermes Evolution
+## 🚀 Recommended: One-Command Upgrade
 
 ```bash
-# Clone to temporary location
-git clone https://github.com/Lexus2016/hermes-agent-evolution.git /tmp/hermes-evolution
+# Clone fresh (git always gets the latest main — see the cache note below)
+rm -rf ~/hermes-agent-evolution /tmp/hermes-evolution
+git clone https://github.com/Lexus2016/hermes-agent-evolution.git ~/hermes-agent-evolution
+
+# Run the upgrade (backup → setup → seed skills → register cron → restart gateway)
+bash ~/hermes-agent-evolution/upgrade.sh
+
+# Verify
+hermes skills list | grep -i evolution
+hermes cron list   | grep -i evolution
 ```
 
-### Step 2: Create Backup
+> **⚠️ Do not pipe the script from a CDN** (`curl … raw.githubusercontent.com`
+> or `jsdelivr`). Those cache the script aggressively (jsDelivr `@main` up to
+> 7 days), so `curl | bash` can run a STALE `upgrade.sh`. `git clone` always
+> pulls the current `main`.
+
+### What `upgrade.sh` does (7 steps)
+
+1. **Backup** the live Hermes data dir (`$HERMES_HOME` or `~/.hermes`).
+2. **Clone** the fork to `~/hermes-agent-evolution`.
+3. **Run `setup-hermes.sh`** — installs new code AND seeds bundled skills
+   (including `evolution/*`) into the real skills dir via `tools/skills_sync.py`.
+4. **Verify** evolution skills landed in the dir Hermes actually scans.
+5. **Register evolution cron jobs** into Hermes' native `jobs.json` registry
+   (via `scripts/register_evolution_cron.py`, idempotent by job name).
+6. **Restart the gateway** so the running process reloads new code + skills.
+   Opt out with `--no-restart` or `HERMES_SKIP_GATEWAY_RESTART=1`.
+7. **Verify** skills and cron jobs are visible to Hermes.
 
 ```bash
-# Automatic backup with timestamp
-BACKUP_DATE=$(date +%Y%m%d_%H%M%S)
-cp -r ~/.hermes ~/.hermes.backup.$BACKUP_DATE
-echo "Backup created at: ~/.hermes.backup.$BACKUP_DATE"
+# Skip the gateway restart (e.g. to drain active sessions yourself first)
+bash ~/hermes-agent-evolution/upgrade.sh --no-restart
+# ...then apply when ready:
+hermes gateway restart
 ```
 
-### Step 3: Run Migration
+---
+
+## 🧩 Why a restart is required
+
+A running gateway loads code and caches the skill list **in memory at start**.
+Updating files on disk changes nothing until the process restarts:
+
+- **Skills only** (hot): inside the gateway run `/reload-skills` (rescans the
+  skills dir, no process restart).
+- **New code / new version**: a full `hermes gateway restart` is required —
+  reload does not reload Python modules.
+
+`hermes gateway restart` is restart-aware: from a shell it does a graceful
+drain-restart; from within the gateway (self-update) it requests an async
+SIGUSR1 self-restart, so it never kills itself mid-script.
+
+---
+
+## ⏰ Cron jobs (important)
+
+Hermes schedules jobs ONLY from its native registry `~/.hermes/cron/jobs.json`
+(see `cron/jobs.py`). The evolution jobs ship as rich custom YAML under
+`cron/evolution/*.yaml` — **copying those files does not schedule anything.**
+`upgrade.sh` registers them for you; to (re-)run it standalone:
 
 ```bash
-# Run automatic migration script
-bash /tmp/hermes-evolution/scripts/migrate-from-hermes.sh
+# Preview without writing:
+~/hermes-agent-evolution/venv/bin/python \
+    ~/hermes-agent-evolution/scripts/register_evolution_cron.py --dry-run
+
+# Register (idempotent — safe to re-run):
+~/hermes-agent-evolution/venv/bin/python \
+    ~/hermes-agent-evolution/scripts/register_evolution_cron.py
+
+hermes cron list | grep -i evolution
 ```
 
-### Step 4: Verify Migration
+---
+
+## 🔐 Configure Evolution (GitHub access)
+
+Evolution's research/issue/PR jobs need GitHub access. **Use a dedicated
+fine-grained Personal Access Token, not your personal/classic token:**
+
+- **Repository access:** only `Lexus2016/hermes-agent-evolution`
+- **Permissions:** Contents (RW), Pull requests (RW), Issues (RW) — nothing else
 
 ```bash
-# Verify all data is preserved
-python3 /tmp/hermes-evolution/scripts/verify-migration.py ~/.hermes.backup.$BACKUP_DATE
+# PUBLIC mode (research + proposals): read/PR/issues scope is enough
+export GITHUB_TOKEN="<fine-grained-pat>"
+
+# PRIVATE mode (owner only: implementation + self-update)
+export GITHUB_PRIVATE_TOKEN="<fine-grained-pat>"
 ```
 
-### Step 5: Test Installation
-
-```bash
-# Test that Hermes Evolution works
-hermes --help
-
-# Test a query
-hermes "What is 2+2?"
-
-# Check evolution skills are available
-hermes skills list | grep evolution
-```
-
-### Step 6: Configure Evolution (Optional)
-
-If you want to enable autonomous evolution:
-
-```bash
-# For PUBLIC mode (research + proposals)
-export GITHUB_TOKEN=*** your_new_token_here
-
-# For PRIVATE mode (repository owner only - implementation + self-update)
-export GITHUB_PRIVATE_TOKEN=*** your_private_token_here
-
-# Add these to ~/.bashrc or ~/.zshrc for persistence
-echo 'export GITHUB_TOKEN=your_token_here' >> ~/.bashrc
-echo 'export GITHUB_PRIVATE_TOKEN=your_private_token_here' >> ~/.bashrc
-```
+> **Security:** Do NOT hard-code tokens into `~/.bashrc` in plaintext or into
+> any git remote URL. Prefer a secrets manager / env file with `chmod 600`,
+> or the Hermes secrets vault. A leaked broad-scope token gives an attacker
+> (or a prompt-injected agent) the keys to your repositories.
 
 ---
 
 ## ✅ Verification
 
-After upgrade, verify everything works:
-
 ```bash
-# Check profiles preserved
-hermes profile list
+hermes profile list                 # profiles preserved
+ls "$(hermes --version 2>/dev/null | grep Project: | cut -d' ' -f2)" >/dev/null 2>&1 || true
+hermes skills list | grep -i evolution
+hermes cron list   | grep -i evolution
 
-# Check custom skills preserved
-ls ~/.hermes/skills/
-
-# Check cron jobs preserved
-hermes cron list
-
-# Test evolution skills
-hermes --skill evolution/research "What's new in AI agents?"
+# Explicitly load an evolution skill (canonical names use a hyphen):
+hermes --skill evolution-research "What's new in AI agents?"
 ```
 
 ---
 
-## 🔄 Rollback (If Needed)
+## 🔄 Rollback
 
-If anything goes wrong, automatic rollback is available:
+`upgrade.sh` prints the exact rollback command with your backup path. Generic form:
 
 ```bash
-# Find your backup
-ls -la ~/.hermes.backup.*
-
-# Rollback to backup
-python3 /tmp/hermes-evolution/scripts/rollback-migration.py ~/.hermes.backup.$BACKUP_DATE
+ls -d "${HERMES_HOME:-$HOME/.hermes}".backup.* 2>/dev/null   # find backups
+# Restore (replace TIMESTAMP):
+HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
+rm -rf "$HOME_DIR" && mv "$HOME_DIR.backup.TIMESTAMP" "$HOME_DIR"
+hermes gateway restart
 ```
+
+A scripted migration/verify/rollback path also exists under `scripts/`
+(`migrate-from-hermes.sh`, `verify-migration.py`, `rollback-migration.py`)
+for advanced, step-by-step control.
 
 ---
 
 ## 📚 What's New
 
-After upgrading to Hermes Evolution, you get:
+### Evolution Skills (canonical names)
+- **evolution-research** — research other AI agents and papers
+- **evolution-issues** — create GitHub issues with proposals
+- **evolution-analysis** — analyze and prioritize improvements
+- **evolution-implementation** — implement and self-update
+- **evolution-upstream-sync** — sync with upstream Hermes Agent
 
-### New Evolution Skills
-- **evolution/research** — Research other AI agents and papers
-- **evolution/issues** — Create GitHub issues with proposals
-- **evolution/analysis** — Analyze and prioritize improvements
-- **evolution/implementation** — Implement and self-update
-- **evolution/upstream-sync** — Sync with upstream Hermes Agent
-
-### Automated Cron Jobs
-- Daily research (9 AM)
-- Daily issue creation (12 PM)
-- Daily analysis (9 PM, PRIVATE mode)
-- Daily implementation (10 PM, PRIVATE mode)
-- Weekly upstream sync (Sunday 8 AM, PRIVATE mode)
-
-### New Documentation
-- EVOLUTION_README.md — Evolution capabilities
-- MIGRATION_GUIDE.md — This guide
-- CONTRIBUTING_EVOLUTION.md — Contribution guidelines
-- SECURITY_EVOLUTION.md — Security policy
+### Automated Cron Jobs (registered in the native scheduler)
+- Research — daily 09:00
+- Issue creation — daily 12:00
+- Analysis — daily 21:00 (PRIVATE mode)
+- Implementation — daily 22:00 (PRIVATE mode)
+- Upstream sync — weekly (PRIVATE mode)
 
 ---
 
 ## 🎯 How Evolution Works
 
-### PUBLIC Mode (All installations)
-- ✅ Research other agents and papers daily
+### PUBLIC Mode (all installations)
+- ✅ Research other agents and papers
 - ✅ Create GitHub issues with improvement proposals
-- ✅ Use all Hermes Agent features
 - ❌ Cannot modify code or self-update
 
-### PRIVATE Mode (Repository owner only)
+### PRIVATE Mode (repository owner only)
 - ✅ Everything in PUBLIC mode, plus:
-- ✅ Analyze all proposals
-- ✅ Prioritize by impact/effort
+- ✅ Analyze and prioritize proposals
 - ✅ Implement selected improvements
-- ✅ Create versions and self-update
+- ✅ Create versions and self-update (with tests + rollback safeguards)
 - ✅ Sync with upstream Hermes Agent
-
----
-
-## 📞 Support
-
-If you encounter issues:
-
-1. **Check logs**: `~/.hermes/logs/`
-2. **Verify backup**: Ensure `~/.hermes.backup.*` exists
-3. **Run verification**: `python3 /tmp/hermes-evolution/scripts/verify-migration.py`
-4. **Rollback if needed**: Use rollback script
-5. **Create issue**: https://github.com/Lexus2016/hermes-agent-evolution/issues
-
----
-
-## 🔐 Security Notes
-
-- Your data is backed up automatically before migration
-- No data is sent to external servers
-- GitHub tokens are stored locally only
-- You can rollback at any time
 
 ---
 
 ## 📖 More Information
 
 - **Repository**: https://github.com/Lexus2016/hermes-agent-evolution
-- **Documentation**: https://github.com/Lexus2016/hermes-agent-evolution/blob/main/EVOLUTION_README.md
+- **Evolution docs**: `EVOLUTION_README.md`
 - **Upstream**: https://github.com/nousresearch/hermes-agent
 
 ---
 
-**Upgrade complete! Welcome to Hermes Evolution!** 🧬🚀
-
-Your data is safe, everything is preserved, and you now have evolution capabilities.
+**Welcome to Hermes Evolution!** 🧬🚀 Your data is backed up, and you can roll
+back at any time.

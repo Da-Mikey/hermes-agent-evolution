@@ -96,31 +96,31 @@ export GITHUB_PRIVATE_TOKEN="your..."
 hermes cron create --name evolution-research \
   --schedule "0 9 * * *" \
   --prompt "$(cat cron/evolution/research.yaml)" \
-  --skills evolution/research
+  --skills evolution-research
 
 # Issues (PUBLIC mode)
 hermes cron create --name evolution-issues \
   --schedule "0 12 * * *" \
   --prompt "$(cat cron/evolution/issues.yaml)" \
-  --skills evolution/issues
+  --skills evolution-issues
 
 # Analysis (PRIVATE mode only)
 hermes cron create --name evolution-analysis \
   --schedule "0 21 * * *" \
   --prompt "$(cat cron/evolution/analysis.yaml)" \
-  --skills evolution/analysis
+  --skills evolution-analysis
 
 # Implementation (PRIVATE mode only)
 hermes cron create --name evolution-implement \
   --schedule "0 22 * * *" \
   --prompt "$(cat cron/evolution/implementation.yaml)" \
-  --skills evolution/implementation
+  --skills evolution-implementation
 
 # Upstream Sync (PRIVATE mode only)
 hermes cron create --name evolution-upstream \
   --schedule "0 8 * * 0" \
   --prompt "$(cat cron/evolution/upstream-sync.yaml)" \
-  --skills evolution/upstream-sync
+  --skills evolution-upstream-sync
 ```
 
 ## 📚 Evolution Skills
