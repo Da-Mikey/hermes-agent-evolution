@@ -9,6 +9,8 @@ BACKUP_DATE=$(date +%Y%m%d_%H%M%S)
 cp -r ~/.hermes ~/.hermes.backup.$BACKUP_DATE
 echo "✅ Backup: ~/.hermes.backup.$BACKUP_DATE"
 echo "Cloning Hermes Evolution..."
+# Clean up any existing clones (old /tmp location and new ~/ location)
+rm -rf ~/hermes-agent-evolution /tmp/hermes-evolution
 git clone https://github.com/Lexus2016/hermes-agent-evolution.git ~/hermes-agent-evolution
 echo "Running migration..."
 export HERMES_EVOLUTION_ROOT="$HOME/hermes-agent-evolution"
