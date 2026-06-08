@@ -103,11 +103,13 @@ hermes cron list | grep -i evolution
 
 ---
 
-## 🔁 Automatic Self-Update (opt-in)
+## 🔁 Automatic Self-Update (ON by default)
 
-Hermes Evolution can update itself daily from this GitHub fork: if `main` has
-new commits, it pulls them, re-runs setup, health-checks, and restarts the
-gateway — **rolling back automatically if anything breaks**.
+Self-evolution is the whole point of this fork, so `upgrade.sh` enables daily
+self-update **automatically — no flag required**. Each day, if `main` has new
+commits, the agent pulls them, re-runs setup, health-checks, and restarts the
+gateway — **rolling back automatically if anything breaks**. This is what makes
+the agent self-evolving rather than "plain Hermes on our repo".
 
 > **Why system cron, not Hermes cron:** the Hermes cron ticker runs as a thread
 > INSIDE the gateway process (`gateway/run.py::_start_cron_ticker`). A
@@ -115,17 +117,17 @@ gateway — **rolling back automatically if anything breaks**.
 > gateway, mid-update. So the updater runs from **system cron** as an
 > independent process.
 
-### Enable
+### It's already on — opting out
+
+`bash upgrade.sh` installs the self-update cron for you. If you specifically do
+NOT want unattended evolution:
 
 ```bash
-# During the upgrade:
-bash ~/hermes-agent-evolution/upgrade.sh --with-auto-update
-
-# Or any time afterwards:
-bash ~/hermes-agent-evolution/scripts/install_auto_update.sh
+bash ~/hermes-agent-evolution/upgrade.sh --no-auto-update
+# or: HERMES_NO_AUTO_UPDATE=1 bash ~/hermes-agent-evolution/upgrade.sh
 ```
 
-Default schedule is daily at ~04:17. Override it:
+To (re)install standalone or change the schedule later (default daily ~04:17):
 
 ```bash
 AUTO_UPDATE_SCHEDULE="30 5 * * *" \

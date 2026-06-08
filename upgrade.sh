@@ -1,5 +1,5 @@
 #!/bin/bash
-# upgrade.sh v2.2 - Automatic Upgrade Script for Hermes Evolution
+# upgrade.sh v2.3 - Automatic Upgrade Script for Hermes Evolution
 # Migrates an existing Hermes Agent install onto the Hermes Evolution fork
 # WITHOUT data loss. Works on any system with `hermes` already installed.
 # Source: https://github.com/Lexus2016/hermes-agent-evolution
@@ -15,17 +15,21 @@
 #   * The running gateway is restarted so it reloads new code + skills
 #     (opt out with --no-restart or HERMES_SKIP_GATEWAY_RESTART=1).
 #
-# Usage: bash upgrade.sh [--no-restart] [--with-auto-update]
+# Usage: bash upgrade.sh [--no-restart] [--no-auto-update]
 
 set -euo pipefail
 
 # --- options ---------------------------------------------------------------
 SKIP_RESTART="${HERMES_SKIP_GATEWAY_RESTART:-0}"
-WITH_AUTO_UPDATE=0
+# Self-evolution is the POINT of this fork: daily auto-update is ON by default.
+# Opt out with --no-auto-update or HERMES_NO_AUTO_UPDATE=1.
+AUTO_UPDATE=1
+if [ "${HERMES_NO_AUTO_UPDATE:-0}" = "1" ]; then AUTO_UPDATE=0; fi
 for arg in "$@"; do
     case "$arg" in
         --no-restart) SKIP_RESTART=1 ;;
-        --with-auto-update) WITH_AUTO_UPDATE=1 ;;
+        --no-auto-update) AUTO_UPDATE=0 ;;
+        --with-auto-update) AUTO_UPDATE=1 ;;  # back-compat; now the default
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -136,12 +140,18 @@ echo ""
 echo "📋 Evolution cron jobs:"
 hermes cron list 2>/dev/null | grep -i "evolution" | sed 's/^/   /' || echo "   (run: hermes cron list)"
 
-# Optional: schedule the daily GitHub self-update via SYSTEM cron (opt-in).
-if [ "$WITH_AUTO_UPDATE" = "1" ]; then
+# Self-evolution: schedule the daily GitHub self-update via SYSTEM cron.
+# ON by default (this is the whole point of the fork). Disable per the message.
+if [ "$AUTO_UPDATE" = "1" ]; then
     echo ""
-    echo "🔁 Installing daily self-update (system cron)..."
+    echo "🔁 Installing daily self-update (system cron) — this is what makes the agent self-evolving..."
     HERMES_EVOLUTION_DIR="$EVOLUTION_DIR" bash "$EVOLUTION_DIR/scripts/install_auto_update.sh" \
         || echo "⚠️  Could not install auto-update cron (see output above)"
+else
+    echo ""
+    echo "⏭️  Auto-update DISABLED (--no-auto-update / HERMES_NO_AUTO_UPDATE=1)."
+    echo "    The agent will NOT self-evolve. Enable later with:"
+    echo "    bash $EVOLUTION_DIR/scripts/install_auto_update.sh"
 fi
 
 echo ""
@@ -151,7 +161,11 @@ echo ""
 echo "📖 What's new:"
 echo "  • Evolution skills bundled (research, issues, analysis, implementation, upstream-sync)"
 echo "  • Evolution cron jobs registered in the native scheduler"
-echo "  • Self-evolution scaffolding"
+if [ "$AUTO_UPDATE" = "1" ]; then
+    echo "  • Daily GitHub self-update: ENABLED — the agent evolves itself"
+else
+    echo "  • Daily GitHub self-update: DISABLED (run install_auto_update.sh to enable)"
+fi
 echo ""
 echo "📂 Backup: $PRELIM_HOME.backup.$BACKUP_DATE"
 echo "🔄 Rollback: rm -rf \"$PRELIM_HOME\" && mv \"$PRELIM_HOME.backup.$BACKUP_DATE\" \"$PRELIM_HOME\""
