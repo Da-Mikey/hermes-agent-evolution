@@ -4,7 +4,7 @@
  * `parts[]` model — text/tool interleave in one turn, tool start↔complete matched
  * by id and updated IN PLACE, `{output,exit_code}` envelope stripped.
  */
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 
 import { DEFAULT_THEME } from '../logic/theme.ts'
 import { createSessionStore, type Message } from '../logic/store.ts'
@@ -343,5 +343,99 @@ describe('session store — resume hydrate (Phase 4b)', () => {
     expect(store.state.messages).toHaveLength(2) // snapshot(1) + the replayed assistant turn(1)
     expect(store.state.messages[0]).toMatchObject({ role: 'user', text: 'old question' })
     expect(store.state.messages[1]!.parts?.[0]).toMatchObject({ type: 'text', text: 'live during resume' })
+  })
+})
+
+describe('session store — rolling message cap (bounds the Yoga node high-water mark)', () => {
+  const ENV_KEY = 'HERMES_TUI_MAX_MESSAGES'
+  const prev = process.env[ENV_KEY]
+  afterEach(() => {
+    if (prev === undefined) delete process.env[ENV_KEY]
+    else process.env[ENV_KEY] = prev
+  })
+
+  test('caps the message array at the env-tuned MESSAGE_CAP, dropping the oldest (head)', () => {
+    process.env[ENV_KEY] = '5'
+    const store = createSessionStore()
+    // push more than the cap; each distinct so we can tell which survived
+    for (let i = 0; i < 55; i++) store.pushUser(`msg ${i}`)
+    expect(store.state.messages).toHaveLength(5)
+    // the oldest 50 were sliced from the head; survivors are the last 5 (msg 50..54)
+    expect(store.state.messages[0]!.text).toBe('msg 50')
+    expect(store.state.messages.at(-1)!.text).toBe('msg 54')
+  })
+
+  test('pushSystem is also capped (head-dropped) at MESSAGE_CAP', () => {
+    process.env[ENV_KEY] = '3'
+    const store = createSessionStore()
+    for (let i = 0; i < 10; i++) store.pushSystem(`sys ${i}`)
+    expect(store.state.messages).toHaveLength(3)
+    expect(store.state.messages[0]!.text).toBe('sys 7')
+    expect(store.state.messages.at(-1)!.text).toBe('sys 9')
+  })
+
+  test('the in-flight streaming turn it opens at overflow SURVIVES the cap (head sliced, not tail)', () => {
+    process.env[ENV_KEY] = '4'
+    const store = createSessionStore()
+    // fill to the cap with user rows so the next push overflows
+    store.pushUser('u0')
+    store.pushUser('u1')
+    store.pushUser('u2')
+    store.pushUser('u3') // array now at the cap (4): [u0, u1, u2, u3]
+    expect(store.state.messages).toHaveLength(4)
+
+    // message.start pushes the assistant turn as the LAST row (length 5) → head sliced to 4.
+    // The freshly-pushed streaming turn is the tail, so it must NOT be the one evicted.
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'in flight' } })
+    expect(store.state.messages).toHaveLength(4)
+    expect(store.state.messages[0]!.text).toBe('u1') // 'u0' dropped from the head, not the tail turn
+    const live = store.state.messages.at(-1)!
+    expect(live.role).toBe('assistant')
+    expect(live.streaming).toBe(true)
+    expect(live.parts?.[0]).toMatchObject({ type: 'text', text: 'in flight' })
+  })
+
+  test('message.start is capped: opening a turn beyond the cap drops the oldest', () => {
+    process.env[ENV_KEY] = '2'
+    const store = createSessionStore()
+    store.pushUser('a')
+    store.pushUser('b')
+    store.apply({ type: 'message.start' }) // array would be 3 → trimmed to 2
+    expect(store.state.messages).toHaveLength(2)
+    expect(store.state.messages[0]!.text).toBe('b') // 'a' dropped from the head
+    expect(store.state.messages.at(-1)!.role).toBe('assistant')
+  })
+
+  test('commitSnapshot caps an over-cap resume snapshot (oldest history dropped)', () => {
+    process.env[ENV_KEY] = '3'
+    const store = createSessionStore()
+    const snapshot: Message[] = Array.from({ length: 8 }, (_, i) => ({ role: 'user', text: `h${i}` }))
+    store.beginBuffer()
+    store.commitSnapshot(snapshot)
+    expect(store.state.messages).toHaveLength(3)
+    expect(store.state.messages[0]!.text).toBe('h5')
+    expect(store.state.messages.at(-1)!.text).toBe('h7')
+  })
+
+  test('defaults to 400 when the env var is unset/invalid', () => {
+    delete process.env[ENV_KEY]
+    const store = createSessionStore()
+    for (let i = 0; i < 450; i++) store.pushUser(`m${i}`)
+    expect(store.state.messages).toHaveLength(400)
+    expect(store.state.messages[0]!.text).toBe('m50') // oldest 50 dropped
+  })
+
+  test('clearTranscript empties messages AND the applied dedup set', () => {
+    const store = createSessionStore()
+    store.pushUser('x')
+    // seed the dedup set with an id, then confirm it is now treated as seen
+    expect(store.duplicate('seen-1')).toBe(false)
+    expect(store.duplicate('seen-1')).toBe(true)
+
+    store.clearTranscript()
+    expect(store.state.messages).toHaveLength(0)
+    // after clear the previously-seen id is processed again (the applied Set was cleared)
+    expect(store.duplicate('seen-1')).toBe(false)
   })
 })

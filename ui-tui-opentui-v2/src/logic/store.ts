@@ -254,6 +254,21 @@ function subagentStatusFor(type: string): string {
 }
 
 export function createSessionStore() {
+  // Rolling cap on retained transcript rows. OpenTUI lays out via Yoga (WASM), whose
+  // linear memory is grow-only — every live `<For>` row is a Yoga-node subtree, so an
+  // uncapped `messages[]` ratchets the high-water mark up over a long session and never
+  // gives it back. Capping the array in place (see `capMessages`) makes Solid's keyed
+  // `<For>` UNMOUNT exactly the evicted oldest rows → `Renderable.destroy()` →
+  // `yogaNode.free()`, returning those nodes to the WASM allocator's free list.
+  //
+  // 400 is generous (far more than a screenful) but bounded; opencode caps at 100.
+  // Read once per store from `HERMES_TUI_MAX_MESSAGES`. Turns trimmed beyond the cap
+  // aren't lost — they live on the gateway and are recoverable via `/resume`.
+  const MESSAGE_CAP = (() => {
+    const raw = Number.parseInt(process.env.HERMES_TUI_MAX_MESSAGES ?? '', 10)
+    return Number.isFinite(raw) && raw > 0 ? raw : 400
+  })()
+
   const [state, setState] = createStore<StoreState>({
     ready: false,
     messages: [],
@@ -299,6 +314,16 @@ export function createSessionStore() {
     setState('theme', themeFromSkin(skin))
   }
 
+  // Trim the transcript to MESSAGE_CAP, dropping the OLDEST rows IN PLACE via
+  // `splice` (NOT a `slice`-reassign). A keyed `<For>` keeps rows by item
+  // REFERENCE, so splicing the head unmounts only the evicted rows (freeing their
+  // Yoga nodes) while the survivors keep their refs and are not remounted. A live
+  // streaming assistant turn is always the LAST row, so head-trimming never drops it.
+  function capMessages(draft: StoreState): void {
+    const overflow = draft.messages.length - MESSAGE_CAP
+    if (overflow > 0) draft.messages.splice(0, overflow)
+  }
+
   // ── parts helpers (operate on a draft message inside produce) ───────────
   function appendPart(m: Message, type: 'text' | 'reasoning', text: string): void {
     const parts = (m.parts ??= [])
@@ -341,6 +366,7 @@ export function createSessionStore() {
     setState(
       produce(draft => {
         draft.messages.push({ role: 'user', text })
+        capMessages(draft)
       })
     )
   }
@@ -353,6 +379,7 @@ export function createSessionStore() {
     setState(
       produce(draft => {
         draft.messages.push({ role: 'system', text: clean })
+        capMessages(draft)
       })
     )
   }
@@ -361,6 +388,8 @@ export function createSessionStore() {
   function clearTranscript() {
     setState('messages', [])
     setState('subagents', [])
+    // Drop the dedup history too — a fresh transcript should re-process any id.
+    applied.clear()
   }
 
   /** Open / close the agents dashboard overlay (/agents). */
@@ -455,6 +484,7 @@ export function createSessionStore() {
         setState(
           produce(draft => {
             draft.messages.push({ role: 'assistant', text: '', parts: [], streaming: true })
+            capMessages(draft)
           })
         )
         break
@@ -658,6 +688,8 @@ export function createSessionStore() {
   /** Replace history with the resume snapshot, then replay events buffered meanwhile. */
   function commitSnapshot(snapshot: Message[]): void {
     setState('messages', snapshot)
+    // An over-cap resume snapshot must be trimmed too (it sets the whole array).
+    setState(produce(capMessages))
     const pending = buffering ?? []
     buffering = null
     for (const event of pending) applyNow(event)
