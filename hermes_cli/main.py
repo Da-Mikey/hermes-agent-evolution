@@ -2000,7 +2000,8 @@ def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
 
 
 def _launch_tui(
-    resume_session_id: Optional[str] = None,
+    # str session id, the bare-`--resume` picker sentinel True, or None.
+    resume_session_id: "Optional[str | bool]" = None,
     tui_dev: bool = False,
     model: Optional[str] = None,
     provider: Optional[str] = None,
@@ -2018,6 +2019,14 @@ def _launch_tui(
 ):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
+
+    # Bare `--resume` arrives as the argparse sentinel True: open the TUI
+    # resume picker instead of resuming a specific session id. Normalize it
+    # here so everything downstream (exit summary, env forwarding) keeps
+    # seeing either a real session id string or None.
+    resume_picker = resume_session_id is True
+    if resume_picker:
+        resume_session_id = None
 
     import tempfile
 
@@ -2125,7 +2134,11 @@ def _launch_tui(
     # resolved for this invocation; direct `node ui-tui/dist/entry.js` users can
     # still set HERMES_TUI_RESUME themselves.
     env.pop("HERMES_TUI_RESUME", None)
-    if resume_session_id:
+    if resume_picker:
+        # Bare --resume: tell the TUI to open the resume picker before any
+        # session.create (create is lazy, so nothing is wasted).
+        env["HERMES_TUI_RESUME"] = "picker"
+    elif resume_session_id:
         env["HERMES_TUI_RESUME"] = resume_session_id
 
     argv, cwd = _make_tui_argv(tui_dir, tui_dev)
@@ -2234,6 +2247,18 @@ def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
 
+    # Bare `--resume` (argparse sentinel True) opens the TUI resume picker —
+    # `_launch_tui` translates it to HERMES_TUI_RESUME=picker. The classic
+    # REPL has no picker overlay, so point at the equivalents instead of
+    # silently resuming something the user didn't choose.
+    if getattr(args, "resume", None) is True and not use_tui:
+        print("Bare --resume opens the session picker, which requires the TUI.")
+        print(
+            "Use 'hermes --tui --resume', 'hermes --resume <id|title>', "
+            "'hermes -c', or 'hermes sessions browse'."
+        )
+        sys.exit(2)
+
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):
@@ -2259,9 +2284,10 @@ def cmd_chat(args):
                 print(f"No previous {kind} session found to continue.")
                 sys.exit(1)
 
-    # Resolve --resume by title if it's not a direct session ID
+    # Resolve --resume by title if it's not a direct session ID. The bare
+    # picker sentinel (True) is not a name — leave it for _launch_tui.
     resume_val = getattr(args, "resume", None)
-    if resume_val:
+    if resume_val and resume_val is not True:
         resolved = _resolve_session_by_name_or_id(resume_val)
         if resolved:
             args.resume = resolved

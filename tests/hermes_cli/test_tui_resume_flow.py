@@ -118,6 +118,82 @@ def test_cmd_chat_tui_resume_resolves_title_before_launch(monkeypatch, main_mod)
     assert captured["resume"] == "20260409_000000_aa11bb"
 
 
+def test_bare_resume_parses_to_picker_sentinel():
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+
+    args = parser.parse_args(["--tui", "--resume"])
+    assert args.resume is True
+
+    args = parser.parse_args(["--resume", "abc123"])
+    assert args.resume == "abc123"
+
+    args = parser.parse_args(["chat", "--tui", "--resume"])
+    assert args.resume is True
+
+
+def test_cmd_chat_tui_bare_resume_skips_resolution_and_launches_picker(
+    monkeypatch, main_mod
+):
+    captured = {}
+
+    def fake_launch(resume_session_id=None, **kwargs):
+        captured["resume"] = resume_session_id
+        raise SystemExit(0)
+
+    def boom(_val):
+        raise AssertionError("bare --resume must not hit name/id resolution")
+
+    monkeypatch.setattr(main_mod, "_resolve_session_by_name_or_id", boom)
+    monkeypatch.setattr(main_mod, "_launch_tui", fake_launch)
+
+    with pytest.raises(SystemExit):
+        main_mod.cmd_chat(_args(resume=True))
+
+    assert captured["resume"] is True
+
+
+def test_cmd_chat_bare_resume_without_tui_exits_with_guidance(
+    monkeypatch, capsys, main_mod
+):
+    monkeypatch.setattr(main_mod, "_resolve_use_tui", lambda args: False)
+    monkeypatch.setattr(
+        main_mod,
+        "_launch_tui",
+        lambda *a, **kw: pytest.fail("must not launch the TUI"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod.cmd_chat(_args(tui=False, resume=True))
+
+    assert exc.value.code == 2
+    out = capsys.readouterr().out
+    assert "requires the TUI" in out
+    assert "hermes --tui --resume" in out
+
+
+def test_launch_tui_sets_picker_env_for_bare_resume(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("HERMES_TUI_RESUME", "stale-missing-session")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui(resume_session_id=True)
+
+    assert captured["env"]["HERMES_TUI_RESUME"] == "picker"
+
+
 def test_cmd_chat_tui_passes_model_and_provider(monkeypatch, main_mod):
     captured = {}
 

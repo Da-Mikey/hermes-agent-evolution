@@ -4816,6 +4816,351 @@ def test_session_most_recent_handles_db_unavailable(monkeypatch):
     assert resp["result"]["session_id"] is None
 
 
+# ── session.list (resume-picker filters + widened projection) ───────
+
+
+def _picker_row(sid, source, started, **extra):
+    row = {
+        "id": sid,
+        "source": source,
+        "title": f"title-{sid}",
+        "preview": f"preview-{sid}",
+        "started_at": started,
+        "last_active": started,
+        "message_count": 3,
+        "ended_at": None,
+        "cwd": None,
+        "model": None,
+    }
+    row.update(extra)
+    return row
+
+
+class _PickerDB:
+    """list_sessions_rich stand-in honouring the kwargs session.list maps."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def list_sessions_rich(
+        self,
+        *,
+        source=None,
+        limit=20,
+        offset=0,
+        order_by_last_active=False,
+        id_query=None,
+    ):
+        self.calls.append(
+            {
+                "source": source,
+                "limit": limit,
+                "offset": offset,
+                "order_by_last_active": order_by_last_active,
+                "id_query": id_query,
+            }
+        )
+        rows = [dict(r) for r in self.rows]
+        if source:
+            rows = [r for r in rows if r.get("source") == source]
+        if id_query:
+            needle = id_query.strip().lower()
+            rows = [r for r in rows if needle in r["id"].lower()]
+        if order_by_last_active:
+            rows.sort(key=lambda r: r.get("last_active") or 0, reverse=True)
+        else:
+            rows.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
+        return rows[offset : offset + limit]
+
+
+def _picker_db():
+    return _PickerDB(
+        [
+            _picker_row(
+                "tui-1",
+                "tui",
+                100,
+                cwd="/home/u/proj",
+                model="nous/hermes-4",
+                ended_at=150.0,
+            ),
+            _picker_row("cli-1", "cli", 90),
+            _picker_row("cron-1", "cron", 80),
+            _picker_row("cron-2", "cron", 70),
+            _picker_row("tg-1", "telegram", 60),
+            _picker_row("tool-1", "tool", 50),
+        ]
+    )
+
+
+def test_session_list_no_params_keeps_legacy_behavior_with_widened_rows(monkeypatch):
+    db = _picker_db()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = server.handle_request({"id": "1", "method": "session.list", "params": {}})
+
+    rows = resp["result"]["sessions"]
+    # Legacy semantics: started_at DESC, `tool` denied, one DB fetch.
+    assert [r["id"] for r in rows] == ["tui-1", "cli-1", "cron-1", "cron-2", "tg-1"]
+    assert db.calls == [
+        {
+            "source": None,
+            "limit": 400,
+            "offset": 0,
+            "order_by_last_active": False,
+            "id_query": None,
+        }
+    ]
+    # Widened projection, None-safe for rows missing the new columns.
+    first, second = rows[0], rows[1]
+    assert first["cwd"] == "/home/u/proj"
+    assert first["model"] == "nous/hermes-4"
+    assert first["ended_at"] == 150.0
+    assert first["last_active"] == 100
+    assert second["cwd"] is None
+    assert second["model"] is None
+    assert second["ended_at"] is None
+    assert second["last_active"] == 90
+    # Legacy keys are still present and unchanged.
+    assert second["title"] == "title-cli-1"
+    assert second["preview"] == "preview-cli-1"
+    assert second["message_count"] == 3
+    assert second["source"] == "cli"
+
+
+def test_session_list_single_source_passes_through_to_db(monkeypatch):
+    db = _picker_db()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.list", "params": {"sources": ["tui"]}}
+    )
+
+    assert [r["id"] for r in resp["result"]["sessions"]] == ["tui-1"]
+    assert db.calls[0]["source"] == "tui"  # pushed into SQL, not Python-filtered
+
+
+def test_session_list_multi_source_filters_gateway_side(monkeypatch):
+    db = _picker_db()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.list",
+            "params": {"sources": ["cron", "telegram"]},
+        }
+    )
+
+    assert [r["id"] for r in resp["result"]["sessions"]] == [
+        "cron-1",
+        "cron-2",
+        "tg-1",
+    ]
+    assert db.calls[0]["source"] is None  # multi-source: DB scan + gateway filter
+
+
+def test_session_list_sources_tool_stays_denied(monkeypatch):
+    db = _picker_db()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.list", "params": {"sources": ["tool"]}}
+    )
+
+    assert resp["result"]["sessions"] == []
+
+
+def test_session_list_query_maps_to_id_query_on_last_active_path(monkeypatch):
+    db = _picker_db()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.list", "params": {"query": "cron"}}
+    )
+
+    assert [r["id"] for r in resp["result"]["sessions"]] == ["cron-1", "cron-2"]
+    assert db.calls[0]["id_query"] == "cron"
+    assert db.calls[0]["order_by_last_active"] is True
+
+
+def test_session_list_offset_limit_paginate(monkeypatch):
+    db = _picker_db()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    def page(offset, limit):
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.list",
+                "params": {
+                    "sources": ["tui", "cli", "cron", "telegram"],
+                    "offset": offset,
+                    "limit": limit,
+                },
+            }
+        )
+        return [r["id"] for r in resp["result"]["sessions"]]
+
+    assert page(0, 2) == ["tui-1", "cli-1"]
+    assert page(2, 2) == ["cron-1", "cron-2"]
+    assert page(4, 2) == ["tg-1"]
+    assert page(6, 2) == []
+
+
+# ── session.peek (resume-picker Space preview) ───────────────────────
+
+
+class _PeekDB:
+    def __init__(self, session, messages):
+        self.session = session
+        self.messages = messages
+
+    def get_session(self, session_id):
+        if self.session and session_id == self.session["id"]:
+            return dict(self.session)
+        return None
+
+    def get_messages(self, session_id):
+        return [dict(m) for m in self.messages]
+
+
+def _peek_db():
+    session = {
+        "id": "sess-1",
+        "title": "picker demo",
+        "source": "tui",
+        "model": "nous/hermes-4",
+        "cwd": "/home/u/proj",
+        "started_at": 100.0,
+        "ended_at": 400.0,
+        "end_reason": "tui_shutdown",
+        "message_count": 6,
+        "actual_cost_usd": None,
+        "estimated_cost_usd": 0.42,
+    }
+    messages = [
+        {"id": 1, "role": "system", "content": "sys prompt", "timestamp": 100.0},
+        {"id": 2, "role": "user", "content": "first prompt", "timestamp": 110.0},
+        {"id": 3, "role": "assistant", "content": "first answer", "timestamp": 120.0},
+        {"id": 4, "role": "tool", "content": "tool output", "timestamp": 130.0},
+        {"id": 5, "role": "user", "content": "second prompt", "timestamp": 140.0},
+        {"id": 6, "role": "assistant", "content": "final answer", "timestamp": 150.0},
+    ]
+    return _PeekDB(session, messages)
+
+
+def test_session_peek_returns_metadata_and_head_tail(monkeypatch):
+    monkeypatch.setattr(server, "_get_db", _peek_db)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.peek",
+            "params": {"session_id": "sess-1", "head": 1, "tail": 2},
+        }
+    )
+
+    result = resp["result"]
+    meta = result["session"]
+    assert meta == {
+        "id": "sess-1",
+        "title": "picker demo",
+        "source": "tui",
+        "model": "nous/hermes-4",
+        "cwd": "/home/u/proj",
+        "started_at": 100.0,
+        "ended_at": 400.0,
+        "end_reason": "tui_shutdown",
+        "message_count": 6,
+        "last_active": 150.0,  # last message timestamp, not ended_at
+        "cost_usd": 0.42,  # estimated fallback when actual is None
+    }
+    # Only displayable (user/assistant) messages, system/tool rows skipped.
+    assert [(m["role"], m["content"]) for m in result["head"]] == [
+        ("user", "first prompt")
+    ]
+    assert [(m["role"], m["content"]) for m in result["tail"]] == [
+        ("user", "second prompt"),
+        ("assistant", "final answer"),
+    ]
+    assert result["total_messages"] == 4
+    assert all(m["truncated"] is False for m in result["head"] + result["tail"])
+
+
+def test_session_peek_head_tail_never_overlap(monkeypatch):
+    db = _peek_db()
+    db.messages = db.messages[:3]  # system + user + assistant
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.peek",
+            "params": {"session_id": "sess-1", "head": 2, "tail": 2},
+        }
+    )
+
+    result = resp["result"]
+    head_ids = [m["id"] for m in result["head"]]
+    tail_ids = [m["id"] for m in result["tail"]]
+    assert head_ids == [2, 3]
+    assert tail_ids == []  # both displayable rows already consumed by head
+    assert result["total_messages"] == 2
+
+
+def test_session_peek_does_not_build_an_agent(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(server, "_get_db", _peek_db)
+    monkeypatch.setattr(
+        server, "_make_agent", lambda *a, **kw: spawned.append("make") or None
+    )
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **kw: spawned.append("build")
+    )
+    before_sessions = dict(server._sessions)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.peek", "params": {"session_id": "sess-1"}}
+    )
+
+    assert "result" in resp
+    assert spawned == []
+    assert server._sessions == before_sessions  # no live session registered
+
+
+def test_session_peek_unknown_id_is_clean_error(monkeypatch):
+    monkeypatch.setattr(server, "_get_db", _peek_db)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.peek", "params": {"session_id": "nope"}}
+    )
+
+    assert resp["error"]["code"] == 4007
+    assert resp["error"]["message"] == "session not found"
+
+
+def test_session_peek_requires_session_id(monkeypatch):
+    monkeypatch.setattr(server, "_get_db", _peek_db)
+
+    resp = server.handle_request({"id": "1", "method": "session.peek", "params": {}})
+
+    assert resp["error"]["code"] == 4006
+
+
+def test_session_peek_db_unavailable(monkeypatch):
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_db_error", "locked")
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.peek", "params": {"session_id": "sess-1"}}
+    )
+
+    assert resp["error"]["code"] == 5046
+    assert "state.db unavailable" in resp["error"]["message"]
+
+
 # ── browser.manage ───────────────────────────────────────────────────
 
 

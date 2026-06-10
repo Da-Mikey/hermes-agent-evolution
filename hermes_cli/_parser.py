@@ -145,8 +145,16 @@ def build_top_level_parser():
         "--resume",
         "-r",
         metavar="SESSION",
+        # nargs="?" + const=True: bare `--resume` parses to the sentinel True,
+        # which `hermes --tui` turns into the session picker
+        # (HERMES_TUI_RESUME=picker). `--resume <id|title>` is unchanged.
+        nargs="?",
+        const=True,
         default=None,
-        help="Resume a previous session by ID or title",
+        help=(
+            "Resume a previous session by ID or title. With --tui, bare "
+            "--resume (no argument) opens the session picker."
+        ),
     )
     parser.add_argument(
         "--continue",
@@ -294,8 +302,14 @@ def build_top_level_parser():
         "--resume",
         "-r",
         metavar="SESSION_ID",
+        # Same bare-flag picker sentinel as the top-level --resume.
+        nargs="?",
+        const=True,
         default=argparse.SUPPRESS,
-        help="Resume a previous session by ID (shown on exit)",
+        help=(
+            "Resume a previous session by ID (shown on exit). With --tui, "
+            "bare --resume opens the session picker."
+        ),
     )
     chat_parser.add_argument(
         "--continue",

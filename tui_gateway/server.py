@@ -3296,6 +3296,23 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
+    """List stored sessions for the resume picker / sidebar.
+
+    Optional params — omitting all of them keeps the legacy behaviour
+    (most-recently-started first, ``tool`` rows denied, default limit 200):
+
+      - ``sources``: list of source tags to include (e.g. ``["cli", "tui"]``).
+        Powers the picker's tab strip. The ``tool`` deny-list still applies
+        on top. A single-element list is pushed into SQL
+        (``list_sessions_rich(source=...)``); multi-element lists are
+        filtered gateway-side over a bounded scan (the DB layer only takes a
+        single ``source`` string).
+      - ``query``: case-insensitive *session-id* substring filter, mapped to
+        ``list_sessions_rich(id_query=...)``. The DB applies ``id_query``
+        only on its order-by-last-active path, so query results are ordered
+        by most recent activity. Title/preview search stays client-side.
+      - ``offset`` / ``limit``: pagination over the filtered list.
+    """
     db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5006)
@@ -3310,16 +3327,67 @@ def _(rid, params: dict) -> dict:
         # platform is added or a user names their own source.
         deny = frozenset({"tool"})
 
-        limit = int(params.get("limit", 200) or 200)
-        # Over-fetch modestly so per-source filtering doesn't leave us
-        # short; the compression-tip projection in ``list_sessions_rich``
-        # can also merge rows.
-        fetch_limit = max(limit * 2, 200)
-        rows = [
-            s
-            for s in db.list_sessions_rich(source=None, limit=fetch_limit)
-            if (s.get("source") or "").strip().lower() not in deny
-        ][:limit]
+        try:
+            limit = max(1, int(params.get("limit", 200) or 200))
+        except (TypeError, ValueError):
+            limit = 200
+        try:
+            offset = max(0, int(params.get("offset", 0) or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        query = str(params.get("query") or "").strip()
+        raw_sources = params.get("sources")
+        sources: list = []
+        if isinstance(raw_sources, (list, tuple)):
+            sources = [
+                str(s).strip().lower() for s in raw_sources if str(s).strip()
+            ]
+
+        if not sources and not query and offset == 0:
+            # Legacy path (no filter params) — byte-for-byte today's
+            # behaviour. Over-fetch modestly so per-source filtering doesn't
+            # leave us short; the compression-tip projection in
+            # ``list_sessions_rich`` can also merge rows.
+            fetch_limit = max(limit * 2, 200)
+            rows = [
+                s
+                for s in db.list_sessions_rich(source=None, limit=fetch_limit)
+                if (s.get("source") or "").strip().lower() not in deny
+            ][:limit]
+        else:
+            # Filtered/paginated path. Single source pushes into SQL; the
+            # deny-list and multi-source filter run gateway-side, so keep
+            # scanning DB pages until the requested window is full (bounded
+            # by a generous safety cap so a pathological DB can't pin us).
+            source_arg = sources[0] if len(sources) == 1 else None
+            allowed = frozenset(sources) if sources else None
+            wanted = offset + limit
+
+            def _eligible(row: dict) -> bool:
+                src = (row.get("source") or "").strip().lower()
+                if src in deny:
+                    return False
+                return allowed is None or src in allowed
+
+            collected: list = []
+            db_offset = 0
+            page = max(wanted * 2, 200)
+            while len(collected) < wanted and db_offset < 10_000:
+                batch = db.list_sessions_rich(
+                    source=source_arg,
+                    limit=page,
+                    offset=db_offset,
+                    # ``id_query`` only applies on the order-by-last-active
+                    # path; keep legacy started_at ordering when unfiltered.
+                    order_by_last_active=bool(query),
+                    id_query=query or None,
+                )
+                collected.extend(r for r in batch if _eligible(r))
+                if len(batch) < page:
+                    break
+                db_offset += page
+            rows = collected[offset : offset + limit]
+
         return _ok(
             rid,
             {
@@ -3331,6 +3399,14 @@ def _(rid, params: dict) -> dict:
                         "started_at": s.get("started_at") or 0,
                         "message_count": s.get("message_count") or 0,
                         "source": s.get("source") or "",
+                        # Picker row metadata (None-safe; older rows may
+                        # predate these columns).
+                        "cwd": s.get("cwd") or None,
+                        "last_active": s.get("last_active")
+                        or s.get("started_at")
+                        or 0,
+                        "ended_at": s.get("ended_at"),
+                        "model": s.get("model") or None,
                     }
                     for s in rows
                 ]
@@ -3338,6 +3414,112 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _err(rid, 5006, str(e))
+
+
+@method("session.peek")
+def _(rid, params: dict) -> dict:
+    """DB-only preview of a stored session for the resume picker.
+
+    ``{session_id, head?, tail?}`` → session metadata plus the first ``head``
+    and last ``tail`` displayable messages (``user``/``assistant`` rows with
+    non-empty text content; tool spam and empty tool-call carriers are
+    skipped). Purely a read: no agent is constructed, no live session state
+    is created or switched — this powers the picker's Space preview, which
+    must stay cheap while the user scrolls.
+
+    Response shape::
+
+        {
+          "session": {id, title, source, model, cwd, started_at, ended_at,
+                      end_reason, message_count, last_active, cost_usd},
+          "head": [{id, role, content, truncated, timestamp}, ...],
+          "tail": [{...}],            # never overlaps head
+          "total_messages": <int>     # displayable (user/assistant) count
+        }
+    """
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    try:
+        head = max(0, int(params.get("head", 2) or 0))
+    except (TypeError, ValueError):
+        head = 2
+    try:
+        tail = max(0, int(params.get("tail", 2) or 0))
+    except (TypeError, ValueError):
+        tail = 2
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5046)
+    try:
+        row = db.get_session(target)
+        if not row:
+            return _err(rid, 4007, "session not found")
+
+        msgs = db.get_messages(target)
+        last_active = (
+            (msgs[-1].get("timestamp") if msgs else None)
+            or row.get("started_at")
+            or 0
+        )
+
+        def _displayable(m: dict) -> bool:
+            if (m.get("role") or "") not in ("user", "assistant"):
+                return False
+            content = m.get("content")
+            if isinstance(content, str):
+                return bool(content.strip())
+            return bool(content)  # multimodal parts list
+
+        def _peek_msg(m: dict) -> dict:
+            content = m.get("content")
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    content = str(content)
+            content = content or ""
+            return {
+                "id": m.get("id"),
+                "role": m.get("role") or "",
+                "content": content[:2000],
+                "truncated": len(content) > 2000,
+                "timestamp": m.get("timestamp"),
+            }
+
+        display = [m for m in msgs if _displayable(m)]
+        head_msgs = display[:head] if head else []
+        # Slice the remainder so head and tail never overlap, even when
+        # head + tail >= len(display).
+        tail_msgs = display[head:][-tail:] if tail else []
+
+        cost = row.get("actual_cost_usd")
+        if cost is None:
+            cost = row.get("estimated_cost_usd")
+
+        return _ok(
+            rid,
+            {
+                "session": {
+                    "id": row["id"],
+                    "title": row.get("title") or "",
+                    "source": row.get("source") or "",
+                    "model": row.get("model") or None,
+                    "cwd": row.get("cwd") or None,
+                    "started_at": row.get("started_at") or 0,
+                    "ended_at": row.get("ended_at"),
+                    "end_reason": row.get("end_reason"),
+                    "message_count": row.get("message_count") or 0,
+                    "last_active": last_active,
+                    "cost_usd": cost,
+                },
+                "head": [_peek_msg(m) for m in head_msgs],
+                "tail": [_peek_msg(m) for m in tail_msgs],
+                "total_messages": len(display),
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5046, str(e))
 
 
 @method("session.most_recent")
