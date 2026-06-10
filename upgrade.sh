@@ -46,11 +46,29 @@ if ! command -v hermes >/dev/null 2>&1; then
     echo "✅ Fresh install complete — continuing with evolution setup."
 fi
 HERMES_BIN="$(readlink -f "$(command -v hermes)" 2>/dev/null || command -v hermes)"
+# Newer installs ship a bash shim (not a symlink — #21454), so readlink alone
+# lands on the shim itself. Parse its `exec "<venv>/bin/hermes"` target.
+case "$HERMES_BIN" in
+    */venv/bin/hermes) : ;;
+    *)
+        SHIM_TARGET="$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$HERMES_BIN" 2>/dev/null | head -n 1)"
+        if [ -n "$SHIM_TARGET" ] && [ -x "$SHIM_TARGET" ]; then
+            HERMES_BIN="$SHIM_TARGET"
+        fi
+        ;;
+esac
 INSTALL_DIR="$(dirname "$(dirname "$(dirname "$HERMES_BIN")")")"
 if [ ! -d "$INSTALL_DIR/.git" ]; then
-    echo "❌ $INSTALL_DIR is not a git checkout — cannot switch remotes."
-    echo "   (Expected layout <INSTALL_DIR>/venv/bin/hermes.)"
-    exit 1
+    # Last resort: the default location install.sh uses.
+    FALLBACK="${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
+    if [ -d "$FALLBACK/.git" ] && [ -x "$FALLBACK/venv/bin/hermes" ]; then
+        INSTALL_DIR="$FALLBACK"
+        HERMES_BIN="$FALLBACK/venv/bin/hermes"
+    else
+        echo "❌ $INSTALL_DIR is not a git checkout — cannot switch remotes."
+        echo "   (Expected layout <INSTALL_DIR>/venv/bin/hermes.)"
+        exit 1
+    fi
 fi
 PY="$INSTALL_DIR/venv/bin/python"
 HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
@@ -128,7 +146,13 @@ fi
 #    (avoids needlessly interrupting a running gateway on a no-op re-run).
 hermes doctor --fix >/dev/null 2>&1 || true
 if [ "$CODE_CHANGED" = "1" ] && hermes gateway status >/dev/null 2>&1; then
-    hermes gateway restart >/dev/null 2>&1 && echo "✅ Gateway restarted (picked up new code)" || true
+    # When no systemd/launchd service is installed (macOS default), `hermes
+    # gateway restart` falls back to running the gateway in the FOREGROUND —
+    # it never returns and would block this script forever. Detach it: with a
+    # service manager the command exits quickly anyway; without one the
+    # detached process simply becomes the new gateway.
+    (nohup hermes gateway restart >/dev/null 2>&1 &)
+    echo "✅ Gateway restart initiated (picked up new code)"
 elif [ "$CODE_CHANGED" = "0" ]; then
     echo "ℹ️  No code change — gateway left running (not restarted)."
 fi
