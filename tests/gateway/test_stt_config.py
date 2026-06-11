@@ -16,7 +16,9 @@ def test_gateway_config_stt_disabled_from_dict_nested():
     assert config.stt_enabled is False
 
 
-def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monkeypatch):
+def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(
+    tmp_path, monkeypatch
+):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
@@ -38,14 +40,21 @@ async def test_enrich_message_with_transcription_surfaces_path_when_stt_disabled
 
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = GatewayConfig(stt_enabled=False)
-    runner._has_setup_skill = lambda: True  # Should NOT be consulted in disabled branch.
+    runner._has_setup_skill = lambda: (
+        True
+    )  # Should NOT be consulted in disabled branch.
 
-    with patch(
-        "tools.transcription_tools.transcribe_audio",
-        side_effect=AssertionError("transcribe_audio should not be called when STT is disabled"),
-    ), patch(
-        "gateway.run._probe_audio_duration",
-        new=AsyncMock(return_value="0:12"),
+    with (
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            side_effect=AssertionError(
+                "transcribe_audio should not be called when STT is disabled"
+            ),
+        ),
+        patch(
+            "gateway.run._probe_audio_duration",
+            new=AsyncMock(return_value="0:12"),
+        ),
     ):
         result, transcripts = await runner._enrich_message_with_transcription(
             "caption",
@@ -182,3 +191,64 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     assert result is not None
     assert "queued voice transcript" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_enrich_message_with_transcription_falls_back_to_local_when_cloud_provider_unavailable():
+    """When the configured cloud provider is unavailable (missing key),
+    transcription should fall back to local faster-whisper if installed (#122)."""
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner._has_setup_skill = lambda: False
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "local fallback worked",
+            "provider": "local",
+        },
+    ):
+        result, transcripts = await runner._enrich_message_with_transcription(
+            "",
+            ["/tmp/voice.ogg"],
+        )
+
+    assert "local fallback worked" in result
+    assert transcripts == ["local fallback worked"]
+
+
+@pytest.mark.asyncio
+async def test_enrich_message_with_transcription_returns_helpful_error_when_no_provider_available():
+    """When no provider (cloud or local) is available, the error message should
+    list every possible fix so the user can self-service (#122)."""
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner._has_setup_skill = lambda: False
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": False,
+            "transcript": "",
+            "error": (
+                "No STT provider available. Install faster-whisper for free local "
+                "transcription, configure HERMES_LOCAL_STT_COMMAND or install a local whisper CLI, "
+                "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
+                "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
+                "set ELEVENLABS_API_KEY for ElevenLabs Scribe, or set VOICE_TOOLS_OPENAI_KEY "
+                "or OPENAI_API_KEY for the OpenAI Whisper API."
+            ),
+        },
+    ):
+        result, transcripts = await runner._enrich_message_with_transcription(
+            "",
+            ["/tmp/voice.ogg"],
+        )
+
+    assert "no STT provider is configured" in result
+    assert transcripts == []
