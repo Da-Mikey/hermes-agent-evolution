@@ -1,5 +1,5 @@
 name: evolution-upstream-sync
-schedule: "0 8 * * 0"  # Weekly on Sunday at 8 AM
+schedule: "0 8 * * 1,3,5"  # Mon/Wed/Fri 8 AM — 3×/week to drain the upstream backlog
 enabled: true
 mode: PRIVATE
 
@@ -43,7 +43,7 @@ safety:
   require_private_mode: true
   test_after_merge: true
   auto_rollback_on_failure: true
-  max_commits_per_sync: 10
+  max_commits_per_sync: 25
 
 # Sync strategy
 strategy:

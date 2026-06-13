@@ -17,10 +17,24 @@ Synchronize with the original Hermes Agent (upstream) and determine which change
 
 ## Process
 
-1. **Fetch changes from upstream:**
-
+0. **Read where we last synced through** (the baseline). This is recorded in
+   `.evolution/upstream-sync-state.json` at the repo root (created/updated in the
+   version-stamp step below). Use its `synced_through_date` to scope the PR query:
 ```bash
-git fetch upstream
+SYNCED_DATE=$(jq -r '.synced_through_date // "2026-01-01"' \
+  .evolution/upstream-sync-state.json 2>/dev/null || echo "2026-01-01")
+```
+
+1. **Fetch upstream and analyze at the PULL-REQUEST level (preferred), with the
+   commit log as a fallback.** A merged upstream PR carries a title, description
+   and labels — far richer grounds to judge relevance than an opaque commit:
+```bash
+git fetch upstream --tags
+# PRIMARY: upstream merged PRs since our baseline (richest context):
+gh pr list --repo nousresearch/hermes-agent --state merged --limit 50 \
+  --search "merged:>=$SYNCED_DATE" \
+  --json number,title,mergedAt,labels,url,mergeCommit
+# FALLBACK: raw commits not in our main (catches direct-push / PR-less commits):
 git log main..upstream/main --oneline
 ```
 
@@ -82,8 +96,9 @@ What changed in upstream...
 
 ## Sync frequency
 
-Recommended:
-- **Weekly** — full sync and analysis
+- **Mon / Wed / Fri** — full sync and analysis (the cron schedule). At up to 25
+  commits/run this closes a large backlog (e.g. 300+ commits behind) in weeks,
+  not months, then keeps pace.
 - **After critical updates** — if there are critical fixes in upstream
 
 ## Security
@@ -133,6 +148,46 @@ protection. Changes in critical paths (`.github/CODEOWNERS`) require owner
 review. This is the same gate that protects the entire self-evolution — upstream code is also
 untrusted until it has passed CI + review.
 
+## Inherit upstream version numbering (do this IN the sync PR)
+
+Upstream releases are tagged by calendar date (`vYYYY.M.D`, e.g. `v2026.6.5`),
+roughly weekly; their `pyproject.toml` version is static. So the meaningful
+"version" to inherit is **the newest upstream release tag your synced commits
+reach**. Stamp it as PART of the sync PR (same branch, so CI covers it):
+
+```bash
+# Newest upstream release tag that is actually an ancestor of THIS sync branch
+# (i.e. reached by the commits you just cherry-picked/merged) — NOT upstream's
+# tip, which may be tags ahead of the ≤25 commits you took this run:
+git fetch upstream --tags
+TAG=$(for t in $(git tag -l 'v20*' | sort -Vr); do \
+        git merge-base --is-ancestor "$t" HEAD 2>/dev/null && { echo "$t"; break; }; \
+      done)
+COMMIT=$(git rev-parse HEAD)
+DATE=$(echo "$TAG" | sed 's/^v//')                          # e.g. 2026.6.5
+# If TAG is unchanged from the current marker, the synced commits are post-release
+# (untagged) work — keep the existing tag/date, just bump synced_through_commit.
+```
+
+1. Update `hermes_cli/__init__.py` → set `__release_date__ = "<DATE>"` (the banner
+   already renders `Hermes Agent v<__version__> (<__release_date__>)`, so the
+   correspondence becomes visible immediately). Leave `__version__` (our own
+   semver) as-is.
+2. Write the baseline marker `.evolution/upstream-sync-state.json`:
+```json
+{
+  "synced_through_tag": "v2026.6.5",
+  "synced_through_commit": "<full sha>",
+  "synced_through_date": "2026-06-05",
+  "our_version": "0.16.0",
+  "synced_at": "<run date>"
+}
+```
+   `synced_through_date` (ISO `YYYY-MM-DD`, derived from the tag) is what step 0
+   reads next run to scope the PR query — so each run only looks at NEW upstream
+   work. Commit both files on the `sync/upstream-*` branch so they ride the same
+   PR + CI as the code.
+
 ## Output format
 
 Save the report to `~/.hermes/profiles/user1/evolution/upstream/YYYY-MM-DD.md`:
@@ -166,6 +221,6 @@ Save the report to `~/.hermes/profiles/user1/evolution/upstream/YYYY-MM-DD.md`:
 
 ## Limits
 
-- No more than 10 upstream commits at a time
+- No more than 25 upstream commits per run
 - Critical changes — priority
 - Breaking changes — always manual review

@@ -116,7 +116,7 @@ def main(argv: list[str]) -> int:
     # Import the canonical Hermes cron API (writes ~/.hermes/cron/jobs.json).
     sys.path.insert(0, str(repo_root))
     try:
-        from cron.jobs import create_job, load_jobs
+        from cron.jobs import create_job, load_jobs, parse_schedule, update_job
     except Exception as exc:  # pragma: no cover - environment dependent
         print(f"[evolution-cron] cannot import cron.jobs: {exc}", file=sys.stderr)
         return 1
@@ -125,8 +125,10 @@ def main(argv: list[str]) -> int:
     # so the expensive LLM agent only runs when GitHub is actually reachable.
     gate_script = None if dry_run else _install_access_gate(repo_root)
 
-    existing_names = {str(j.get("name", "")).strip() for j in load_jobs()}
+    existing_jobs = {str(j.get("name", "")).strip(): j for j in load_jobs()}
+    existing_names = set(existing_jobs)
     created: list[tuple[str, str]] = []
+    updated: list[tuple[str, str]] = []
     skipped: list[str] = []
     failed: list[tuple[str, str]] = []
 
@@ -148,10 +150,6 @@ def main(argv: list[str]) -> int:
         if spec.get("no_agent") and str(spec.get("script") or "").strip() and not dry_run:
             _install_script(repo_root, str(spec["script"]).strip())
 
-        if name in existing_names:
-            skipped.append(name)
-            continue
-
         schedule = str(spec.get("schedule") or "").strip()
         prompt = spec.get("prompt") or ""
         no_agent = bool(spec.get("no_agent"))
@@ -165,6 +163,39 @@ def main(argv: list[str]) -> int:
         skills = _normalize_skills(spec.get("skills"))
         toolsets = _normalize_toolsets(spec.get("toolsets"))
         deliver = str(spec.get("deliver") or "local").strip()
+
+        # Existing job: reconcile mutable config from YAML instead of blindly
+        # skipping. create_job() is idempotent-by-name, so without this an edit
+        # to schedule/prompt/skills/toolsets in a *.yaml would NEVER take effect
+        # on an already-registered job (the historical re-register gotcha — a
+        # changed upstream-sync frequency, say, would silently stay on the old
+        # schedule). We only touch jobs we own (everything here is evolution-*).
+        if name in existing_names:
+            cur = existing_jobs[name]
+            if not cur.get("id"):
+                # Malformed record without an id — cannot target an update.
+                skipped.append(name)
+                continue
+            changes: dict = {}
+            want_sched = parse_schedule(schedule).get("display", schedule)
+            cur_sched = (cur.get("schedule") or {}).get("display") or cur.get("schedule_display")
+            if want_sched != cur_sched:
+                changes["schedule"] = schedule
+            if not no_agent:
+                if str(prompt) != (cur.get("prompt") or ""):
+                    changes["prompt"] = str(prompt)
+                if list(skills) != list(cur.get("skills") or []):
+                    changes["skills"] = skills
+                if list(toolsets) != list(cur.get("enabled_toolsets") or []):
+                    changes["enabled_toolsets"] = toolsets
+            if not changes:
+                skipped.append(name)
+            elif dry_run:
+                updated.append((name, "DRY-RUN: " + ", ".join(sorted(changes))))
+            else:
+                update_job(cur["id"], changes)
+                updated.append((name, ", ".join(sorted(changes))))
+            continue
 
         if dry_run:
             created.append((name, "DRY-RUN"))
@@ -218,13 +249,15 @@ def main(argv: list[str]) -> int:
 
     verb = "would register" if dry_run else "registered"
     print(
-        f"[evolution-cron] {verb}={len(created)} "
-        f"skipped(existing)={len(skipped)} failed={len(failed)}"
+        f"[evolution-cron] {verb}={len(created)} reconciled={len(updated)} "
+        f"skipped(unchanged)={len(skipped)} failed={len(failed)}"
     )
     for name, jid in created:
         print(f"  + {name} ({jid})")
+    for name, fields in updated:
+        print(f"  ~ {name} (updated: {fields})")
     for name in skipped:
-        print(f"  = {name} (already registered)")
+        print(f"  = {name} (unchanged)")
     for name, err in failed:
         print(f"  ! {name}: {err}")
 
