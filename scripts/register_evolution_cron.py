@@ -48,6 +48,36 @@ def _find_venv_python(repo_root: Path) -> str | None:
     return None
 
 
+def _ensure_venv_python(repo_root: Path, argv: list[str]) -> None:
+    """Guarantee we run under the install's venv interpreter.
+
+    The system python typically lacks the FULL Hermes dependency set (dotenv,
+    croniter, …), so importing cron.jobs and parsing schedules would fail in
+    assorted ways depending on which dep is missing first. Rather than play
+    whack-a-mole, re-exec under the venv python up front so the registrar
+    "just works" regardless of which interpreter launched it — no human OR
+    agent ever has to pick the interpreter. No-op when already on the venv
+    python (``samefile`` follows symlinks) or when no venv is found. Loop-guarded
+    via ``_HERMES_REG_REEXEC`` so a single re-exec can never recurse.
+    """
+    if os.environ.get("_HERMES_REG_REEXEC") == "1":
+        return
+    venv_py = _find_venv_python(repo_root)
+    if not venv_py:
+        return
+    try:
+        if os.path.samefile(sys.executable, venv_py):
+            return  # already the venv interpreter
+    except OSError:
+        pass
+    os.environ["_HERMES_REG_REEXEC"] = "1"
+    print(
+        f"[evolution-cron] re-executing under venv python: {venv_py}",
+        file=sys.stderr,
+    )
+    os.execv(venv_py, [venv_py, str(Path(__file__).resolve()), *argv[1:]])
+
+
 def _load_yaml(path: Path) -> dict:
     import yaml  # PyYAML ships with Hermes (used for cli-config.yaml etc.)
 
@@ -123,6 +153,12 @@ def main(argv: list[str]) -> int:
     positional = [a for a in argv[1:] if not a.startswith("--")]
 
     repo_root = Path(__file__).resolve().parent.parent
+
+    # Before importing ANY Hermes module, make sure we're on the venv python
+    # that actually has the dependencies (dotenv, croniter, …). This replaces
+    # the process when needed, so nobody has to launch us with the right python.
+    _ensure_venv_python(repo_root, argv)
+
     src_dir = Path(positional[0]) if positional else repo_root / "cron" / "evolution"
     if not src_dir.is_dir():
         print(f"[evolution-cron] no evolution cron dir at {src_dir}", file=sys.stderr)
@@ -132,24 +168,6 @@ def main(argv: list[str]) -> int:
     sys.path.insert(0, str(repo_root))
     try:
         from cron.jobs import create_job, load_jobs, parse_schedule, update_job
-    except ModuleNotFoundError as exc:  # pragma: no cover - environment dependent
-        # A Hermes dependency (e.g. python-dotenv) isn't importable under the
-        # current interpreter. Re-exec under the install's venv python — which
-        # has the full dependency set — so this script "just works" no matter
-        # which interpreter launched it. Nobody (human OR agent) should ever
-        # have to pick `venv/bin/python` by hand. Guard against re-exec loops.
-        if os.environ.get("_HERMES_REG_REEXEC") != "1":
-            venv_py = _find_venv_python(repo_root)
-            if venv_py and Path(venv_py).resolve() != Path(sys.executable).resolve():
-                os.environ["_HERMES_REG_REEXEC"] = "1"
-                print(
-                    f"[evolution-cron] re-executing under venv python ({venv_py}) "
-                    f"— current interpreter lacks: {exc}",
-                    file=sys.stderr,
-                )
-                os.execv(venv_py, [venv_py, str(Path(__file__).resolve()), *argv[1:]])
-        print(f"[evolution-cron] cannot import cron.jobs: {exc}", file=sys.stderr)
-        return 1
     except Exception as exc:  # pragma: no cover - environment dependent
         print(f"[evolution-cron] cannot import cron.jobs: {exc}", file=sys.stderr)
         return 1
