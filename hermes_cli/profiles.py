@@ -876,6 +876,18 @@ def create_profile(
         except Exception:
             pass  # best-effort — don't fail profile creation over this
 
+    # Seed a per-profile .env (PR #44792 parity) so a FRESH profile carries the
+    # install's credentials instead of silently showing everything as
+    # unconfigured once Channels/Keys endpoints became profile-scoped. Only for
+    # non-clone creates: clone/clone-config deliberately copy ONLY the files the
+    # source actually has (a missing source .env stays missing), so we must not
+    # fabricate one on those paths.
+    if source_dir is None:
+        try:
+            _seed_profile_env(profile_dir)
+        except OSError:
+            pass  # best-effort — profile creation must not fail over .env seeding
+
     # Write the opt-out marker so seed_profile_skills() and `hermes update`'s
     # all-profile sync loop both skip this profile for bundled-skill seeding.
     if no_skills:
@@ -958,6 +970,35 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
         return None
 
 
+_PROFILE_ENV_PLACEHOLDER = (
+    "# Per-profile secrets for this Hermes profile.\n"
+    "# API keys and tokens set here override the shell environment.\n"
+    "# Behavioral settings belong in config.yaml, not here.\n"
+)
+
+
+def _seed_profile_env(profile_dir: Path) -> bool:
+    """Give a profile its own ``.env`` if it lacks one.
+
+    Copies the DEFAULT install's ``.env`` when present, otherwise writes the
+    placeholder header; tightens perms to 0600. No-op (returns ``False``) when
+    the profile already has a ``.env``; returns ``True`` when one was created.
+
+    Shared by ``create_profile`` (new profiles, PR #44792 parity) and
+    ``backfill_profile_envs`` (pre-#44792 profiles) so both seed identically.
+    """
+    env_path = profile_dir / ".env"
+    if env_path.exists():
+        return False
+    default_env = _get_default_hermes_home() / ".env"
+    if default_env.is_file():
+        shutil.copy2(default_env, env_path)
+    else:
+        env_path.write_text(_PROFILE_ENV_PLACEHOLDER, encoding="utf-8")
+    os.chmod(str(env_path), 0o600)
+    return True
+
+
 def backfill_profile_envs(quiet: bool = False) -> List[str]:
     """Give every named profile that predates per-profile ``.env`` files one.
 
@@ -981,28 +1022,14 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
     if not profiles_root.is_dir():
         return backfilled
 
-    default_env = _get_default_hermes_home() / ".env"
-
     for entry in sorted(profiles_root.iterdir()):
         if not entry.is_dir() or not _PROFILE_ID_RE.match(entry.name):
             continue
         if entry.name == "default":
             continue
-        env_path = entry / ".env"
-        if env_path.exists():
-            continue
         try:
-            if default_env.is_file():
-                shutil.copy2(default_env, env_path)
-            else:
-                env_path.write_text(
-                    "# Per-profile secrets for this Hermes profile.\n"
-                    "# API keys and tokens set here override the shell environment.\n"
-                    "# Behavioral settings belong in config.yaml, not here.\n",
-                    encoding="utf-8",
-                )
-            os.chmod(str(env_path), 0o600)
-            backfilled.append(entry.name)
+            if _seed_profile_env(entry):
+                backfilled.append(entry.name)
         except OSError as e:
             if not quiet:
                 print(f"⚠ Could not seed .env for profile '{entry.name}': {e}")
