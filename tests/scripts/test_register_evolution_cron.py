@@ -165,3 +165,87 @@ class TestNoAgentJobs:
         assert rc == 0
         refreshed = stale.read_text()
         assert "stale old version" not in refreshed  # real script copied over
+
+
+class TestReconcileExistingJob:
+    """An edit to an already-registered evolution job's YAML must be applied via
+    update_job — create_job is idempotent-by-name and would otherwise leave the
+    old config in place (the historical re-register gotcha that froze schedule
+    changes)."""
+
+    def _write_agent_yaml(self, src_dir, schedule):
+        (src_dir / "upstream-sync.yaml").write_text(
+            "name: evolution-upstream-sync\n"
+            f'schedule: "{schedule}"\n'
+            "enabled: true\n"
+            'prompt: "sync upstream"\n'
+            "skills:\n"
+            "  - evolution/upstream-sync\n"
+            "toolsets:\n"
+            "  - web\n"
+            "  - file\n"
+            "  - terminal\n"
+        )
+
+    def _existing(self, mod, jobs_mod, schedule):
+        sched = jobs_mod.parse_schedule(schedule)
+        return {
+            "id": "job-123",
+            "name": "evolution-upstream-sync",
+            "schedule": sched,
+            "schedule_display": sched.get("display"),
+            "prompt": "sync upstream",
+            "skills": mod._normalize_skills(["evolution/upstream-sync"]),
+            "enabled_toolsets": mod._normalize_toolsets(["web", "file", "terminal"]),
+        }
+
+    def _wire(self, mod, jobs_mod, monkeypatch, tmp_path, existing):
+        home = tmp_path / "hermes-home"
+        (home / "scripts").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [existing])
+        monkeypatch.setattr(
+            jobs_mod,
+            "create_job",
+            lambda **kw: (_ for _ in ()).throw(AssertionError("must not create")),
+        )
+        calls = {}
+        monkeypatch.setattr(
+            jobs_mod,
+            "update_job",
+            lambda job_id, updates: calls.update(job_id=job_id, updates=updates)
+            or {**existing, **updates},
+        )
+        return calls
+
+    def test_changed_schedule_is_reconciled(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        import cron.jobs as jobs_mod
+
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        self._write_agent_yaml(src_dir, "0 8 * * 1,3,5")  # new schedule in YAML
+        existing = self._existing(mod, jobs_mod, "0 8 * * 0")  # old weekly schedule
+        calls = self._wire(mod, jobs_mod, monkeypatch, tmp_path, existing)
+
+        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
+
+        assert rc == 0
+        assert calls["job_id"] == "job-123"
+        # only the schedule changed → only the schedule is updated
+        assert calls["updates"] == {"schedule": "0 8 * * 1,3,5"}
+
+    def test_unchanged_job_is_left_alone(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        import cron.jobs as jobs_mod
+
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        self._write_agent_yaml(src_dir, "0 8 * * 1,3,5")
+        existing = self._existing(mod, jobs_mod, "0 8 * * 1,3,5")  # matches YAML
+        calls = self._wire(mod, jobs_mod, monkeypatch, tmp_path, existing)
+
+        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
+
+        assert rc == 0
+        assert calls == {}  # no update_job call — nothing changed
