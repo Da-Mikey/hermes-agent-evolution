@@ -19,6 +19,14 @@ def _import_module():
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _never_reexec(monkeypatch):
+    """main() re-execs under the venv python when not already on it. In-process
+    test calls of main() must NEVER re-exec — os.execv would replace the pytest
+    process. The loop-guard env var disables it for every test here."""
+    monkeypatch.setenv("_HERMES_REG_REEXEC", "1")
+
+
 class TestNormalizeToolsets:
     def test_empty_returns_none(self):
         mod = _import_module()
