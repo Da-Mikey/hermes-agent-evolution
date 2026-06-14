@@ -47,6 +47,13 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 AUTHOR_MAP = {
     "lexus@cdzv.com": "Lexus2016",
     "evolution@hermes.ai": "Lexus2016",  # autonomous evolution agent commits
+    "2081789787@qq.com": "pengyuyanITYU",  # upstream sync 2026-06-14 (#43618)
+    "andyfieb@gmail.com": "mollusk",  # upstream sync 2026-06-14 (#44493)
+    "drmani215@gmail.com": "bionicbutterfly13",  # upstream sync 2026-06-14
+    "evisolpxe@gmail.com": "Evisolpxe",  # upstream sync 2026-06-14
+    "kyssta69@gmail.com": "kyssta-exe",  # upstream sync 2026-06-14 (#44446)
+    "loongfay@foxmail.com": "loongfay",  # upstream sync 2026-06-14
+    "omarbaradei21@gmail.com": "OmarB97",  # upstream sync 2026-06-14
     "konsisumer@users.noreply.github.com": "konsisumer",  # upstream sync 2026-06-10
     "maplestoryjuni222@gmail.com": "BROCCOLO1D",  # upstream sync 2026-06-10
     "philip.a.dsouza@gmail.com": "PhilipAD",  # second email of existing contributor
