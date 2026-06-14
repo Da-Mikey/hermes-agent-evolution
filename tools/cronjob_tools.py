@@ -8,9 +8,13 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 import json
 import logging
 import re
+import shutil
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from hermes_constants import display_hermes_home
 
@@ -31,6 +35,139 @@ from cron.jobs import (
     trigger_job,
     update_job,
 )
+
+
+# ---------------------------------------------------------------------------
+# Cron availability preflight + per-task retry rate limiter
+# ---------------------------------------------------------------------------
+#
+# Issue #214: cronjob tool failures recur without surfacing underlying cause.
+# We add:
+#   1. A preflight probe that checks whether cron is usable (crontab binary
+#      and, on Linux, a running cron daemon) before mutating state.
+#   2. A per-task retry limiter so repeated failures back off with a clear
+#      "too many attempts" message instead of looping noisily.
+#   3. Richer error payloads that include the underlying CLI output.
+
+_MAX_CONSECUTIVE_CRON_FAILURES = 3
+_CRON_RETRY_WINDOW_SECONDS = 300.0  # failures older than this are forgotten
+_cron_failure_tracker: Dict[str, List[float]] = {}
+_cron_failure_tracker_lock = threading.Lock()
+
+
+def _record_cron_failure(task_id: Optional[str]) -> int:
+    """Record a cron failure for *task_id* and return the current streak."""
+    if not task_id:
+        return 1
+    now = time.monotonic()
+    with _cron_failure_tracker_lock:
+        window = [
+            ts
+            for ts in _cron_failure_tracker.get(task_id, [])
+            if now - ts < _CRON_RETRY_WINDOW_SECONDS
+        ]
+        window.append(now)
+        _cron_failure_tracker[task_id] = window
+        return len(window)
+
+
+def _reset_cron_failure(task_id: Optional[str]) -> None:
+    """Reset the failure streak for *task_id* after a successful operation."""
+    if not task_id:
+        return
+    with _cron_failure_tracker_lock:
+        _cron_failure_tracker.pop(task_id, None)
+
+
+def _cron_preflight_check() -> Optional[str]:
+    """Probe basic cron availability and return a user-facing error string.
+
+    Returns ``None`` when cron appears usable, otherwise a short diagnostic
+    message explaining what is missing.  The check is best-effort: on systems
+    where ``crontab`` is intentionally absent or where Hermes is using the
+    internal JSON scheduler only, we still verify that the cron directory is
+    writable so job persistence does not fail silently.
+    """
+    from cron.jobs import CRON_DIR, ensure_dirs
+
+    try:
+        ensure_dirs()
+        probe = CRON_DIR / ".preflight_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as exc:
+        return (
+            f"Cron directory is not writable ({CRON_DIR}): {exc}. "
+            "Check permissions for the user running Hermes."
+        )
+
+    crontab = shutil.which("crontab")
+    if crontab is None:
+        return (
+            "The 'crontab' command is not available on PATH. "
+            "Install a cron implementation (e.g. cronie, vixie-cron) "
+            "or verify that Hermes is running in an environment with cron support."
+        )
+
+    try:
+        result = subprocess.run(
+            [crontab, "-l"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return f"Cron preflight probe failed: crontab -l could not run: {exc}"
+
+    if result.returncode != 0:
+        # ``crontab -l`` exits 1 when the user has no crontab — that is normal.
+        # Anything else (e.g. permission denied, service missing) is a real problem.
+        stderr = (result.stderr or "").strip()
+        if "no crontab" not in stderr.lower() and "no such file" not in stderr.lower():
+            return (
+                f"Cron preflight probe failed: crontab -l exited {result.returncode}."
+                + (f"\nstderr: {stderr}" if stderr else "")
+            )
+
+    # Best-effort daemon presence check on common Unix paths.
+    daemon_paths = [Path("/usr/sbin/cron"), Path("/usr/sbin/crond")]
+    if sys.platform != "win32" and not any(p.exists() for p in daemon_paths):
+        # Not a hard failure: some container/embedded environments have no
+        # separate daemon binary, but Hermes still uses the internal scheduler.
+        logger.debug("No separate cron daemon binary found; relying on internal scheduler")
+
+    return None
+
+
+def _format_cron_error(
+    exc: Exception,
+    operation: str,
+    cli_output: Optional[str] = None,
+) -> str:
+    """Return a rich error string for cron failures.
+
+    Includes the operation name, the exception message, and any captured CLI
+    output so the user can see the root cause without re-running manually.
+    """
+    parts = [f"Cron operation '{operation}' failed: {exc}"]
+    if cli_output:
+        parts.append(f"Underlying output:\n{cli_output}")
+    return "\n".join(parts)
+
+
+def _validate_cron_action(action: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Normalize and validate the cron action parameter.
+
+    Returns ``(normalized_action, error)``; ``error`` is ``None`` when valid.
+    """
+    normalized = (action or "").strip().lower()
+    if not normalized:
+        return "", "action is required"
+    allowed = {"create", "list", "update", "pause", "resume", "remove", "run", "run_now", "trigger"}
+    if normalized not in allowed:
+        return normalized, f"Unknown cron action '{action}'. Allowed: {', '.join(sorted(allowed - {'run_now', 'trigger'}))}"
+    return normalized, None
 
 
 # ---------------------------------------------------------------------------
@@ -620,11 +757,27 @@ def cronjob(
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
-    del task_id  # unused but kept for handler signature compatibility
+
+    normalized, action_error = _validate_cron_action(action)
+    if action_error:
+        return tool_error(action_error, success=False)
+
+    # Retry-rate limiter: noisy failure loops are capped per task.
+    failure_streak = _record_cron_failure(task_id)
+    if failure_streak > _MAX_CONSECUTIVE_CRON_FAILURES:
+        return tool_error(
+            f"Cron tool has failed {failure_streak} consecutive times for this task "
+            "(too many attempts). Please inspect the earlier errors or run "
+            "cronjob(action='list') before retrying.",
+            success=False,
+        )
+
+    # Preflight: ensure cron is available before invoking backend operations.
+    preflight_error = _cron_preflight_check()
+    if preflight_error:
+        return tool_error(preflight_error, success=False)
 
     try:
-        normalized = (action or "").strip().lower()
-
         if normalized == "create":
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
@@ -684,6 +837,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
             )
+            _reset_cron_failure(task_id)
             return json.dumps(
                 {
                     "success": True,
@@ -703,6 +857,7 @@ def cronjob(
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            _reset_cron_failure(task_id)
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
@@ -739,6 +894,7 @@ def cronjob(
             removed = remove_job(job_id)
             if not removed:
                 return tool_error(f"Failed to remove job '{job_id}'", success=False)
+            _reset_cron_failure(task_id)
             return json.dumps(
                 {
                     "success": True,
@@ -754,14 +910,17 @@ def cronjob(
 
         if normalized == "pause":
             updated = pause_job(job_id, reason=reason)
+            _reset_cron_failure(task_id)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "resume":
             updated = resume_job(job_id)
+            _reset_cron_failure(task_id)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
             updated = trigger_job(job_id)
+            _reset_cron_failure(task_id)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "update":
@@ -846,12 +1005,15 @@ def cronjob(
             if not updates:
                 return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
+            _reset_cron_failure(task_id)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
     except Exception as e:
-        return tool_error(str(e), success=False)
+        _record_cron_failure(task_id)
+        cli_output = getattr(e, "output", None)
+        return tool_error(_format_cron_error(e, normalized or action or "unknown", cli_output=cli_output), success=False)
 
 
 
