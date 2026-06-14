@@ -10,9 +10,23 @@ category: evolution
 
 **Operating mode:** PUBLIC (all installations)
 
+## Mission
+
+This serves one mission: **become the best self-evolving AI agent in the world** —
+autonomously completing real work of any level *better than any other agent* and
+improving *faster than anyone*. "Best" is measured against the frontier and our
+own past self, never just declared.
+
+**Focus test — keep a finding only if it makes the agent YES to ≥1:**
+(1) better at autonomous real work of any level, (2) more useful to people (owner
++ growing community), or (3) evolve faster/better than competitors.
+
 ## Task
 
-Research other AI agents, academic papers, and trends to generate ideas for improving Hermes Evolution.
+Study other AI agents, academic papers, and trends to **match and SURPASS the
+frontier — not merely borrow ideas**. Find what would make THIS agent the *best*
+at autonomous real work, the most useful, and the fastest to improve. A finding
+earns its place only if it moves us ahead of the field on one of the three goals.
 
 ## Research sources
 
@@ -80,9 +94,14 @@ Save the result to `~/.hermes/profiles/user1/evolution/research/YYYY-MM-DD.md`:
 
 ### [FEATURE] Better memory management
 - **Source**: https://github.com/microsoft/autogen/pull/123
+- **Frontier standing**: behind | at-par | ahead — where THIS agent stands vs the
+  best on this capability today (the measured side of "be the best"). `behind` →
+  catch up AND surpass; `at-par` → differentiate / pull ahead; `ahead` → maintain
+  the lead. A finding that leaves us merely at-par with the field is weak.
 - **Impact**: High
 - **Effort**: Medium
-- **Priority Score**: 1.6 (0.8 * 2 / 0.5)
+- **Priority Score**: 1.36 (impact 0.8 × 2 × (1 − 0.4 × effort 0.5) — effort
+  DAMPENS, never divides; matches evolution-analysis)
 
 Description...
 
