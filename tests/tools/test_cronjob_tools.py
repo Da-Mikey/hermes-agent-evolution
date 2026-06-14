@@ -1,6 +1,7 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
+from pathlib import Path
 import pytest
 
 from tools.cronjob_tools import (
@@ -503,3 +504,163 @@ class TestResolveModelOverride:
         )
         assert provider == "custom:cliproxy"
         assert model == "gpt-5.4"
+
+
+# =========================================================================
+# Cron preflight, action validation, and retry rate limiter (issue #214)
+# =========================================================================
+
+from tools.cronjob_tools import (  # noqa: E402
+    _cron_preflight_check,
+    _format_cron_error,
+    _validate_cron_action,
+    _MAX_CONSECUTIVE_CRON_FAILURES,
+    _cron_failure_tracker,
+)
+
+
+class TestCronPreflightAndValidation:
+    """Issue #214 diagnostics: cron availability, input validation, and
+    richer error messages."""
+
+    def test_validate_cron_action_normalizes_and_rejects(self):
+        norm, err = _validate_cron_action("  CREATE ")
+        assert norm == "create"
+        assert err is None
+
+        norm, err = _validate_cron_action(None)
+        assert norm == ""
+        assert "required" in err
+
+        norm, err = _validate_cron_action("nope")
+        assert norm == "nope"
+        assert "Unknown cron action" in err
+        assert "create" in err and "list" in err
+
+    def test_preflight_returns_none_when_cron_dir_writable_and_crontab_present(
+        self, tmp_path, monkeypatch
+    ):
+        """When crontab is on PATH and the cron dir is writable, preflight
+        passes.  We monkeypatch CRON_DIR to a temp dir so the test does not
+        depend on the real ~/.hermes state."""
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("tools.cronjob_tools.shutil.which", lambda cmd: "/usr/bin/crontab")
+
+        fake_result = type(
+            "FakeResult",
+            (),
+            {"returncode": 1, "stderr": "no crontab for user"},
+        )()
+        monkeypatch.setattr(
+            "tools.cronjob_tools.subprocess.run", lambda *a, **kw: fake_result
+        )
+
+        assert _cron_preflight_check() is None
+
+    def test_preflight_reports_missing_crontab(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("tools.cronjob_tools.shutil.which", lambda cmd: None)
+        err = _cron_preflight_check()
+        assert err is not None
+        assert "crontab" in err.lower()
+
+    def test_preflight_reports_crontab_error_output(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("tools.cronjob_tools.shutil.which", lambda cmd: "/usr/bin/crontab")
+
+        fake_result = type(
+            "FakeResult",
+            (),
+            {"returncode": 2, "stderr": "permission denied"},
+        )()
+        monkeypatch.setattr(
+            "tools.cronjob_tools.subprocess.run", lambda *a, **kw: fake_result
+        )
+
+        err = _cron_preflight_check()
+        assert err is not None
+        assert "exited 2" in err
+        assert "permission denied" in err
+
+    def test_preflight_reports_unwritable_cron_dir(self, tmp_path, monkeypatch):
+        cron_dir = tmp_path / "cron_readonly"
+        cron_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("cron.jobs.CRON_DIR", cron_dir)
+
+        def failing_write_text(*args, **kwargs):
+            raise PermissionError("cannot write")
+
+        monkeypatch.setattr(Path(".").__class__, "write_text", failing_write_text)
+        err = _cron_preflight_check()
+        assert err is not None
+        assert "not writable" in err
+        assert "cannot write" in err
+
+    def test_format_cron_error_includes_cli_output(self):
+        exc = ValueError("bad schedule")
+        msg = _format_cron_error(exc, "create", cli_output="stderr: bad minute")
+        assert "create" in msg
+        assert "bad schedule" in msg
+        assert "stderr: bad minute" in msg
+
+
+class TestCronRetryLimiter:
+    """Issue #214: repeated failures must eventually return 'too many attempts'."""
+
+    def test_retry_limit_kicks_in_after_max_failures(self, tmp_path, monkeypatch):
+        from tools.cronjob_tools import cronjob, _cron_failure_tracker
+
+        # Use a temp cron dir and a broken crontab to force failures.
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+        monkeypatch.setattr("tools.cronjob_tools.shutil.which", lambda cmd: None)
+
+        task_id = "test-task-214"
+        # Clear any stale state
+        _cron_failure_tracker.pop(task_id, None)
+
+        for i in range(_MAX_CONSECUTIVE_CRON_FAILURES):
+            result = json.loads(
+                cronjob(action="list", task_id=task_id)
+            )
+            assert result["success"] is False
+            assert "crontab" in result["error"].lower()
+
+        # Next call should short-circuit with the retry-limit message.
+        result = json.loads(
+            cronjob(action="list", task_id=task_id)
+        )
+        assert result["success"] is False
+        assert "too many attempts" in result["error"].lower()
+
+    def test_retry_counter_resets_on_success(self, tmp_path, monkeypatch):
+        from tools.cronjob_tools import cronjob, _cron_failure_tracker
+
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+        monkeypatch.setattr("tools.cronjob_tools.shutil.which", lambda cmd: None)
+
+        task_id = "test-task-reset"
+        _cron_failure_tracker.pop(task_id, None)
+
+        # One failure
+        result = json.loads(cronjob(action="list", task_id=task_id))
+        assert result["success"] is False
+
+        # Simulate recovery by restoring a working crontab.
+        monkeypatch.setattr("tools.cronjob_tools.shutil.which", lambda cmd: "/usr/bin/crontab")
+        fake_result = type(
+            "FakeResult",
+            (),
+            {"returncode": 1, "stderr": "no crontab for user"},
+        )()
+        monkeypatch.setattr(
+            "tools.cronjob_tools.subprocess.run", lambda *a, **kw: fake_result
+        )
+
+        result = json.loads(cronjob(action="list", task_id=task_id))
+        assert result["success"] is True
+        # Counter should be gone after a success.
+        assert task_id not in _cron_failure_tracker
