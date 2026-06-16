@@ -41,12 +41,15 @@ class TestRepeatTrigger:
 
 class TestFailureTrigger:
     def test_three_consecutive_failures_nudges_even_below_repeat(self):
-        msgs = _run("terminal", 3, result="bash: foo: command not found")
+        # A change-and-retry class (runtime_error) needs the generic 3-strike.
+        msgs = _run("terminal", 3, result="error: build step blew up")
         n = maybe_nudge(msgs)
         assert n is not None and "failed 3 times" in n
 
-    def test_two_failures_not_enough(self):
-        assert maybe_nudge(_run("terminal", 2, result="permission denied")) is None
+    def test_two_change_and_retry_failures_not_enough(self):
+        # runtime_error is NOT deterministic — a corrected retry can succeed, so
+        # two is below the generic 3-strike and stays quiet.
+        assert maybe_nudge(_run("terminal", 2, result="error: transient blip")) is None
 
     def test_exit_code_marker_counts_as_failure(self):
         msgs = _run("execute_code", 3, result="process finished, exit code: 1")
@@ -56,6 +59,33 @@ class TestFailureTrigger:
         msgs = _run("mcp_tqmemory_health", 3, result="server unreachable: ClosedResourceError")
         n = maybe_nudge(msgs)
         assert n is not None
+
+
+class TestNonRetryableTrigger:
+    """#231 — DETERMINISTIC failure classes (timeout/permission/missing_command/
+    limit) reproduce on retry, so two in a row trip a hard stop below the generic
+    3-strike threshold."""
+
+    def test_two_permission_denials_stop_hard(self):
+        n = maybe_nudge(_run("terminal", 2, result="permission denied"))
+        assert n is not None and "non-retryable" in n and "permission" in n
+
+    def test_two_timeouts_stop_hard(self):
+        n = maybe_nudge(_run("terminal", 2, result="failure-class=timeout — The operation timed out"))
+        assert n is not None and "non-retryable" in n and "timeout" in n
+
+    def test_single_deterministic_failure_is_quiet(self):
+        assert maybe_nudge(_run("terminal", 1, result="permission denied")) is None
+
+    def test_mixed_deterministic_classes_do_not_accumulate(self):
+        # A permission failure then a timeout failure are different classes — the
+        # deterministic counter only fires on the SAME class repeating, so this
+        # falls through to the generic path (2 < 3) and stays quiet.
+        msgs = [{"role": "user", "content": "go"}]
+        msgs += [_asst("terminal", call_id="c0"), _result("permission denied", "c0")]
+        msgs += [_asst("terminal", call_id="c1"), _result("connection timed out", "c1")]
+        # most-recent-first: timeout(1) then permission — classes differ, counter=1
+        assert maybe_nudge(msgs) is None
 
 
 class TestRunBoundaries:

@@ -598,12 +598,21 @@ def _run_conversation_impl(
 
             _lg_sig = _loop_guard.current_run_signature(messages)
             _lg_tool = _lg_sig[0] if _lg_sig else None
-            if _lg_tool != getattr(agent, "_loop_guard_nudged_tool", None):
-                agent._loop_guard_nudged_tool = None  # run changed/ended — re-arm
-                _lg_nudge = _loop_guard.maybe_nudge(messages) if _lg_tool else None
+            _lg_count = _lg_sig[1] if _lg_sig else 0
+            _lg_prev = getattr(agent, "_loop_guard_nudged", None)  # (tool, count) | None
+            # Re-nudge when the stuck run is NEW (tool changed/ended) OR it has
+            # grown by >=3 calls since the last nudge. Without the growth check a
+            # single nudge fired once and then went silent for the next dozen
+            # identical calls — the spiral ran on to 15+ unguided (#231). Escalating
+            # re-nudges keep pressure on a persistent loop.
+            if _lg_tool is None:
+                agent._loop_guard_nudged = None  # run ended — re-arm
+            elif (_lg_prev is None or _lg_prev[0] != _lg_tool
+                  or _lg_count - _lg_prev[1] >= 3):
+                _lg_nudge = _loop_guard.maybe_nudge(messages)
                 if _lg_nudge:
                     messages.append({"role": "user", "content": _lg_nudge})
-                    agent._loop_guard_nudged_tool = _lg_tool
+                    agent._loop_guard_nudged = (_lg_tool, _lg_count)
                     if not agent.quiet_mode:
                         agent._safe_print("\n🌀 loop-guard: nudging a strategy change")
         except Exception as _lg_err:  # never let the guard break the loop
