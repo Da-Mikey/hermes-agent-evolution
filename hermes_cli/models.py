@@ -3931,19 +3931,6 @@ def validate_requested_model(
                 "message": None,
             }
 
-        # Check if the model is in our static curated listing for this provider
-        curated_models = _PROVIDER_MODELS.get(normalized, [])
-        if requested_for_lookup in set(curated_models):
-            return {
-                "accepted": True,
-                "persist": True,
-                "recognized": True,
-                "message": (
-                    f"Note: `{requested}` was not found in this provider's live model listing, "
-                    f"but is recognized by Hermes."
-                ),
-            }
-
         # Auto-correct if the top match is very similar (e.g. typo)
         auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
         if auto:
@@ -3960,23 +3947,25 @@ def validate_requested_model(
         if suggestions:
             suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
 
-            # Model not in live /v1/models — check the curated catalog
-            # before rejecting.  Providers may omit models from their live
-            # listing that are still valid (stale cache, partial rollout,
-            # gated previews).  Use the pure-catalog helper (no extra live
-            # fetch) so we only accept models Hermes actually ships.  (#46850)
-            if _model_in_provider_catalog(
-                requested_for_lookup.lower(), _provider_keys(normalized)
-            ):
-                return {
-                    "accepted": True,
-                    "persist": True,
-                    "recognized": True,
-                    "message": (
-                        f"Note: `{requested}` was not found in the live /v1/models listing "
-                        f"but exists in the curated catalog — accepted."
-                    ),
-                }
+        # Model not in live /v1/models — check the curated catalog before
+        # rejecting.  Providers may omit models from their live listing that are
+        # still valid (stale cache, partial rollout, gated previews).  Use the
+        # pure-catalog helper (no extra live fetch) so we only accept models
+        # Hermes actually ships.  (#46850 — supersedes the fork's earlier #185
+        # `in set(curated_models)` path; unified to the upstream wording/logic
+        # so the two parallel implementations no longer shadow each other.)
+        if _model_in_provider_catalog(
+            requested_for_lookup.lower(), _provider_keys(normalized)
+        ):
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": (
+                    f"Note: `{requested}` was not found in the live /v1/models listing "
+                    f"but exists in the curated catalog — accepted."
+                ),
+            }
 
         return {
             "accepted": False,
