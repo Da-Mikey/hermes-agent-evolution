@@ -50,6 +50,25 @@ _FAILURE_MARKERS = (
 
 _EXIT_CODE_RE = re.compile(r"exit code[:\s]+([1-9]\d*)", re.IGNORECASE)
 
+# Failure classes (from tool_diagnostics) that are DETERMINISTIC — a near-identical
+# retry reproduces them, so they must not be looped on (#231). Distinct from
+# change-and-retry classes (not_found, runtime_error) where a corrected retry can
+# legitimately succeed. Two of these in a row already warrants a hard stop, below
+# the generic fail_threshold.
+_NON_RETRYABLE = frozenset({"timeout", "permission", "missing_command", "limit"})
+_NONRETRY_THRESHOLD = 2
+
+
+def _failure_category(content: Any) -> Optional[str]:
+    """The tool_diagnostics failure class of a result, or None if not a failure.
+    Imported lazily with a no-op fallback so loop_guard stays standalone."""
+    try:
+        from agent.tool_diagnostics import classify
+    except Exception:  # pragma: no cover - keep standalone if import path differs
+        return None
+    hit = classify(content)
+    return hit[0] if hit else None
+
 
 def _looks_like_failure(content: Any) -> bool:
     if not isinstance(content, str) or not content:
@@ -60,15 +79,17 @@ def _looks_like_failure(content: Any) -> bool:
     return bool(_EXIT_CODE_RE.search(content))
 
 
-def _recent_tool_runs(messages: List[Dict[str, Any]]) -> List[Tuple[str, bool]]:
-    """Most-recent-first list of (single_tool_name, result_failed) for the
-    trailing run of assistant turns that each called EXACTLY ONE tool.
+def _recent_tool_runs(messages: List[Dict[str, Any]]) -> List[Tuple[str, bool, Optional[str]]]:
+    """Most-recent-first list of (single_tool_name, result_failed, failure_class)
+    for the trailing run of assistant turns that each called EXACTLY ONE tool.
+    ``failure_class`` is the tool_diagnostics category of the failing result (or
+    None when the turn did not fail).
 
     Stops at the first assistant turn that is not a single-tool call (a text
     reply, or a multi-tool turn) — that breaks the "stuck on one tool" run.
     Multi-tool turns are normal varied work, not a single-tool spiral.
     """
-    runs: List[Tuple[str, bool]] = []
+    runs: List[Tuple[str, bool, Optional[str]]] = []
     i = len(messages) - 1
     # Collect tool results by id as we walk back so we can mark failures.
     while i >= 0:
@@ -88,13 +109,15 @@ def _recent_tool_runs(messages: List[Dict[str, Any]]) -> List[Tuple[str, bool]]:
                 break  # tool changed — the same-tool run ends here
             # Results for this turn are the "tool" messages that follow it.
             failed = False
+            category: Optional[str] = None
             for j in range(i + 1, len(messages)):
                 tm = messages[j]
                 if tm.get("role") != "tool":
                     break
                 if _looks_like_failure(tm.get("content")):
                     failed = True
-            runs.append((tool, failed))
+                    category = _failure_category(tm.get("content")) or category
+            runs.append((tool, failed, category))
             i -= 1
         elif msg.get("role") == "tool":
             i -= 1  # skip result messages; handled with their assistant turn
@@ -124,11 +147,37 @@ def maybe_nudge(
     same = [r for r in runs if r[0] == tool]
     count = len(same)
     consec_fail = 0
-    for _t, failed in same:
+    consec_nonretry = 0
+    nonretry_class: Optional[str] = None
+    counting_nonretry = True
+    for _t, failed, category in same:
         if failed:
             consec_fail += 1
         else:
             break
+        # Trailing run of failures that are all the SAME deterministic class.
+        if counting_nonretry and category in _NON_RETRYABLE:
+            if nonretry_class is None or category == nonretry_class:
+                nonretry_class = category
+                consec_nonretry += 1
+            else:
+                counting_nonretry = False
+        else:
+            counting_nonretry = False
+
+    # Highest-priority: a DETERMINISTIC failure repeated even once (#231). These
+    # reproduce on a near-identical retry, so the generic 3-strike threshold is
+    # too lenient — two in a row is already a spiral (terminal timeouts, denied
+    # paths, missing binaries, size-limit caps). Stop hard and name the class.
+    if consec_nonretry >= _NONRETRY_THRESHOLD:
+        return (
+            f"[loop-guard] `{tool}` returned a non-retryable `{nonretry_class}` "
+            f"failure {consec_nonretry} times in a row. This class is DETERMINISTIC "
+            f"— the same call reproduces it, so retrying is futile. Do NOT call "
+            f"`{tool}` the same way again. Change the approach now: adjust the "
+            f"parameters/path/command, route to a fallback tool, or report the "
+            f"blocker concisely if it can't be resolved."
+        )
 
     if consec_fail >= fail_threshold:
         return (
