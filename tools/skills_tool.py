@@ -749,6 +749,60 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         return tool_error(str(e), success=False)
 
 
+def skills_search(query: str, limit: int = 5) -> str:
+    """Rank skills by relevance to the current task/state (state-grounded retrieval).
+
+    First increment of #247 ("Online skill acquisition via state-grounded dynamic
+    retrieval"). Unlike ``skills_list`` (a static, alphabetical dump of every
+    skill), this surfaces the few skills most relevant to *what the agent is doing
+    right now*, given a free-form description of the current task or state.
+
+    Args:
+        query: Free-form text describing the current task or state.
+        limit: Maximum number of results to return (default 5).
+
+    Returns:
+        JSON string with the best-first ranked skills (name, description,
+        category, score, matched_terms).
+    """
+    try:
+        from tools.skill_retrieval import rank_skills
+
+        if not isinstance(query, str) or not query.strip():
+            return tool_error("query must be a non-empty string", success=False)
+
+        try:
+            limit_int = int(limit)
+        except (TypeError, ValueError):
+            limit_int = 5
+        if limit_int <= 0:
+            limit_int = 5
+
+        ranked = rank_skills(query, limit=limit_int)
+        results = [
+            {
+                "name": r.name,
+                "description": r.description,
+                "category": r.category,
+                "score": r.score,
+                "matched_terms": r.matched_terms,
+            }
+            for r in ranked
+        ]
+        return json.dumps(
+            {
+                "success": True,
+                "query": query,
+                "skills": results,
+                "count": len(results),
+                "hint": "Use skill_view(name) to load full content for a relevant skill",
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
 # ── Plugin skill serving ──────────────────────────────────────────────────
 
 
@@ -1647,4 +1701,40 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+)
+
+SKILLS_SEARCH_SCHEMA = {
+    "name": "skills_search",
+    "description": (
+        "Rank available skills by relevance to the CURRENT task or state, "
+        "best-first. Prefer this over skills_list when you know what you are "
+        "trying to do — pass a short description of the task/state as the query "
+        "and get back only the few most relevant skills (with match terms and a "
+        "relevance score), then skill_view the one you want."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Free-form text describing the current task or state to match skills against.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of ranked skills to return (default 5).",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+registry.register(
+    name="skills_search",
+    toolset="skills",
+    schema=SKILLS_SEARCH_SCHEMA,
+    handler=lambda args, **kw: skills_search(
+        query=args.get("query", ""), limit=args.get("limit", 5)
+    ),
+    check_fn=check_skills_requirements,
+    emoji="🔎",
 )
