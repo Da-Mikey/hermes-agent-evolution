@@ -61,6 +61,7 @@ AUTHOR_MAP = {
     "rio.jeong@thebytesize.ai": "rio-jeong",
     "yehaotian@xuanshudeMac-mini.local": "ArcanePivot",
     "dbeyer7@gmail.com": "benegessarit",
+    "adalsteinni@gmail.com": "AIalliAI",  # upstream sync 2026-06-16 (#44159)
     "kenmege@yahoo.com": "Kenmege",
     "tianying.x@eukarya.io": "xtymac",
     "dkobi16@gmail.com": "Diyoncrz18",
