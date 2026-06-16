@@ -862,5 +862,8 @@ class TestValidateCuratedFallback:
         assert result["accepted"] is True
         assert result["persist"] is True
         assert result["recognized"] is True
-        assert "not found in this provider's live model listing" in result["message"]
-        assert "recognized by Hermes" in result["message"]
+        # Unified with upstream's curated-catalog acceptance path (#46850); the
+        # fork's earlier "recognized by Hermes" wording (#185) was superseded so
+        # the two parallel implementations no longer shadow each other.
+        assert "not found in the live /v1/models listing" in result["message"]
+        assert "curated catalog" in result["message"]
