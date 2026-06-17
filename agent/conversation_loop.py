@@ -474,6 +474,7 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    persist_user_timestamp: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Thin wrapper that traces one agent run (#167), then delegates.
 
@@ -495,6 +496,7 @@ def run_conversation(
             task_id=task_id,
             stream_callback=stream_callback,
             persist_user_message=persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
         )
         if isinstance(result, dict):
             hermes_telemetry.set_attributes(
@@ -512,6 +514,7 @@ def _run_conversation_impl(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    persist_user_timestamp: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -527,6 +530,8 @@ def _run_conversation_impl(
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
             synthetic prefixes.
+        persist_user_timestamp: Optional platform event timestamp to store
+            as metadata on that persisted user message.
                 or queuing follow-up prefetch work.
 
     Returns:
@@ -548,6 +553,7 @@ def _run_conversation_impl(
         task_id,
         stream_callback,
         persist_user_message,
+        persist_user_timestamp,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,

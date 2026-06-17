@@ -46,6 +46,12 @@ The normal steady state is `BEHIND` = a handful (one day of upstream commits).
 ### 1. Size the merge — decide autonomous vs escalate
 
 ```bash
+# Enable the `theirs` merge driver that .gitattributes maps generated upstream
+# artifacts to (e.g. website/static/api/model-catalog.json, whose `updated_at`
+# timestamp collides every single sync). Without this the driver name is unknown
+# and git falls back to a normal conflict — which, on an hermes_cli-adjacent
+# file, would force escalation every day. Idempotent:
+git config merge.theirs.driver 'cp -f "%B" "%A"'
 git merge --no-ff --no-commit upstream/main || true   # stage the merge, surface conflicts
 CONFLICTS=$(git diff --name-only --diff-filter=U | wc -l)
 echo "conflicted files: $CONFLICTS"
@@ -76,6 +82,11 @@ Resolution rules:
 - **Upstream-domain files we don't customize** (`apps/desktop/**`, `ui-tui/**`,
   `web/**`, platforms we don't run): take upstream — `git checkout --theirs <f>`.
   These must always be current.
+- **Trivial conflicts are NOT a reason to escalate** — auto-resolve by taking
+  upstream: generated/published artifacts (e.g. `website/static/api/model-catalog.json`
+  — handled by the merge driver above so it shouldn't even appear), pure
+  whitespace/alignment differences, and timestamp-only hunks. Only the COUNT of
+  SUBSTANTIVE conflicts (real logic / our features at stake) gates escalation.
 - **Our evolution additions** (telemetry, dotenv-secrets, reasoning-strip,
   docs-only CI, evolution skills/cron/scripts): keep ours — but they are usually
   ADDITIVE (new files / new lines) and rarely conflict. When they do, keep both
