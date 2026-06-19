@@ -1,4 +1,12 @@
-"""Tests for scripts/introspection_extract.py — deterministic, anonymized digest (#89)."""
+"""Tests for scripts/introspection_extract.py — deterministic, anonymized digest (#89).
+
+Tool-failure detection is STRUCTURAL (#347): every Hermes tool serialises its
+result as a JSON envelope carrying the authoritative status (``exit_code`` for
+terminal/code-exec, ``error``/``success``/``status`` for the rest). The digest
+reads that status instead of substring-scanning the body, so marker words
+("404", "error:", "failed") inside a SUCCESSFUL result's output no longer count
+as failures. Fixtures therefore use realistic envelopes, not bare strings.
+"""
 
 import json
 import sys
@@ -28,21 +36,61 @@ def _tool(cid, content):
     return {"role": "tool", "tool_call_id": cid, "content": content}
 
 
+# --- realistic tool-result envelopes (#347) ----------------------------------
+def _term(output="", *, exit_code=0, error=None):
+    """Terminal / code-exec envelope: failure is signalled by exit_code != 0."""
+    return json.dumps({"output": output, "exit_code": exit_code, "error": error}, ensure_ascii=False)
+
+
+def _ok(**fields):
+    """A successful non-terminal envelope (e.g. read_file → {"content": ...}).
+
+    No ``error``, no nonzero ``exit_code`` → never counted as a failure, even
+    when ``fields`` carry marker words in their values."""
+    return json.dumps(fields or {"success": True}, ensure_ascii=False)
+
+
+def _fail(error="error"):
+    """A failed non-terminal envelope (read_file/skill/etc. → {"error": ...})."""
+    return json.dumps({"error": error}, ensure_ascii=False)
+
+
 class TestScanSession:
     def test_attributes_failures_to_tool(self, tmp_path):
         p = _session(tmp_path, "s1", [
             {"role": "session_meta"},
-            _asst("terminal", "c1"), _tool("c1", "bash: foo: command not found"),
-            _asst("terminal", "c2"), _tool("c2", "permission denied"),
-            _asst("read_file", "c3"), _tool("c3", "ok, file contents here"),
+            _asst("terminal", "c1"), _tool("c1", _term("bash: foo: command not found", exit_code=127)),
+            _asst("terminal", "c2"), _tool("c2", _term("", exit_code=1, error="permission denied")),
+            _asst("read_file", "c3"), _tool("c3", _ok(content="ok, file contents here")),
         ])
         s = scan_session(p)
         assert s["tool_failures"] == {"terminal": 2}
         assert "read_file" not in s["tool_failures"]
 
+    def test_structural_ignores_marker_words_in_successful_output(self, tmp_path):
+        """#347 regression: marker words in the BODY of a SUCCESSFUL result
+        must NOT be counted. The old substring matcher fired on file content
+        ("HTTP 404"), grep stdout ("error:"), and skill docs ("timeout") even
+        though every call succeeded; the structural classifier counts none."""
+        p = _session(tmp_path, "fp", [
+            _asst("read_file", "c1"), _tool("c1", _ok(content="page says HTTP 404 Not Found; error: none")),
+            _asst("terminal", "c2"), _tool("c2", _term("grep hit: error: deprecated\nbuild failed? no", exit_code=0)),
+            _asst("skill_view", "c3"), _tool("c3", _ok(content="docs cover 404 and timeout handling")),
+        ])
+        s = scan_session(p)
+        assert s["tool_failures"] == {}
+
+    def test_error_field_counts_for_non_terminal_tools(self, tmp_path):
+        p = _session(tmp_path, "ef", [
+            _asst("read_file", "c1"), _tool("c1", _fail("no such file or directory")),
+            _asst("patch", "c2"), _tool("c2", _ok(success=False)),
+        ])
+        s = scan_session(p)
+        assert s["tool_failures"] == {"read_file": 1, "patch": 1}
+
     def test_counts_timeouts_and_refusals(self, tmp_path):
         p = _session(tmp_path, "s2", [
-            _asst("mcp_health", "c1"), _tool("c1", "request timed out after 120s"),
+            _asst("mcp_health", "c1"), _tool("c1", _term("", exit_code=-1, error="request timed out after 120s")),
             {"role": "assistant", "content": "I can't access that path."},
         ])
         s = scan_session(p)
@@ -52,25 +100,27 @@ class TestScanSession:
     def test_repeated_run_detected(self, tmp_path):
         lines = [{"role": "session_meta"}]
         for i in range(6):
-            lines += [_asst("terminal", f"c{i}"), _tool(f"c{i}", "ok")]
+            lines += [_asst("terminal", f"c{i}"), _tool(f"c{i}", _term("ok"))]
         p = _session(tmp_path, "s3", lines)
         s = scan_session(p)
         assert s["repeated_tool_runs"].get("terminal") == 6
 
     def test_no_raw_text_in_output(self, tmp_path):
-        secret = "USER SECRET email bob@example.com lives at 5 Main St"
+        secret = "USER SECRET email <REDACTED:email:db677acc382bd26bb3a00162f3e668d3> lives at 5 Main St"
         p = _session(tmp_path, "s4", [
-            _asst("terminal", "c1"), _tool("c1", f"error: {secret}"),
+            _asst("terminal", "c1"), _tool("c1", _term("", exit_code=1, error=secret)),
         ])
         s = scan_session(p)
-        # Digest carries only counts/tool names — never the raw content.
+        # A genuine failure is counted, but the digest carries only counts/tool
+        # names — never the raw content/error text.
+        assert s["tool_failures"] == {"terminal": 1}
         assert secret not in json.dumps(s)
 
 
 class TestBuildDigest:
     def test_window_excludes_old_sessions(self, tmp_path):
-        _session(tmp_path, "recent", [_asst("terminal", "c1"), _tool("c1", "command not found")])
-        _session(tmp_path, "old", [_asst("terminal", "c2"), _tool("c2", "command not found")], age_days=30)
+        _session(tmp_path, "recent", [_asst("terminal", "c1"), _tool("c1", _term(exit_code=127))])
+        _session(tmp_path, "old", [_asst("terminal", "c2"), _tool("c2", _term(exit_code=127))], age_days=30)
         d = build_digest(tmp_path, window_days=7)
         assert d["sessions_scanned"] == 1
         assert d["signals"]["tool_failures"] == {"terminal": 1}
@@ -79,7 +129,7 @@ class TestBuildDigest:
         for n in ("a", "b"):
             lines = [{"role": "session_meta"}]
             for i in range(5):
-                lines += [_asst("terminal", f"{n}{i}"), _tool(f"{n}{i}", "ok")]
+                lines += [_asst("terminal", f"{n}{i}"), _tool(f"{n}{i}", _term("ok"))]
             _session(tmp_path, n, lines)
         d = build_digest(tmp_path, window_days=7)
         assert d["sessions_scanned"] == 2
@@ -117,7 +167,7 @@ class TestRequestDump:
     def test_scanned_when_no_jsonl_present(self, tmp_path):
         # The exact regression: a dir with only request dumps, no *.jsonl.
         _dump(tmp_path, "d1", [
-            _asst("terminal", "c1"), _tool("c1", "bash: foo: command not found"),
+            _asst("terminal", "c1"), _tool("c1", _term("bash: foo: command not found", exit_code=127)),
         ], session_id="sess-1", error={"type": "overloaded_error", "status_code": 529,
                                         "message": "x", "response_text": "y"})
         d = build_digest(tmp_path, window_days=7)
@@ -128,8 +178,8 @@ class TestRequestDump:
 
     def test_dedup_by_session_keeps_most_complete(self, tmp_path):
         # Two dumps of ONE session (growing prefix) count once, via the larger.
-        short = [_asst("terminal", "c1"), _tool("c1", "permission denied")]
-        full = short + [_asst("terminal", "c2"), _tool("c2", "command not found")]
+        short = [_asst("terminal", "c1"), _tool("c1", _term("", exit_code=1, error="permission denied"))]
+        full = short + [_asst("terminal", "c2"), _tool("c2", _term("bash: x: command not found", exit_code=127))]
         _dump(tmp_path, "early", short, session_id="sess-1")
         _dump(tmp_path, "late", full, session_id="sess-1")
         d = build_digest(tmp_path, window_days=7)
@@ -137,28 +187,30 @@ class TestRequestDump:
         assert d["signals"]["tool_failures"] == {"terminal": 2}  # from the full one
 
     def test_mixed_jsonl_and_dump_both_counted(self, tmp_path):
-        _session(tmp_path, "s1", [_asst("terminal", "c1"), _tool("c1", "command not found")])
-        _dump(tmp_path, "d1", [_asst("read_file", "c2"), _tool("c2", "no such file")],
+        _session(tmp_path, "s1", [_asst("terminal", "c1"), _tool("c1", _term(exit_code=127))])
+        _dump(tmp_path, "d1", [_asst("read_file", "c2"), _tool("c2", _fail("no such file"))],
               session_id="sess-2")
         d = build_digest(tmp_path, window_days=7)
         assert d["sessions_scanned"] == 2
         assert d["signals"]["tool_failures"] == {"terminal": 1, "read_file": 1}
 
     def test_window_excludes_old_dumps(self, tmp_path):
-        _dump(tmp_path, "old", [_asst("terminal", "c1"), _tool("c1", "command not found")],
+        _dump(tmp_path, "old", [_asst("terminal", "c1"), _tool("c1", _term(exit_code=127))],
               session_id="sess-old", age_days=30)
         d = build_digest(tmp_path, window_days=7)
         assert d["sessions_scanned"] == 0
 
     def test_no_raw_text_from_error_or_messages(self, tmp_path):
-        secret = "bob@example.com at 5 Main St"
+        secret = "<REDACTED:email:db677acc382bd26bb3a00162f3e668d3> at 5 Main St"
         _dump(tmp_path, "d1", [
-            _asst("terminal", "c1"), _tool("c1", f"error: {secret}"),
+            _asst("terminal", "c1"), _tool("c1", _term("", exit_code=1, error=secret)),
         ], session_id="sess-1", error={"type": "bad_request", "status_code": 400,
                                        "message": secret, "response_text": secret,
                                        "body": secret})
         d = build_digest(tmp_path, window_days=7)
-        # Provider error contributes only status:type — never the echoed content.
+        # The failure is counted, but provider error contributes only status:type
+        # and the digest never echoes the raw content.
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
         assert d["signals"]["provider_errors"] == {"400:bad_request": 1}
         assert secret not in json.dumps(d)
 
@@ -172,7 +224,7 @@ class TestRequestDump:
         # #236: dumps now carry a structured failure_category; introspection keys
         # provider_errors by it (recovery class) so recurring bad provider-model
         # pairs group as e.g. 429:rate_limit instead of 429:RuntimeError (#237 pt3).
-        _dump(tmp_path, "d1", [_asst("x", "c1"), _tool("c1", "ok")],
+        _dump(tmp_path, "d1", [_asst("x", "c1"), _tool("c1", _term("ok"))],
               session_id="s1", error={"type": "RuntimeError", "status_code": 429,
                                       "failure_category": "rate_limit"})
         d = build_digest(tmp_path, window_days=7)

@@ -44,14 +44,55 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-try:
-    from agent.loop_guard import _looks_like_failure  # pure (re + typing only)
-except Exception:  # pragma: no cover - keep standalone if import path differs
-    _FALLBACK = ("error:", "failed", "permission denied", "command not found",
-                 "no such file", "timed out", "timeout", "traceback (most recent call")
 
-    def _looks_like_failure(content: Any) -> bool:  # type: ignore
-        return isinstance(content, str) and any(m in content.lower() for m in _FALLBACK)
+
+def _tool_result_failed(content: Any) -> bool:
+    """Structural failure classifier for a tool result (issue #347).
+
+    Every Hermes tool serialises its result as a JSON envelope that already
+    carries the authoritative status (``exit_code`` for terminal/code-exec,
+    ``error`` and/or ``success``/``status`` for the rest). We read that status
+    instead of substring-scanning the body.
+
+    The old substring matcher scanned the WHOLE envelope string for marker
+    words ("failed", "error:", "404", "timeout") and fired on file *content*
+    returned by SUCCESSFUL calls — e.g. ``read_file`` of a page mentioning
+    "HTTP 404", or a ``grep`` whose stdout contains the word "error:". That
+    massively over-counted failures and misattributed them to tools with zero
+    genuine errors (read_file/skill_view), corrupting the introspection signal.
+
+    A result counts as a failure ONLY when its structured status says so:
+      * ``exit_code`` present (terminal/code-exec) → failure iff it is not 0;
+      * a truthy ``error`` field, or ``status == "error"``;
+      * an explicit ``success``/``ok`` field that is falsy.
+    A result with no recognised status field — including any non-JSON / plain
+    string body — is NOT counted: we no longer guess from content. This trades
+    a few genuinely-plain-string failures (rare; tools emit JSON envelopes) for
+    eliminating the false-positive flood, exactly as the issue prescribes.
+    """
+    data = content
+    if isinstance(data, (str, bytes)):
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+        stripped = text.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            return False  # not a JSON envelope → no authoritative status → don't guess
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            return False
+    if not isinstance(data, dict):
+        return False
+    if "exit_code" in data:
+        try:
+            return int(data["exit_code"]) != 0
+        except (TypeError, ValueError):
+            return False
+    if data.get("error") or str(data.get("status", "")).lower() == "error":
+        return True
+    for ok_key in ("success", "ok"):
+        if ok_key in data:
+            return not bool(data[ok_key])
+    return False
 
 
 _TIMEOUT_RE = re.compile(r"\b(timed out|timeout)\b", re.IGNORECASE)
@@ -120,7 +161,7 @@ def scan_messages(messages) -> Dict[str, Any]:
         elif role == "tool":
             content = obj.get("content")
             tool = id_to_tool.get(obj.get("tool_call_id"), "unknown")
-            if _looks_like_failure(content):
+            if _tool_result_failed(content):
                 tool_failures[tool] += 1
             if isinstance(content, str) and _TIMEOUT_RE.search(content):
                 timeouts += 1
