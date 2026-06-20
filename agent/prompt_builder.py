@@ -159,7 +159,11 @@ def _resolve_claude_imports(content: str, base_dir: Path) -> str:
             return match.group(0)
         imported = _strip_yaml_frontmatter(imported)
         imported = _scan_context_content(imported, rel)
-        return f"<!-- imported from {rel} -->\n{imported}"
+        # Markdown blockquote marker (NOT an HTML comment): the assembled
+        # CLAUDE.md is re-scanned for injection, and an "<!-- ... -->" marker
+        # would false-positive on html_comment_injection when the import path
+        # contains a flagged keyword (e.g. @config/system.md).
+        return f"> imported from {rel}\n{imported}"
 
     return _IMPORT_RE.sub(_replace, content)
 
@@ -1931,14 +1935,16 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
-                    # Scan the CLAUDE.md body FIRST, then inline imports (each
-                    # imported file is scanned individually inside
-                    # _resolve_claude_imports). The assembled result is NOT
-                    # re-scanned — re-scanning would trip the injection scanner
-                    # on our own generated "<!-- imported from ... -->" marker
-                    # whenever the import path contains a flagged keyword.
-                    content = _scan_context_content(content, name)
+                    # Inline @path imports (each imported file is also scanned
+                    # individually inside _resolve_claude_imports), THEN scan
+                    # the assembled blob. The full re-scan is deliberate: it
+                    # catches an injection split across the import/body seam
+                    # that per-fragment scanning alone would miss. The import
+                    # marker is a markdown blockquote (not an HTML comment) so
+                    # the re-scan doesn't false-positive on keyword import
+                    # paths like @config/system.md.
                     content = _resolve_claude_imports(content, cwd_path)
+                    content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
                     return _truncate_content(
                         result, "CLAUDE.md", context_length=context_length,
