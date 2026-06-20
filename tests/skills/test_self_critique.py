@@ -95,6 +95,17 @@ class TestParsing:
         result = self_critique.critique("ask", "answer", critique_fn=fn)
         assert result["verdict"] == "satisfied"
 
+    def test_extracts_object_after_stray_brace_literal(self):
+        # A stray '{...}' before the real object must not break extraction.
+        noisy = 'note: {tbd}\n{"verdict": "partial", "missing_items": ["x"]}'
+
+        def fn(messages, **kwargs):
+            return noisy
+
+        result = self_critique.critique("ask", "answer", critique_fn=fn)
+        assert result["verdict"] == "partial"
+        assert result["missing_items"] == ["x"]
+
     def test_unrecognized_verdict_becomes_unknown(self):
         result = self_critique.critique(
             "ask", "answer",

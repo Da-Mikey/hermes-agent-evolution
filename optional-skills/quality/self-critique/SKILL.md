@@ -60,9 +60,11 @@ python optional-skills/quality/self-critique/scripts/self_critique.py --input au
 ```
 
 You can also call it in-process and inject your own LLM function (used in
-tests and when embedding):
+tests and when embedding). Put the `scripts/` dir on `sys.path` first (or run
+from inside it):
 
 ```python
+import sys; sys.path.insert(0, ".../optional-skills/quality/self-critique/scripts")
 from self_critique import critique
 result = critique(original_request, final_response, tool_trace_json)
 ```

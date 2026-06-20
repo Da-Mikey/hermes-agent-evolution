@@ -121,20 +121,32 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL)
     if fence:
         stripped = fence.group(1).strip()
+    # Fast path: the whole thing is the JSON object.
     try:
         obj = json.loads(stripped)
         return obj if isinstance(obj, dict) else None
     except (ValueError, TypeError):
         pass
-    # Fall back to the first balanced-looking {...} span.
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            obj = json.loads(stripped[start : end + 1])
-            return obj if isinstance(obj, dict) else None
-        except (ValueError, TypeError):
-            return None
+    # Robust path: scan each '{' for the first balanced span that parses as an
+    # object. Tolerates a stray brace literal before the real object (a plain
+    # rfind('}') span would swallow it and fail). Inputs are small/bounded.
+    for i, ch in enumerate(stripped):
+        if ch != "{":
+            continue
+        depth = 0
+        for j in range(i, len(stripped)):
+            if stripped[j] == "{":
+                depth += 1
+            elif stripped[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(stripped[i : j + 1])
+                        if isinstance(obj, dict):
+                            return obj
+                    except (ValueError, TypeError):
+                        pass
+                    break  # this '{' didn't yield a valid object; try the next
     return None
 
 
@@ -254,7 +266,9 @@ def critique(
     try:
         raw = fn(messages, timeout=timeout, main_runtime=main_runtime)
     except TypeError:
-        # An injected critique_fn may not accept the runtime kwargs.
+        # An injected critique_fn may not accept the runtime kwargs. Note: a
+        # TypeError raised *inside* fn also lands here, causing one redundant
+        # retry before degrading — acceptable for this test/embed seam.
         try:
             raw = fn(messages)
         except Exception as e:  # noqa: BLE001
