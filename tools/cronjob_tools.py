@@ -37,6 +37,16 @@ from cron.jobs import (
 )
 
 
+def _notify_provider_jobs_changed_safe() -> None:
+    """Tell the active cron scheduler provider the job set changed (no-op for
+    the built-in). Best-effort — never lets a provider error break the tool."""
+    try:
+        from cron.scheduler import _notify_provider_jobs_changed
+        _notify_provider_jobs_changed()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Cron availability preflight + per-task retry rate limiter
 # ---------------------------------------------------------------------------
@@ -838,6 +848,7 @@ def cronjob(
                 no_agent=_no_agent,
             )
             _reset_cron_failure(task_id)
+            _notify_provider_jobs_changed_safe()
             return json.dumps(
                 {
                     "success": True,
@@ -895,6 +906,7 @@ def cronjob(
             if not removed:
                 return tool_error(f"Failed to remove job '{job_id}'", success=False)
             _reset_cron_failure(task_id)
+            _notify_provider_jobs_changed_safe()
             return json.dumps(
                 {
                     "success": True,
@@ -911,11 +923,13 @@ def cronjob(
         if normalized == "pause":
             updated = pause_job(job_id, reason=reason)
             _reset_cron_failure(task_id)
+            _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "resume":
             updated = resume_job(job_id)
             _reset_cron_failure(task_id)
+            _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
@@ -1006,6 +1020,7 @@ def cronjob(
                 return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
             _reset_cron_failure(task_id)
+            _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
