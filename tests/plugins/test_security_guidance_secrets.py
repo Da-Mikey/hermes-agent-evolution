@@ -103,6 +103,13 @@ class TestRegexSecretDetection:
         names = self._names('api_key = "' + ("Z" * 24) + '"\n')
         assert "generic_secret_assignment" in names
 
+    def test_prefix_key_with_filler_substring_still_detected(self):
+        # A real fixed-prefix key that happens to contain "00000000" must NOT be
+        # suppressed — placeholder exclusion for prefix rules is EXAMPLE-only,
+        # so a real secret is never silently dropped (nit #1, fail-open fix).
+        tok = "ghp" + "_" + "00000000" + ("c" * 28)  # 36 chars after ghp_
+        assert "github_token" in self._names(f'gh = "{tok}"\n')
+
     def test_each_rule_fires_once(self):
         content = f'a = "{_AWS_KEY}"\nb = "{_AWS_KEY}"\n'
         findings = self.s.scan_secrets("f.py", content)

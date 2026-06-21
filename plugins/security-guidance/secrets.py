@@ -7,7 +7,10 @@ this Hermes-side logic lives in its own module. Two layers:
 1. Regex rules for well-known credential formats (AWS, GitHub, Slack, Google,
    Stripe, npm, PEM private keys, JWT, generic api-key assignments).
 2. A conservative Shannon-entropy check: a high-entropy value assigned to a
-   secret-named key, with obvious placeholders/example values excluded.
+   secret-named key, with obvious placeholders/example values excluded. The
+   threshold is deliberately conservative (~4.0 bits/char) to keep the
+   false-positive rate low, so it will NOT flag low-entropy human passphrases
+   (e.g. "correcthorsebatterystaple"); known-format keys are caught by layer 1.
 
 Findings are returned as ``(ruleName, reminder)`` tuples — the same shape the
 regex security rules use — so they flow through the existing warn/block path in
@@ -22,11 +25,27 @@ from typing import Dict, List, Set, Tuple
 
 # Same scan cap as the regex scanner — pattern-matching a huge blob is poor
 # signal-to-noise and slows the agent loop.
+# Same scan cap as the regex scanner in __init__.py (_MAX_SCAN_BYTES there) —
+# kept independent so this module stays stdlib-only and importable in isolation.
+# If you change one, change both.
 _MAX_SCAN_BYTES = 256 * 1024
 
 # Obvious non-secrets — example keys, placeholders, redactions. Checked against
 # the matched text so AWS's documented ``AKIAIOSFODNN7EXAMPLE`` and friends, or
 # ``api_key = "your-key-here"``, don't generate false warnings.
+# Two exclusion sets:
+#   _EXAMPLE_RE   — unambiguous "this is documentation, not a real key" words.
+#     Safe to apply even to fixed-prefix tokens (AKIA…/ghp_…), because a real
+#     random key won't contain the literal word "example"/"dummy"/etc.
+#   _PLACEHOLDER_RE — broader, includes structural fillers (your-, xxxx, 0000,
+#     <...>). Applied ONLY to assignment-style/entropy values, never to a
+#     fixed-prefix token — otherwise a real key that merely *contains* "xxxx"
+#     or "0000" as a substring would be silently dropped (a fail-open miss in
+#     a security tool). See scan_secrets().
+_EXAMPLE_RE = re.compile(
+    r"(?i)(example|redacted|placeholder|dummy|sample|changeme|fake|"
+    r"test[_-]?(?:key|token|secret))"
+)
 _PLACEHOLDER_RE = re.compile(
     r"(?i)(example|redacted|placeholder|dummy|sample|changeme|your[_-]?|"
     r"x{4,}|\.\.\.|<[a-z0-9_ .-]+>|fake|test[_-]?(?:key|token|secret)|0{8,})"
@@ -65,7 +84,7 @@ _SECRET_RULES: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("google_api_key", "Google API key",
      re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("stripe_secret_key", "Stripe secret key",
-     re.compile(r"\b(?:sk|rk)_live_[0-9a-zA-Z]{24,}\b")),
+     re.compile(r"\b(?:sk|rk)_live_[0-9a-zA-Z]{24,}\b")),  # live keys only; sk_test_ is low-risk by design
     ("npm_token", "npm token",
      re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
     ("jwt_token", "JSON Web Token",
@@ -119,7 +138,13 @@ def scan_secrets(path: str, content: str) -> List[Tuple[str, str]]:
     seen: Set[str] = set()
     for rule_name, kind, rx in _SECRET_RULES:
         m = rx.search(content)
-        if not m or _is_placeholder(m.group(0)) or rule_name in seen:
+        if not m or rule_name in seen:
+            continue
+        # Fixed-prefix rules are high-precision — only suppress documented
+        # EXAMPLE-style tokens. The assignment-style rule's value can legitimately
+        # be a structural placeholder ("your-key-here"), so it gets the broad set.
+        excl = _PLACEHOLDER_RE if rule_name == "generic_secret_assignment" else _EXAMPLE_RE
+        if excl.search(m.group(0)):
             continue
         seen.add(rule_name)
         hits.append((rule_name, _SECRET_REMINDER.format(kind=kind)))
