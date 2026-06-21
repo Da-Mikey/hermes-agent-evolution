@@ -8,6 +8,7 @@ progress and keeps hammering the same tool:
   * hard limits / access denials retried instead of routed around (#175)
   * an unreachable MCP server looped on health checks (#176)
   * spirals that eventually hit the max-iteration abort (#143)
+  * mono-tool spirals where the agent fixates on ONE tool category (#432)
 
 Mechanism (deliberately conservative — advisory, never blocking):
 inspect the most recent CONSECUTIVE assistant tool-call turns. If the SAME tool
@@ -17,7 +18,17 @@ user-role message (the codebase's mid-loop guidance pattern) telling the model
 to stop, re-check the goal, and change strategy. A real loop is broken; a rare
 false positive costs one advisory message.
 
-Pure functions over the `messages` list → fully unit-testable, no agent state
+Tools are split into two categories for thresholding:
+- Mutating tools (terminal, write_file, patch, execute_code, etc.) get LOWER
+  thresholds because a fixation on these is more costly and the model should
+  be stopped sooner (#432).
+- Idempotent tools (read_file, search_files, web_search, etc.) use the default
+  higher thresholds since re-reading data is less harmful and sometimes needed.
+
+At higher call counts, the nudge escalates from advisory to a DIRECTIVE that
+requires the model to explain progress before continuing (#432).
+
+Pure functions over the ``messages`` list -> fully unit-testable, no agent state
 required (the caller tracks "already nudged this run" to avoid spamming).
 """
 
@@ -57,6 +68,59 @@ _EXIT_CODE_RE = re.compile(r"exit code[:\s]+([1-9]\d*)", re.IGNORECASE)
 # the generic fail_threshold.
 _NON_RETRYABLE = frozenset({"timeout", "permission", "missing_command", "limit"})
 _NONRETRY_THRESHOLD = 2
+
+# Mutating tools get LOWER thresholds than idempotent tools because a fixation
+# on mutating operations (writing files, running commands) is more costly and
+# indicates a deeper strategy problem (#432).
+_IDEMPOTENT_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "web_search",
+        "web_extract",
+        "session_search",
+        "browser_snapshot",
+        "browser_console",
+        "browser_get_images",
+        "mcp_filesystem_read_file",
+        "mcp_filesystem_read_text_file",
+        "mcp_filesystem_read_multiple_files",
+        "mcp_filesystem_list_directory",
+        "mcp_filesystem_list_directory_with_sizes",
+        "mcp_filesystem_directory_tree",
+        "mcp_filesystem_get_file_info",
+        "mcp_filesystem_search_files",
+    }
+)
+_MUTATING_TOOLS = frozenset(
+    {
+        "terminal",
+        "execute_code",
+        "write_file",
+        "patch",
+        "todo",
+        "memory",
+        "skill_manage",
+        "browser_click",
+        "browser_type",
+        "browser_press",
+        "browser_scroll",
+        "browser_navigate",
+        "send_message",
+        "cronjob",
+        "delegate_task",
+        "process",
+    }
+)
+# Default thresholds: lower for mutating tools, higher for idempotent (#432).
+# Mutating:  repeat at 4, fail at 2, escalate at 8
+# Idempotent: repeat at 8, fail at 4, escalate at 15
+_MUTATING_REPEAT_THRESHOLD = 4
+_IDEMPOTENT_REPEAT_THRESHOLD = 8
+_MUTATING_FAIL_THRESHOLD = 2
+_IDEMPOTENT_FAIL_THRESHOLD = 4
+_MUTATING_ESCALATE_THRESHOLD = 8
+_IDEMPOTENT_ESCALATE_THRESHOLD = 15
 
 
 def _failure_category(content: Any) -> Optional[str]:
@@ -126,22 +190,72 @@ def _recent_tool_runs(messages: List[Dict[str, Any]]) -> List[Tuple[str, bool, O
     return runs
 
 
+def _tool_category(tool_name: str) -> str:
+    """Return 'mutating', 'idempotent', or 'unknown' for a tool name."""
+    if tool_name in _MUTATING_TOOLS:
+        return "mutating"
+    if tool_name in _IDEMPOTENT_TOOLS:
+        return "idempotent"
+    return "unknown"
+
+
+def _tool_spiral_score(tool_name: str, count: int, base: int) -> Optional[str]:
+    """Compute a diversity-awareness score for the nudge message.
+
+    Returns a one-line annotation like 'spiral-index: 5' when the number of
+    consecutive calls is meaningfully above the base threshold, or None for
+    short runs.
+    """
+    if count <= base:
+        return None
+    excess = count - base
+    intensity = min(excess // 2, 5)  # cap at 5 for readability
+    if intensity >= 2:
+        return f"spiral-intensity: {intensity} of 5"
+    return None
+
+
 def maybe_nudge(
     messages: List[Dict[str, Any]],
     *,
-    repeat_threshold: int = 6,
-    fail_threshold: int = 3,
+    repeat_threshold: Optional[int] = None,
+    fail_threshold: Optional[int] = None,
 ) -> Optional[str]:
     """Return a nudge string if the trailing single-tool run is stuck, else None.
 
-    Two triggers (failure takes precedence — it's the higher-signal one):
-      * the same tool's last `fail_threshold` results all look like failures
-      * the same tool was called `repeat_threshold`+ times in a row
+    Three trigger levels (each is lower for mutating tools than idempotent):
+      1. Non-retryable failure class repeated twice (highest priority, #231)
+      2. Generic failures >= fail_threshold
+      3. Same tool called >= repeat_threshold times in a row
+      4. Escalated interrupt at higher counts (#432)
+
+    Returns None when the agent is making varied progress (not stuck).
     """
     runs = _recent_tool_runs(messages)
     if not runs:
         return None
     tool = runs[0][0]
+
+    # Pick thresholds based on tool category (#432).
+    # Unknown tools get mutating thresholds as the safer default.
+    cat = _tool_category(tool)
+    is_mutating = cat == "mutating"
+    is_unknown = cat == "unknown"
+    if repeat_threshold is None:
+        repeat_threshold = (
+            _MUTATING_REPEAT_THRESHOLD if (is_mutating or is_unknown)
+            else _IDEMPOTENT_REPEAT_THRESHOLD
+        )
+    if fail_threshold is None:
+        fail_threshold = (
+            _MUTATING_FAIL_THRESHOLD if (is_mutating or is_unknown)
+            else _IDEMPOTENT_FAIL_THRESHOLD
+        )
+    escalate_threshold = (
+        _MUTATING_ESCALATE_THRESHOLD if (is_mutating or is_unknown)
+        else _IDEMPOTENT_ESCALATE_THRESHOLD
+    )
+
     # All entries in `runs` share the same tool (run breaks on tool change),
     # but guard anyway:
     same = [r for r in runs if r[0] == tool]
@@ -165,6 +279,14 @@ def maybe_nudge(
         else:
             counting_nonretry = False
 
+    # Category label for nudge messages.
+    if is_mutating:
+        cat_label = "mutating"
+    elif is_unknown:
+        cat_label = "unknown"
+    else:
+        cat_label = "idempotent"
+
     # Highest-priority: a DETERMINISTIC failure repeated even once (#231). These
     # reproduce on a near-identical retry, so the generic 3-strike threshold is
     # too lenient — two in a row is already a spiral (terminal timeouts, denied
@@ -181,21 +303,41 @@ def maybe_nudge(
 
     if consec_fail >= fail_threshold:
         return (
-            f"[loop-guard] The `{tool}` tool has failed {consec_fail} times in a "
-            f"row with the same approach. STOP repeating it. Diagnose the actual "
-            f"blocker first (check prerequisites / environment / the exact error "
-            f"class), then either switch to a different tool or strategy, or — if "
-            f"the blocker can't be resolved — report it concisely instead of "
-            f"retrying. Do not call `{tool}` again the same way."
+            f"[loop-guard] The `{tool}` tool ({cat_label}) has failed "
+            f"{consec_fail} times in a row with the same approach. STOP repeating "
+            f"it. Diagnose the actual blocker first (check prerequisites / "
+            f"environment / the exact error class), then either switch to a "
+            f"different tool or strategy, or — if the blocker can't be resolved "
+            f"— report it concisely instead of retrying. Do not call `{tool}` "
+            f"again the same way."
         )
+
     if count >= repeat_threshold:
+        # Build diversity score for the nudge.
+        score = _tool_spiral_score(tool, count, repeat_threshold)
+        score_line = f"\n{score}" if score else ""
+
+        if count >= escalate_threshold:
+            return (
+                f"[loop-guard] You have called `{tool}` ({cat_label}) {count} "
+                f"times in a row without resolving the task.{score_line}\n"
+                f"⚠️  ESCALATED INTERRUPT: This is a deep mono-tool spiral. "
+                f"PAUSE and summarize in one paragraph the concrete progress "
+                f"these {count} calls have made toward the goal. If no measurable "
+                f"progress exists, state the actual blocker explicitly and "
+                f"propose a fundamentally different strategy — do NOT call "
+                f"`{tool}` again until you have provided this summary."
+            )
+
         return (
-            f"[loop-guard] You have called `{tool}` {count} times in a row without "
-            f"resolving the task. Pause and re-read the goal: what concrete "
-            f"progress have these calls made? Check your plan/success criterion, "
-            f"then either change strategy, move to the next step, or report the "
-            f"blocker. Avoid another near-identical `{tool}` call."
+            f"[loop-guard] You have called `{tool}` ({cat_label}) {count} times "
+            f"in a row without resolving the task.{score_line} Pause and re-read "
+            f"the goal: what concrete progress have these calls made? Check your "
+            f"plan/success criterion, then either change strategy, move to the "
+            f"next step, or report the blocker. Avoid another near-identical "
+            f"`{tool}` call."
         )
+
     return None
 
 

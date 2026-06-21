@@ -712,6 +712,12 @@ def _run_conversation_impl(
                 if _lg_nudge:
                     messages.append({"role": "user", "content": _lg_nudge})
                     agent._loop_guard_nudged = (_lg_tool, _lg_count)
+                    if "ESCALATED INTERRUPT" in _lg_nudge:
+                        logger.warning(
+                            "loop_guard: ESCALATED INTERRUPT for %s (%d calls) — "
+                            "deep mono-tool spiral detected (#432)",
+                            _lg_tool, _lg_count,
+                        )
                     if not agent.quiet_mode:
                         agent._safe_print("\n🌀 loop-guard: nudging a strategy change")
         except Exception as _lg_err:  # never let the guard break the loop

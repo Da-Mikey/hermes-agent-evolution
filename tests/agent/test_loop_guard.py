@@ -1,4 +1,10 @@
-"""Tests for agent/loop_guard.py — advisory loop / repeated-failure detection."""
+"""Tests for agent/loop_guard.py — advisory loop / repeated-failure detection.
+
+Mutating tools (terminal, write_file, etc.) get LOWER thresholds because
+fixation on them is more costly (#432). Idempotent tools (read_file, etc.)
+use higher thresholds. Tests use ``terminal`` (mutating, threshold=4) and
+``read_file`` (idempotent, threshold=8) to exercise both paths.
+"""
 
 from agent.loop_guard import current_run_signature, maybe_nudge
 
@@ -25,12 +31,21 @@ def _run(tool, n, *, result="ok"):
 
 
 class TestRepeatTrigger:
-    def test_below_threshold_is_quiet(self):
-        assert maybe_nudge(_run("terminal", 5)) is None
+    def test_mutating_below_threshold_is_quiet(self):
+        # terminal is mutating (repeat_threshold=4) — 3 calls should be quiet.
+        assert maybe_nudge(_run("terminal", 3)) is None
 
-    def test_at_threshold_nudges(self):
-        n = maybe_nudge(_run("terminal", 6))
+    def test_mutating_at_threshold_nudges(self):
+        n = maybe_nudge(_run("terminal", 4))
         assert n is not None and "terminal" in n and "loop-guard" in n
+
+    def test_idempotent_below_threshold_is_quiet(self):
+        # read_file is idempotent (repeat_threshold=8) — 7 calls should be quiet.
+        assert maybe_nudge(_run("read_file", 7)) is None
+
+    def test_idempotent_at_threshold_nudges(self):
+        n = maybe_nudge(_run("read_file", 8))
+        assert n is not None and "read_file" in n and "loop-guard" in n
 
     def test_signature_counts_the_run(self):
         assert current_run_signature(_run("read_file", 4)) == ("read_file", 4)
@@ -40,31 +55,42 @@ class TestRepeatTrigger:
 
 
 class TestFailureTrigger:
-    def test_three_consecutive_failures_nudges_even_below_repeat(self):
-        # A change-and-retry class (runtime_error) needs the generic 3-strike.
-        msgs = _run("terminal", 3, result="error: build step blew up")
+    def test_mutating_two_failures_nudge(self):
+        # terminal is mutating (fail_threshold=2) — 2 failures trigger.
+        msgs = _run("terminal", 2, result="error: build step blew up")
         n = maybe_nudge(msgs)
-        assert n is not None and "failed 3 times" in n
+        assert n is not None and "failed 2 times" in n
 
-    def test_two_change_and_retry_failures_not_enough(self):
-        # runtime_error is NOT deterministic — a corrected retry can succeed, so
-        # two is below the generic 3-strike and stays quiet.
-        assert maybe_nudge(_run("terminal", 2, result="error: transient blip")) is None
+    def test_mutating_one_failure_not_enough(self):
+        assert maybe_nudge(_run("terminal", 1, result="error: transient blip")) is None
+
+    def test_idempotent_three_failures_still_quiet(self):
+        # read_file is idempotent (fail_threshold=4) — 3 failures is below threshold.
+        assert maybe_nudge(_run("read_file", 3, result="error: not found")) is None
+
+    def test_idempotent_four_failures_nudge(self):
+        msgs = _run("read_file", 4, result="error: not found")
+        n = maybe_nudge(msgs)
+        assert n is not None and "failed 4 times" in n
 
     def test_exit_code_marker_counts_as_failure(self):
-        msgs = _run("execute_code", 3, result="process finished, exit code: 1")
+        msgs = _run("execute_code", 2, result="process finished, exit code: 1")
         assert maybe_nudge(msgs) is not None
 
     def test_mcp_unreachable_failures(self):
         msgs = _run("mcp_tqmemory_health", 3, result="server unreachable: ClosedResourceError")
         n = maybe_nudge(msgs)
+        # mcp_tqmemory_health is not in mutating/idempotent sets, so 'unknown'
+        # category uses the safer (lower) default -> mutating thresholds.
+        # fail_threshold=2 for unknown, so 3 failures trigger.
         assert n is not None
 
 
 class TestNonRetryableTrigger:
     """#231 — DETERMINISTIC failure classes (timeout/permission/missing_command/
     limit) reproduce on retry, so two in a row trip a hard stop below the generic
-    3-strike threshold."""
+    strike threshold.
+    """
 
     def test_two_permission_denials_stop_hard(self):
         n = maybe_nudge(_run("terminal", 2, result="permission denied"))
@@ -77,15 +103,65 @@ class TestNonRetryableTrigger:
     def test_single_deterministic_failure_is_quiet(self):
         assert maybe_nudge(_run("terminal", 1, result="permission denied")) is None
 
-    def test_mixed_deterministic_classes_do_not_accumulate(self):
-        # A permission failure then a timeout failure are different classes — the
-        # deterministic counter only fires on the SAME class repeating, so this
-        # falls through to the generic path (2 < 3) and stays quiet.
+    def test_mixed_deterministic_classes_fall_through_to_generic_fail(self):
+        # A permission then a timeout are different classes — the deterministic
+        # counter only fires on the SAME class repeating. But the generic fail
+        # threshold for mutating tools is 2, so 2 mixed failures STILL trigger
+        # via the fail path (not the non-retryable path).
         msgs = [{"role": "user", "content": "go"}]
         msgs += [_asst("terminal", call_id="c0"), _result("permission denied", "c0")]
         msgs += [_asst("terminal", call_id="c1"), _result("connection timed out", "c1")]
-        # most-recent-first: timeout(1) then permission — classes differ, counter=1
-        assert maybe_nudge(msgs) is None
+        n = maybe_nudge(msgs)
+        # Falls through to generic fail path: 2 failures >= mutating fail_threshold=2
+        assert n is not None and "failed 2 times" in n
+
+
+class TestEscalatedInterrupt:
+    """#432 — mono-tool spirals beyond the repeat threshold get an escalated
+    FORCED INTERRUPT message requiring the agent to summarize progress.
+    """
+
+    def test_mutating_escalated_at_threshold(self):
+        # terminal mutating: repeat=4, escalate=8. At 8 calls, expect escalated.
+        msgs = _run("terminal", 8)
+        n = maybe_nudge(msgs)
+        assert n is not None and "ESCALATED INTERRUPT" in n
+
+    def test_mutating_escalated_above_threshold(self):
+        msgs = _run("terminal", 10)
+        n = maybe_nudge(msgs)
+        assert n is not None and "ESCALATED INTERRUPT" in n
+
+    def test_idempotent_escalated_at_threshold(self):
+        # read_file idempotent: repeat=8, escalate=15. At 15 calls, expect escalated.
+        msgs = _run("read_file", 15)
+        n = maybe_nudge(msgs)
+        assert n is not None and "ESCALATED INTERRUPT" in n
+
+    def test_idempotent_below_escalate_is_regular_nudge(self):
+        # read_file idempotent: repeat=8, escalate=15. At 10 calls, regular nudge.
+        msgs = _run("read_file", 10)
+        n = maybe_nudge(msgs)
+        assert n is not None and "ESCALATED INTERRUPT" not in n
+
+    def test_mutating_below_escalate_is_regular_nudge(self):
+        # terminal mutating: repeat=4, escalate=8. At 6 calls, regular nudge.
+        msgs = _run("terminal", 6)
+        n = maybe_nudge(msgs)
+        assert n is not None and "ESCALATED INTERRUPT" not in n
+
+    def test_unknown_tool_uses_mutating_thresholds(self):
+        # mcp tools not in either set use the safer default (mutating thresholds).
+        msgs = _run("mcp_custom_query", 10)
+        n = maybe_nudge(msgs)
+        # repeat=4 for unknown (mutating default), escalate=8. At 10, escalated.
+        assert n is not None and "unknown" in n and "ESCALATED INTERRUPT" in n
+
+    def test_spiral_intensity_appears_at_high_counts(self):
+        # terminal mutating: repeat=4, escalate=8. At 10 calls, spiral-intensity >= 2.
+        msgs = _run("terminal", 10)
+        n = maybe_nudge(msgs)
+        assert n is not None and "spiral-intensity" in n
 
 
 class TestRunBoundaries:
