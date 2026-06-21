@@ -28,6 +28,7 @@ EXPECTED_FIELDS = {
     "primary_recovery_attempted",
     "has_retried_429",
     "fail_fast_attempted",
+    "auth_failover_attempted",
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
 }
