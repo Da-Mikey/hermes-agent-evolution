@@ -110,7 +110,7 @@ def evaluate(
     issues = fetch_open_issues(runner)
     if issues is None:
         return {"open_features": None, "cap": cap, "throttle": False,
-                "note": "gh unavailable — failing open (no throttle)"}
+                "note": "gh unavailable; defaulting to no throttle"}
     n = count_open_features(issues)
     return {"open_features": n, "cap": cap, "throttle": should_throttle(n, cap)}
 
