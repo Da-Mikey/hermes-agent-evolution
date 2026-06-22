@@ -1,15 +1,15 @@
 ---
 name: evolution-analysis
-description: Analyze issues and PRs to prioritize implementation (PRIVATE mode only)
+description: Analyze issues and PRs to prioritize implementation
 version: 1.0.0
 author: Hermes Evolution
 category: evolution
-mode: PRIVATE
+mode: PUBLIC
 ---
 
 # Evolution Analysis Skill
 
-**Operating mode:** PRIVATE (repository owner only)
+**Operating mode:** PUBLIC (github token auth via GITHUB_TOKEN or gh CLI)
 
 ## Mission
 
@@ -335,4 +335,7 @@ Save to `~/.hermes/profiles/user1/evolution/analysis/YYYY-MM-DD.json`:
 
 ## Security
 
-If GITHUB_PRIVATE_TOKEN is not set — **ABORT**. This skill only works in PRIVATE mode.
+Verify `gh auth status` works before proceeding — the gh CLI is the primary
+auth mechanism. If gh CLI auth is unavailable AND GITHUB_TOKEN is not set,
+**ABORT**. Do NOT export tokens into the environment — `gh` handles auth via
+its own stored credentials.

@@ -15,8 +15,9 @@ prompt: |
   in-cycle — but the state when you merge must be fully green), max 5 merges per
   run, and run `hermes update --yes` after merging (it has built-in rollback).
 
-  CRITICAL: This job ONLY runs in PRIVATE mode.
-  If GITHUB_PRIVATE_TOKEN is not set, ABORT immediately.
+  CRITICAL: Verify `gh auth status` works before proceeding — the gh CLI is
+  the primary auth mechanism. GITHUB_TOKEN is set as fallback. If neither
+  gh CLI auth nor GITHUB_TOKEN is available, ABORT immediately.
 
 skills:
   - evolution/integration
@@ -26,9 +27,9 @@ toolsets:
   - file
   - terminal   # gh pr merge / gh pr checks / hermes update
 
-# GitHub API configuration (PRIVATE mode — owner integrates)
+# GitHub API configuration (uses GITHUB_TOKEN; gh CLI is preferred)
 github:
-  token_env: GITHUB_PRIVATE_TOKEN
+  token_env: GITHUB_TOKEN
   owner: Lexus2016
   repo: hermes-agent-evolution
 

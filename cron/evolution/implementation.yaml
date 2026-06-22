@@ -19,8 +19,9 @@ prompt: |
   4. LIMIT: 5 auto-merges per day
   5. Breaking changes need manual review
   
-  This job ONLY runs in PRIVATE mode.
-  If GITHUB_PRIVATE_TOKEN is not set, ABORT immediately.
+  CRITICAL: Verify `gh auth status` works before proceeding — the gh CLI is
+  the primary auth mechanism. GITHUB_TOKEN is set as fallback. If neither
+  gh CLI auth nor GITHUB_TOKEN is available, ABORT immediately.
 
 skills:
   - evolution/implementation
@@ -30,9 +31,9 @@ toolsets:
   - file
   - terminal
 
-# GitHub API configuration (PRIVATE mode)
+# GitHub API configuration (uses GITHUB_TOKEN; gh CLI is preferred)
 github:
-  token_env: GITHUB_PRIVATE_TOKEN
+  token_env: GITHUB_TOKEN
   owner: Lexus2016
   repo: hermes-agent-evolution
 

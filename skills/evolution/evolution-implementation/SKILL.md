@@ -1,15 +1,15 @@
 ---
 name: evolution-implementation
-description: Implement selected issues and self-update (PRIVATE mode only)
+description: Implement selected issues and self-update
 version: 1.0.0
 author: Hermes Evolution
 category: evolution
-mode: PRIVATE
+mode: PUBLIC
 ---
 
 # Evolution Implementation Skill
 
-**Operating mode:** PRIVATE (repository owner only)
+**Operating mode:** PUBLIC (github token auth via GITHUB_TOKEN or gh CLI)
 
 ## Task
 
