@@ -1,77 +1,18 @@
 name: Tests
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-  pull_request:
-    branches: [main]
-    # NO paths-ignore here (issue #108): branch protection REQUIRES the
-    # `test (1..6)` statuses, and a workflow filtered out by paths-ignore
-    # reports nothing at all — markdown-only PRs then sit BLOCKED forever.
-    # Instead the `changes` job below detects docs-only diffs and the test
-    # jobs SKIP themselves: a skipped check run satisfies required status
-    # checks, a missing one does not.
+  workflow_call:
 
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same PR/branch
+# Cancel in-progress runs for the same ref
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Detect docs/markdown-only PRs so the heavy jobs can skip themselves
-  # while still REPORTING a (skipped) check run — required status checks
-  # are satisfied by skipped runs but permanently blocked by absent ones
-  # (issue #108). This job must be infallible: any uncertainty falls back
-  # to docs_only=false (i.e. run the tests — fail-safe direction).
-  changes:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      docs_only: ${{ steps.filter.outputs.docs_only }}
-    steps:
-      - name: Classify changed files via API
-        id: filter
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          DOCS_ONLY=false
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES=$(gh api \
-              "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-              --paginate --jq '.[].filename' 2>/dev/null)
-            if [ -n "$FILES" ]; then
-              DOCS_ONLY=true
-              while IFS= read -r f; do
-                case "$f" in
-                  # skills/cron are behavioral instructions, not docs: a SKILL.md
-                  # edit can introduce dead skill->script wiring (#101/#188), so
-                  # force the full test run to enforce evolution_skill_lint.
-                  skills/*|cron/*) DOCS_ONLY=false; break ;;
-                  *.md|docs/*) ;;
-                  *) DOCS_ONLY=false; break ;;
-                esac
-              done <<< "$FILES"
-            fi
-          fi
-          echo "docs_only=$DOCS_ONLY" >> "$GITHUB_OUTPUT"
-          echo "docs_only=$DOCS_ONLY"
-          exit 0
-
   test:
-    needs: changes
-    # NOTE: no job-level `if` here. A skipped matrix job reports a single
-    # check run named 'test' (the matrix is never expanded), so the required
-    # 'test (1..6)' contexts would still be missing and the PR stays BLOCKED.
-    # Instead the job always runs (matrix expands, all six check runs exist)
-    # and every STEP below skips on docs-only PRs — each run completes
-    # successfully in seconds.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -80,25 +21,26 @@ jobs:
         slice: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout code
-        if: needs.changes.outputs.docs_only != 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Restore duration cache
-        if: needs.changes.outputs.docs_only != 'true'
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
-          # Single stable key. main always overwrites, PRs always find it.
+          # main always writes a new suffix, but jobs pick the latest one with the same prefix
+          # quote from https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#cache-hits-and-misses
+          # If you provide restore-keys, the cache action sequentially searches for any caches that match the list of restore-keys.
+          # If there are no exact matches, the action searches for partial matches of the restore keys.
+          # When the action finds a partial match, the most recent cache is restored to the path directory.
           key: test-durations
 
       - name: Install ripgrep (prebuilt binary)
-        if: needs.changes.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           RG_VERSION=15.1.0
           RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
           RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
-          curl -sSfL -o "$RG_TARBALL" \
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
             "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
           echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
           tar -xzf "$RG_TARBALL"
@@ -107,8 +49,7 @@ jobs:
           rg --version
 
       - name: Install uv
-        if: needs.changes.outputs.docs_only != 'true'
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
@@ -121,25 +62,23 @@ jobs:
             uv.lock
 
       - name: Set up Python 3.11
-        if: needs.changes.outputs.docs_only != 'true'
         run: uv python install 3.11
 
       - name: Install dependencies
-        if: needs.changes.outputs.docs_only != 'true'
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
         # fails if the lock is out of sync with pyproject.toml), giving a
         # reproducible env. It also creates .venv itself, so no separate
         # `uv venv` step is needed.
-        run: uv sync --locked --python 3.11 --extra all --extra dev
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
 
       - name: Minimize uv cache
-        if: needs.changes.outputs.docs_only != 'true'
         # Optimized for CI: prunes pre-built wheels that are cheap to
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
       - name: Run tests (slice ${{ matrix.slice }}/6)
-        if: needs.changes.outputs.docs_only != 'true'
         # Per-file isolation via scripts/run_tests_parallel.py: discovers
         # every test_*.py file under tests/ (excluding integration/ + e2e/),
         # then runs `python -m pytest <file>` in a freshly-spawned subprocess
@@ -173,8 +112,7 @@ jobs:
           NOUS_API_KEY: ""
 
       - name: Upload per-slice durations
-        if: needs.changes.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-durations-slice-${{ matrix.slice }}
           path: test_durations.json
@@ -184,11 +122,11 @@ jobs:
   # (including PRs) get balanced slicing.
   save-durations:
     needs: test
-    if: always() && github.ref == 'refs/heads/main'
+    if: needs.test.result == 'success' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Download all slice durations
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: test-durations-slice-*
           path: durations
@@ -208,19 +146,17 @@ jobs:
           "
 
       - name: Save merged duration cache
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
-          key: test-durations
+          key: test-durations-${{ github.run_id }}
 
   e2e:
-    needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install ripgrep (prebuilt binary)
         run: |
@@ -228,7 +164,7 @@ jobs:
           RG_VERSION=15.1.0
           RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
           RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
-          curl -sSfL -o "$RG_TARBALL" \
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
             "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
           echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
           tar -xzf "$RG_TARBALL"
@@ -237,7 +173,7 @@ jobs:
           rg --version
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
@@ -257,7 +193,9 @@ jobs:
         # fails if the lock is out of sync with pyproject.toml), giving a
         # reproducible env. It also creates .venv itself, so no separate
         # `uv venv` step is needed.
-        run: uv sync --locked --python 3.11 --extra all --extra dev
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
