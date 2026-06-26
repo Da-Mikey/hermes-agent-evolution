@@ -103,7 +103,10 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     if per_job:
         return per_job
     try:
-        from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+        )  # lazy: avoid heavy import at cron module load
+
         return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:
         logger.warning(
@@ -112,13 +115,29 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
-    "telegram", "discord", "slack", "whatsapp", "signal",
-    "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
-    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "telegram",
+    "discord",
+    "slack",
+    "whatsapp",
+    "signal",
+    "matrix",
+    "mattermost",
+    "homeassistant",
+    "dingtalk",
+    "feishu",
+    "wecom",
+    "wecom_callback",
+    "weixin",
+    "sms",
+    "email",
+    "webhook",
+    "bluebubbles",
+    "qqbot",
+    "yuanbao",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -180,7 +199,9 @@ _running_lock = threading.Lock()
 _sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
 
-def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
+def _get_parallel_pool(
+    max_workers: Optional[int],
+) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
     global _parallel_pool, _parallel_pool_max_workers
     if _parallel_pool is None or _parallel_pool_max_workers != max_workers:
@@ -278,7 +299,14 @@ def _cron_job_origin_log_suffix(job: dict) -> str:
         return ""
 
     fields = []
-    for key in ("platform", "chat_id", "thread_id", "source_ip", "remote", "forwarded_for"):
+    for key in (
+        "platform",
+        "chat_id",
+        "thread_id",
+        "source_ip",
+        "remote",
+        "forwarded_for",
+    ):
         value = origin.get(key)
         if value is None:
             continue
@@ -297,8 +325,10 @@ def _plugin_cron_env_var(platform_name: str) -> str:
     """
     try:
         from hermes_cli.plugins import discover_plugins
+
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
+
         entry = platform_registry.get(platform_name.lower())
         if entry and entry.cron_deliver_env_var:
             return entry.cron_deliver_env_var
@@ -381,8 +411,10 @@ def _iter_home_target_platforms():
         yield name
     try:
         from hermes_cli.plugins import discover_plugins
+
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
+
         for entry in platform_registry.plugin_entries():
             if entry.cron_deliver_env_var and entry.name not in _HOME_TARGET_ENV_VARS:
                 yield entry.name
@@ -420,14 +452,12 @@ def cron_delivery_targets() -> list[dict]:
         if not _is_known_delivery_platform(name):
             continue
         env_var = _resolve_home_env_var(name)
-        targets.append(
-            {
-                "id": name,
-                "name": name.replace("_", " ").title(),
-                "home_target_set": bool(_get_home_target_chat_id(name)),
-                "home_env_var": env_var or None,
-            }
-        )
+        targets.append({
+            "id": name,
+            "name": name.replace("_", " ").title(),
+            "home_target_set": bool(_get_home_target_chat_id(name)),
+            "home_env_var": env_var or None,
+        })
     return targets
 
 
@@ -469,7 +499,9 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
         from tools.send_message_tool import _parse_target_ref
 
-        parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(platform_key, rest)
+        parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(
+            platform_key, rest
+        )
         if is_explicit:
             chat_id, thread_id = parsed_chat_id, parsed_thread_id
         else:
@@ -478,9 +510,12 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         # Resolve human-friendly labels like "Alice (dm)" to real IDs.
         try:
             from gateway.channel_directory import resolve_channel_name
+
             resolved = resolve_channel_name(platform_key, chat_id)
             if resolved:
-                parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
+                parsed_chat_id, parsed_thread_id, resolved_is_explicit = (
+                    _parse_target_ref(platform_key, resolved)
+                )
                 if resolved_is_explicit:
                     chat_id = parsed_chat_id
                     if parsed_thread_id is not None:
@@ -588,7 +623,11 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     for part in parts:
         target = _resolve_single_delivery_target(job, part)
         if target:
-            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
+            key = (
+                target["platform"].lower(),
+                str(target["chat_id"]),
+                target.get("thread_id"),
+            )
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
@@ -603,8 +642,8 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
 
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
-_VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
-_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"})
+_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 
 
 def _send_media_via_adapter(
@@ -631,22 +670,34 @@ def _send_media_via_adapter(
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
-            route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+            route_platform = (
+                platform if platform is not None else getattr(adapter, "platform", None)
+            )
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+                coro = adapter.send_voice(
+                    chat_id=chat_id, audio_path=media_path, metadata=metadata
+                )
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                coro = adapter.send_video(
+                    chat_id=chat_id, video_path=media_path, metadata=metadata
+                )
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(
+                    chat_id=chat_id, image_path=media_path, metadata=metadata
+                )
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                coro = adapter.send_document(
+                    chat_id=chat_id, file_path=media_path, metadata=metadata
+                )
 
             from agent.async_utils import safe_schedule_threadsafe
+
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
                 logger.warning(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
+                    job.get("id", "?"),
+                    media_path,
                 )
                 return
             try:
@@ -657,10 +708,17 @@ def _send_media_via_adapter(
             if result and not getattr(result, "success", True):
                 logger.warning(
                     "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                    job.get("id", "?"),
+                    media_path,
+                    getattr(result, "error", "unknown"),
                 )
         except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            logger.warning(
+                "Job '%s': failed to send media %s: %s",
+                job.get("id", "?"),
+                media_path,
+                e,
+            )
 
 
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
@@ -677,7 +735,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     targets = _resolve_delivery_targets(job)
     if not targets:
         if job.get("deliver", "local") != "local":
-            msg = f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
+            msg = (
+                f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
+            )
             logger.warning("Job '%s': %s", job["id"], msg)
             return msg
         return None  # local-only jobs don't deliver — not a failure
@@ -703,14 +763,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            f'To stop or manage this job, send me a new message (e.g. "stop reminder {task_name}").'
         )
     else:
         delivery_content = content
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+
+    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(
+        delivery_content
+    )
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     try:
@@ -734,12 +797,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             logger.warning(
                 "Job '%s': origin has thread_id=%s but delivery target lost it "
                 "(deliver=%s, target=%s)",
-                job["id"], origin_thread, job.get("deliver", "local"), target,
+                job["id"],
+                origin_thread,
+                job.get("deliver", "local"),
+                target,
             )
         elif thread_id:
             logger.debug(
                 "Job '%s': delivering to %s:%s thread_id=%s",
-                job["id"], platform_name, chat_id, thread_id,
+                job["id"],
+                platform_name,
+                chat_id,
+                thread_id,
             )
 
         # Built-in names resolve to their enum member; plugin platform names
@@ -763,7 +832,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
-        if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+        if (
+            runtime_adapter is not None
+            and loop is not None
+            and getattr(loop, "is_running", lambda: False)()
+        ):
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
@@ -771,8 +844,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
+
                     future = safe_schedule_threadsafe(
-                        runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                        runtime_adapter.send(
+                            chat_id, text_to_send, metadata=send_metadata
+                        ),
                         loop,
                     )
                     if future is None:
@@ -787,7 +863,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             err = getattr(send_result, "error", "unknown")
                             logger.warning(
                                 "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
-                                job["id"], platform_name, chat_id, err,
+                                job["id"],
+                                platform_name,
+                                chat_id,
+                                err,
                             )
                             adapter_ok = False  # fall through to standalone path
                         elif (
@@ -796,7 +875,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             and getattr(send_result, "raw_response", None)
                             and send_result.raw_response.get("thread_fallback")
                         ):
-                            requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
+                            requested_thread_id = (
+                                send_result.raw_response.get("requested_thread_id")
+                                or thread_id
+                            )
                             msg = (
                                 f"configured thread_id {requested_thread_id} for "
                                 f"{platform_name}:{chat_id} was not found; delivered without thread_id"
@@ -817,17 +899,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
                 if adapter_ok:
-                    logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+                    logger.info(
+                        "Job '%s': delivered to %s:%s via live adapter",
+                        job["id"],
+                        platform_name,
+                        chat_id,
+                    )
                     delivered = True
             except Exception as e:
                 logger.warning(
                     "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
-                    job["id"], platform_name, chat_id, e,
+                    job["id"],
+                    platform_name,
+                    chat_id,
+                    e,
                 )
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -837,7 +934,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(
+                        asyncio.run,
+                        _send_to_platform(
+                            platform,
+                            pconfig,
+                            chat_id,
+                            cleaned_delivery_content,
+                            thread_id=thread_id,
+                            media_files=media_files,
+                        ),
+                    )
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
@@ -851,7 +958,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.append(msg)
                 continue
 
-            logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            logger.info(
+                "Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id
+            )
 
     if delivery_errors:
         return "; ".join(delivery_errors)
@@ -871,7 +980,10 @@ def _get_script_timeout() -> int:
             if timeout > 0:
                 return timeout
         except Exception:
-            logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
+            logger.warning(
+                "Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default",
+                _SCRIPT_TIMEOUT,
+            )
 
     env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
     if env_value:
@@ -880,7 +992,9 @@ def _get_script_timeout() -> int:
             if timeout > 0:
                 return timeout
         except Exception:
-            logger.warning("Invalid HERMES_CRON_SCRIPT_TIMEOUT=%r; using config/default", env_value)
+            logger.warning(
+                "Invalid HERMES_CRON_SCRIPT_TIMEOUT=%r; using config/default", env_value
+            )
 
     try:
         cfg = load_config() or {}
@@ -1005,7 +1119,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         pass
 
     try:
-        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        popen_kwargs = (
+            {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        )
         result = subprocess.run(
             argv,
             capture_output=True,
@@ -1021,6 +1137,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         # Redact secrets from both stdout and stderr before any return path.
         try:
             from agent.redact import redact_sensitive_text
+
             stdout = redact_sensitive_text(stdout)
             stderr = redact_sensitive_text(stderr)
         except Exception:
@@ -1122,11 +1239,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     context_from = job.get("context_from")
     if context_from:
         from cron.jobs import OUTPUT_DIR
+
         if isinstance(context_from, str):
             context_from = [context_from]
         for source_job_id in context_from:
             # Guard against path traversal — valid job IDs are 12-char hex strings
-            if not source_job_id or not all(c in "0123456789abcdef" for c in source_job_id):
+            if not source_job_id or not all(
+                c in "0123456789abcdef" for c in source_job_id
+            ):
                 logger.warning(
                     "context_from: skipping invalid job_id %r for job_id=%r name=%r%s",
                     source_job_id,
@@ -1150,7 +1270,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
-                    latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
+                    latest_output = (
+                        latest_output[:_MAX_CONTEXT_CHARS]
+                        + "\n\n[... output truncated ...]"
+                    )
                 if latest_output:
                     prompt = (
                         f"## Output from job '{source_job_id}'\n"
@@ -1163,7 +1286,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 else:
                     continue  # silent skip — empty output
             except (OSError, PermissionError) as e:
-                logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
+                logger.warning(
+                    "context_from: failed to read output for job %r: %s",
+                    source_job_id,
+                    e,
+                )
                 # silent skip — do not pollute the prompt with error messages
 
     # Always prepend cron execution guidance so the agent knows how
@@ -1181,7 +1308,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "job / send_message / delivery, and do NOT include internal tooling or "
         "telemetry. The user wants the result, not the plumbing. "
         "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+        'with exactly "[SILENT]" (nothing else) to suppress delivery. '
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
@@ -1204,7 +1331,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
-    from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
+    from agent.skill_bundles import (
+        build_bundle_invocation_message,
+        resolve_bundle_command_key,
+    )
 
     parts = []
     skipped: list[str] = []
@@ -1221,7 +1351,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 task_id=str(job.get("id") or "") or None,
             )
             if bundle_payload:
-                bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
+                bundle_message, _loaded_bundle_skills, _missing_bundle_skills = (
+                    bundle_payload
+                )
                 if parts:
                     parts.append("")
                 parts.append(bundle_message)
@@ -1237,12 +1369,20 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         try:
             loaded = json.loads(skill_view(skill_name))
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
+            logger.warning(
+                "Cron job '%s': skill '%s' returned invalid JSON, skipping",
+                job.get("name", job.get("id")),
+                skill_name,
+            )
             skipped.append(skill_name)
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
+            logger.warning(
+                "Cron job '%s': skill not found, skipping — %s",
+                job.get("name", job.get("id")),
+                error,
+            )
             skipped.append(skill_name)
             continue
 
@@ -1250,18 +1390,20 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         try:
             bump_use(skill_name)
         except Exception:
-            logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
+            logger.debug(
+                "Cron job: failed to bump skill usage for '%s'",
+                skill_name,
+                exc_info=True,
+            )
 
         content = str(loaded.get("content") or "").strip()
         if parts:
             parts.append("")
-        parts.extend(
-            [
-                f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
-                "",
-                content,
-            ]
-        )
+        parts.extend([
+            f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
+            "",
+            content,
+        ])
 
     if skipped:
         notice = (
@@ -1273,7 +1415,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         parts.insert(0, notice)
 
     if prompt:
-        parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
+        parts.extend([
+            "",
+            f"The user has provided the following instruction alongside the skill invocation: {prompt}",
+        ])
     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
 
 
@@ -1399,7 +1544,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
@@ -1522,9 +1667,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     _session_db = None
     try:
         from hermes_state import SessionDB
+
         _session_db = SessionDB()
     except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+        logger.debug(
+            "Job '%s': SQLite session store not available: %s", job.get("id", "?"), e
+        )
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -1538,7 +1686,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
-                job_name, job_id,
+                job_name,
+                job_id,
             )
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
@@ -1557,7 +1706,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # didn't run and can audit the offending skill.
         logger.warning(
             "Job '%s' (ID: %s): blocked by prompt-injection scanner — %s",
-            job_name, job_id, block_exc,
+            job_name,
+            job_id,
+            block_exc,
         )
         blocked_doc = (
             f"# Cron Job: {job_name}\n\n"
@@ -1653,7 +1804,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # and drop back to old behaviour rather than crashing the job.
         logger.warning(
             "Job '%s': configured workdir %r no longer exists — running without it",
-            job_id, _job_workdir,
+            job_id,
+            _job_workdir,
         )
         _job_workdir = None
     _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
@@ -1665,15 +1817,24 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
+
         try:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="utf-8")
+            load_dotenv(
+                str(_get_hermes_home() / ".env"), override=True, encoding="utf-8"
+            )
         except UnicodeDecodeError:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
+            load_dotenv(
+                str(_get_hermes_home() / ".env"), override=True, encoding="latin-1"
+            )
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(
+                delivery_target["platform"]
+            )
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(
+                str(delivery_target["chat_id"])
+            )
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
                 ""
                 if delivery_target.get("thread_id") is None
@@ -1686,6 +1847,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         _cfg = {}
         try:
             import yaml
+
             _cfg_path = str(_get_hermes_home() / "config.yaml")
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, encoding="utf-8") as _f:
@@ -1698,11 +1860,14 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     elif isinstance(_model_cfg, dict):
                         model = _model_cfg.get("default", model)
         except Exception as e:
-            logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+            logger.warning(
+                "Job '%s': failed to load config.yaml, using defaults: %s", job_id, e
+            )
 
         # Apply IPv4 preference if configured.
         try:
             from hermes_constants import apply_ipv4_preference
+
             _net_cfg = _cfg.get("network", {})
             if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
                 apply_ipv4_preference(force=True)
@@ -1711,6 +1876,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Reasoning config from config.yaml
         from hermes_constants import parse_reasoning_effort
+
         effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
         reasoning_config = parse_reasoning_effort(effort)
 
@@ -1718,7 +1884,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
         # retained as a legacy fallback for older CLI/godmode configs.
         prefill_messages = None
-        agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
+        agent_cfg = (
+            _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
+        )
         prefill_file = (
             os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
             or _cfg.get("prefill_messages_file", "")
@@ -1735,11 +1903,18 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     if not isinstance(prefill_messages, list):
                         prefill_messages = None
                 except Exception as e:
-                    logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
+                    logger.warning(
+                        "Job '%s': failed to parse prefill messages file '%s': %s",
+                        job_id,
+                        pfpath,
+                        e,
+                    )
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        max_iterations = (
+            _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        )
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
@@ -1749,6 +1924,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             format_runtime_provider_error,
         )
         from hermes_cli.auth import AuthError
+
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -1763,7 +1939,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
             # Primary provider auth failed — try fallback chain before giving up.
-            logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
+            logger.warning(
+                "Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc
+            )
             fb = _cfg.get("fallback_providers") or _cfg.get("fallback_model")
             fb_list = (fb if isinstance(fb, list) else [fb]) if fb else []
             runtime = None
@@ -1777,22 +1955,36 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     if entry.get("api_key"):
                         fb_kwargs["explicit_api_key"] = entry["api_key"]
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
+                    logger.info(
+                        "Job '%s': fallback resolved to %s",
+                        job_id,
+                        runtime.get("provider"),
+                    )
                     break
                 except Exception as fb_exc:
-                    logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
+                    logger.debug(
+                        "Job '%s': fallback %s failed: %s",
+                        job_id,
+                        entry.get("provider"),
+                        fb_exc,
+                    )
             if runtime is None:
-                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+                raise RuntimeError(
+                    format_runtime_provider_error(auth_exc)
+                ) from auth_exc
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        fallback_model = (
+            _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        )
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
             try:
                 from agent.credential_pool import load_pool
+
                 pool = load_pool(runtime_provider)
                 if pool.has_credentials():
                     credential_pool = pool
@@ -1803,7 +1995,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                         len(pool.entries()),
                     )
             except Exception as e:
-                logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
+                logger.debug(
+                    "Job '%s': failed to load credential pool for %s: %s",
+                    job_id,
+                    runtime_provider,
+                    e,
+                )
 
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
@@ -1814,16 +2011,19 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # shouldn't kill an otherwise-working cron job. See #4219.
         try:
             from tools.mcp_tool import discover_mcp_tools
+
             _mcp_tools = discover_mcp_tools()
             if _mcp_tools:
                 logger.info(
                     "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+                    job_id,
+                    len(_mcp_tools),
                 )
         except Exception as _mcp_exc:
             logger.warning(
                 "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
+                job_id,
+                _mcp_exc,
             )
 
         agent = AIAgent(
@@ -1843,7 +2043,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
-            openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+            openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get(
+                "min_coding_score"
+            ),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
@@ -1858,7 +2060,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -1886,7 +2088,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _cron_future = _cron_pool.submit(
+            _cron_context.run, agent.run_conversation, prompt
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -1896,7 +2100,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 result = None
                 while True:
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future},
+                        timeout=_POLL_INTERVAL,
                     )
                     if done:
                         result = _cron_future.result()
@@ -1935,8 +2140,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.error(
                 "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
+                job_name,
+                _secs_ago,
+                _cron_inactivity_limit,
+                _last_desc,
+                _iter_n,
+                _iter_max,
                 _cur_tool or "none",
             )
             if hasattr(agent, "interrupt"):
@@ -1974,13 +2183,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             final_response = ""
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
-        logged_response = final_response if final_response else "(No response generated)"
-        
+        logged_response = (
+            final_response if final_response else "(No response generated)"
+        )
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
+**Run Time:** {_hermes_now().strftime("%Y-%m-%d %H:%M:%S")}
+**Schedule:** {job.get("schedule_display", "N/A")}
 
 ## Prompt
 
@@ -1990,19 +2201,19 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 {logged_response}
 """
-        
+
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
-        
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
+**Run Time:** {_hermes_now().strftime("%Y-%m-%d %H:%M:%S")}
+**Schedule:** {job.get("schedule_display", "N/A")}
 
 ## Prompt
 
@@ -2037,11 +2248,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # system_prompt; this only UPDATEs the title column. The run-time
             # suffix keeps it unique against the sessions.title index across runs.
             try:
-                _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+                _title_base = (
+                    " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+                )
                 _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
                 _session_db.set_session_title(_cron_session_id, _cron_title)
             except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
+                logger.debug(
+                    "Job '%s': failed to set cron session title: %s", job_id, e
+                )
             try:
                 _session_db.end_session(_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:
@@ -2049,7 +2264,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             try:
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+                logger.debug(
+                    "Job '%s': failed to close SQLite session store: %s", job_id, e
+                )
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -2065,23 +2282,26 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # so their transports don't accumulate in the process-global cache.
         try:
             from agent.auxiliary_client import cleanup_stale_async_clients
+
             cleanup_stale_async_clients()
         except Exception as e:
-            logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
+            logger.debug(
+                "Job '%s': failed to reap stale auxiliary clients: %s", job_id, e
+            )
 
 
 def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
     """
     Check and run all due jobs.
-    
+
     Uses a file lock so only one tick runs at a time, even if the gateway's
     in-process ticker and a standalone daemon or manual tick overlap.
-    
+
     Args:
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
@@ -2106,11 +2326,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+            logger.info("%s - No jobs due", _hermes_now().strftime("%H:%M:%S"))
             return 0
 
         if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            logger.info(
+                "%s - %s job(s) due", _hermes_now().strftime("%H:%M:%S"), len(due_jobs)
+            )
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
@@ -2128,7 +2350,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             if _env_par:
                 _max_workers = int(_env_par) or None
         except (ValueError, TypeError):
-            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
+            logger.warning(
+                "Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded"
+            )
         if _max_workers is None:
             try:
                 _ucfg = load_config() or {}
@@ -2172,17 +2396,64 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
                 should_deliver = bool(deliver_content.strip())
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                if (
+                    should_deliver
+                    and success
+                    and SILENT_MARKER in deliver_content.strip().upper()
+                ):
+                    logger.info(
+                        "Job '%s': agent returned %s — skipping delivery",
+                        job["id"],
+                        SILENT_MARKER,
+                    )
                     should_deliver = False
 
                 delivery_error = None
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_error = _deliver_result(
+                            job, deliver_content, adapters=adapters, loop=loop
+                        )
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+                    if delivery_error:
+                        # Fallback: write the undeliverable content to a well-known file
+                        # so the user can retrieve it when the primary channel is down.
+                        evolution_dir = Path(
+                            os.environ.get("HERMES_EVOLUTION_DIR")
+                            or str(
+                                Path.home()
+                                / ".hermes"
+                                / "profiles"
+                                / "user1"
+                                / "evolution"
+                            )
+                        )
+                        evolution_dir.mkdir(parents=True, exist_ok=True)
+                        fallback_path = evolution_dir / "last_delivery_fallback.md"
+                        try:
+                            fallback_path.write_text(
+                                f"# Cron Delivery Fallback\n\n"
+                                f"**Job:** {job.get('name', job['id'])}\n"
+                                f"**Job ID:** {job['id']}\n"
+                                f"**Error:** {delivery_error}\n"
+                                f"**Timestamp:** {_hermes_now().isoformat()}\n\n"
+                                f"---\n\n"
+                                f"{deliver_content}\n"
+                            )
+                            logger.info(
+                                "Job '%s': delivery fallback written to %s",
+                                job["id"],
+                                fallback_path,
+                            )
+                        except OSError as fbe:
+                            logger.error(
+                                "Job '%s': failed to write delivery fallback: %s",
+                                job["id"],
+                                fbe,
+                            )
 
                 # Treat empty final_response as a soft failure so last_status
                 # is not "ok" — the agent ran but produced nothing useful.
@@ -2195,7 +2466,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 return True
 
             except Exception as e:
-                logger.error("Error processing job %s: %s", job['id'], e)
+                logger.error("Error processing job %s: %s", job["id"], e)
                 mark_job_run(job["id"], False, str(e))
                 return False
 
@@ -2219,7 +2490,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             job_id = job["id"]
             with _running_lock:
                 if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                    logger.info(
+                        "Job '%s' already running — skipping", job.get("name", job_id)
+                    )
                     return None
                 _running_job_ids.add(job_id)
             _ctx = contextvars.copy_context()
@@ -2272,6 +2545,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         def _sweep_mcp_orphans() -> None:
             try:
                 from tools.mcp_tool import _kill_orphaned_mcp_children
+
                 _kill_orphaned_mcp_children()
             except Exception as _e:
                 logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
