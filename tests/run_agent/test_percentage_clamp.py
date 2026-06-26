@@ -98,7 +98,9 @@ class TestSourceLinesAreClamped:
     def test_memory_tool_clamped(self):
         src = self._read_file("tools/memory_tool.py")
         # Both _success_response and _render_block should have min(100, ...)
-        count = src.count("min(100, int((current / limit)")
+        # _success_response uses `new_total`, _render_block uses `current`;
+        # count the shared prefix to catch both.
+        count = src.count("min(100, int((")
         assert count >= 2, (
             f"memory_tool.py has only {count} clamped pct lines, expected >= 2"
         )
