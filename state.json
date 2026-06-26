@@ -1,18 +1,17 @@
 {
-  "last_cycle": "2026-06-27",
-  "cycle_timestamp": "2026-06-27T20:30:00+00:00",
-  "cycle_started": "2026-06-27T20:30:00+00:00",
+  "last_cycle": "2026-06-28",
+  "cycle_timestamp": "2026-06-28T00:00:00+00:00",
+  "cycle_started": "2026-06-28T00:00:00+00:00",
   "hydra_version": "2",
-  "heads_activated": [],
+  "heads_activated": ["evolution-research"],
   "issues_dispatched": false,
   "heads_skipped": {
-    "evolution-research": "~21h since last research cycle. 24h cadence recommended. No trigger event. Skipping.",
     "evolution-issues": "No new research findings to convert since last cycle.",
     "evolution-introspection": "0 new completed sessions since last introspection. No material to analyze.",
     "evolution-analysis": "2 open PRs (546, 552), neither labeled 'accepted'. Nothing to triage or prioritize.",
     "evolution-implementation": "Pipeline blocked upstream — no analyzed/approved changes to implement.",
     "evolution-integration": "2 MERGEABLE PRs (546, 552) still unlabeled. Integration requires 'accepted' label from Mike.",
-    "evolution-upstream-sync": "12,542 commits behind. 28h cadence recommended. ~21h since last check — not yet due."
+    "evolution-upstream-sync": "12,542 commits behind. ~27h since last check; 28h cadence just barely met but no trigger event (human decision on rebase/merge still pending)."
   },
   "fresh_material": {
     "new_sessions_since_last_introspection": 0,
@@ -36,15 +35,15 @@
     "pending": [
       {
         "change_id": "evolution/issue-432-mono-tool-spiral-guard",
-        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback still pending on production impact.",
+        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback pending from Mike on real-world effectiveness.",
         "requested_at": "2026-06-21T21:05:00+00:00",
-        "days_pending": 6
+        "days_pending": 7
       },
       {
         "change_id": "pr-470",
-        "summary": "Unblock evolution pipeline: switch from GITHUB_PRIVATE_TOKEN to GITHUB_TOKEN / gh CLI for fork ops. Approved in analysis but awaits Mike's go-ahead.",
+        "summary": "Unblock evolution pipeline: switch from GITHUB_PRIVATE_TOKEN to GITHUB_TOKEN / gh CLI — feedback pending.",
         "requested_at": "2026-06-22T20:08:11+00:00",
-        "days_pending": 5
+        "days_pending": 6
       }
     ]
   },
@@ -60,20 +59,20 @@
   "blockers": {
     "pipeline_blocked": true,
     "notes": {
-      "feedback_backlog": "2 pending feedback requests (issue-432: 6 days, pr-470: 5 days) still need Mike's response before pipeline can advance.",
-      "prs_needing_labels": "2 PRs (546, 552) are MERGEABLE but unlabeled. Integration head blocks here — needs 'accepted' label applied by Mike.",
+      "feedback_backlog": "2 pending feedback requests (issue-432: 7 days, pr-470: 6 days) still need Mike's input.",
+      "prs_needing_labels": "2 PRs (546, 552) are MERGEABLE but unlabeled. Integration head blocks here.",
       "upstream_drift": "12,542 commits behind upstream/main. Growth rate ~15-50 commits/day."
     }
   },
   "recommendation": {
     "activate_other_heads": false,
-    "reason": "Pipeline remains blocked by same human prerequisites. No new material (sessions, feedback responses, upstream sync trigger) since last cycle at 23:30 UTC yesterday.",
+    "reason": "Pipeline remains blocked by same human prerequisites (pending feedback + PR labels). Research is the only independent head activated. research subagent dispatched in background — results will surface when it completes.",
     "action_items": [
-      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 6 days old, pr-470: 5 days old). The pipeline cannot advance without these.",
+      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 7 days, pr-470: 6 days).",
       "[HIGH] Label the 2 MERGEABLE PRs (546, 552) with 'accepted' to unblock the integration head.",
-      "[MEDIUM] Review the 4 issues created from June 25 introspection findings (stored locally since GitHub Issues are disabled on Da-Mikey/hermes-agent-evolution).",
-      "[LOW] Consider strategic decision on upstream sync: 12,542 commits behind. Decide between rebase-strategy (clean history, hard conflict resolution) vs merge-strategy (messy but safer)."
+      "[MEDIUM] Review the 4 issues created from June 25 introspection findings (stored locally since no GitHub token configured).",
+      "[LOW] Decide on upstream sync strategy: 12,542 commits behind. Consider rebase vs merge vs status quo."
     ]
   },
-  "notes": "Hydra cycle 2026-06-27 20:30 UTC. Activated 0/7 heads. No new material since previous cycle — pipeline blocked at same human prerequisites. Two feedback requests now 5-6 days old. DeepSeek API timeout issue (31 of 38 session dumps) remains the dominant operational concern but is tracked outside the evolution pipeline."
+  "notes": "Hydra cycle 2026-06-28 00:00 UTC. Activated 1/7 heads (research). Pipeline still human-blocked. Research dispatched as background subagent — results arrive asynchronously."
 }
