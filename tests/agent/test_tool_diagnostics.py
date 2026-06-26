@@ -16,20 +16,29 @@ class TestClassify:
 
     def test_permission(self):
         assert classify("Refusing to write to sensitive system path")[0] == "permission"
-        assert classify("error: permission denied")[0] in ("permission", "missing_command", "runtime_error")
+        assert classify("error: permission denied")[0] in (
+            "permission",
+            "missing_command",
+            "runtime_error",
+        )
 
     def test_timeout(self):
         assert classify("request timed out after 120s")[0] == "timeout"
         assert classify("ClosedResourceError: server unreachable")[0] == "timeout"
 
     def test_limit(self):
-        assert classify("value exceeds the maximum length of 2200 characters")[0] == "limit"
+        assert (
+            classify("value exceeds the maximum length of 2200 characters")[0]
+            == "limit"
+        )
 
     def test_not_found(self):
         assert classify("grep: no matches found")[0] == "not_found"
 
     def test_runtime_error_fallback(self):
-        assert classify("Traceback (most recent call last):\n  ...")[0] == "runtime_error"
+        assert (
+            classify("Traceback (most recent call last):\n  ...")[0] == "runtime_error"
+        )
         assert classify("process exited, exit code: 1")[0] == "runtime_error"
 
 
