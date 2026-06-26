@@ -27,6 +27,44 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+# Durable-write tools the review fork holds by default. These are the ONLY
+# surfaces through which a review fork can persist something that re-enters a
+# future session (``memory`` -> MEMORY.md/USER.md; ``skill_manage`` -> the skill
+# library). The read-only memory/skill tools (skill_view, skills_list, …) are
+# intentionally NOT here — stripping these two removes durable-WRITE capability
+# while leaving inspection intact.
+_DURABLE_WRITE_TOOLS = {"memory", "skill_manage"}
+
+
+def _review_tool_whitelist(block_durable_writes: bool = False) -> set:
+    """Build the runtime tool whitelist for a background-review fork.
+
+    The whitelist is the dispatch gate: ``get_pre_tool_call_block_message``
+    (hermes_cli/plugins.py) denies any tool absent from it. Normally the fork is
+    whitelisted for the full memory + skills toolsets.
+
+    When ``block_durable_writes`` is True — the case of a correction-triggered
+    review whose correction is NOT yet promotable (transient first sighting) —
+    the durable WRITE tools (``memory`` / ``skill_manage``) are removed from the
+    whitelist, so the LLM fork is *structurally* unable to persist that one-off
+    correction. Durable persistence for the correction path then happens ONLY
+    through the deterministic ``CorrectionLearner`` promotion path. This is
+    enforcement, not advice.
+    """
+    from model_tools import get_tool_definitions
+
+    names = {
+        t["function"]["name"]
+        for t in get_tool_definitions(
+            enabled_toolsets=["memory", "skills"],
+            quiet_mode=True,
+        )
+    }
+    if block_durable_writes:
+        names -= _DURABLE_WRITE_TOOLS
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Background-review aux-model selector + routed digest.
 #
@@ -572,12 +610,18 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    block_durable_writes: bool = False,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
     Spawns a forked ``AIAgent`` inheriting the parent's runtime, runs the
     review prompt, and surfaces a compact action summary back to the user
     via ``agent._safe_print`` and ``agent.background_review_callback``.
+
+    ``block_durable_writes`` (X1 enforcement): when True (a correction-triggered
+    review for a NOT-yet-promotable transient correction), the fork's runtime
+    tool whitelist excludes the durable memory/skill writers, so the LLM fork
+    cannot persist the one-off correction. See ``_review_tool_whitelist``.
     """
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
@@ -719,26 +763,30 @@ def _run_review_in_thread(
             # agent.compression_enabled, so this short-circuits both paths.
             review_agent.compression_enabled = False
 
-            from model_tools import get_tool_definitions
             from hermes_cli.plugins import (
                 set_thread_tool_whitelist,
                 clear_thread_tool_whitelist,
             )
 
-            review_whitelist = {
-                t["function"]["name"]
-                for t in get_tool_definitions(
-                    enabled_toolsets=["memory", "skills"],
-                    quiet_mode=True,
+            # Durable-write gate (X1). For a transient correction-triggered
+            # review the durable writers (memory / skill_manage) are stripped
+            # from the whitelist, so the fork is structurally unable to persist
+            # a one-off correction — the deterministic CorrectionLearner is the
+            # only durable gate for that path.
+            review_whitelist = _review_tool_whitelist(block_durable_writes)
+            if block_durable_writes:
+                deny_msg_fmt = (
+                    "Background review denied tool: {tool_name}. This is a "
+                    "transient (first-sighting) correction review with NO "
+                    "durable-write capability; durable persistence happens "
+                    "only via the deterministic recurrence guard."
                 )
-            }
-            set_thread_tool_whitelist(
-                review_whitelist,
-                deny_msg_fmt=(
+            else:
+                deny_msg_fmt = (
                     "Background review denied non-whitelisted tool: "
                     "{tool_name}. Only memory/skill tools are allowed."
-                ),
-            )
+                )
+            set_thread_tool_whitelist(review_whitelist, deny_msg_fmt=deny_msg_fmt)
             try:
                 # Routed to a different model -> replay a digest (cache is cold
                 # on that model anyway, so minimise cold-written tokens). Same
@@ -836,17 +884,84 @@ def _run_review_in_thread(
             pass
 
 
+def _format_correction_focus(correction_hint: Dict[str, Any]) -> str:
+    """Build the focused-review preamble for a detected structured correction.
+
+    Phase 1 (learn-from-corrections): when the turn was an INTERRUPT / DENY /
+    STEER correction, tell the reviewer to capture THAT specific correction —
+    it is the loudest, highest-signal feedback and must not be diluted by the
+    generic nudge-driven pass.
+
+    The preamble is **tier-aware** (the generalization guard's decision is
+    threaded in via ``tier`` / ``durable``). This is the load-bearing safety
+    instruction: a TRANSIENT (first-sighting, not-yet-recurring) correction
+    must NOT be durably persisted by the LLM reviewer — otherwise a one-off
+    correction would leak straight into memory/skills on its first sighting,
+    bypassing the deterministic recurrence guard. Only a DURABLE-promoted
+    correction may be embedded where it re-enters future sessions.
+    """
+    kind = str(correction_hint.get("kind", "")).upper()
+    context = str(correction_hint.get("context", "")).strip()
+    target = correction_hint.get("target")
+    durable = bool(correction_hint.get("durable"))
+    tier = str(correction_hint.get("tier", "transient")).lower()
+    kind_phrase = {
+        "INTERRUPT": "interrupted the agent mid-turn and redirected it",
+        "DENY": "denied/vetoed an action the agent attempted",
+        "STEER": "sent an out-of-band message steering the agent mid-turn",
+    }.get(kind, "corrected the agent")
+    lines = [
+        "**Structured user correction detected this turn.** "
+        f"The user {kind_phrase}. This is the loudest, highest-signal "
+        "feedback the agent gets — pay attention to THIS correction "
+        "specifically.",
+        f"Correction kind: {kind}",
+    ]
+    if target:
+        lines.append(f"Target: {target}")
+    if context:
+        lines.append(f"What the user said / what was vetoed: {context}")
+
+    if durable or tier == "durable":
+        lines.append(
+            "This correction has recurred across sessions (or the user asked "
+            "to remember it): it is a DURABLE preference. Embed it where it "
+            "will re-enter future sessions — memory and/or the governing "
+            "skill — so the next session starts already knowing.\n"
+        )
+    else:
+        lines.append(
+            "This is the FIRST sighting of this correction (tier: transient). "
+            "It is NOT yet established as a durable preference — it may be a "
+            "one-off tied to today's task. DO NOT persist it durably to "
+            "memory or skills on this evidence alone. Note it for this "
+            "session only; the deterministic recurrence guard will promote it "
+            "automatically if it recurs in a future session.\n"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def spawn_background_review_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     review_memory: bool = False,
     review_skills: bool = False,
+    correction_hint: Optional[Dict[str, Any]] = None,
+    block_durable_writes: bool = False,
 ):
     """Build the review thread target and prompt for a background review.
 
     Returns a ``(target, prompt)`` tuple.  The caller (``AIAgent._spawn_background_review``)
     owns the actual ``threading.Thread`` construction so test-level patches
     of ``run_agent.threading.Thread`` keep working.
+
+    ``correction_hint`` (Phase 1): when present, a focused preamble describing
+    the detected INTERRUPT / DENY / STEER correction is prepended to the
+    review prompt so the reviewer captures that specific correction.
+
+    ``block_durable_writes`` (X1 enforcement): threaded into the thread target so
+    a transient correction-triggered review runs with the durable memory/skill
+    writers stripped from its runtime tool whitelist.
     """
     # Pick the right prompt based on which triggers fired.  Allow per-agent
     # override (the prompts moved to module-level constants but old code paths
@@ -858,8 +973,14 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    if correction_hint:
+        prompt = _format_correction_focus(correction_hint) + prompt
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(
+            agent, messages_snapshot, prompt,
+            block_durable_writes=block_durable_writes,
+        )
 
     return _target, prompt
 

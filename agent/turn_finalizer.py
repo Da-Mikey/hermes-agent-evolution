@@ -396,9 +396,17 @@ def finalize_turn(
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
 
+    # Capture the interrupt redirect message into a LOCAL *before*
+    # clear_interrupt() nulls it (run_agent.py sets _interrupt_message = None).
+    # The structured-correction detector below (decide_correction_review) runs
+    # ~46 lines AFTER this clear, so reading the live attribute there would
+    # always see None and the INTERRUPT correction branch would be DEAD on the
+    # default runtime. Capture-before-clear keeps that branch live.
+    _captured_interrupt = getattr(agent, "_interrupt_message", None)
+
     # Include interrupt message if one triggered the interrupt
-    if interrupted and agent._interrupt_message:
-        result["interrupt_message"] = agent._interrupt_message
+    if interrupted and _captured_interrupt:
+        result["interrupt_message"] = _captured_interrupt
 
     # Clear interrupt state after handling
     agent.clear_interrupt()
@@ -422,14 +430,44 @@ def finalize_turn(
         messages=messages,
     )
 
-    # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    # Detect a structured user correction on this turn (INTERRUPT / DENY /
+    # STEER) and decide whether to spawn the background memory/skill review.
+    # This is shared with the Codex-runtime finalizer (``agent/codex_runtime.py``)
+    # via ``agent/correction_review.py`` so the two runtimes cannot drift.
+    #
+    # Detection + recording (the deterministic CorrectionLearner via
+    # ``agent._record_turn_correction``) ALWAYS runs when a correction is
+    # present — the highest-signal feedback the agent gets, including the loud
+    # interrupted/denied turns the legacy ``not interrupted`` gate dropped.
+    #
+    # The LLM review fork runs AFTER the response is delivered so it never
+    # competes with the user's task. It is spawned ONLY when a nudge counter
+    # fired (the legacy healthy-completion path) OR the correction was promoted
+    # to DURABLE. A pure-transient correction with no nudge is recorded
+    # deterministically but does NOT spawn the fork — the fork would be barred
+    # from durable writes anyway (X1), so it would burn an aux-model call for
+    # nothing. When the fork DOES spawn for an unpromoted correction (because a
+    # nudge co-occurred), X1 strips its durable writers universally.
+    from agent.correction_review import decide_correction_review
+
+    _review_decision = decide_correction_review(
+        agent,
+        final_text=final_response,
+        interrupted=interrupted,
+        messages=messages,
+        interrupt_message=_captured_interrupt,
+        turn_exit_reason=_turn_exit_reason,
+        should_review_memory=_should_review_memory,
+        should_review_skills=_should_review_skills,
+    )
+    if _review_decision["spawn"]:
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
+                review_memory=_review_decision["review_memory"],
+                review_skills=_review_decision["review_skills"],
+                correction_hint=_review_decision["correction_hint"],
+                block_durable_writes=_review_decision["block_durable_writes"],
             )
         except Exception:
             pass  # Background review is best-effort

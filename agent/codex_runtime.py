@@ -370,19 +370,45 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
 
-    # Background review fork — same cadence + signature as the default
-    # path (line ~15449). Only fires when a trigger actually tripped AND
-    # we have a real final response.
-    if (
-        turn.final_text
-        and not turn.interrupted
-        and (should_review_memory or should_review_skills)
-    ):
+    # Background review fork — routed through the SHARED correction-review
+    # decision (agent/correction_review.py) so this runtime detects + RECORDS
+    # user corrections on the SAME rules as the default finalizer, with no
+    # drift. Previously this path carried an unmodified nudge-only gate and
+    # silently never learned from a correction. Detection + recording always
+    # runs when a correction is present; the fork spawns only on a nudge or a
+    # DURABLE correction, and an unpromoted correction strips the fork's durable
+    # writers (X1).
+    #
+    # RUNTIME-SCOPE HONESTY (codex INTERRUPT): DENY and STEER are derived from
+    # tool-result messages and work on the codex runtime. INTERRUPT does NOT:
+    # the codex runtime never propagates a user interrupt into its session
+    # (``AIAgent.request_interrupt`` has no production callers and codex's own
+    # ``interrupted`` flag is only a deadline-timeout), so ``_interrupt_message``
+    # is never set by a real user redirect here. The capture-before-clear fix in
+    # the default finalizer does NOT revive codex INTERRUPT — that is a
+    # PRE-EXISTING codex interrupt-propagation gap, deferred and out of scope for
+    # this feature. We still pass the attribute through for parity so the branch
+    # lights up automatically once that platform gap is closed.
+    from agent.correction_review import decide_correction_review
+
+    review_decision = decide_correction_review(
+        agent,
+        final_text=turn.final_text,
+        interrupted=turn.interrupted,
+        messages=messages,
+        interrupt_message=getattr(agent, "_interrupt_message", None),
+        turn_exit_reason=None,
+        should_review_memory=should_review_memory,
+        should_review_skills=should_review_skills,
+    )
+    if review_decision["spawn"]:
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=should_review_memory,
-                review_skills=should_review_skills,
+                review_memory=review_decision["review_memory"],
+                review_skills=review_decision["review_skills"],
+                correction_hint=review_decision["correction_hint"],
+                block_durable_writes=review_decision["block_durable_writes"],
             )
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
