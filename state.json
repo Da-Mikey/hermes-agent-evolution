@@ -1,28 +1,27 @@
 {
   "last_cycle": "2026-06-26",
-  "cycle_timestamp": "2026-06-26T22:00:00+00:00",
-  "cycle_started": "2026-06-26T22:00:00+00:00",
+  "cycle_timestamp": "2026-06-27T00:31:00+00:00",
+  "cycle_started": "2026-06-27T00:31:00+00:00",
   "hydra_version": "2",
-  "heads_activated": [],
-  "issues_dispatched": false,
+  "heads_activated": ["evolution-issues"],
+  "issues_dispatched": true,
   "heads_skipped": {
-    "evolution-research": "~1.5h since last research cycle; 24h cadence — next due ~2026-06-27T22:00Z.",
-    "evolution-issues": "No new research findings to convert since last cycle.",
+    "evolution-research": "Research findings from 2026-06-28 cycle already gathered; next research due ~2026-06-29T00:00 UTC (24h cadence).",
     "evolution-introspection": "0 new completed sessions since last introspection. No material to analyze.",
-    "evolution-analysis": "2 open PRs (546, 552) still unlabeled 'accepted'. Nothing to triage.",
-    "evolution-implementation": "Pipeline blocked upstream — no analyzed/approved changes to implement.",
-    "evolution-integration": "2 MERGEABLE PRs (546, 552) still unlabeled. Integration requires 'accepted' label.",
-    "evolution-upstream-sync": "12,542 commits behind. ~20h since last check; 28h cadence just barely — but no strategic decision on sync strategy has been made (rebase vs merge). Holding."
+    "evolution-analysis": "No GitHub remote configured — cannot verify PR labels or merge status. Pipeline condition is local-fabricated.",
+    "evolution-implementation": "No analyzed/approved changes without analysis head completing.",
+    "evolution-integration": "No remote configured — cannot merge PRs or label them.",
+    "evolution-upstream-sync": "No remote (origin/main) configured in evolution repo. Sync impossible until remote is set with upstream URL."
   },
   "fresh_material": {
     "new_sessions_since_last_introspection": 0,
     "new_feedback_responses_since_last_cycle": 0,
     "proposals_pending": 0,
     "new_upstream_commits_since_last_sync": 0,
-    "upstream_total_behind": 12542,
+    "upstream_total_behind": "N/A — no remote configured",
     "new_open_prs": 0,
-    "open_prs_mergable": 2,
-    "open_prs_labeled_accepted": 0,
+    "open_prs_mergable": "N/A — no remote configured",
+    "open_prs_labeled_accepted": "N/A — no remote configured",
     "introspection_findings_converted_to_issues": 4
   },
   "proposals": {
@@ -36,15 +35,15 @@
     "pending": [
       {
         "change_id": "evolution/issue-432-mono-tool-spiral-guard",
-        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback requested at 2026-06-21, 5 days pending",
+        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback requested 2026-06-21 (6 days pending)",
         "requested_at": "2026-06-21T21:05:00+00:00",
-        "days_pending": 5
+        "days_pending": 6
       },
       {
         "change_id": "pr-470",
-        "summary": "Unblock evolution pipeline: switch from GITHUB_PRIVATE_TOKEN to GITHUB_TOKEN / github app installation — feedback requested at 2026-06-22, 4 days pending",
+        "summary": "Unblock evolution pipeline token switch — feedback requested 2026-06-22 (5 days pending)",
         "requested_at": "2026-06-22T20:08:11+00:00",
-        "days_pending": 4
+        "days_pending": 5
       }
     ]
   },
@@ -60,22 +59,21 @@
   "blockers": {
     "pipeline_blocked": true,
     "notes": {
-      "feedback_backlog": "2 pending feedback requests (issue-432: 5 days, pr-470: 4 days) still need Mike's response.",
-      "prs_needing_labels": "2 PRs (546, 552) are MERGEABLE but unlabeled. Integration head blocks here.",
-      "upstream_drift": "12,542 commits behind upstream/main. Growth rate ~0 commits in last 20h (stable).",
-      "research_findings_pending": "7 findings from last research cycle (2026-06-28T00:00) not yet converted to issues. Awaiting Mike's decision."
+      "feedback_backlog": "2 pending feedback requests (issue-432: 6 days, pr-470: 5 days) need human response.",
+      "no_remote_configured": "Evolution repo has no git remote. Upstream sync, PR management, and remote issue creation are all impossible until a remote URL is set.",
+      "research_findings_pending": "7 findings from last research cycle not yet committed. Subagent dispatched to create issue files.",
+      "upstream_drift": "Cannot measure — no remote configured."
     }
   },
   "recommendation": {
     "activate_other_heads": false,
-    "reason": "Pipeline remains blocked by same human prerequisites (pending feedback + PR labels). Research ran last cycle — 24h cadence not yet met. All other heads skip. Same blockers as prior cycle, unchanged.",
+    "reason": "Pipeline remains blocked. Core blockers: (1) 2 feedback requests need human response, (2) no git remote configured in evolution repo — upstream sync, PR management, and remote issue tracking are impossible without it.",
     "action_items": [
-      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 5 days, pr-470: 4 days) to unblock evolution-issues.",
-      "[HIGH] Label the 2 MERGEABLE PRs (546, 552) with 'accepted' to unblock the integration head.",
-      "[MEDIUM] Review the 4 issues created from June 25 introspection findings (stored locally since no GITHUB_TOKEN flow).",
-      "[MEDIUM] Review 7 research findings from last cycle — 2 high-relevance (MCP Python SDK v2.0.0a3, Hermes upstream PRs), 1 medium (Claude Code v2.1.193 shell classifier pattern).",
-      "[LOW] Decide on upstream sync strategy: 12,542 commits behind. Consider rebase vs merge vs strategic cherry-pick."
+      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 6 days, pr-470: 5 days)",
+      "[HIGH] Configure a git remote in ~/.hermes/evolution/ if you want upstream sync, PR management, or remote issue creation",
+      "[MEDIUM] Review the 3 issue files created from research findings once the subagent completes",
+      "[MEDIUM] Set GITHUB_TOKEN or equivalent if you want automated issue/PR operations",
+      "[LOW] Consider configuring 'origin' to point to the hermes-agent fork, or create a dedicated evolution-tracker repo"
     ]
   },
-  "notes": "Hydra cycle 2026-06-26 22:00 UTC. Activated 0/7 heads — pipeline still human-blocked. All blockers unchanged from prior cycle. Silent exit."
-}
+  "notes": "Hydra cycle 2026-06-27 00:31 UTC. Activated 1/7 heads (evolution-issues). Pipeline still human-blocked by (1) pending feedback, (2) no git remote. Research findings from last cycle being converted to local issue files by subagent."}
