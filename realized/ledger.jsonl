@@ -1,0 +1,1 @@
+{"change_id": "evolution/issue-432-mono-tool-spiral-guard", "pr_number": 436, "commit": "a60abf2e3", "summary": "Mono-tool spiral detection with escalated interrupt", "source": "integration", "merged_at": "2026-06-21T23:05:00Z", "feedback_requested": true, "tag": "merged/issue-432-20260621-2305"}

@@ -1,0 +1,34 @@
+{
+  "timestamp": "2026-06-25T19:05:00+00:00",
+  "session": "request_dump_cron_0b013aa0bd43_20260625_150046_20260625_150956_312507.json",
+  "topics": [
+    "Evolution pipeline orchestration (Hydra head)",
+    "Cron-based autonomous improvement cycles",
+    "Subagent delegation for evolution tasks",
+    "DeepSeek v4 Flash API timeout failures",
+    "Prometheus system persona / cron job delivery protocol"
+  ],
+  "improvements": [
+    "API timeout handling: All 7 Hydra cron sessions (2026-06-24 through 2026-06-25) fail with ReadError/Broken pipe timeouts. The retry logic exhausts max_retries without success. Consider: (a) shorter/leaner system prompts for cron jobs to reduce token processing time, (b) progressive backoff between retries instead of rapid re-attempts, (c) circuit-breaker pattern to pause cron execution when API is consistently timing out",
+    "Cron job prompt size: The Hydra orchestrator system prompt (Prometheus persona + 7-head descriptions + procedure) exceeds 2500 tokens before tools. This is excessive for a flash-tier model. Consider moving detailed head descriptions to inline references or on-demand loading, leaving only a compact dispatcher prompt for the orchestrator",
+    "Evolution pipeline stuck detection: All Hydra attempts since 2026-06-24 have failed identically, yet cron continues to fire every ~3-6 hours. Add a staleness check: if the last N cycles all failed with the same error category, escalate (e.g., page user, emit diagnostic, pause pipeline, switch to fallback model)",
+    "Model fallback: All failures use deepseek-v4-flash. The 5 sessions using prometheus-smart may have fared differently. Consider automatic model fallback on first timeout (attempt flash -> if timeout, retry with smart/reasoning model)",
+    "Thinking mode: All cron sessions have thinking.type=disabled. Enabling thinking on the orchestrator could improve its ability to correctly parse the 7-head dispatching logic within fewer tokens, potentially avoiding the timeout threshold"
+  ],
+  "pain_points": [
+    "100% timeout rate on Hydra orchestrator cron jobs: 7/7 attempts failed (2026-06-24 through 2026-06-25). The evolution pipeline has been completely blocked for ~2 days",
+    "Broken pipe errors (ReadError, errno 32): Suggest the API connection is being severed mid-stream, likely due to the model taking too long to generate or the client-side timeout being too aggressive",
+    "Same cron ID (0b013aa0bd43) retrying identically: No evidence of adaptive behavior between failed cycles — same model, same prompt, same result",
+    "No introspection head has ever been successfully delegated: The task description says previous introspection attempts have 100% timeout rate. This means the introspection head itself cannot run as a delegated subagent either — a chicken-and-egg problem",
+    "35 total session dumps, 27 timeouts (77%): The system is generating far more failure artifacts than successful interactions. No evidence that failed cron sessions are being cleaned up or archived separately from successful ones"
+  ],
+  "compliments": [],
+  "action_items": [
+    "1. [HIGH] Fix API timeout: Investigate deepseek-v4-flash latency. Reduce Hydra orchestrator system prompt to <500 tokens by moving head descriptions to a separate skill loaded on demand. Enable thinking mode for the orchestrator.",
+    "2. [HIGH] Add circuit breaker: If 3+ consecutive Hydra cycles fail with identical errors, pause the cron and notify the user. Do not burn retries into the void.",
+    "3. [MEDIUM] Implement model fallback: On first timeout with flash model, retry with prometheus-smart (or another reasoning-capable model) before exhausting flash retries.",
+    "4. [MEDIUM] Session file hygiene: Move or compress old failure dumps (27 timeout files consuming ~1.2MB). Separate successful from failed sessions for easier introspection.",
+    "5. [LOW] Introspection head self-test: Before delegating introspection as a subagent, verify it can complete a 10-second read-only pass. If it times out too, the introspection task should be run inline by the orchestrator rather than delegated.",
+    "6. [LOW] Evolution state.json check: Verify ~/.hermes/evolution/state.json exists and is valid. A missing or corrupt state file could be causing the Hydra to stall before ever delegating heads — the timeout may not be from the model but from the system blocking on a missing prerequisite."
+  ]
+}
