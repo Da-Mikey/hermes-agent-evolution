@@ -20,47 +20,43 @@ if TYPE_CHECKING:  # avoid a circular import; policy_interceptors imports this m
     from agent.policy_interceptors import PolicyInterceptorRegistry
 
 
-IDEMPOTENT_TOOL_NAMES = frozenset(
-    {
-        "read_file",
-        "search_files",
-        "web_search",
-        "web_extract",
-        "session_search",
-        "browser_snapshot",
-        "browser_console",
-        "browser_get_images",
-        "mcp_filesystem_read_file",
-        "mcp_filesystem_read_text_file",
-        "mcp_filesystem_read_multiple_files",
-        "mcp_filesystem_list_directory",
-        "mcp_filesystem_list_directory_with_sizes",
-        "mcp_filesystem_directory_tree",
-        "mcp_filesystem_get_file_info",
-        "mcp_filesystem_search_files",
-    }
-)
+IDEMPOTENT_TOOL_NAMES = frozenset({
+    "read_file",
+    "search_files",
+    "web_search",
+    "web_extract",
+    "session_search",
+    "browser_snapshot",
+    "browser_console",
+    "browser_get_images",
+    "mcp_filesystem_read_file",
+    "mcp_filesystem_read_text_file",
+    "mcp_filesystem_read_multiple_files",
+    "mcp_filesystem_list_directory",
+    "mcp_filesystem_list_directory_with_sizes",
+    "mcp_filesystem_directory_tree",
+    "mcp_filesystem_get_file_info",
+    "mcp_filesystem_search_files",
+})
 
-MUTATING_TOOL_NAMES = frozenset(
-    {
-        "terminal",
-        "execute_code",
-        "write_file",
-        "patch",
-        "todo",
-        "memory",
-        "skill_manage",
-        "browser_click",
-        "browser_type",
-        "browser_press",
-        "browser_scroll",
-        "browser_navigate",
-        "send_message",
-        "cronjob",
-        "delegate_task",
-        "process",
-    }
-)
+MUTATING_TOOL_NAMES = frozenset({
+    "terminal",
+    "execute_code",
+    "write_file",
+    "patch",
+    "todo",
+    "memory",
+    "skill_manage",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_scroll",
+    "browser_navigate",
+    "send_message",
+    "cronjob",
+    "delegate_task",
+    "process",
+})
 
 
 @dataclass(frozen=True)
@@ -80,7 +76,9 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
-    idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
+    idempotent_tools: frozenset[str] = field(
+        default_factory=lambda: IDEMPOTENT_TOOL_NAMES
+    )
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
     @classmethod
@@ -98,30 +96,44 @@ class ToolCallGuardrailConfig:
 
         defaults = cls()
         return cls(
-            warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
-            hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
+            warnings_enabled=_as_bool(
+                data.get("warnings_enabled"), defaults.warnings_enabled
+            ),
+            hard_stop_enabled=_as_bool(
+                data.get("hard_stop_enabled"), defaults.hard_stop_enabled
+            ),
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
             ),
             same_tool_failure_warn_after=_positive_int(
-                warn_after.get("same_tool_failure", data.get("same_tool_failure_warn_after")),
+                warn_after.get(
+                    "same_tool_failure", data.get("same_tool_failure_warn_after")
+                ),
                 defaults.same_tool_failure_warn_after,
             ),
             no_progress_warn_after=_positive_int(
-                warn_after.get("idempotent_no_progress", data.get("no_progress_warn_after")),
+                warn_after.get(
+                    "idempotent_no_progress", data.get("no_progress_warn_after")
+                ),
                 defaults.no_progress_warn_after,
             ),
             exact_failure_block_after=_positive_int(
-                hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
+                hard_stop_after.get(
+                    "exact_failure", data.get("exact_failure_block_after")
+                ),
                 defaults.exact_failure_block_after,
             ),
             same_tool_failure_halt_after=_positive_int(
-                hard_stop_after.get("same_tool_failure", data.get("same_tool_failure_halt_after")),
+                hard_stop_after.get(
+                    "same_tool_failure", data.get("same_tool_failure_halt_after")
+                ),
                 defaults.same_tool_failure_halt_after,
             ),
             no_progress_block_after=_positive_int(
-                hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
+                hard_stop_after.get(
+                    "idempotent_no_progress", data.get("no_progress_block_after")
+                ),
                 defaults.no_progress_block_after,
             ),
         )
@@ -135,7 +147,9 @@ class ToolCallSignature:
     args_hash: str
 
     @classmethod
-    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
+    def from_call(
+        cls, tool_name: str, args: Mapping[str, Any] | None
+    ) -> "ToolCallSignature":
         canonical = canonical_tool_args(args or {})
         return cls(tool_name=tool_name, args_hash=_sha256(canonical))
 
@@ -214,7 +228,9 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     if tool_name == "memory":
         data = safe_json_loads(result)
         if isinstance(data, dict):
-            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
+            if data.get("success") is False and "exceed the limit" in data.get(
+                "error", ""
+            ):
                 return True, " [full]"
 
     lower = result[:500].lower()
@@ -254,7 +270,9 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
-    def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
+    def before_call(
+        self, tool_name: str, args: Mapping[str, Any] | None
+    ) -> ToolGuardrailDecision:
         # Policy interceptors run first and apply regardless of hard_stop_enabled:
         # a denied policy is a deterministic user rule, not a loop limit.
         if self.policy_registry is not None and self.policy_registry.enabled:
@@ -332,7 +350,10 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
-            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
+            if (
+                self.config.hard_stop_enabled
+                and same_count >= self.config.same_tool_failure_halt_after
+            ):
                 decision = ToolGuardrailDecision(
                     action="halt",
                     code="same_tool_failure_halt",
@@ -347,7 +368,10 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
 
-            if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
+            if (
+                self.config.warnings_enabled
+                and exact_count >= self.config.exact_failure_warn_after
+            ):
                 return ToolGuardrailDecision(
                     action="warn",
                     code="repeated_exact_failure_warning",
@@ -361,17 +385,22 @@ class ToolCallGuardrailController:
                     signature=signature,
                 )
 
-            if self.config.warnings_enabled and same_count >= self.config.same_tool_failure_warn_after:
+            if (
+                self.config.warnings_enabled
+                and same_count >= self.config.same_tool_failure_warn_after
+            ):
                 return ToolGuardrailDecision(
                     action="warn",
                     code="same_tool_failure_warning",
-                    message=_tool_failure_recovery_hint(tool_name, same_count),
+                    message=_tool_failure_recovery_hint(tool_name, same_count, result),
                     tool_name=tool_name,
                     count=same_count,
                     signature=signature,
                 )
 
-            return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
+            return ToolGuardrailDecision(
+                tool_name=tool_name, count=exact_count, signature=signature
+            )
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
@@ -387,7 +416,10 @@ class ToolCallGuardrailController:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
 
-        if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
+        if (
+            self.config.warnings_enabled
+            and repeat_count >= self.config.no_progress_warn_after
+        ):
             return ToolGuardrailDecision(
                 action="warn",
                 code="idempotent_no_progress_warning",
@@ -401,7 +433,9 @@ class ToolCallGuardrailController:
                 signature=signature,
             )
 
-        return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+        return ToolGuardrailDecision(
+            tool_name=tool_name, count=repeat_count, signature=signature
+        )
 
     def _is_idempotent(self, tool_name: str) -> bool:
         if tool_name in self.config.mutating_tools:
@@ -426,30 +460,97 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
         return result
     label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
     suffix = (
-        f"\n\n[{label}: "
-        f"{decision.code}; count={decision.count}; {decision.message}]"
+        f"\n\n[{label}: {decision.code}; count={decision.count}; {decision.message}]"
     )
     return (result or "") + suffix
 
 
-def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
-    """Action-oriented guidance for recovering from repeated tool failures."""
+# ---------------------------------------------------------------------------
+# Failure-class → non-terminal fallback mapping for terminal failures (#602).
+# When a terminal call fails repeatedly, route the model to the *right*
+# alternative tool instead of another terminal invocation.
+# ---------------------------------------------------------------------------
+
+# Groups of non-terminal tools by remediation category.
+_FALLBACK_READ: tuple[str, ...] = ("read_file", "search_files")
+_FALLBACK_EDIT: tuple[str, ...] = ("patch", "write_file")
+_FALLBACK_SEARCH: tuple[str, ...] = ("search_files",)
+
+_TERMINAL_FALLBACK_MAP: dict[str, tuple[str, ...]] = {
+    "missing_command": (*_FALLBACK_READ, *_FALLBACK_EDIT, *_FALLBACK_SEARCH),
+    "permission": _FALLBACK_READ,  # can't mutate, but can read/search
+    "timeout": _FALLBACK_READ,  # don't re-launch a slow cmd; read/search instead
+    "not_found": _FALLBACK_SEARCH,  # find the right path before any cmd
+    "provider_dead": _FALLBACK_SEARCH,  # search provider is down; try local search
+    "limit": (*_FALLBACK_READ, *_FALLBACK_EDIT),  # chunk with read-like tools
+    "runtime_error": _FALLBACK_SEARCH,  # cmd errored → find and inspect the source
+}
+
+
+def _fallback_tool_list(category: str | None) -> str:
+    """Return a human-readable comma-separated tool list for a category."""
+    tools = _TERMINAL_FALLBACK_MAP.get(category or "", _FALLBACK_READ)
+    return ", ".join(tools)
+
+
+def _tool_failure_recovery_hint(
+    tool_name: str, count: int, result: str | None = None
+) -> str:
+    """Action-oriented guidance for recovering from repeated tool failures.
+
+    When the failing tool is ``terminal`` AND a failure category can be
+    derived from the result, the hint provides a **specific** non-terminal
+    fallback suggestion plus a structured, machine-parseable failure-class
+    indicator — this is far more actionable than a generic "try something
+    else" plea (#602).
+    """
     common = (
         f"{tool_name} has failed {count} times this turn. This looks like a loop. "
         "Do not switch to text-only replies; keep using tools, but diagnose before retrying. "
         "First inspect the latest error/output and verify your assumptions. "
     )
-    if tool_name == "terminal":
+
+    if tool_name != "terminal":
         return common + (
-            "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
-            "in the same tool, then try an absolute path, a simpler command, a different "
-            "working directory, or a different tool such as read_file/write_file/patch."
+            "Try different arguments, a narrower query/path, an absolute path when relevant, "
+            "or a different tool that can make progress. If the blocker is external, report "
+            "the blocker after one diagnostic attempt instead of repeating the same failing path."
         )
-    return common + (
-        "Try different arguments, a narrower query/path, an absolute path when relevant, "
-        "or a different tool that can make progress. If the blocker is external, report "
-        "the blocker after one diagnostic attempt instead of repeating the same failing path."
+
+    # ── terminal-specific recovery: classify failure and route ──────────
+    category: str | None = None
+    fallback_hint: str = ""
+    try:
+        from agent.tool_diagnostics import classify
+
+        hit = classify(result or "")
+        if hit is not None:
+            category = hit[0]
+    except Exception:
+        pass
+
+    if category is not None:
+        fallback_list = _fallback_tool_list(category)
+        fallback_hint = (
+            f"The failure class is {category}. "
+            f"Do NOT call terminal again on this turn — "
+            f"use a non-terminal tool instead: {fallback_list}. "
+        )
+    else:
+        fallback_hint = (
+            "Do NOT call terminal again on this turn — "
+            "use a non-terminal tool instead (read_file, search_files, patch). "
+        )
+
+    # Structured, machine-parseable indicator appended after the prose so
+    # tooling / guardrails can consume it without parsing natural language.
+    structured = (
+        f"[terminal_fallback failure_class={category or 'unknown'} "
+        f"tools={_fallback_tool_list(category)} "
+        f"hard_instruction=do_not_call_terminal_this_turn]"
     )
+
+    return common + fallback_hint + "\n\n" + structured
 
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
