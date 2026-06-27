@@ -107,6 +107,56 @@ from utils import base_url_host_matches, base_url_hostname, env_float, model_for
 
 logger = logging.getLogger(__name__)
 
+from agent.retry_utils import _FailureCounter
+
+# ── Per-fallback-entry failure tracking ─────────────────────────────────
+# Each fallback entry in the main and configured fallback chains gets a
+# persistent _FailureCounter keyed by entry label.  When an entry
+# consistently fails, its counter trips and the entry is skipped on
+# subsequent auxiliary calls, avoiding wasted API credits and retry time.
+# Protected by a lock so concurrent auxiliary calls (e.g. multiple gateway
+# sessions) can share the same counters safely.
+_entry_failure_counters: dict[str, _FailureCounter] = {}
+_entry_failure_lock = threading.Lock()
+
+# Default threshold and cooldown for per-entry failure counters.
+_ENTRY_FAILURE_THRESHOLD = 3
+_ENTRY_FAILURE_COOLDOWN = 60.0  # seconds to skip the entry after trip
+
+
+def _get_or_create_entry_counter(
+    entry_label: str,
+    threshold: int = _ENTRY_FAILURE_THRESHOLD,
+) -> _FailureCounter:
+    """Return the persistent ``_FailureCounter`` for ``entry_label``.
+
+    Creates a new counter with the given threshold and the module-level
+    cooldown (``_ENTRY_FAILURE_COOLDOWN``) if one doesn't exist yet.
+    Thread-safe: only one counter is created per label.
+    """
+    with _entry_failure_lock:
+        counter = _entry_failure_counters.get(entry_label)
+        if counter is None:
+            counter = _FailureCounter(
+                threshold=threshold,
+                cooldown=_ENTRY_FAILURE_COOLDOWN,
+            )
+            _entry_failure_counters[entry_label] = counter
+        return counter
+
+
+def reset_entry_failures(label: str) -> None:
+    """Reset the failure counter for a fallback entry by label.
+
+    Also removes the entry from the dict so a fresh counter is created
+    on the next call.  Exposed for testing and for a future ``hermes
+    config aux reset`` command.
+    """
+    with _entry_failure_lock:
+        counter = _entry_failure_counters.pop(label, None)
+        if counter is not None:
+            counter.reset()
+
 
 # ── Interrupt protection for atomic auxiliary tasks ──────────────────────
 # Some auxiliary tasks must NOT be aborted mid-flight by a gateway interrupt
@@ -3082,13 +3132,33 @@ def _try_payment_fallback(
             _log_skip_unhealthy(label, task)
             tried.append(f"{label} (unhealthy)")
             continue
+        # ── Per-entry failure tracking ──────────────────────────────
+        entry_counter = _get_or_create_entry_counter(label)
+        if entry_counter.is_tripped:
+            logger.info(
+                "Auxiliary %s: skipping %s (failure threshold reached, "
+                "retry in %ds)",
+                task or "call", label, int(entry_counter.remaining_cooldown),
+            )
+            tried.append(f"{label} (failure-tracked)")
+            continue
+        # ─────────────────────────────────────────────────────────────
         client, model = try_fn()
         if client is not None:
+            entry_counter.succeeded()
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
             )
             return client, model, label
+        # Failed — track the failure.
+        if entry_counter.trip():
+            logger.warning(
+                "Auxiliary %s: %s failed %d times consecutively — "
+                "skipping for %ds",
+                task or "call", label, entry_counter.count,
+                int(entry_counter.remaining_cooldown),
+            )
         tried.append(label)
 
     logger.warning(
@@ -3182,17 +3252,38 @@ def _try_configured_fallback_chain(
 
         label = f"fallback_chain[{i}]({fb_provider})"
 
+        # ── Per-entry failure tracking ──────────────────────────────
+        entry_counter = _get_or_create_entry_counter(label)
+        if entry_counter.is_tripped:
+            logger.info(
+                "Auxiliary %s: skipping %s (failure threshold reached, "
+                "retry in %ds)",
+                task or "call", label, int(entry_counter.remaining_cooldown),
+            )
+            tried.append(f"{label} (failure-tracked)")
+            continue
+        # ─────────────────────────────────────────────────────────────
+
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
             fb_client, resolved_model = None, None
 
         if fb_client is not None:
+            entry_counter.succeeded()
             logger.info(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, resolved_model or fb_model or "default",
             )
             return fb_client, resolved_model or fb_model, label
+        # Resolution failed (fb_client is None) — track the failure.
+        if entry_counter.trip():
+            logger.warning(
+                "Auxiliary %s: %s failed %d times consecutively — "
+                "skipping for %ds",
+                task or "call", label, entry_counter.count,
+                int(entry_counter.remaining_cooldown),
+            )
         tried.append(label)
 
     if tried:
@@ -3278,18 +3369,38 @@ def _try_main_fallback_chain(
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
             continue
+        # ── Per-entry failure tracking ──────────────────────────────
+        entry_counter = _get_or_create_entry_counter(label)
+        if entry_counter.is_tripped:
+            logger.info(
+                "Auxiliary %s: skipping %s (failure threshold reached, "
+                "retry in %ds)",
+                task or "call", label, int(entry_counter.remaining_cooldown),
+            )
+            tried.append(f"{label} (failure-tracked)")
+            continue
+        # ─────────────────────────────────────────────────────────────
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
         if fb_client is not None:
+            entry_counter.succeeded()
             logger.info(
                 "Auxiliary %s: %s on %s — main fallback chain to %s (%s)",
                 task or "call", reason, failed_provider or "auto", label,
                 resolved_model or fb_model,
             )
             return fb_client, resolved_model or fb_model, fb_provider
+        # Resolution failed (fb_client is None) — track the failure.
+        if entry_counter.trip():
+            logger.warning(
+                "Auxiliary %s: %s failed %d times consecutively — "
+                "skipping for %ds",
+                task or "call", label, entry_counter.count,
+                int(entry_counter.remaining_cooldown),
+            )
         tried.append(label)
 
     if tried:
@@ -3442,14 +3553,34 @@ def _resolve_auto(
             _log_skip_unhealthy(label)
             tried.append(f"{label} (unhealthy)")
             continue
+        # ── Per-entry failure tracking ──────────────────────────────
+        entry_counter = _get_or_create_entry_counter(label)
+        if entry_counter.is_tripped:
+            logger.info(
+                "Auxiliary auto-detect: skipping %s (failure threshold "
+                "reached, retry in %ds)",
+                label, int(entry_counter.remaining_cooldown),
+            )
+            tried.append(f"{label} (failure-tracked)")
+            continue
+        # ─────────────────────────────────────────────────────────────
         client, model = try_fn()
         if client is not None:
+            entry_counter.succeeded()
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
                             label, model or "default", ", ".join(tried))
             else:
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
             return client, model
+        # Failed — track the failure.
+        if entry_counter.trip():
+            logger.warning(
+                "Auxiliary auto-detect: %s failed %d times consecutively — "
+                "skipping for %ds",
+                label, entry_counter.count,
+                int(entry_counter.remaining_cooldown),
+            )
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
