@@ -66,52 +66,54 @@ _EXIT_CODE_RE = re.compile(r"exit code[:\s]+([1-9]\d*)", re.IGNORECASE)
 # change-and-retry classes (not_found, runtime_error) where a corrected retry can
 # legitimately succeed. Two of these in a row already warrants a hard stop, below
 # the generic fail_threshold.
-_NON_RETRYABLE = frozenset({"timeout", "permission", "missing_command", "limit"})
+_NON_RETRYABLE = frozenset({
+    "timeout",
+    "permission",
+    "missing_command",
+    "limit",
+    "provider_dead",
+})
 _NONRETRY_THRESHOLD = 2
 
 # Mutating tools get LOWER thresholds than idempotent tools because a fixation
 # on mutating operations (writing files, running commands) is more costly and
 # indicates a deeper strategy problem (#432).
-_IDEMPOTENT_TOOLS = frozenset(
-    {
-        "read_file",
-        "search_files",
-        "web_search",
-        "web_extract",
-        "session_search",
-        "browser_snapshot",
-        "browser_console",
-        "browser_get_images",
-        "mcp_filesystem_read_file",
-        "mcp_filesystem_read_text_file",
-        "mcp_filesystem_read_multiple_files",
-        "mcp_filesystem_list_directory",
-        "mcp_filesystem_list_directory_with_sizes",
-        "mcp_filesystem_directory_tree",
-        "mcp_filesystem_get_file_info",
-        "mcp_filesystem_search_files",
-    }
-)
-_MUTATING_TOOLS = frozenset(
-    {
-        "terminal",
-        "execute_code",
-        "write_file",
-        "patch",
-        "todo",
-        "memory",
-        "skill_manage",
-        "browser_click",
-        "browser_type",
-        "browser_press",
-        "browser_scroll",
-        "browser_navigate",
-        "send_message",
-        "cronjob",
-        "delegate_task",
-        "process",
-    }
-)
+_IDEMPOTENT_TOOLS = frozenset({
+    "read_file",
+    "search_files",
+    "web_search",
+    "web_extract",
+    "session_search",
+    "browser_snapshot",
+    "browser_console",
+    "browser_get_images",
+    "mcp_filesystem_read_file",
+    "mcp_filesystem_read_text_file",
+    "mcp_filesystem_read_multiple_files",
+    "mcp_filesystem_list_directory",
+    "mcp_filesystem_list_directory_with_sizes",
+    "mcp_filesystem_directory_tree",
+    "mcp_filesystem_get_file_info",
+    "mcp_filesystem_search_files",
+})
+_MUTATING_TOOLS = frozenset({
+    "terminal",
+    "execute_code",
+    "write_file",
+    "patch",
+    "todo",
+    "memory",
+    "skill_manage",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_scroll",
+    "browser_navigate",
+    "send_message",
+    "cronjob",
+    "delegate_task",
+    "process",
+})
 # Default thresholds: lower for mutating tools, higher for idempotent (#432).
 # Mutating:  repeat at 4, fail at 2, escalate at 8
 # Idempotent: repeat at 8, fail at 4, escalate at 15
@@ -143,7 +145,9 @@ def _looks_like_failure(content: Any) -> bool:
     return bool(_EXIT_CODE_RE.search(content))
 
 
-def _recent_tool_runs(messages: List[Dict[str, Any]]) -> List[Tuple[str, bool, Optional[str]]]:
+def _recent_tool_runs(
+    messages: List[Dict[str, Any]],
+) -> List[Tuple[str, bool, Optional[str]]]:
     """Most-recent-first list of (single_tool_name, result_failed, failure_class)
     for the trailing run of assistant turns that each called EXACTLY ONE tool.
     ``failure_class`` is the tool_diagnostics category of the failing result (or
@@ -161,9 +165,7 @@ def _recent_tool_runs(messages: List[Dict[str, Any]]) -> List[Tuple[str, bool, O
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             tcs = [tc for tc in msg["tool_calls"] if isinstance(tc, dict)]
             names = [
-                tc.get("function", {}).get("name")
-                for tc in tcs
-                if tc.get("function")
+                tc.get("function", {}).get("name") for tc in tcs if tc.get("function")
             ]
             names = [n for n in names if n]
             if len(set(names)) != 1:
@@ -243,16 +245,19 @@ def maybe_nudge(
     is_unknown = cat == "unknown"
     if repeat_threshold is None:
         repeat_threshold = (
-            _MUTATING_REPEAT_THRESHOLD if (is_mutating or is_unknown)
+            _MUTATING_REPEAT_THRESHOLD
+            if (is_mutating or is_unknown)
             else _IDEMPOTENT_REPEAT_THRESHOLD
         )
     if fail_threshold is None:
         fail_threshold = (
-            _MUTATING_FAIL_THRESHOLD if (is_mutating or is_unknown)
+            _MUTATING_FAIL_THRESHOLD
+            if (is_mutating or is_unknown)
             else _IDEMPOTENT_FAIL_THRESHOLD
         )
     escalate_threshold = (
-        _MUTATING_ESCALATE_THRESHOLD if (is_mutating or is_unknown)
+        _MUTATING_ESCALATE_THRESHOLD
+        if (is_mutating or is_unknown)
         else _IDEMPOTENT_ESCALATE_THRESHOLD
     )
 
