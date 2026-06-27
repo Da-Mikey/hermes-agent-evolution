@@ -1,17 +1,16 @@
 {
-  "last_cycle": "2026-06-28",
-  "cycle_timestamp": "2026-06-26T23:31:00+00:00",
-  "cycle_started": "2026-06-26T23:31:00+00:00",
+  "last_cycle": "2026-06-29",
+  "cycle_timestamp": "2026-06-29T23:31:00+00:00",
   "hydra_version": "2",
   "heads_activated": [],
   "heads_skipped": {
-    "evolution-research": "Research from 2026-06-28 cycle already gathered. No trigger for fresh research (no new upstream release, no user prompt).",
-    "evolution-issues": "No git remote configured in evolution repo — cannot create issues on GitHub. 3 issue files exist locally awaiting manual review.",
+    "evolution-research": "3 issues from 2026-06-28 research cycle already staged in issues/. No new trigger (same cycle cadence) — wait for next cycle.",
+    "evolution-issues": "No git remote configured in evolution repo — issues can't be pushed to GitHub. Local issue files exist (3 files). Manual review needed before GitHub submission.",
     "evolution-introspection": "0 completed sessions since last introspection run. No material to analyze.",
-    "evolution-analysis": "No git remote configured — cannot read PR labels or verify merge readiness. No new issues to prioritize.",
-    "evolution-implementation": "No analyzed/approved changes ready. 2 feedback requests (issue-432: 8 days, pr-470: 7 days) awaiting human response before pipeline proceeds.",
-    "evolution-integration": "No remote configured — cannot merge PRs or manage labels.",
-    "evolution-upstream-sync": "Hermes-agent workspace on evolution/issue-525-telegram-delivery-fallback-file (feature branch). Must git checkout main first. 733 commits behind upstream (unchanged). No remote configured on evolution repo."
+    "evolution-analysis": "No git remote configured — cannot read PR labels or verify merge readiness. 2 feedback requests still pending human response (issue-432: 9 days, pr-470: 8 days).",
+    "evolution-implementation": "No analyzed/approved changes ready. 2 feedback requests pending human response. Pipeline blocked upstream of implementation.",
+    "evolution-integration": "No remote configured — cannot merge PRs or manage labels. Hermes-agent workspace on evolution/issue-573-telegram-circuit-breaker (feature branch, not main).",
+    "evolution-upstream-sync": "Hermes-agent workspace on evolution/issue-573-telegram-circuit-breaker feature branch (not main) — cannot safely sync. No remote configured. 733 commits behind upstream."
   },
   "fresh_material": {
     "new_sessions_since_last_introspection": 0,
@@ -35,15 +34,15 @@
     "pending": [
       {
         "change_id": "evolution/issue-432-mono-tool-spiral-guard",
-        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback requested 2026-06-21, now 8 days pending",
+        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback requested 2026-06-21, now 9 days pending.",
         "requested_at": "2026-06-21T21:05:00+00:00",
-        "days_pending": 8
+        "days_pending": 9
       },
       {
         "change_id": "pr-470",
-        "summary": "Unblock evolution pipeline token switch — feedback requested 2026-06-22, now 7 days pending",
+        "summary": "Unblock evolution pipeline token switch — feedback requested 2026-06-22, now 8 days pending.",
         "requested_at": "2026-06-22T20:08:11+00:00",
-        "days_pending": 7
+        "days_pending": 8
       }
     ]
   },
@@ -59,23 +58,23 @@
   "blockers": {
     "pipeline_blocked": true,
     "notes": {
-      "feedback_backlog": "2 pending feedback requests (issue-432: 8 days, pr-470: 7 days) need human response before implementation head can proceed",
-      "no_remote_configured": "Evolution repo has no git remote. Upstream sync, PR management, and issue creation are impossible until git remote add origin <url> is run",
-      "workspace_on_feature_branch": "Hermes-agent HEAD is on evolution/issue-525-telegram-delivery-fallback-file, not main. Run git checkout main before any upstream-sync",
-      "upstream_drift": "733 commits behind upstream/main — growing ~30-50/day. No sync attempted yet"
+      "feedback_backlog": "2 pending feedback requests (issue-432: 9 days, pr-470: 8 days) need human response before pipeline can advance.",
+      "no_remote_configured": "Evolution repo has no git remote. Upstream sync, PR management, and issue creation on GitHub all blocked.",
+      "workspace_on_feature_branch": "Hermes-agent HEAD is on evolution/issue-573-telegram-circuit-breaker, not main. Cannot safely upstream-sync or integrate until main.",
+      "upstream_drift": "733 commits behind upstream/main — growing ~30-50/day. No sync attempted yet."
     }
   },
   "recommendation": {
     "activate_other_heads": false,
-    "reason": "Pipeline remains blocked by same 3 blockers as previous cycles. No change in state since 2026-06-27 cycle. All heads skipped.",
+    "reason": "Pipeline remains blocked by same 3 blockers as the last 3 cycles. No state change since 2026-06-28. Activation would produce no actionable output.",
     "action_items": [
-      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 8 days, pr-470: 7 days)",
-      "[HIGH] Configure a git remote in ~/.hermes/evolution/ if you want upstream sync, PR management, and issue creation",
-      "[HIGH] git checkout main in ~/.hermes/hermes-agent/ before the next Hydra cycle — workspace is on evolution/issue-525-telegram-delivery-fallback-file",
-      "[MEDIUM] Review the 3 issue files in ~/.hermes/evolution/issues/ from the 2026-06-28 research cycle",
-      "[MEDIUM] Consider an upstream-sync strategy: 733 commits behind, growing daily. Merge or cherry-pick?",
-      "[LOW] The stash (stash@{0}) has fix/cron-stable-prompt-cache-key — consider whether to apply or drop it"
+      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 9 days old, pr-470: 8 days old). Pipeline cannot advance without these.",
+      "[HIGH] Configure a git remote in ~/.hermes/evolution/ if you want upstream sync, PR management, and GitHub-side issue creation.",
+      "[HIGH] git checkout main in ~/.hermes/hermes-agent/ before the next Hydra cycle — workspace is on evolution/issue-573-telegram-circuit-breaker.",
+      "[MEDIUM] Review the 3 issue files in ~/.hermes/evolution/issues/ from the 2026-06-28 research cycle and decide which to open against the fork.",
+      "[MEDIUM] Consider an upstream-sync strategy: 733 commits behind, growing ~50/day. Merge or cherry-pick?",
+      "[LOW] The stash (stash@{0}) has fix/cron-stable-prompt-cache-key — consider whether to apply or discard it."
     ]
   },
-  "notes": "Hydra cycle 2026-06-28 23:31 UTC. No heads activated — same pipeline blockers persist. 3 research issue files exist but cannot be promoted to GitHub without a remote. Upstream drift steady at 733. Feedback backlog growing: issue-432 now at 8 days, pr-470 at 7 days."
+  "notes": "Hydra cycle 2026-06-29 23:31 UTC. No heads activated — same pipeline blockers persist as the last 3 consecutive cycles. 3 issue files exist locally but cannot be pushed without a remote. 2 feedback requests now at 9 and 8 days pending. Upstream drift continues unaddressed. The next meaningful cycle requires at least one blocker to be resolved."
 }
