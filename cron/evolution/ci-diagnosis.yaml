@@ -1,0 +1,17 @@
+name: evolution-ci-diagnosis
+description: "CI failure auto-diagnosis for evolution PRs — poll open PRs, extract failing logs, auto-fix trivial failures or create child issues (issue #577)"
+schedule:
+  minute: "*/30"
+  hour: "*"
+prompt: |
+  CI diagnosis cycle — check open PRs for CI failures and act.
+  Run: python {{HERMES_HOME}}/scripts/evolution_ci_diagnosis.py --limit 10
+skills:
+  - evolution/implementation
+toolsets:
+  - terminal
+  - file
+output: ~/.hermes/profiles/user1/evolution/ci-diagnosis
+limits:
+  max_runs_per_day: 48
+  max_tokens_per_run: 4000
