@@ -29,13 +29,14 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.model_metadata import is_local_endpoint
+from agent.provider_retry import retry_sync_with_backoff
 from agent.retry_utils import extract_retry_after_seconds, jittered_backoff
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
 from tools.terminal_tool import is_persistent_env
-from utils import base_url_host_matches, base_url_hostname, env_int
+from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +236,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         api_kwargs=api_kwargs,
                     )
                 )
-                result["response"] = request_client.chat.completions.create(
-                    **api_kwargs
+                result["response"] = retry_sync_with_backoff(
+                    lambda: request_client.chat.completions.create(**api_kwargs),
+                    max_retries=2,
                 )
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
@@ -654,6 +656,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
+            cache_key=getattr(agent, "cache_key", None),
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
@@ -769,6 +772,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             reasoning_config=agent.reasoning_config,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
+            cache_key=getattr(agent, "cache_key", None),
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
@@ -801,6 +805,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         reasoning_config=agent.reasoning_config,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
+        cache_key=getattr(agent, "cache_key", None),
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=_is_nous,
@@ -1071,6 +1076,35 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     return msg
 
 
+def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
+    """Point the cached system prompt's ``Model:``/``Provider:`` lines at
+    the active runtime after a provider switch.
+
+    The system prompt is session-stable and replayed verbatim for prefix-cache
+    warmth, but after a failover the new backend's cache is cold anyway —
+    while a stale identity line makes the agent misreport which model it is
+    when asked.  Rewrite the lines in place WITHOUT persisting to the session
+    DB: the stored row keeps the primary's labels, so when the primary is
+    restored the prompt is byte-identical to the stored copy again and its
+    prefix cache still matches.
+
+    Only the LAST occurrence of each line is touched — the identity lines
+    live in the volatile tail of the prompt, and earlier matches could be
+    user content (memory snapshots, context files).
+    """
+    sp = getattr(agent, "_cached_system_prompt", None)
+    if not isinstance(sp, str) or not sp:
+        return
+    for label, value in (("Model", model), ("Provider", provider)):
+        if not value:
+            continue
+        matches = list(re.finditer(rf"(?m)^{label}: .*$", sp))
+        if matches:
+            last = matches[-1]
+            sp = f"{sp[: last.start()]}{label}: {value}{sp[last.end() :]}"
+    agent._cached_system_prompt = sp
+
+
 def try_activate_fallback(
     agent,
     reason: "FailoverReason | None" = None,
@@ -1119,6 +1153,29 @@ def try_activate_fallback(
                 agent._rate_limited_providers = _provider_cooldowns
             if _current_provider:
                 _provider_cooldowns[_current_provider] = _until
+            # Structured diagnostic so cron introspection can classify
+            # rate-limit/billing events without parsing free-text logs.
+            # See issue #514.
+            logger.warning(
+                "provider failover: %s/%s rate-limited/billing exhausted, "
+                "cooldown=%ss retry_after=%r fallback_index=%d/%d",
+                _current_provider,
+                _current_model,
+                int(_cooldown),
+                _retry_after_raw,
+                getattr(agent, "_fallback_index", 0),
+                len(getattr(agent, "_fallback_chain", [])),
+                extra={
+                    "event": "provider_rate_limit_failover",
+                    "reason": reason.value if reason else None,
+                    "provider": _current_provider,
+                    "model": _current_model,
+                    "retry_after_raw": _retry_after_raw,
+                    "cooldown_seconds": _cooldown,
+                    "fallback_index": getattr(agent, "_fallback_index", 0),
+                    "fallback_chain_length": len(getattr(agent, "_fallback_chain", [])),
+                },
+            )
     if agent._fallback_index >= len(agent._fallback_chain):
         return False
 
@@ -1264,6 +1321,24 @@ def try_activate_fallback(
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
+        # Structured diagnostic so cron introspection can confirm the
+        # fallback provider/model that is now active. See issue #514.
+        logger.warning(
+            "provider failover: switched to %s/%s (%s)",
+            agent.provider,
+            agent.model,
+            agent.api_mode,
+            extra={
+                "event": "provider_fallback_activated",
+                "provider": agent.provider,
+                "model": agent.model,
+                "api_mode": agent.api_mode,
+                "base_url": agent.base_url,
+                "previous_provider": _current_provider,
+                "previous_model": _current_model,
+            },
+        )
+
         # Clear the credential pool when the fallback provider doesn't match
         # the pool's provider.  The pool was seeded for the primary provider;
         # leaving it attached means downstream recovery (rate_limit / billing /
@@ -1389,6 +1464,10 @@ def try_activate_fallback(
                 provider=agent.provider,
                 api_mode=agent.api_mode,
             )
+
+        # Keep the prompt's self-identity in sync with the model actually
+        # answering, so "what model are you?" doesn't report the primary.
+        rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
         agent._buffer_status(
             f"🔄 Primary model failed — switching to fallback: "
@@ -1913,14 +1992,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
-            else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+            else env_float("HERMES_API_TIMEOUT", 1800.0)
         )
         # Read timeout: config wins here too.  Otherwise use
         # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
         if _provider_timeout_cfg is not None:
             _stream_read_timeout = _provider_timeout_cfg
         else:
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+            _stream_read_timeout = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
             # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
@@ -2690,9 +2769,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:
-        _stream_stale_timeout_base = float(
-            os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0)
-        )
+        _stream_stale_timeout_base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
     # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
     # for prefill on large contexts.  Disable the stale detector unless
     # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
@@ -2719,6 +2796,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
         else:
             _stream_stale_timeout = _stream_stale_timeout_base
+        # Reasoning-model floor: known reasoning models (Nemotron 3 Ultra,
+        # OpenAI o1/o3, Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ,
+        # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
+        # model threshold during their thinking phase.  The cloud gateway
+        # upstream kills the socket first, surfacing as BrokenPipeError.
+        # Raises the floor only — never overrides explicit user config
+        # (handled by get_provider_stale_timeout above).
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
+        _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
+        if _reasoning_floor is not None:
+            _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
