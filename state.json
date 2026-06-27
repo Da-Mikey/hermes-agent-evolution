@@ -1,21 +1,22 @@
 {
-  "last_cycle": "2026-06-27",
-  "cycle_timestamp": "2026-06-27T09:07:24+00:00",
+  "last_cycle": "2026-06-30",
+  "cycle_timestamp": "2026-06-30T15:00:00+00:00",
   "hydra_version": "2",
-  "heads_activated": [
-    "evolution-upstream-sync"
-  ],
+  "heads_activated": [],
   "heads_skipped": {
-    "evolution-research": "Last research cycle completed 2026-06 with 7 findings. No new triggers (no fresh paper releases identified, no model announcements). Next research window: ~24h.",
-    "evolution-issues": "No new research findings to convert into issues. 3 existing issues from prior cycle remain open.",
-    "evolution-introspection": "Ran yesterday (2026-06-26 cycle). Only ~6h of fresh session data. Next introspection window: ~24h.",
-    "evolution-analysis": "No GitHub PR label workflow active. Cannot read PR status or verify merge readiness.",
-    "evolution-implementation": "Pipeline blocked by 2 pending human feedback requests (6d and 5d). No analyzed changes ready.",
-    "evolution-integration": "No merged/accepted changes staged for integration. Depends on upstream-sync completing first."
+    "evolution-research": "On 24h cadence (last ran June 28). Pipeline still human-blocked; new research adds noise without implementation path.",
+    "evolution-issues": "No new research findings to convert.",
+    "evolution-introspection": "Zero new session dumps since last introspection (June 27 14:03 UTC). No material to analyze.",
+    "evolution-analysis": "No GitHub PR label workflow. PR #574 still unlabeled. Gate unconfigured.",
+    "evolution-implementation": "Still blocked on 2 pending feedback requests (both now 9 days) and PR #574 labels.",
+    "evolution-integration": "PR #574 lacks 'accepted' label. No merge candidates.",
+    "evolution-upstream-sync": "824 commits behind upstream. Structural history mismatch needs human strategy decision."
   },
   "fresh_material": {
-    "new_sessions_since_last_introspection": "Minor \u2014 2 session dumps from today (03:00 UTC). Not enough for full introspection cycle.",
-    "upstream_sync_status": "Initiated upstream-sync subagent \u2014 Hermes agent upstream is accessible (770 commits behind)."
+    "new_sessions_since_last_introspection": "0 — no new session dumps since 2026-06-27.",
+    "upstream_hermes_prs": "824 commits behind upstream (unchanged since last cycle).",
+    "upstream_sync_status": "824 commits behind upstream/main. No shared git history — same structural blocker.",
+    "new_issue_files_no_gh_issue": "0 — all previous issues dispatched."
   },
   "proposals": {
     "total": 7,
@@ -28,15 +29,15 @@
     "pending": [
       {
         "change_id": "evolution/issue-432-mono-tool-spiral-guard",
-        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) \u2014 feedback requested 2026-06-21, now 6 days pending",
+        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback requested 2026-06-21, now 9 days pending",
         "requested_at": "2026-06-21T21:05:00+00:00",
-        "days_pending": 6
+        "days_pending": 9
       },
       {
         "change_id": "pr-470",
-        "summary": "Unblock evolution pipeline token switch \u2014 feedback requested 2026-06-22, now 5 days pending",
+        "summary": "Unblock evolution pipeline token switch — feedback requested 2026-06-22, now 8 days pending",
         "requested_at": "2026-06-22T20:08:11+00:00",
-        "days_pending": 5
+        "days_pending": 9
       }
     ]
   },
@@ -52,21 +53,23 @@
   "blockers": {
     "pipeline_blocked": true,
     "notes": {
-      "feedback_backlog": "2 pending feedback requests (issue-432: 6 days, pr-470: 5 days) \u2014 human needed.",
-      "no_upstream_sync_evolution_repo": "Evolution state repo has no remote. Reports only trackable locally.",
-      "no_pr_workflow": "No GitHub PR label workflow active. Analysis/integration heads depend on PR labels."
+      "feedback_backlog": "2 pending feedback requests, both now 9 days. Oldest is 9 days pending.",
+      "no_pr_workflow": "No GitHub PR label workflow. Analysis/integration gates depend on labels.",
+      "upstream_drift_structural": "824 commits behind upstream with no shared git history — human strategy decision needed.",
+      "implementation_blocked_upstream": "PR #574 unlabeled — pipeline gates blocked.",
+      "pending_feedback_aging": "9 days on oldest feedback. Approaching 1.5 weeks."
     }
   },
   "recommendation": {
-    "activate_other_heads": true,
-    "reason": "evolution-upstream-sync activated for Hermes agent upstream sync (first viable window \u2014 upstream remote is configured and accessible). Remaining pipeline still blocked by human feedback + missing PR workflow.",
+    "activate_other_heads": false,
+    "reason": "No new sessions, no new research pipeline-ready, no PR label workflow, no upstream sync strategy. All 7 heads skipped — same blockers as the previous 4 cycles. Pipeline is entirely human-blocked.",
     "action_items": [
-      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 6 days, pr-470: 5 days)",
-      "[HIGH] Check upstream-sync result \u2014 verify merge pushed to origin",
-      "[MEDIUM] Configure GitHub PR label workflow for evolution-analysis head",
-      "[LOW] Review 3 open issue files in ~/.hermes/evolution/issues/ from prior research cycle",
-      "[LOW] Consider adding a git remote to the evolution state repo itself"
+      "[HIGH] Respond to 2 pending feedback requests (both now 9 days). These are the #1 blocker.",
+      "[HIGH] Decide upstream sync strategy: rebase, reset, or merge? 824 commits behind, growing.",
+      "[MEDIUM] Label PR #574 'accepted' or 'rejected' to unblock integration.",
+      "[MEDIUM] Configure a GitHub PR label workflow for automated gates.",
+      "[LOW] Review GitHub issues #593, #594, #595 from last research cycle."
     ]
   },
-  "notes": "Hydra cycle 2026-06-27T07:31:17+00:00. 1 of 7 heads activated (evolution-introspection dispatched as deleg_7f4d949d). New Devyn session dump (2026-06-26, ~106KB) being analyzed. 6 heads skipped: pipeline structurally blocked by missing remote, no PR workflow, and 2 pending feedback requests. 8th consecutive cycle with limited activation."
+  "notes": "Hydra cycle 2026-06-30T15:00:00+00:00. 0 of 7 heads activated. 4th consecutive cycle with zero activation — pipeline remains human-blocked on feedback, PR labels, and upstream strategy. No new session material. No regression."
 }
