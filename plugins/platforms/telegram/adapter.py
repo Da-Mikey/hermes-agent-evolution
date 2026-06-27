@@ -90,6 +90,7 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace, env_float, env_int
+from agent.retry_utils import _FailureCounter
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -544,6 +545,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # While True, send() short-circuits to a failure so callers
         # (cron live-adapter branch) fall through to standalone delivery.
         self._send_path_degraded: bool = False
+        # Circuit breaker for send/poll failures: trips after N consecutive
+        # failures, stays tripped for T seconds. Prevents log-spam and wasted
+        # retries when Telegram's API is persistently unreachable.
+        self._send_failure_tracker: _FailureCounter = _FailureCounter(
+            threshold=3, cooldown=30.0
+        )
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # Track forum chats where we've already registered bot commands
@@ -1612,6 +1619,8 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] %s Last error: %s", self.name, message, error)
             self._set_fatal_error("telegram_network_error", message, retryable=True)
             await self._notify_fatal_error()
+            # Trip the circuit breaker so send() also stops retrying.
+            self._send_failure_tracker.trip()
             return
 
         delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
@@ -1700,6 +1709,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
             self._send_path_degraded = False
+            # Reset the circuit breaker on confirmed healthy reconnect.
+            self._send_failure_tracker.succeeded()
         except Exception as probe_err:
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
@@ -2812,6 +2823,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
+            # Reset the circuit breaker on successful send.
+            self._send_failure_tracker.succeeded()
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -2823,6 +2836,8 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             
         except Exception as e:
+            # Trip the circuit breaker on any send failure.
+            tripped = self._send_failure_tracker.trip()
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             err_str = str(e).lower()
             error_kind = classify_send_error(e)
@@ -2843,6 +2858,22 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
+            # Circuit breaker: if tripped, short-circuit with a retryable
+            # error so callers don't keep hammering the failing API.
+            if tripped:
+                logger.warning(
+                    "[%s] Send circuit breaker tripped (%d consecutive failures), "
+                    "cooldown %0.1fs",
+                    self.name,
+                    self._send_failure_tracker.count,
+                    self._send_failure_tracker.remaining_cooldown,
+                )
+                return SendResult(
+                    success=False,
+                    error=f"circuit_breaker_tripped: {e}",
+                    retryable=True,
+                    error_kind=error_kind,
+                )
             return SendResult(
                 success=False,
                 error=str(e),
