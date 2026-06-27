@@ -3,6 +3,11 @@
 Replaces fixed exponential backoff with jittered delays to prevent
 thundering-herd retry spikes when multiple sessions hit the same
 rate-limited provider concurrently.
+
+Also provides ``_FailureCounter``, a thread-safe session-scoped
+utility for tracking consecutive failures with optional cooldown,
+shared by the Telegram adapter circuit breaker and the auxiliary
+client fallback chain.
 """
 
 import calendar
@@ -10,6 +15,7 @@ import email.utils
 import random
 import threading
 import time
+from typing import Optional
 
 # Monotonic counter for jitter seed uniqueness within the same process.
 # Protected by a lock to avoid race conditions in concurrent retry paths
@@ -89,3 +95,135 @@ def extract_retry_after_seconds(
         return max(0.0, min(retry_time - now, 300.0))
     except Exception:
         return None
+
+
+class _FailureCounter:
+    """Thread-safe, session-scoped consecutive-failure counter with optional cooldown.
+
+    Track how many times a *single operation* (send, poll, fallback entry)
+    has failed consecutively. When the threshold is exceeded the operation
+    is considered ``tripped`` (unless a cooldown duration is configured).
+
+    Thread-safe: all mutable state is protected by a reentrant lock so
+    multiple callers (e.g. async gateway tasks) can share one instance.
+
+    Typical usage::
+
+        counter = _FailureCounter(threshold=3, cooldown=30.0)
+        # … on failure …
+        if counter.trip():
+            logger.warning("circuit breaker tripped, waiting %ss", counter.remaining_cooldown)
+            return fallback_result
+        # … on success …
+        counter.reset()
+    """
+
+    def __init__(
+        self,
+        threshold: int = 3,
+        cooldown: float = 0.0,
+    ) -> None:
+        """
+        Args:
+            threshold: Consecutive failures after which ``trip()`` returns True.
+            cooldown: Seconds to remain in tripped state (0 = no cooldown).
+        """
+        if threshold < 1:
+            raise ValueError(f"threshold must be >= 1, got {threshold}")
+        self._threshold = threshold
+        self._cooldown = cooldown
+        self._count = 0
+        self._tripped_at: float = 0.0
+        self._lock = threading.RLock()
+
+    # ── Public helpers ────────────────────────────────────────────────
+
+    def reset(self) -> None:
+        """Reset the failure count and clear the tripped state."""
+        with self._lock:
+            self._count = 0
+            self._tripped_at = 0.0
+
+    def increment(self, now: Optional[float] = None) -> int:
+        """Increment failure count and return the new value."""
+        with self._lock:
+            self._count += 1
+            return self._count
+
+    # ── Introspection (read-only, no lock needed for simple fields) ───
+
+    @property
+    def count(self) -> int:
+        """Current consecutive-failure count."""
+        with self._lock:
+            return self._count
+
+    @property
+    def threshold(self) -> int:
+        """Configured failure threshold."""
+        return self._threshold
+
+    @property
+    def is_tripped(self) -> bool:
+        """True iff the counter has exceeded threshold AND is in cooldown.
+
+        A counter with no cooldown (``cooldown=0``) never stays tripped —
+        ``trip()`` returns True once, but the next call returns False so
+        the caller can decide to skip/retry based on the fresh return
+        value rather than querying ``is_tripped`` later.
+        """
+        with self._lock:
+            if self._count < self._threshold:
+                return False
+            if self._cooldown <= 0:
+                return False
+            return time.time() < self._tripped_at + self._cooldown
+
+    @property
+    def remaining_cooldown(self) -> float:
+        """Seconds remaining in the cooldown period (0 if not in cooldown)."""
+        with self._lock:
+            if self._cooldown <= 0 or self._count < self._threshold:
+                return 0.0
+            remaining = (self._tripped_at + self._cooldown) - time.time()
+            return max(0.0, remaining)
+
+    # ── Core action ───────────────────────────────────────────────────
+
+    def trip(self, now: Optional[float] = None) -> bool:
+        """Check whether the circuit is tripped after incrementing.
+
+        Increments the failure count. Returns True if the counter has
+        reached threshold (regardless of cooldown).  Use this as the
+        immediate decision in a failure handler — do NOT call
+        ``increment()`` before ``trip()``; ``trip()`` handles the
+        increment itself.
+
+        A counter with no cooldown returns True once when the threshold
+        is crossed (this call), then False on every subsequent call
+        (because ``remaining_cooldown`` is 0 and the skip is no longer
+        meaningful — the caller has already seen the signal once).
+        """
+        with self._lock:
+            self._count += 1
+            at = now if now is not None else time.time()
+            if self._count >= self._threshold:
+                self._tripped_at = at
+                return True
+            return False
+
+    def succeeded(self) -> None:
+        """Mark a successful operation: reset count and cooldown.
+
+        Equivalent to ``reset()``. Use this as the success handler
+        to make the call site read naturally::
+
+            try:
+                result = await do_work()
+                counter.succeeded()
+                return result
+            except Exception:
+                if counter.trip():
+                    logger.warning("…")
+        """
+        self.reset()
