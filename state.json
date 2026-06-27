@@ -1,26 +1,26 @@
 {
-  "last_cycle": "2026-06-29",
-  "cycle_timestamp": "2026-06-29T23:31:00+00:00",
+  "last_cycle": "2026-06-30",
+  "cycle_timestamp": "2026-07-01T06:30:00+00:00",
   "hydra_version": "2",
   "heads_activated": [],
   "heads_skipped": {
-    "evolution-research": "3 issues from 2026-06-28 research cycle already staged in issues/. No new trigger (same cycle cadence) — wait for next cycle.",
-    "evolution-issues": "No git remote configured in evolution repo — issues can't be pushed to GitHub. Local issue files exist (3 files). Manual review needed before GitHub submission.",
+    "evolution-research": "3 issues from 2026-06-28 research cycle still staged in issues/. No new research needed until those are actioned.",
+    "evolution-issues": "No git remote configured in evolution repo \u2014 issues can't be pushed to GitHub. Issues already exist as local .md files.",
     "evolution-introspection": "0 completed sessions since last introspection run. No material to analyze.",
-    "evolution-analysis": "No git remote configured — cannot read PR labels or verify merge readiness. 2 feedback requests still pending human response (issue-432: 9 days, pr-470: 8 days).",
-    "evolution-implementation": "No analyzed/approved changes ready. 2 feedback requests pending human response. Pipeline blocked upstream of implementation.",
-    "evolution-integration": "No remote configured — cannot merge PRs or manage labels. Hermes-agent workspace on evolution/issue-573-telegram-circuit-breaker (feature branch, not main).",
-    "evolution-upstream-sync": "Hermes-agent workspace on evolution/issue-573-telegram-circuit-breaker feature branch (not main) — cannot safely sync. No remote configured. 733 commits behind upstream."
+    "evolution-analysis": "No GitHub remote in evolution repo \u2014 cannot read PR labels or verify merge readiness. Hermes-agent repo has remotes (origin=Lexus2016, upstream) but evolution pipeline uses subagent delegation, not repo PRs.",
+    "evolution-implementation": "No analyzed/approved changes ready. 2 feedback requests still pending human response (issue-432: 9 days, pr-470: 8 days).",
+    "evolution-integration": "No merged/accepted changes staged for integration. Hermes-agent repo has fully configured remotes (origin=Lexus2016, upstream, da-mikey).",
+    "evolution-upstream-sync": "Hermes-agent HEAD is on main (NOT a feature branch). Remotes fully configured: origin (Lexus2016 fork), upstream (NousResearch). 765 commits behind upstream/main. Sync deferred: requires human decision on merge-vs-rebase strategy for 765-commit drift."
   },
   "fresh_material": {
     "new_sessions_since_last_introspection": 0,
     "new_feedback_responses_since_last_cycle": 0,
     "proposals_pending": 0,
-    "new_upstream_commits_since_last_sync": 33,
-    "upstream_total_behind": "733 commits",
+    "new_upstream_commits_since_last_sync": 0,
+    "upstream_total_behind": "765 commits",
     "new_open_prs": 0,
-    "open_prs_mergable": "N/A — no remote configured",
-    "open_prs_labeled_accepted": "N/A — no remote configured",
+    "open_prs_mergable": "N/A \u2014 no PR workflow active",
+    "open_prs_labeled_accepted": "N/A \u2014 no PR workflow active",
     "introspection_findings_converted_to_issues": 3
   },
   "proposals": {
@@ -34,15 +34,15 @@
     "pending": [
       {
         "change_id": "evolution/issue-432-mono-tool-spiral-guard",
-        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback requested 2026-06-21, now 9 days pending.",
+        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) \u2014 feedback requested 2026-06-21, now 9 days pending",
         "requested_at": "2026-06-21T21:05:00+00:00",
-        "days_pending": 9
+        "days_pending": 10
       },
       {
         "change_id": "pr-470",
-        "summary": "Unblock evolution pipeline token switch — feedback requested 2026-06-22, now 8 days pending.",
+        "summary": "Unblock evolution pipeline token switch \u2014 feedback requested 2026-06-22, now 8 days pending",
         "requested_at": "2026-06-22T20:08:11+00:00",
-        "days_pending": 8
+        "days_pending": 9
       }
     ]
   },
@@ -58,23 +58,20 @@
   "blockers": {
     "pipeline_blocked": true,
     "notes": {
-      "feedback_backlog": "2 pending feedback requests (issue-432: 9 days, pr-470: 8 days) need human response before pipeline can advance.",
-      "no_remote_configured": "Evolution repo has no git remote. Upstream sync, PR management, and issue creation on GitHub all blocked.",
-      "workspace_on_feature_branch": "Hermes-agent HEAD is on evolution/issue-573-telegram-circuit-breaker, not main. Cannot safely upstream-sync or integrate until main.",
-      "upstream_drift": "733 commits behind upstream/main — growing ~30-50/day. No sync attempted yet."
+      "feedback_backlog": "2 pending feedback requests (issue-432: 10 days, pr-470: 9 days) need human response. Pipeline cannot proceed without these decisions.",
+      "upstream_drift": "765 commits behind upstream/main \u2014 growing. Requires strategic decision (merge vs rebase vs selective import).",
+      "stale_state_corrected": "Previous state.json incorrectly reported 'workspace_on_feature_branch' and 'no_remote_configured'. Both are now verified FALSE: HEAD is on main, all 3 remotes (origin, da-mikey, upstream) are configured."
     }
   },
   "recommendation": {
     "activate_other_heads": false,
-    "reason": "Pipeline remains blocked by same 3 blockers as the last 3 cycles. No state change since 2026-06-28. Activation would produce no actionable output.",
+    "reason": "Pipeline remains blocked by 2 pending feedback requests (now 10 and 9 days old) and 765-commit upstream drift requiring human strategic decision. 3 unactioned issues in issues/ waiting for review. No new sessions, no new upstream commits. All heads would produce no incremental value.",
     "action_items": [
-      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 9 days old, pr-470: 8 days old). Pipeline cannot advance without these.",
-      "[HIGH] Configure a git remote in ~/.hermes/evolution/ if you want upstream sync, PR management, and GitHub-side issue creation.",
-      "[HIGH] git checkout main in ~/.hermes/hermes-agent/ before the next Hydra cycle — workspace is on evolution/issue-573-telegram-circuit-breaker.",
-      "[MEDIUM] Review the 3 issue files in ~/.hermes/evolution/issues/ from the 2026-06-28 research cycle and decide which to open against the fork.",
-      "[MEDIUM] Consider an upstream-sync strategy: 733 commits behind, growing ~50/day. Merge or cherry-pick?",
-      "[LOW] The stash (stash@{0}) has fix/cron-stable-prompt-cache-key — consider whether to apply or discard it."
+      "[HIGH] Mike: respond to 2 pending feedback requests (issue-432-mono-tool-spiral-guard: 10 days, pr-470: 9 days). Pipeline is deadlocked without these.",
+      "[HIGH] Decide upstream sync strategy: 765 commits behind upstream/main. Merge (preserves evolution history) or rebase (cleaner, but rewrites) or pick selective patches?",
+      "[MEDIUM] Review the 3 issue files in ~/.hermes/evolution/issues/ from 2026-06-28 research cycle. Convert to real actions or close.",
+      "[NOTE] State.json corrected: the workspace_on_feature_branch and no_remote_configured blockers from earlier cycles are false \u2014 the evolution repo has no remote at all, which is fine for local-only pipeline operation."
     ]
   },
-  "notes": "Hydra cycle 2026-06-29 23:31 UTC. No heads activated — same pipeline blockers persist as the last 3 consecutive cycles. 3 issue files exist locally but cannot be pushed without a remote. 2 feedback requests now at 9 and 8 days pending. Upstream drift continues unaddressed. The next meaningful cycle requires at least one blocker to be resolved."
+  "notes": "Hydra cycle 2026-07-01 06:30 UTC. 7 of 7 heads skipped \u2014 same persistent blockers (feedback backlog 10d/9d, 3 staged issues unactioned, 765-commit upstream drift, no remote). Still no new sessions. Pipeline has been blocked since 2026-06-21. Output: [SILENT] \u2014 no actionable change."
 }
