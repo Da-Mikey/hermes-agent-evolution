@@ -199,7 +199,12 @@ terminal:
   #   real    - force your real OS-user HOME
   #   profile - force HERMES_HOME/home for strict per-profile CLI config isolation
   home_mode: "auto"
-  docker_mount_cwd_to_workspace: false  # SECURITY: off by default. Opt in to mount the launch cwd into Docker /workspace.
+  # classify_all_shell: opt-in pre-flight shell command classification.
+  # When true, EVERY terminal command runs through a classifier (heuristic +
+  # optionally LLM-based) before execution. Dangerous commands are blocked;
+  # risky commands are logged as warnings. Default: false.
+  classify_all_shell: false
+  docker_mount_cwd_to_workspace: false  # SECURITY: off by default. Opt in to mount the launch cwd i... [truncated]
   lifetime_seconds: 300
   # sudo_password: "hunter2"  # Optional: pipe a sudo password via sudo -S. SECURITY WARNING: plaintext.
   # sudo_password: ""         # Explicit empty password: try empty and never open the interactive sudo prompt.

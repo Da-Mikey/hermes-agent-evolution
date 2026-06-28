@@ -1207,6 +1207,13 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+    # classify_all_shell: opt-in pre-flight shell command classification
+    try:
+        agent._classify_all_shell = bool(
+            _agent_cfg.get("terminal", {}).get("classify_all_shell", False)
+        )
+    except Exception:
+        agent._classify_all_shell = False
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

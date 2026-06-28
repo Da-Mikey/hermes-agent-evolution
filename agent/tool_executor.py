@@ -37,6 +37,10 @@ from agent.tool_dispatch_helpers import (
     _append_subdir_hint_to_multimodal,
     make_tool_result_message,
 )
+from agent.shell_classifier import (
+    ShellRisk,
+    classify_command,
+)
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -462,6 +466,43 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         )
                 except Exception:
                     pass
+
+            # ── classify_all_shell gate (opt-in pre-flight check) ──
+            if (
+                block_result is None
+                and function_name == "terminal"
+                and getattr(agent, "_classify_all_shell", False)
+            ):
+                try:
+                    cmd = function_args.get("command", "")
+                    classification = classify_command(cmd)
+                    if classification.risk is ShellRisk.DANGEROUS:
+                        block_msg = (
+                            f"BLOCKED by shell classifier: "
+                            f"{classification.rationale}"
+                        )
+                        block_result = json.dumps(
+                            {"error": block_msg}, ensure_ascii=False
+                        )
+                        _emit_terminal_post_tool_call(
+                            agent,
+                            function_name=function_name,
+                            function_args=function_args,
+                            result=block_result,
+                            effective_task_id=effective_task_id,
+                            tool_call_id=getattr(tool_call, "id", "") or "",
+                            status="blocked",
+                            error_type="shell_classifier_block",
+                            error_message=block_msg,
+                            middleware_trace=list(middleware_trace),
+                        )
+                    elif classification.risk is ShellRisk.RISKY:
+                        logger.warning(
+                            "Risky shell command (classify_all_shell): %.120s — %s",
+                            cmd, classification.rationale,
+                        )
+                except Exception:
+                    pass  # never block tool execution on classifier errors
 
         parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail))
 
@@ -1036,6 +1077,34 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     )
             except Exception:
                 pass  # never block tool execution
+
+        # ── classify_all_shell gate (opt-in pre-flight check) ──
+        if (
+            _block_msg is None
+            and _guardrail_block_decision is None
+            and function_name == "terminal"
+            and getattr(agent, "_classify_all_shell", False)
+        ):
+            try:
+                cmd = function_args.get("command", "")
+                classification = classify_command(cmd)
+                if classification.risk is ShellRisk.DANGEROUS:
+                    _block_msg = (
+                        f"BLOCKED by shell classifier: "
+                        f"{classification.rationale}"
+                    )
+                    _execution_blocked = True
+                    logger.warning(
+                        "Dangerous shell command blocked (classify_all_shell): %.120s — %s",
+                        cmd, classification.rationale,
+                    )
+                elif classification.risk is ShellRisk.RISKY:
+                    logger.warning(
+                        "Risky shell command (classify_all_shell): %.120s — %s",
+                        cmd, classification.rationale,
+                    )
+            except Exception:
+                pass  # never block tool execution on classifier errors
 
         tool_start_time = time.time()
 
