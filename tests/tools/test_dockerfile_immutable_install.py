@@ -78,6 +78,7 @@ def test_dockerfile_bakes_code_scoped_install_method_stamp() -> None:
     assert shim_block, "install-method stamp must be in the shim-wiring RUN block"
 
 
+
 def test_dockerfile_redirects_lazy_installs_to_durable_target() -> None:
     """Immutable image seals the venv but redirects lazy installs to the
     writable data volume, so opt-in backends still install at first use
