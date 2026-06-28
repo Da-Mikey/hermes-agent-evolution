@@ -26,19 +26,20 @@ Implement selected issues, create versions, and self-update.
     with `"skipped": "stale analysis input (<date>) — upstream stage failed"`
     and STOP. Acting on outdated decisions is worse than skipping a cycle.
 
-1c. **Decomposition gate — block monolithic picks (#579).** For EACH selected
-    issue with `effort_score >= 0.4`, verify that child issues exist before
-    implementation — a large monolithic issue has no chance of landing in one
-    cycle. Run the deterministic gate:
+1c. **Mandatory decomposition gate — NEVER select an issue for implementation
+    if it is flagged `needs-split` and has no decomposed child issues.** After
+    loading the selection and before branching, hydrate each selected issue's
+    labels and comments. If an issue carries the `needs-split` label, query
+    GitHub for child issues (open or closed) that reference this issue by number
+    in their title or body, or carry a parent-link label. If none exist, SKIP it,
+    keep the issue OPEN with the `needs-split` label, and log the reason. This
+    makes the analysis stage's decomposition rule blocking rather than advisory.
 
     ```bash
-    python scripts/evolution_decomposition_gate.py check <N> --effort <score>
+    # Example child-issue check (heuristic: title/body references #N or a parent label)
+    gh issue list --repo Lexus2016/hermes-agent-evolution --state all \
+      --search "#<N>" --json number,title,labels
     ```
-
-    Exit 0 = PASS (effort < 0.4 OR children found).  Exit 1 = BLOCKED — log
-    `"blocked: needs decomposition"`, add the `needs-split` label to the parent,
-    and SKIP the issue (do NOT close it — it is wanted, just too large).
-    Continue with the remaining selections.
 
 1a0. **`next-increment` issues — CONTINUE a multi-phase roadmap feature.** If a
     selected issue is labelled `next-increment`, a PRIOR increment already MERGED
