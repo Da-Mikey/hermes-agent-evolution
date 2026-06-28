@@ -1,23 +1,23 @@
 {
-  "last_cycle": "2026-06-28",
-  "cycle_timestamp": "2026-06-28T05:30:00+00:00",
+  "last_cycle": "2026-06-29",
+  "cycle_timestamp": "2026-06-29T10:15:00+00:00",
   "hydra_version": "2",
   "heads_activated": [],
   "heads_skipped": {
-    "evolution-research": "Last ran 2026-06-26. Not yet at 4-day threshold. Pipeline blocked anyway — no point generating research that can't be actioned.",
+    "evolution-research": "Last ran 2026-06-26. Not yet at 4-day threshold. Pipeline blocked anyway \u2014 2 feedback requests pending (~12d/~11d), PR #597 unlabeled, upstream drift 695+ unresolved.",
     "evolution-issues": "No new research or introspection material since last cycle.",
-    "evolution-introspection": "Last ran 2026-06-28 at 02:33 (commit 8d1e713). Newest session dump (03:01) is a cron session — already accounted for. No new conversation sessions to analyze.",
-    "evolution-analysis": "PR #597 still unlabeled. No GitHub PR label workflow. No change in issue files.",
-    "evolution-implementation": "Blocked on 2 pending feedback requests (~11d and ~10d). Implementation files (windows-remote SKILL.md, android-adb SKILL_PATCH.md) awaiting human approval before commit.",
-    "evolution-integration": "No merge candidates — PR #597 lacks labels, no accepted label on any PR.",
-    "evolution-upstream-sync": "695+ commits behind upstream/main. Structural drift unchanged since last report. Last sync attempted June 27; needs human strategy decision (rebase/reset/merge)."
+    "evolution-introspection": "Last ran 2026-06-28T02:33 (commit 8d1e713). No new session dumps since.",
+    "evolution-analysis": "PR #597 still unlabeled (no GitHub PR label workflow). Issue landscape unchanged.",
+    "evolution-implementation": "Blocked on 2 pending feedback requests (~12d/~11d). Implementation pipeline stalled.",
+    "evolution-integration": "All 3 merge candidates (PR #10/#11/#12) blocked by check-attribution infra issue. 2 additional PRs (#7/#8) with merge conflicts. Same blockers as last cycle.",
+    "evolution-upstream-sync": "695+ commits behind upstream/main. Structural drift unchanged \u2014 strategy needs human decision (rebase/reset/merge)."
   },
   "fresh_material": {
-    "new_sessions_since_last_introspection": "0 — newest dump (03:01) is a cron session, present before last state write.",
-    "new_issues_since_last_cycle": "0 — existing issue files unchanged.",
-    "upstream_sync_status": "695 commits behind upstream/main. Unchanged since last report.",
+    "new_sessions_since_last_introspection": "0 \u2014 newest dump unchanged since last cycle.",
+    "new_issues_since_last_cycle": "0",
+    "upstream_sync_status": "695 commits behind upstream/main. Unchanged.",
     "origin_ahead": "3 commits ahead of origin/main (same 3 as last cycle).",
-    "da_mikey_ahead": "2 commits ahead of da-mikey/main (cleanup fixes from recent cycles)."
+    "da_mikey_ahead": "2 commits ahead of da-mikey/main."
   },
   "proposals": {
     "total": 7,
@@ -30,13 +30,13 @@
     "pending": [
       {
         "change_id": "evolution/issue-432-mono-tool-spiral-guard",
-        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) — feedback pending.",
+        "summary": "Mono-tool spiral detection with escalated interrupt (PR #436 merged) \u2014 feedback pending.",
         "requested_at": "2026-06-21T21:05:00+00:00",
         "days_pending": 11
       },
       {
         "change_id": "pr-470",
-        "summary": "Unblock evolution pipeline token switch — feedback pending.",
+        "summary": "Unblock evolution pipeline token switch \u2014 feedback pending.",
         "requested_at": "2026-06-22T20:08:11+00:00",
         "days_pending": 10
       }
@@ -62,25 +62,27 @@
   "blockers": {
     "pipeline_blocked": true,
     "notes": {
-      "feedback_backlog": "2 pending feedback requests, now ~11d and ~10d. Mono-tool spiral guard approaching 2 weeks.",
-      "no_pr_workflow": "No GitHub PR label workflow — analysis/integration gates blocked.",
-      "upstream_drift_structural": "695 behind upstream — no shared git history. Strategy needs human decision.",
-      "pr_597_unlabeled": "Open PR #597 has no labels — cannot proceed to integration review.",
-      "impl_from_last_cycle_uncommitted": "windows-remote-skill SKILL.md and android-adb SKILL_PATCH.md exist in implementations/ but not committed or applied — awaiting feedback.",
-      "pending_feedback_aging": "~11/10 days. Mono-tool spiral guard approaching 2-week mark."
+      "feedback_backlog": "2 pending feedback requests, now ~12d and ~11d. Both approaching 2-week mark.",
+      "no_pr_workflow": "No GitHub PR label workflow \u2014 analysis/integration gates blocked.",
+      "upstream_drift_structural": "695 behind upstream \u2014 strategy needs human decision.",
+      "pr_597_unlabeled": "Open PR #597 has no labels \u2014 cannot proceed to integration review.",
+      "impl_from_last_cycle_uncommitted": "windows-remote-skill SKILL.md and android-adb SKILL_PATCH.md exist in implementations/ but not committed or applied \u2014 awaiting feedback.",
+      "pending_feedback_aging": "~11/10 days. Mono-tool spiral guard approaching 2-week mark.",
+      "check_attribution_infra": "Evolution bot emails not whitelisted in contributor-check workflow. Blocks 3 PRs from merging."
     }
   },
   "recommendation": {
     "activate_other_heads": false,
-    "reason": "Silent cycle — zero fresh material. All 7 heads human-gated (feedback backlog, PR workflow, upstream strategy). Pipeline cannot make progress until Mike responds to 2 feedback requests and makes 3 decisions.",
+    "reason": "Silent cycle \u2014 zero fresh material, same structural blockers as multiple prior cycles. All 7 heads gated on human action (feedback responses, PR labeling, upstream strategy decision, check-attribution fix).",
     "action_items": [
-      "[HIGH] Respond to 2 pending feedback requests (now ~11d/10d) — mono-tool spiral guard and pipeline token switch.",
+      "[HIGH] Respond to 2 pending feedback requests (~12d/~11d) \u2014 PR #436 (mono-tool spiral guard) and pipeline token switch.",
       "[HIGH] Decide upstream sync strategy: rebase, reset, or merge? 695 behind upstream, growing.",
       "[MEDIUM] Label PR #597 accepted/rejected to unblock integration.",
-      "[MEDIUM] Configure a GitHub PR label workflow for automated gates.",
-      "[LOW] Commit and push last cycle's introspection implementations if feedback is granted.",
-      "[NOTABLE] Research last ran June 26 — approaching 3-day mark. Pipeline could use a fresh research cycle once unblocked."
+      "[MEDIUM] Configure GitHub PR label workflow for automated gates.",
+      "[MEDIUM] Fix check-attribution workflow: whitelist evolution@ emails to unblock PR #10/#11/#12.",
+      "[LOW] Commit and push previous cycles' implementation artifacts if feedback is granted.",
+      "[NOTABLE] Research last ran June 26 \u2014 approaching 4-day mark. Pipeline could use research even if gated."
     ]
   },
-  "notes": "Hydra cycle 2026-06-28T05:30:00+00:00. 0 of 7 heads activated — 11th+ consecutive silent cycle. Pipeline remains fully human-blocked. Recording state and moving on."
+  "notes": "Hydra cycle 2026-06-29T10:15:00+00:00. 0 of 7 heads activated \u2014 12th+ consecutive silent cycle. All structural blockers unchanged since last report."
 }
