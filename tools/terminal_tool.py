@@ -1824,9 +1824,22 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
         },
     }
 
+    # Command-specific semantics first (wins over general mapping).
     cmd_semantics = semantics.get(base_cmd)
     if cmd_semantics and exit_code in cmd_semantics:
         return cmd_semantics[exit_code]
+
+    # General well-known exit codes that apply regardless of the command.
+    # These provide immediate, actionable meaning so the agent doesn't
+    # waste turns investigating command-not-found or permission errors.
+    _WELL_KNOWN_EXIT_CODES: dict[int, str] = {
+        126: "Command invoked but could not execute (permission/format issue)",
+        127: "Command not found — the executable does not exist on this system",
+        128: "Invalid argument to exit / command not executable — the shell could not run the command",
+    }
+    mapped = _WELL_KNOWN_EXIT_CODES.get(exit_code)
+    if mapped:
+        return mapped
 
     return None
 
