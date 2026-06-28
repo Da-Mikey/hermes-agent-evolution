@@ -3,16 +3,17 @@
   "merged": [],
   "skipped": [
     {
-      "pr": "11",
-      "reason": "Code review failed: missing env_float in utils.py (crashes all tests with ImportError) + missing reasoning_timeouts module (ModuleNotFoundError at runtime). Sent back for rework after one re-run confirmed failures are real bugs, not flakes."
+      "pr": "14",
+      "reason": "Structural fork-divergence: branch based on Lexus2016 fork history (1850 files diff, 197K insertions apart from da-mikey/main). Zero CI checks (never triggered due to add/add conflicts on every file). PR closed, issue #13 flipped to needs-work with rework brief."
     },
     {
       "pr": "8",
-      "reason": "Merge conflict (CONFLICTING/DIRTY) — branch evolution/issue-573-telegram-circuit-breaker-lexus cannot merge cleanly"
+      "reason": "Same structural fork-divergence as PR #14. Branch based on Lexus2016 fork history, conflicts on every single file via add/add conflicts. Referenced issue #573 does not exist in da-mikey repo. PR closed with rework comment."
     },
     {
       "pr": "7",
-      "reason": "Merge conflict (CONFLICTING/DIRTY) — branch evolution/issue-572-fallback-failure-tracking-lexus cannot merge cleanly"
+      "reason": "Same structural fork-divergence as PR #14. Branch based on Lexus2016 fork history. Referenced issue #572 does not exist in da-mikey repo. PR closed with rework comment."
     }
-  ]
+  ],
+  "note": "All three PRs were based on the Lexus2016 fork's history (commit 46380f418) which diverges completely from da-mikey/main (c113050b5). Fork fork relationship: upstream/nousresearch -> Lexus2016/evolution -> Da-Mikey/evolution. Branches were created before the Da-Mikey fork inception point. Resolution: close PRs, post rework briefs, reimplement from da-mikey/main."
 }
