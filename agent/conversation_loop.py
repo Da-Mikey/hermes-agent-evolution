@@ -5010,7 +5010,7 @@ def _run_conversation_impl(
                     if (
                         _prior_was_tool
                         and not getattr(agent, "_post_tool_empty_retried", False)
-                        and not _has_inline_thinking  # thinking model still working — let prefill handle
+                        and not _has_inline_thinking  # thinking model still working — let prefill handle it
                     ):
                         agent._post_tool_empty_retried = True
                         # Clear stale narration so it doesn't resurface
@@ -5025,15 +5025,17 @@ def _run_conversation_impl(
                             "⚠️ Model returned empty after tool calls — "
                             "nudging to continue"
                         )
-                        # Append the empty assistant message first so the
-                        # message sequence stays valid:
-                        #   tool(result) → assistant("(empty)") → user(nudge)
-                        # Without this, we'd have tool → user which most
-                        # APIs reject as an invalid sequence.
+                        # Inject a placeholder assistant message with a note
+                        # describing what happened, so the user sees a
+                        # non-empty turn and the model's next turn has valid
+                        # role alternation.  Use "Running the requested
+                        # actions…" as the placeholder — this is clearer than
+                        # "(empty)" and gives the model a plausible narrative
+                        # to continue from on the next API call.
                         _nudge_msg = agent._build_assistant_message(
                             assistant_message, finish_reason
                         )
-                        _nudge_msg["content"] = "(empty)"
+                        _nudge_msg["content"] = "Running the requested actions…"
                         _nudge_msg["_empty_recovery_synthetic"] = True
                         messages.append(_nudge_msg)
                         messages.append({
