@@ -1,0 +1,18 @@
+{
+  "date": "2026-06-28",
+  "merged": [],
+  "skipped": [
+    {
+      "pr": "11",
+      "reason": "Code review failed: missing env_float in utils.py (crashes all tests with ImportError) + missing reasoning_timeouts module (ModuleNotFoundError at runtime). Sent back for rework after one re-run confirmed failures are real bugs, not flakes."
+    },
+    {
+      "pr": "8",
+      "reason": "Merge conflict (CONFLICTING/DIRTY) — branch evolution/issue-573-telegram-circuit-breaker-lexus cannot merge cleanly"
+    },
+    {
+      "pr": "7",
+      "reason": "Merge conflict (CONFLICTING/DIRTY) — branch evolution/issue-572-fallback-failure-tracking-lexus cannot merge cleanly"
+    }
+  ]
+}
