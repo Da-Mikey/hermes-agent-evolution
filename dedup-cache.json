@@ -1,0 +1,26 @@
+{
+  "7402dacc7bdf80e3": {
+    "date": "2026-07-15",
+    "issue": null,
+    "status": "considered",
+    "title": "Claude Code v2.1.193 \u2014 Shell Classification + Memory Pressure Reaping"
+  },
+  "a66036aaed27e642": {
+    "date": "2026-07-15",
+    "issue": "22",
+    "status": "filed",
+    "title": "[FEATURE] MCP Python SDK v2 Migration \u2014 Tracking and Planning"
+  },
+  "f59fabde701756ab": {
+    "date": "2026-07-15",
+    "issue": null,
+    "status": "considered",
+    "title": "Hermes Agent Upstream PR Review: #53240 (delegation base_url) and #53237 (Anthropic headers)"
+  },
+  "fee6948d8b6c73d8": {
+    "date": "2026-07-15",
+    "issue": "23",
+    "status": "filed",
+    "title": "[IMPROVEMENT] Add Platform Capability Awareness to System Prompt"
+  }
+}
