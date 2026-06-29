@@ -1,26 +1,10 @@
 {
-  "synced_through_commit": "298bb93d397faffc64aa5cfd58cbd707561d292a",
-  "synced_through_tag": "v2026.6.5",
-  "synced_through_date": "2026-06-05",
+  "synced_through_commit": "5d19803d4219c3fa9b11ad15ed3818d0c63accec",
+  "synced_through_tag": "v0.18.1",
+  "synced_through_date": "2026-06-25",
   "our_version": "0.16.0",
   "synced_at": "2026-06-29",
   "deferred": [
-    {"sha": "bb5cb3283898fdfb7f6c98f13598aedb10fbb2d9", "summary": "refactor(honcho): canonicalize identity-mapping on pinUserPeer, migrate legacy key", "reason": "conflict"},
-    {"sha": "d7dfeed6dc4218f51176dcd31ca2f4b926d5e89a", "summary": "feat(honcho-setup): replace deployment-shape prompt with gateway-gated identity tree", "reason": "conflict"},
-    {"sha": "99feb036077a2d6dc99e12d1902d05d28e13eb0a", "summary": "docs(honcho): demote pinPeerName to deprecated alias; document gateway identity tree", "reason": "conflict"},
-    {"sha": "23a7458acfbea42e6c8ddf88bdba5c06152fe42c", "summary": "docs(website): cover gateway identity mapping in Honcho feature page", "reason": "conflict"},
-    {"sha": "2708c33c7570d5d3d53c19c80124b06d0d939c08", "summary": "docs(honcho): anonymize example peer name to alice", "reason": "conflict"},
-    {"sha": "85e6232a0716fd6df5f061d0e1eae55ff40d1e2c", "summary": "fix(providers): support anthropic proxy v1 endpoints", "reason": "conflict"},
-    {"sha": "d842155da1e878035d1c2e306b1278d2c7374e91", "summary": "Keep resumed profile cwd scoped to profile DB", "reason": "conflict"},
-    {"sha": "9f33d673e9e631661f0f913d6967fbe27e142900", "summary": "fix(tui): persist resumed profile cwd updates to profile db", "reason": "conflict"},
-    {"sha": "7b9dc7cd0a489230a70f5876492b47e43686bca1", "summary": "test(gateway): align web profile wrapper expectation", "reason": "conflict"},
-    {"sha": "5e851bc6bc5161960548d7ee72899a199a971ad7", "summary": "fix(discord): cap slash commands at Discord's 100-command limit", "reason": "conflict"},
-    {"sha": "a4ee1f223d5f3c0cae13a98c7214daefc2836145", "summary": "fix(install): make `npm install -g` packages reachable on PATH", "reason": "conflict"},
-    {"sha": "98205da008601525a658a106edb3c26199beb2b7", "summary": "test(install): cover bundled-Node npm global prefix redirect", "reason": "conflict"},
-    {"sha": "1db8f7ea8094d35ee9afdf81c6bd3b41d2fced1b", "summary": "fix(install): repair existing managed-Node global prefix on re-run", "reason": "conflict"},
-    {"sha": "5f6be7f31bd7ef53f92d030b060325783f84f169", "summary": "fix(teams): package Microsoft Teams SDK as an installable extra (salvage #43945) (#46764)", "reason": "conflict"},
-    {"sha": "f3b32e9f52204ad654d4c43b364a8bfa4a32b520", "summary": "fix(desktop): restore Electron binary before macOS pack rename (salvage #38673)", "reason": "conflict"},
-    {"sha": "c23a2eec15617c209e0ad28d3b78f41afa74dcd1", "summary": "chore: map salvaged contributor email for attribution (#38673)", "reason": "conflict"},
-    {"sha": "c33e0457d7e012866d635583641fc91b67342af2", "summary": "Merge pull request #46836 from NousResearch/bb/salvage-macos-electron-pack", "reason": "conflict"}
+    {"reason": "upstream-force-pushed-new-history", "sha": "FORCE-PUSH-RESET", "summary": "upstream force-pushed beyond v2026.6.5; full history replaced. All deferred commits lost."}
   ]
 }
