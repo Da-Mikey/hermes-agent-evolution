@@ -2,24 +2,7 @@
   "date": "2026-06-29",
   "merged": [],
   "skipped": [
-    {
-      "pr": "20",
-      "issue": "16",
-      "title": "feat: improve empty-response placeholder text from '(empty)' to 'Running the requested actions…' (Closes #16)",
-      "reason": "CONFLICTING merge conflict — auto-update-branch returned 422 (merge conflict between base and head). gh v2.45.0 lacks --admin update-branch. Manual conflict resolution needed."
-    },
-    {
-      "pr": "19",
-      "issue": "18",
-      "title": "feat: add well-known exit code mapping (126, 127, 128) to terminal tool (Closes #18)",
-      "reason": "CONFLICTING merge conflict — auto-update-branch returned 422 (merge conflict between base and head). gh v2.45.0 lacks --admin update-branch. Manual conflict resolution needed."
-    },
-    {
-      "pr": "21",
-      "issue": null,
-      "title": "[UPSTREAM] Sync: 25 commits (bb5cb328..c33e0457)",
-      "reason": "Non-agent branch (sync/upstream-*). Merging upstream syncs is outside the evolution scope."
-    }
+    {"pr": "21", "reason": "Non-evolution/issue-* branch (sync/upstream-2026-06-29) — excluded per safety gate"}
   ],
-  "summary": "Zero merges this cycle. Both agent evolution/issue-* PRs (#19, #20) are blocked by merge conflicts that cannot be auto-updated (gh v2.45.0 doesn't support update-branch, and the API endpoints both return 422 merge-conflict). The upstream sync PR #21 is a non-evolution branch and was skipped by policy."
+  "note": "No evolution/issue-* PRs open. Two already merged earlier today (PRs 19, 20). No action needed."
 }
