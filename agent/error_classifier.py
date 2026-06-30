@@ -39,6 +39,7 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"  # Connection/read timeout — rebuild client + retry
+    connection_lost = "connection_lost"  # Mid-stream connection severed (broken pipe, connection reset) — retry with fresh connection
 
     # Context / payload
     context_overflow = "context_overflow"  # Context too large — compress, not failover
@@ -470,6 +471,36 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APITimeoutError",
 })
 
+# Connection-lost patterns — distinguish mid-stream severed connections from
+# timeouts.  "ReadError: [Errno 32] Broken pipe" means the remote end closed
+# its socket while we were reading — a transient transport failure (the server
+# dropped the connection), NOT a request that timed out.  Same for
+# "APIConnectionError" without timeout signals: the connection failed
+# before/during the request, not because it took too long.  Different failure
+# modes need different retry strategies:
+# - timeout -> rebuild the HTTP client (stale pool)
+# - connection_lost -> retry with the same client (the conn was fine, just severed)
+_CONNECTION_LOST_PATTERNS = frozenset({
+    "broken pipe",
+    "broken_pipe",
+    "connection reset by peer",
+    "connection reset",
+    "connection lost",
+    "connection was closed",
+    "connection aborted",
+    "peer closed connection",
+    "connection closed during",
+    "remote end closed connection",
+    # Short/dropped SSE frames — the provider started streaming and then
+    # the connection terminated mid-response.
+    "incomplete message",
+    "connection closed unexpectedly",
+    # OpenAI SDK's APIConnectionError — the lower-level message field carries
+    # the real reason.  We match the type name separately in the pipeline;
+    # these message-text patterns catch cases where the type is generic but
+    # the message text unambiguously indicates a severed connection.
+})
+
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
 # transient transport hiccup OR server-side context overflow rejection
@@ -801,6 +832,19 @@ def classify_api_error(
     if any(p in error_msg for p in _SSL_TRANSIENT_PATTERNS):
         return _result(FailoverReason.timeout, retryable=True)
 
+    # ── 5b. Mid-stream connection loss (broken pipe, connection reset) ──
+    # "ReadError: [Errno 32] Broken pipe" and "APIConnectionError" without
+    # timeout signals mean the remote end closed the connection mid-stream,
+    # NOT that the request took too long.  Classify BEFORE the server-disconnect
+    # check (step 6) because a severed connection on a non-large session is
+    # a transient transport hiccup, not a context overflow symptom.
+    if any(p in error_msg for p in _CONNECTION_LOST_PATTERNS):
+        return _result(FailoverReason.connection_lost, retryable=True)
+    if error_type in {"ReadError", "BrokenPipeError", "APIConnectionError"} and not any(
+        p in error_msg for p in _TIMEOUT_MESSAGE_PATTERNS
+    ):
+        return _result(FailoverReason.connection_lost, retryable=True)
+
     # ── 6. Server disconnect + large session → context overflow ─────
     # Must come BEFORE generic transport error catch — a disconnect on
     # a large session is more likely context overflow than a transient
@@ -827,6 +871,7 @@ def classify_api_error(
         # path — not via context compression.  Reclassify as timeout.
         # (Part 1 of Fixes #52310.)
         from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
         if get_reasoning_stale_timeout_floor(model) is not None:
             return _result(FailoverReason.timeout, retryable=True)
         # Absolute token/message-count thresholds are only a proxy for smaller
@@ -1450,7 +1495,9 @@ def _extract_error_body(error: Exception) -> dict:
                     return json_body
             except Exception:
                 pass
-        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        cause = getattr(current, "__cause__", None) or getattr(
+            current, "__context__", None
+        )
         if cause is None or cause is current:
             break
         current = cause

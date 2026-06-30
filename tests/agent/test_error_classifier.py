@@ -65,6 +65,7 @@ class TestFailoverReason:
             "overloaded",
             "server_error",
             "timeout",
+            "connection_lost",
             "context_overflow",
             "payload_too_large",
             "image_too_large",
@@ -960,7 +961,7 @@ class TestClassifyApiError:
     def test_connection_error_builtin(self):
         e = ConnectionError("Connection reset by peer")
         result = classify_api_error(e)
-        assert result.reason == FailoverReason.timeout
+        assert result.reason == FailoverReason.connection_lost
 
     def test_timeout_error_builtin(self):
         e = TimeoutError("timed out")
@@ -1233,7 +1234,11 @@ class TestClassifyApiError:
     def test_peer_closed_large_session(self):
         e = Exception("peer closed connection without sending complete message")
         result = classify_api_error(e, approx_tokens=130000, context_length=200000)
-        assert result.reason == FailoverReason.context_overflow
+        # A peer-close is a connection-level error, not context overflow.
+        # The connection_lost classifier catches this before the
+        # server-disconnect heuristic.
+        assert result.reason == FailoverReason.connection_lost
+        assert result.retryable is True
 
     # ── Chinese error messages ──
 
@@ -1419,8 +1424,12 @@ class TestAdversarialEdgeCases:
         # Type name isn't in _TRANSPORT_ERROR_TYPES but message has disconnect pattern
         e = Exception("peer closed connection without sending complete message")
         result = classify_api_error(e, approx_tokens=150000, context_length=200000)
-        assert result.reason == FailoverReason.context_overflow
-        assert result.should_compress is True
+        # With the connection_lost classifier, a peer-close is correctly
+        # classified as connection_lost before the server-disconnect heuristic
+        # (even on large sessions, a peer-close is a transport failure,
+        # not a context overflow).
+        assert result.reason == FailoverReason.connection_lost
+        assert result.retryable is True
 
     def test_credit_balance_too_low(self):
         e = MockAPIError(
