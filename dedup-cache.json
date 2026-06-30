@@ -1,15 +1,33 @@
 {
+  "585043aa0e7d2b08": {
+    "date": "2026-06-30",
+    "issue": null,
+    "status": "considered",
+    "title": "CrewAI Symlink Path Traversal \u2014 audit Hermes skill loading for similar vulnerability pattern"
+  },
   "7402dacc7bdf80e3": {
     "date": "2026-07-15",
     "issue": null,
     "status": "considered",
     "title": "Claude Code v2.1.193 \u2014 Shell Classification + Memory Pressure Reaping"
   },
+  "9d3b306e23799bbe": {
+    "date": "2026-06-30",
+    "issue": null,
+    "status": "considered",
+    "title": "Memory Pressure Reaping for agent cron sessions"
+  },
   "a66036aaed27e642": {
     "date": "2026-07-15",
     "issue": "22",
     "status": "filed",
     "title": "[FEATURE] MCP Python SDK v2 Migration \u2014 Tracking and Planning"
+  },
+  "e7e36e2a7110e048": {
+    "date": "2026-06-30",
+    "issue": null,
+    "status": "considered",
+    "title": "Backport Hermes Agent upstream bugfixes for cronjob schedule alias and Anthropic headers"
   },
   "f59fabde701756ab": {
     "date": "2026-07-15",
