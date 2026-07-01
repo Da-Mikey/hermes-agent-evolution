@@ -1,9 +1,25 @@
 {
-  "synced_through_commit": "298bb93d397faffc64aa5cfd58cbd707561d292a",
+  "synced_through_commit": "d986bb0c6de6bcffda4981e83652284d481a90f4",
   "synced_through_tag": "v2026.6.5",
   "synced_through_date": "2026-06-05",
   "our_version": "0.16.0",
-  "synced_at": "2026-06-13",
-  "deferred": [],
-  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it — so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review."
+  "synced_at": "2026-07-01",
+  "deferred": [
+    {"sha": "984e6cb5b8bbfc7f0b1c18a3ec3c599ad98614cb", "summary": "feat(whatsapp): add WhatsApp Business Cloud API adapter", "reason": "conflict"},
+    {"sha": "e80754647c90c0320ddd89e36c4b8ac1e738b87b", "summary": "style(desktop): render in-thread tool codicons as filled glyphs", "reason": "conflict"},
+    {"sha": "984e69ff623b84249d126118d6a5298750c7103b", "summary": "Auto-restart gateway after Telegram QR onboarding", "reason": "conflict"},
+    {"sha": "fa32af886fa89acec2584ea6ad2b9ca173b82e4b", "summary": "fix: dedupe concurrent gateway restarts + surface restart outcome", "reason": "conflict"},
+    {"sha": "c1308ebf3f0f5b6a13363836420b6d078d04da61", "summary": "style(desktop): filled SVG glyphs for in-thread tool icons", "reason": "conflict"},
+    {"sha": "38273676eab0185d068143c3deaa5a259d857f8b", "summary": "fix(desktop): carve sticky user bubbles out of titlebar drag region", "reason": "conflict"},
+    {"sha": "cd9a9cd8e5e12daed968360f70d28e749c6c1fa0", "summary": "fix(gateway): Slack approval UX in threads", "reason": "conflict"},
+    {"sha": "a5c32cdf30f28eb02ff085d444965610e44a3365", "summary": "fix(update): self-heal venv left half-built by interrupted install", "reason": "conflict"},
+    {"sha": "70d5d7e39b566090944688623f5bbea89e21b967", "summary": "fix(memory,skills): repair write-approval inline prompt", "reason": "conflict"},
+    {"sha": "5718811de0960a4aa46f528b1c6a14f31ed60012", "summary": "feat(tts): add Gemini persona prompt file", "reason": "conflict"},
+    {"sha": "189ffe7362c8a1381acb7c9e77d1970aa2566a43", "summary": "test: port voice-reply suffix assertions", "reason": "conflict"},
+    {"sha": "4c797d0e23c12ffdfd9d34ce032e5e335094b2e9", "summary": "fix(desktop): hide Windows console children", "reason": "conflict"},
+    {"sha": "a72bb03757c0c925c686f9774eefc8dc5a77b329", "summary": "fix(docker): optimize image size", "reason": "conflict"},
+    {"sha": "3bfbb3f2a0255acfd2cf8e18d702c0b291808047", "summary": "change(tooling): typecheck in CI, update ts to 6", "reason": "conflict"},
+    {"sha": "90f4b3040dccc36963930ec9796ed1743c7742a8", "summary": "change(tooling): remove react-compiler eslint", "reason": "conflict"},
+    {"sha": "d986bb0c6de6bcffda4981e83652284d481a90f4", "summary": "feat(dashboard): full-featured profile builder", "reason": "conflict"}
+  ]
 }
