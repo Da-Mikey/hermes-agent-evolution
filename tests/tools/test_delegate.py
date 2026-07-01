@@ -143,6 +143,41 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_denied_toolsets_default_omits_limitation_note(self):
+        prompt = _build_child_system_prompt("Research the topic")
+        self.assertNotIn("TOOLSET LIMITATION", prompt)
+
+    def test_denied_toolsets_empty_list_omits_limitation_note(self):
+        prompt = _build_child_system_prompt("Research the topic", denied_toolsets=[])
+        self.assertNotIn("TOOLSET LIMITATION", prompt)
+
+    def test_denied_toolsets_present_adds_limitation_note(self):
+        """#648: toolsets requested but dropped because the PARENT session
+        doesn't have them must be surfaced to the subagent up front, instead
+        of it discovering the gap by trying and failing."""
+        prompt = _build_child_system_prompt("Research the topic", denied_toolsets=["web"])
+        self.assertIn("TOOLSET LIMITATION", prompt)
+        self.assertIn("web", prompt)
+        self.assertIn("PARENT session doesn't have it enabled", prompt)
+
+    def test_denied_toolsets_singular_grammar(self):
+        prompt = _build_child_system_prompt("Research the topic", denied_toolsets=["web"])
+        self.assertIn("toolset was requested", prompt)
+        self.assertNotIn("toolsets were requested", prompt)
+
+    def test_denied_toolsets_plural_grammar(self):
+        prompt = _build_child_system_prompt(
+            "Research and build", denied_toolsets=["web", "browser"]
+        )
+        self.assertIn("toolsets were requested", prompt)
+
+    def test_denied_toolsets_lists_all_missing_names(self):
+        prompt = _build_child_system_prompt(
+            "Research and build", denied_toolsets=["web", "browser"]
+        )
+        self.assertIn("web", prompt)
+        self.assertIn("browser", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
@@ -2932,3 +2967,112 @@ class TestShallowDelegationDetector(unittest.TestCase):
         entry = self._run_child(messages=messages)["results"][0]
         self.assertNotIn("shallow_result", entry)
         self.assertNotIn("SHALLOW DELEGATION", entry["summary"])
+
+
+class TestDeniedToolsetsSurfacedToChild(unittest.TestCase):
+    """#648: requesting toolsets the parent doesn't have silently dropped
+    them from the child, with no visibility into why — the subagent
+    discovered the gap only by trying and failing, wasting a full
+    delegation cycle. _build_child_agent must now surface exactly which
+    requested toolsets were denied, in the child's own system prompt."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_denied_toolsets_appear_in_child_system_prompt(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+
+        _build_child_agent(
+            task_index=0, goal="research the topic", context=None,
+            toolsets=["terminal", "web"], model=None, max_iterations=50,
+            parent_agent=parent, task_count=1,
+        )
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs["ephemeral_system_prompt"]
+        self.assertIn("TOOLSET LIMITATION", prompt)
+        self.assertIn("web", prompt)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_no_note_when_all_requested_toolsets_available(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file", "web"]
+
+        _build_child_agent(
+            task_index=0, goal="research the topic", context=None,
+            toolsets=["terminal", "web"], model=None, max_iterations=50,
+            parent_agent=parent, task_count=1,
+        )
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs["ephemeral_system_prompt"]
+        self.assertNotIn("TOOLSET LIMITATION", prompt)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_no_note_when_toolsets_not_requested(self, MockAgent, mock_cfg):
+        """Omitting toolsets inherits the parent's set entirely — nothing
+        was denied, so no limitation note is expected."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+
+        _build_child_agent(
+            task_index=0, goal="research the topic", context=None,
+            toolsets=None, model=None, max_iterations=50,
+            parent_agent=parent, task_count=1,
+        )
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs["ephemeral_system_prompt"]
+        self.assertNotIn("TOOLSET LIMITATION", prompt)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_duplicate_requested_toolsets_deduplicated_in_note(self, MockAgent, mock_cfg):
+        """A duplicated request (e.g. ["web", "web"]) must not render as
+        'web, web' in the note."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal"]
+
+        _build_child_agent(
+            task_index=0, goal="research the topic", context=None,
+            toolsets=["web", "web"], model=None, max_iterations=50,
+            parent_agent=parent, task_count=1,
+        )
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs["ephemeral_system_prompt"]
+        self.assertIn("TOOLSET LIMITATION", prompt)
+        self.assertNotIn("web, web", prompt)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_denied_toolsets_reflects_final_list_not_intermediate_state(
+        self, MockAgent, mock_cfg
+    ):
+        """#648 review fix: denied_toolsets must be computed against the
+        FINAL child_toolsets (after blocked-tool stripping), not an
+        intermediate state — otherwise a toolset dropped by
+        _strip_blocked_tools (not by the parent-toolset intersection) would
+        be silently missing from the child with no note at all. 'delegation'
+        is always stripped for a non-orchestrator (default 'leaf') child
+        regardless of whether the parent has it."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "delegation"]
+
+        _build_child_agent(
+            task_index=0, goal="do the thing", context=None,
+            toolsets=["terminal", "delegation"], model=None, max_iterations=50,
+            parent_agent=parent, task_count=1, role="leaf",
+        )
+        call_kwargs = MockAgent.call_args[1]
+        prompt = call_kwargs["ephemeral_system_prompt"]
+        self.assertIn("TOOLSET LIMITATION", prompt)
+        self.assertIn("delegation", prompt)

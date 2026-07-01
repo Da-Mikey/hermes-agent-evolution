@@ -967,6 +967,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    denied_toolsets: Optional[List[str]] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -975,6 +976,21 @@ def _build_child_system_prompt(
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
+
+    ``denied_toolsets`` (#648): toolsets the delegating call explicitly
+    asked for that are missing from the FINAL resolved child toolset list
+    (computed against child_toolsets after parent intersection, MCP
+    preservation, and blocked-tool stripping — so it reflects reality
+    regardless of which step dropped a name). Usually this is because the
+    PARENT session doesn't have them enabled — a subagent must never gain
+    tools its parent lacks — but a few toolsets are restricted for
+    subagents by default regardless of the parent (e.g. delegation itself
+    for non-orchestrator children). Without this note the subagent
+    discovers the gap only by trying and failing, wasting a full
+    delegation cycle before the parent even learns why. Named here, in
+    the prompt, rather than fixed by relaxing the parent-toolset
+    intersection: that intersection is a security boundary (no privilege
+    escalation via delegation), not a bug.
     """
     parts = [
         "You are a focused subagent working on a specific delegated task.",
@@ -988,6 +1004,23 @@ def _build_child_system_prompt(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+        )
+    if denied_toolsets:
+        _plural = len(denied_toolsets) > 1
+        parts.append(
+            f"\nTOOLSET LIMITATION: the following toolset{'s' if _plural else ''} "
+            f"{'were' if _plural else 'was'} requested for you but "
+            f"{'are' if _plural else 'is'} NOT available in your final toolset — "
+            f"{', '.join(denied_toolsets)}. This is usually because your PARENT "
+            "session doesn't have it enabled (a subagent can never gain tools its "
+            "parent lacks), though a small set of toolsets (like delegation "
+            "itself) are restricted for subagents by default regardless of the "
+            "parent. Do not assume you have these tools or waste calls "
+            "discovering this yourself. If the task cannot be completed without "
+            "them, say so plainly in your summary and recommend the operator "
+            "either enable the missing toolset(s) on the parent session before "
+            "delegating, or complete this specific part of the work without "
+            "delegation."
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
@@ -1431,6 +1464,22 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Toolsets explicitly requested but missing from the FINAL child list
+    # (#648) — computed against child_toolsets AFTER every adjustment above
+    # (parent intersection, MCP preservation, blocked-tool stripping), not
+    # against an intermediate state, so this always reflects what the child
+    # actually ended up with regardless of WHICH step dropped a name.
+    # Deduplicated and order-preserving. Only meaningful when toolsets were
+    # explicitly requested — omitting toolsets inherits the parent wholesale,
+    # so nothing was denied.
+    denied_toolsets = []
+    if toolsets:
+        _seen_denied = set()
+        for t in toolsets:
+            if t not in child_toolsets and t not in _seen_denied:
+                denied_toolsets.append(t)
+                _seen_denied.add(t)
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
@@ -1439,6 +1488,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        denied_toolsets=denied_toolsets,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
