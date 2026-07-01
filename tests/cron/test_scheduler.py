@@ -983,6 +983,12 @@ class TestRunJobSessionPersistence:
             mock_agent = MagicMock()
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
+            fake_db.get_messages.return_value = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "did something"},
+                {"role": "assistant", "content": "ok"},
+            ]
 
             success, output, final_response, error = run_job(job)
 
@@ -1001,6 +1007,152 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_run_job_marks_cron_noop_when_zero_tool_calls(self, tmp_path):
+        """#607: a cron session that ends successfully but never called a
+        tool (or delegate_task) never attempted the scheduled deliverable —
+        end_session must record 'cron_noop', not 'cron_complete'."""
+        job = {
+            "id": "noop-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "I'll take care of that.",
+            }
+            mock_agent_cls.return_value = mock_agent
+            fake_db.get_messages.return_value = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "I'll take care of that."},
+            ]
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        fake_db.get_messages.assert_called_once()
+        get_messages_args = fake_db.get_messages.call_args
+        assert get_messages_args[0][0].startswith("cron_noop-job_")
+        assert get_messages_args[1]["include_inactive"] is True
+        fake_db.end_session.assert_called_once()
+        call_args = fake_db.end_session.call_args
+        assert call_args[0][1] == "cron_noop"
+
+    def test_run_job_keeps_cron_complete_when_tool_calls_happened(self, tmp_path):
+        """A session with at least one real tool result stays 'cron_complete'."""
+        job = {
+            "id": "worked-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "Done."}
+            mock_agent_cls.return_value = mock_agent
+            fake_db.get_messages.return_value = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "file written"},
+                {"role": "assistant", "content": "Done."},
+            ]
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        fake_db.end_session.assert_called_once()
+        call_args = fake_db.end_session.call_args
+        assert call_args[0][1] == "cron_complete"
+
+    def test_run_job_survives_in_place_compaction_without_false_cron_noop(self, tmp_path):
+        """#607 follow-up: in-place context compaction (#38763) can rewrite the
+        in-memory ``messages`` list mid-session, replacing early tool-call
+        turns with a summary. The noop check must read the DURABLE session DB
+        (include_inactive=True) rather than the agent's returned
+        ``result["messages"]``, so a genuinely productive session that got
+        compacted is never misclassified as cron_noop."""
+        job = {
+            "id": "compacted-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            # The live API-facing list post-compaction: the earlier tool
+            # call/result turns have been rewritten into a summary message —
+            # no role=="tool" entry survives here.
+            mock_agent.run_conversation.return_value = {
+                "final_response": "Done.",
+                "messages": [
+                    {"role": "user", "content": "[compacted summary of earlier work]"},
+                    {"role": "assistant", "content": "Done."},
+                ],
+            }
+            mock_agent_cls.return_value = mock_agent
+            # The durable DB (include_inactive=True) still has the original
+            # tool turns as soft-deleted rows.
+            fake_db.get_messages.return_value = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "file written", "active": 0},
+                {"role": "user", "content": "[compacted summary of earlier work]"},
+                {"role": "assistant", "content": "Done."},
+            ]
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        fake_db.end_session.assert_called_once()
+        call_args = fake_db.end_session.call_args
+        assert call_args[0][1] == "cron_complete"
 
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
