@@ -1,0 +1,8 @@
+{
+  "date": "2026-07-03",
+  "merged": [],
+  "skipped": [
+    {"pr": 29, "reason": "Merge conflicts and dirty merge state"},
+    {"pr": 27, "reason": "Merge conflicts and dirty merge state"}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "date": "2026-06-30",
+  "merged": [],
+  "skipped": [
+    {
+      "pr": "27",
+      "reason": "Merge conflicts (CONFLICTING/DIRTY). Branch is 39+ commits behind main with massive upstream diff (300+ files diff). No CI checks ever ran. gh version 2.45.0 lacks `pr update-branch`. Cannot resolve conflicts or produce a clean merge in-cycle."
+    },
+    {
+      "pr": "21",
+      "reason": "Not an evolution/issue-* branch — sync/upstream-* is an upstream sync PR. Skipped by policy."
+    }
+  ]
+}

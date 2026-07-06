@@ -1,0 +1,20 @@
+{
+  "date": "2026-07-01",
+  "merged": [],
+  "skipped": [
+    {
+      "pr": "27",
+      "reason": "Merge conflicts (CONFLICTING) on evolution/issue-25-classify-connection-lost. gh v2.45.0 lacks `pr update-branch`; cannot resolve conflicts in automated integration. No CI checks reported. Issue #25 remains open with `accepted` label.",
+      "issue": "25",
+      "title": "fix: classify ReadError/Broken pipe as connection_lost instead of timeout"
+    },
+    {
+      "pr": "28",
+      "reason": "Non-evolution branch (sync/upstream-2026-07-01) — never merged by integration skill"
+    },
+    {
+      "pr": "21",
+      "reason": "Non-evolution branch (sync/upstream-2026-06-29) — never merged by integration skill"
+    }
+  ]
+}
