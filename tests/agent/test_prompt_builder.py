@@ -238,10 +238,10 @@ class TestDynamicContextFileCap:
         assert _dynamic_context_file_max_chars(8_000) == CONTEXT_FILE_MAX_CHARS
 
     def test_dynamic_scales_above_floor_for_large_window(self):
-        # 200K-token window → ~48K (200000 * 4 * 0.06), well above the floor
+        # 200K-token window → 64K (200000 * 4 * 0.08), well above the floor
         # and above Codex's 32 KiB project_doc default.
         cap = _dynamic_context_file_max_chars(200_000)
-        assert cap == 48_000
+        assert cap == 64_000
         assert cap > CONTEXT_FILE_MAX_CHARS
 
     def test_dynamic_respects_ceiling(self):
@@ -254,7 +254,7 @@ class TestDynamicContextFileCap:
 
     def test_get_context_file_max_chars_uses_context_length(self):
         # With no explicit config, the resolver derives the cap from context.
-        assert _get_context_file_max_chars(200_000) == 48_000
+        assert _get_context_file_max_chars(200_000) == 64_000
         assert _get_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
 
     def test_explicit_config_beats_dynamic(self, monkeypatch):
@@ -267,7 +267,7 @@ class TestDynamicContextFileCap:
 
     def test_large_window_avoids_truncation_of_midsize_doc(self):
         # A 30K-char AGENTS.md is truncated at the flat default but survives
-        # whole on a large-context model (dynamic cap ~48K).
+        # whole on a large-context model (dynamic cap ~64K).
         content = "z" * 30_000
         small = _truncate_content(content, "AGENTS.md", context_length=8_000)
         big = _truncate_content(content, "AGENTS.md", context_length=200_000)
@@ -1799,5 +1799,29 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
+
+
+class TestDynamicContextFileCapFitsAgentsMd:
+    """#B3: at the old 0.06 window fraction, a 256K-context model capped context
+    files at ~62.9K chars and TRUNCATED the repo's ~72K AGENTS.md, so the
+    evolution cron agents silently lost its tail (## Known Pitfalls, ## Testing).
+    The cap for a large-context model must comfortably fit AGENTS.md, while
+    small-context models must stay pinned to the 20K floor."""
+
+    def test_large_context_model_fits_a_72k_agents_md(self):
+        # kimi-k2.7 and peers report a 256K token window.
+        cap = _dynamic_context_file_max_chars(262_144)
+        assert cap >= 72_500, f"cap {cap} would truncate a ~72K AGENTS.md"
+        assert cap <= _CONTEXT_FILE_DYNAMIC_CEILING
+
+    def test_small_context_model_stays_at_floor(self):
+        # A 32K-window model must not be pushed above the historical 20K floor by
+        # the fraction bump — the cap scales with the window but never drops the
+        # floor, and a small window's budget stays below it.
+        assert _dynamic_context_file_max_chars(32_000) == CONTEXT_FILE_MAX_CHARS
+
+    def test_unknown_context_length_uses_flat_default(self):
+        assert _dynamic_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
+        assert _dynamic_context_file_max_chars(0) == CONTEXT_FILE_MAX_CHARS
 
 
