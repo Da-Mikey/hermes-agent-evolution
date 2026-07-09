@@ -30,11 +30,7 @@ from typing import Any, Dict, List, Optional
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
-from agent.error_classifier import (
-    FailoverReason,
-    classify_api_error,
-    next_untried_model_variant,
-)
+from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
@@ -64,8 +60,9 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
-    extract_retry_after_seconds,
+    is_zai_coding_overload_error,
     jittered_backoff,
+    zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
@@ -79,9 +76,7 @@ logger = logging.getLogger(__name__)
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
-INTERRUPT_WAITING_FOR_MODEL_PREFIX = (
-    "Operation interrupted: waiting for model response ("
-)
+INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -163,7 +158,6 @@ def _ra():
     ``run_agent.OpenAI`` and have those patches reach this code path.
     """
     import run_agent
-
     return run_agent
 
 
@@ -198,9 +192,10 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     if provider == "nous":
         return True
     base = str(base_url or "")
-    return base_url_host_matches(
-        base, "inference-api.nousresearch.com"
-    ) or base_url_host_matches(base, "inference.nousresearch.com")
+    return (
+        base_url_host_matches(base, "inference-api.nousresearch.com")
+        or base_url_host_matches(base, "inference.nousresearch.com")
+    )
 
 
 def _billing_or_entitlement_message(
@@ -236,18 +231,15 @@ def _billing_or_entitlement_message(
         return "\n".join(lines)
 
     lines = [
-        "HTTP 402 Payment Required — the provider account is out of credit or quota.",
         (
-            f"{provider_label} reported that billing, credits, or account "
-            f"entitlement is exhausted for {model_label}."
+            f"{provider_label} reported HTTP 402 (out of credit or quota) — billing, "
+            f"credits, or account entitlement is exhausted for {model_label}."
         ),
         "Add credits or update billing with that provider, then retry.",
     ]
     if base_url_host_matches(str(base_url or ""), "openrouter.ai"):
         lines.append("OpenRouter credits: https://openrouter.ai/settings/credits")
-    lines.append(
-        "You can switch providers temporarily with /model <model> --provider <provider>."
-    )
+    lines.append("You can switch providers temporarily with /model <model> --provider <provider>.")
     return "\n".join(lines)
 
 
@@ -333,8 +325,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "Session DB get_session failed for system-prompt restore "
                 "(session=%s): %s. Falling back to fresh build — prefix "
                 "cache will miss for this turn.",
-                agent.session_id,
-                exc,
+                agent.session_id, exc,
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
@@ -362,8 +353,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             "from scratch this turn. Prefix cache will miss until "
             "the rebuild persists. Investigate the previous turn's "
             "update_system_prompt write path.",
-            agent.session_id,
-            stored_state,
+            agent.session_id, stored_state,
         )
 
     # First turn of a new session (or recovering from a broken stored
@@ -375,7 +365,6 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
-
         _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
@@ -404,16 +393,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(
-                agent.session_id, agent._cached_system_prompt
-            )
+            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
                 "%s. Subsequent turns will rebuild the system prompt and "
                 "miss the prefix cache.",
-                agent.session_id,
-                exc,
+                agent.session_id, exc,
             )
 
 
@@ -425,7 +411,7 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         value = ""
         for line in prompt.splitlines():
             if line.startswith(prefix):
-                value = line[len(prefix) :].strip()
+                value = line[len(prefix):].strip()
         return value
 
     stored_model = line_value("Model")
@@ -441,9 +427,7 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     return True
 
 
-def _get_continuation_prompt(
-    is_partial_stub: bool, dropped_tools: Optional[List[str]] = None
-) -> str:
+def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         return (
@@ -693,17 +677,7 @@ def _run_conversation_impl(
             should_review_memory=_should_review_memory,
         )
 
-    # Plan-and-execute opt-in (#292, final child of #283): when plan mode is
-    # explicitly enabled (HERMES_PLAN_MODE env / plan_mode config — default OFF),
-    # build a plan from this run's task and arm it on ``agent._active_plan``,
-    # which flips the otherwise-inert #290 emission and #291 divergence hooks
-    # live. With the flag off this is a no-op and behavior is byte-identical to
-    # the ReAct baseline. See ``AIAgent._maybe_activate_plan_mode``.
-    agent._maybe_activate_plan_mode(user_message)
-
-    while (
-        api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0
-    ) or agent._budget_grace_call:
+    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -714,7 +688,7 @@ def _run_conversation_impl(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-
+        
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -727,9 +701,7 @@ def _run_conversation_impl(
         elif not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
-                agent._safe_print(
-                    f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)"
-                )
+                agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
             break
 
         # Loop guard: if the model is stuck repeating one tool (or repeatedly
@@ -854,15 +826,14 @@ def _run_conversation_impl(
                         break
                 agent.step_callback(api_call_count, prev_tools)
             except Exception as _step_err:
-                logger.debug(
-                    "step_callback error (iteration %s): %s", api_call_count, _step_err
-                )
+                logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
         # Track tool-calling iterations for skill nudge.
         # Counter resets whenever skill_manage is actually used.
-        if agent._skill_nudge_interval > 0 and "skill_manage" in agent.valid_tool_names:
+        if (agent._skill_nudge_interval > 0
+                and "skill_manage" in agent.valid_tool_names):
             agent._iters_since_skill += 1
-
+        
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model
         # was thinking), drain it now — before we build api_messages — so
@@ -882,7 +853,6 @@ def _run_conversation_impl(
                 _sm = messages[_si]
                 if isinstance(_sm, dict) and _sm.get("role") == "tool":
                     from agent.prompt_builder import format_steer_marker
-
                     marker = format_steer_marker(_pre_api_steer)
                     existing = _sm.get("content", "")
                     if isinstance(existing, str):
@@ -908,18 +878,12 @@ def _run_conversation_impl(
                 if _lock is not None:
                     with _lock:
                         if agent._pending_steer:
-                            agent._pending_steer = (
-                                agent._pending_steer + "\n" + _pre_api_steer
-                            )
+                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
                         else:
                             agent._pending_steer = _pre_api_steer
                 else:
                     existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (
-                        (existing + "\n" + _pre_api_steer)
-                        if existing
-                        else _pre_api_steer
-                    )
+                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -950,7 +914,6 @@ def _run_conversation_impl(
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
-
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
             request_logger.info(
@@ -1021,47 +984,22 @@ def _run_conversation_impl(
         # stay warm.
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
-            effective_system = (
-                effective_system + "\n\n" + agent.ephemeral_system_prompt
-            ).strip()
+            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
-            api_messages = [
-                {"role": "system", "content": effective_system}
-            ] + api_messages
+            api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
         if moa_config:
             try:
-                from agent.moa_loop import aggregate_moa_context
+                from agent.moa_loop import _preset_temperature, aggregate_moa_context
 
                 _moa_context = aggregate_moa_context(
                     user_prompt=original_user_message if isinstance(original_user_message, str) else str(original_user_message),
                     api_messages=api_messages,
                     reference_models=moa_config.get("reference_models") or [],
                     aggregator=moa_config.get("aggregator") or {},
-                    temperature=float(moa_config.get("reference_temperature", 0.6) or 0.6),
-                    aggregator_temperature=float(moa_config.get("aggregator_temperature", 0.4) or 0.4),
-                )
-                if _moa_context:
-                    for _msg in reversed(api_messages):
-                        if _msg.get("role") == "user":
-                            _base = _msg.get("content", "")
-                            if isinstance(_base, str):
-                                _msg["content"] = _base + "\n\n" + _moa_context
-                            break
-            except Exception as _moa_exc:
-                logger.warning("MoA context aggregation failed: %s", _moa_exc)
-
-        if moa_config:
-            try:
-                from agent.moa_loop import aggregate_moa_context
-
-                _moa_context = aggregate_moa_context(
-                    user_prompt=original_user_message if isinstance(original_user_message, str) else str(original_user_message),
-                    api_messages=api_messages,
-                    reference_models=moa_config.get("reference_models") or [],
-                    aggregator=moa_config.get("aggregator") or {},
-                    temperature=float(moa_config.get("reference_temperature", 0.6) or 0.6),
-                    aggregator_temperature=float(moa_config.get("aggregator_temperature", 0.4) or 0.4),
+                    temperature=_preset_temperature(moa_config, "reference_temperature"),
+                    aggregator_temperature=_preset_temperature(moa_config, "aggregator_temperature"),
+                    max_tokens=moa_config.get("reference_max_tokens"),
                 )
                 if _moa_context:
                     for _msg in reversed(api_messages):
@@ -1076,9 +1014,7 @@ def _run_conversation_impl(
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
         if agent.prefill_messages:
-            sys_offset = (
-                1 if (api_messages and api_messages[0].get("role") == "system") else 0
-            )
+            sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
@@ -1132,17 +1068,13 @@ def _run_conversation_impl(
                 if isinstance(tc, dict) and "function" in tc:
                     try:
                         args_obj = json.loads(tc["function"]["arguments"])
-                        tc = {
-                            **tc,
-                            "function": {
-                                **tc["function"],
-                                "arguments": json.dumps(
-                                    args_obj,
-                                    separators=(",", ":"),
-                                    sort_keys=True,
-                                ),
-                            },
-                        }
+                        tc = {**tc, "function": {
+                            **tc["function"],
+                            "arguments": json.dumps(
+                                args_obj, separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        }}
                     except Exception:
                         tc["function"]["arguments"] = _repair_tool_call_arguments(
                             tc["function"]["arguments"],
@@ -1157,24 +1089,27 @@ def _run_conversation_impl(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
-        # Calculate approximate request size for logging
+        # Calculate approximate request size for logging and pressure checks.
+        # estimate_messages_tokens_rough(api_messages) includes the system
+        # prompt copy but not the tool schema payload, which is sent as a
+        # separate field. Add tools back for compression decisions so long
+        # tool-heavy turns do not creep up to the context ceiling and leave
+        # no room for the model's final answer.
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
-        approx_request_tokens = estimate_request_tokens_rough(
+        request_pressure_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
         )
 
         _runtime_context_error = _ollama_context_limit_error(
-            agent, approx_request_tokens
+            agent, request_pressure_tokens
         )
         if _runtime_context_error:
             final_response = _runtime_context_error
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
             messages.append({"role": "assistant", "content": final_response})
-            agent._emit_status(
-                "❌ Ollama runtime context is too small for Hermes tool use"
-            )
+            agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
             api_call_count -= 1
             agent._api_call_count = api_call_count
             try:
@@ -1183,19 +1118,90 @@ def _run_conversation_impl(
                 pass
             break
 
+        # Pre-API pressure check. The turn-prologue preflight only saw the
+        # incoming user message; a single turn can then grow by many large
+        # tool results and leave no output budget before the NEXT call (the
+        # live 271k/272k Codex failure). The post-response should_compress
+        # gate at the tool-loop tail uses API-reported last_prompt_tokens,
+        # which LAGS a just-appended huge tool result — so it misses this
+        # case. Re-check here against the current request estimate.
+        #
+        # Mirror the turn-prologue preflight's guard chain exactly (see
+        # turn_context.py): (1) defer when the rough estimate is known-noisy
+        # relative to a recent real provider prompt that fit under threshold
+        # (schema overhead / post-compaction over-count, #36718); (2) skip
+        # while a same-session compression-failure cooldown is active; (3) then
+        # should_compress() — reusing the canonical threshold_tokens (output
+        # room already reserved by _compute_threshold_tokens) and its summary-
+        # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
+        # hard per-turn backstop shared with the overflow error handlers.
+        _compressor = agent.context_compressor
+        _defer_preflight = getattr(
+            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
+        )
+        _compression_cooldown = getattr(
+            _compressor, "get_active_compression_failure_cooldown", lambda: None
+        )()
+        if (
+            agent.compression_enabled
+            and len(messages) > 1
+            and compression_attempts < 3
+            and not _defer_preflight(request_pressure_tokens)
+            and not _compression_cooldown
+            and _compressor.should_compress(request_pressure_tokens)
+        ):
+            compression_attempts += 1
+            logger.info(
+                "Pre-API compression: ~%s request tokens >= %s threshold "
+                "(context=%s, attempt=%s/3)",
+                f"{request_pressure_tokens:,}",
+                f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
+                if getattr(_compressor, "context_length", 0) else "unknown",
+                compression_attempts,
+            )
+            agent._emit_status(
+                f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
+                f"near the context/output limit. Compacting before the next model call."
+            )
+            messages, active_system_prompt = agent._compress_context(
+                messages,
+                system_message,
+                approx_tokens=request_pressure_tokens,
+                task_id=effective_task_id,
+            )
+            # Reset retry/empty-response state so the compacted request
+            # gets a fresh chance instead of inheriting stale recovery
+            # counters from the pre-compaction history.
+            agent._empty_content_retries = 0
+            agent._thinking_prefill_retries = 0
+            agent._last_content_with_tools = None
+            agent._last_content_tools_all_housekeeping = False
+            agent._mute_post_response = False
+            # Re-baseline the flush cursor for the compaction mode that just
+            # ran. Legacy session-rotation returns None (the child session has
+            # not seen the compacted transcript, so the next flush writes it
+            # whole); in-place compaction returns list(messages) because the
+            # compacted rows are already persisted under the same session id —
+            # leaving None there would re-append them, doubling the active
+            # context and retriggering compression. Mirrors the post-response
+            # and preflight compaction sites; see
+            # conversation_history_after_compression().
+            conversation_history = conversation_history_after_compression(
+                agent, messages
+            )
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            agent.iteration_budget.refund()
+            continue
+        
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
-
+        
         if not agent.quiet_mode:
-            agent._vprint(
-                f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}..."
-            )
-            agent._vprint(
-                f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)"
-            )
-            agent._vprint(
-                f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}"
-            )
+            agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
+            agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
+            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
         else:
             # Animated thinking spinner in quiet mode
             face = random.choice(KawaiiSpinner.get_thinking_faces())
@@ -1204,36 +1210,19 @@ def _run_conversation_impl(
                 # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                 # (works in both streaming and non-streaming modes)
                 agent.thinking_callback(f"{face} {verb}...")
-            elif (
-                not agent._has_stream_consumers()
-                and agent._should_start_quiet_spinner()
-            ):
+            elif not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
                 # Raw KawaiiSpinner only when no streaming consumers and the
                 # spinner output has a safe sink.
-                spinner_type = random.choice([
-                    "brain",
-                    "sparkle",
-                    "pulse",
-                    "moon",
-                    "star",
-                ])
-                thinking_spinner = KawaiiSpinner(
-                    f"{face} {verb}...",
-                    spinner_type=spinner_type,
-                    print_fn=agent._print_fn,
-                )
+                spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
+                thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=agent._print_fn)
                 thinking_spinner.start()
-
+        
         # Log request details if verbose
         if agent.verbose_logging:
-            logging.debug(
-                f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}"
-            )
-            logging.debug(
-                f"Last message role: {messages[-1]['role'] if messages else 'none'}"
-            )
+            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}")
+            logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
-
+        
         api_start_time = time.time()
         retry_count = 0
         max_retries = agent._api_max_retries
@@ -1258,22 +1247,23 @@ def _run_conversation_impl(
                         nous_rate_limit_remaining,
                         format_remaining as _fmt_nous_remaining,
                     )
-
                     _nous_remaining = nous_rate_limit_remaining()
                     if _nous_remaining is not None and _nous_remaining > 0:
                         _nous_msg = (
                             f"Nous Portal rate limit active — "
                             f"resets in {_fmt_nous_remaining(_nous_remaining)}."
                         )
-                        agent._buffer_vprint(f"⏳ {_nous_msg} Trying fallback...")
+                        agent._buffer_vprint(
+                            f"⏳ {_nous_msg} Trying fallback..."
+                        )
                         agent._buffer_status(f"⏳ {_nous_msg}")
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt
-                            )
+                                agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
+                            _retry.consecutive_rate_limit_hits = 0
                             continue
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
@@ -1297,47 +1287,6 @@ def _run_conversation_impl(
                 except Exception:
                     pass  # Never let rate guard break the agent loop
 
-            # ── Generic provider cooldown guard ───────────────────
-            # If this provider was recently rate-limited (and the cooldown is
-            # still active), skip straight to fallback instead of burning
-            # another request that will likely 429 again.  This complements
-            # the per-provider cooldown recorded by _try_activate_fallback.
-            _provider_cooldowns = getattr(agent, "_rate_limited_providers", None) or {}
-            _current_provider = (getattr(agent, "provider", "") or "").strip().lower()
-            _cooldown_until = (
-                _provider_cooldowns.get(_current_provider)
-                if _current_provider
-                else None
-            )
-            if _cooldown_until and _cooldown_until > time.monotonic():
-                _remaining = max(1, int(_cooldown_until - time.monotonic()))
-                _cooldown_msg = (
-                    f"Provider {_current_provider} is rate-limit cooled down "
-                    f"for {_remaining}s — trying fallback..."
-                )
-                agent._buffer_vprint(f"⏳ {_cooldown_msg}")
-                agent._buffer_status(f"⏳ {_cooldown_msg}")
-                if agent._try_activate_fallback():
-                    retry_count = 0
-                    compression_attempts = 0
-                    _retry.primary_recovery_attempted = False
-                    continue
-                # No fallback — surface the cooldown and bail.
-                agent._flush_status_buffer()
-                agent._persist_session(messages, conversation_history)
-                return {
-                    "final_response": (
-                        f"⏳ {_cooldown_msg}\n\n"
-                        "No fallback provider available. "
-                        "Wait for the cooldown to expire or add a fallback provider."
-                    ),
-                    "messages": messages,
-                    "api_calls": api_call_count,
-                    "completed": False,
-                    "failed": True,
-                    "error": _cooldown_msg,
-                }
-
             try:
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
@@ -1352,9 +1301,15 @@ def _run_conversation_impl(
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
-                    api_kwargs = agent._get_transport().preflight_kwargs(
-                        api_kwargs, allow_stream=False
-                    )
+                    api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                # Copilot x-initiator: the first API call of a user turn is
+                # marked "user" so Copilot bills a premium request; tool-loop
+                # follow-ups keep the default "agent" header (#3040).
+                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
+                    _xh = dict(api_kwargs.get("extra_headers") or {})
+                    _xh["x-initiator"] = "user"
+                    api_kwargs["extra_headers"] = _xh
+                    agent._is_user_initiated_turn = False
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -1383,7 +1338,6 @@ def _run_conversation_impl(
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-
                     if has_hook("pre_api_request"):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
@@ -1406,9 +1360,7 @@ def _run_conversation_impl(
                         # ``api_kwargs`` is the same object passed to the
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(
-                            api_kwargs
-                        )
+                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -1492,7 +1444,6 @@ def _run_conversation_impl(
                     # health checking, but skip for Mock clients in tests
                     # (mocks return SimpleNamespace, not stream iterators).
                     from unittest.mock import Mock
-
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
@@ -1521,9 +1472,9 @@ def _run_conversation_impl(
                     api_call_count=api_call_count,
                     middleware_trace=list(_llm_middleware_trace),
                 )
-
+                
                 api_duration = time.time() - api_start_time
-
+                
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:
@@ -1531,21 +1482,15 @@ def _run_conversation_impl(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
-
+                
                 if not agent.quiet_mode:
-                    agent._vprint(
-                        f"{agent.log_prefix}⏱️  API call completed in {api_duration:.2f}s"
-                    )
-
+                    agent._vprint(f"{agent.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
+                
                 if agent.verbose_logging:
                     # Log response with provider info if available
-                    resp_model = (
-                        getattr(response, "model", "N/A") if response else "N/A"
-                    )
-                    logging.debug(
-                        f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}"
-                    )
-
+                    resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
+                    logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
+                
                 # Validate response shape before proceeding
                 response_invalid = False
                 error_details = []
@@ -1559,39 +1504,26 @@ def _run_conversation_impl(
                             # Provider returned a terminal failure (e.g. quota exhaustion).
                             # Treat as invalid so the fallback chain is triggered instead of
                             # letting the error bubble up outside the retry/fallback loop.
-                            _codex_resp_status = (
-                                str(getattr(response, "status", "") or "")
-                                .strip()
-                                .lower()
-                            )
+                            _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
                             if _codex_resp_status in {"failed", "cancelled"}:
                                 _codex_error_obj = getattr(response, "error", None)
                                 _codex_error_msg = (
-                                    _codex_error_obj.get("message")
-                                    if isinstance(_codex_error_obj, dict)
-                                    else str(_codex_error_obj)
-                                    if _codex_error_obj
+                                    _codex_error_obj.get("message") if isinstance(_codex_error_obj, dict)
+                                    else str(_codex_error_obj) if _codex_error_obj
                                     else f"Responses API returned status '{_codex_resp_status}'"
                                 )
                                 logger.warning(
                                     "Codex response status='%s' (error=%s). Routing to fallback. %s",
-                                    _codex_resp_status,
-                                    _codex_error_msg,
+                                    _codex_resp_status, _codex_error_msg,
                                     agent._client_log_context(),
                                 )
                                 response_invalid = True
-                                error_details.append(
-                                    f"response.status={_codex_resp_status}: {_codex_error_msg}"
-                                )
+                                error_details.append(f"response.status={_codex_resp_status}: {_codex_error_msg}")
                             else:
                                 # output_text fallback: stream backfill may have failed
                                 # but normalize can still recover from output_text
                                 _out_text = getattr(response, "output_text", None)
-                                _out_text_stripped = (
-                                    _out_text.strip()
-                                    if isinstance(_out_text, str)
-                                    else ""
-                                )
+                                _out_text_stripped = _out_text.strip() if isinstance(_out_text, str) else ""
                                 if _out_text_stripped:
                                     logger.debug(
                                         "Codex response.output is empty but output_text is present "
@@ -1600,14 +1532,11 @@ def _run_conversation_impl(
                                     )
                                 else:
                                     _resp_status = getattr(response, "status", None)
-                                    _resp_incomplete = getattr(
-                                        response, "incomplete_details", None
-                                    )
+                                    _resp_incomplete = getattr(response, "incomplete_details", None)
                                     logger.warning(
                                         "Codex response.output is empty after stream backfill "
                                         "(status=%s, incomplete_details=%s, model=%s). %s",
-                                        _resp_status,
-                                        _resp_incomplete,
+                                        _resp_status, _resp_incomplete,
                                         getattr(response, "model", None),
                                         f"api_mode={agent.api_mode} provider={agent.provider}",
                                     )
@@ -1620,9 +1549,7 @@ def _run_conversation_impl(
                         if response is None:
                             error_details.append("response is None")
                         else:
-                            error_details.append(
-                                "response.content invalid (not a non-empty list)"
-                            )
+                            error_details.append("response.content invalid (not a non-empty list)")
                 elif agent.api_mode == "bedrock_converse":
                     _btv = agent._get_transport()
                     if not _btv.validate_response(response):
@@ -1630,16 +1557,14 @@ def _run_conversation_impl(
                         if response is None:
                             error_details.append("response is None")
                         else:
-                            error_details.append(
-                                "Bedrock response invalid (no output or choices)"
-                            )
+                            error_details.append("Bedrock response invalid (no output or choices)")
                 else:
                     _ctv = agent._get_transport()
                     if not _ctv.validate_response(response):
                         response_invalid = True
                         if response is None:
                             error_details.append("response is None")
-                        elif not hasattr(response, "choices"):
+                        elif not hasattr(response, 'choices'):
                             error_details.append("response has no 'choices' attribute")
                         elif response.choices is None:
                             error_details.append("response.choices is None")
@@ -1655,11 +1580,8 @@ def _run_conversation_impl(
                         api_start_time=api_start_time,
                         api_kwargs=api_kwargs,
                         error_type="InvalidAPIResponse",
-                        error_message=", ".join(error_details)
-                        or "Invalid API response",
-                        status_code=getattr(
-                            getattr(response, "error", None), "code", None
-                        ),
+                        error_message=", ".join(error_details) or "Invalid API response",
+                        status_code=getattr(getattr(response, "error", None), "code", None),
                         retry_count=retry_count,
                         max_retries=max_retries,
                         retryable=True,
@@ -1672,71 +1594,53 @@ def _run_conversation_impl(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
-
+                    
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
                     retry_count += 1
-
+                    
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status(
-                            "⚠️ Empty/malformed response — switching to fallback..."
-                        )
+                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
+                        _retry.consecutive_rate_limit_hits = 0
                         continue
 
                     # Check for error field in response (some providers include this)
                     error_msg = "Unknown"
                     provider_name = "Unknown"
-                    if response and hasattr(response, "error") and response.error:
+                    if response and hasattr(response, 'error') and response.error:
                         error_msg = str(response.error)
                         # Try to extract provider from error metadata
-                        if (
-                            hasattr(response.error, "metadata")
-                            and response.error.metadata
-                        ):
-                            provider_name = response.error.metadata.get(
-                                "provider_name", "Unknown"
-                            )
-                    elif response and hasattr(response, "message") and response.message:
+                        if hasattr(response.error, 'metadata') and response.error.metadata:
+                            provider_name = response.error.metadata.get('provider_name', 'Unknown')
+                    elif response and hasattr(response, 'message') and response.message:
                         error_msg = str(response.message)
-
+                    
                     # Try to get provider from model field (OpenRouter often returns actual model used)
-                    if (
-                        provider_name == "Unknown"
-                        and response
-                        and hasattr(response, "model")
-                        and response.model
-                    ):
+                    if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
                         provider_name = f"model={response.model}"
-
+                    
                     # Check for x-openrouter-provider or similar metadata
                     if provider_name == "Unknown" and response:
                         # Log all response attributes for debugging
-                        resp_attrs = {
-                            k: str(v)[:100]
-                            for k, v in vars(response).items()
-                            if not k.startswith("_")
-                        }
+                        resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
                         if agent.verbose_logging:
-                            logging.debug(
-                                f"Response attributes for invalid response: {resp_attrs}"
-                            )
-
+                            logging.debug(f"Response attributes for invalid response: {resp_attrs}")
+                    
                     # Extract error code from response for contextual diagnostics
                     _resp_error_code = None
-                    if response and hasattr(response, "error") and response.error:
-                        _code_raw = getattr(response.error, "code", None)
+                    if response and hasattr(response, 'error') and response.error:
+                        _code_raw = getattr(response.error, 'code', None)
                         if _code_raw is None and isinstance(response.error, dict):
-                            _code_raw = response.error.get("code")
+                            _code_raw = response.error.get('code')
                         if _code_raw is not None:
                             try:
                                 _resp_error_code = int(_code_raw)
@@ -1748,60 +1652,44 @@ def _run_conversation_impl(
                     if _resp_error_code == 524:
                         _failure_hint = f"upstream provider timed out (Cloudflare 524, {api_duration:.0f}s)"
                     elif _resp_error_code == 504:
-                        _failure_hint = (
-                            f"upstream gateway timeout (504, {api_duration:.0f}s)"
-                        )
+                        _failure_hint = f"upstream gateway timeout (504, {api_duration:.0f}s)"
                     elif _resp_error_code == 429:
-                        _failure_hint = f"rate limited by upstream provider (429)"
+                        _failure_hint = "rate limited by upstream provider (429)"
                     elif _resp_error_code in {500, 502}:
                         _failure_hint = f"upstream server error ({_resp_error_code}, {api_duration:.0f}s)"
                     elif _resp_error_code in {503, 529}:
-                        _failure_hint = (
-                            f"upstream provider overloaded ({_resp_error_code})"
-                        )
+                        _failure_hint = f"upstream provider overloaded ({_resp_error_code})"
                     elif _resp_error_code is not None:
                         _failure_hint = f"upstream error (code {_resp_error_code}, {api_duration:.0f}s)"
                     elif api_duration < 10:
-                        _failure_hint = (
-                            f"fast response ({api_duration:.1f}s) — likely rate limited"
-                        )
+                        _failure_hint = f"fast response ({api_duration:.1f}s) — likely rate limited"
                     elif api_duration > 60:
                         _failure_hint = f"slow response ({api_duration:.0f}s) — likely upstream timeout"
                     else:
                         _failure_hint = f"response time {api_duration:.1f}s"
 
-                    agent._buffer_vprint(
-                        f"⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}"
-                    )
+                    agent._buffer_vprint(f"⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}")
                     agent._buffer_vprint(f"   🏢 Provider: {provider_name}")
                     cleaned_provider_error = agent._clean_error_message(error_msg)
-                    agent._buffer_vprint(
-                        f"   📝 Provider message: {cleaned_provider_error}"
-                    )
+                    agent._buffer_vprint(f"   📝 Provider message: {cleaned_provider_error}")
                     agent._buffer_vprint(f"   ⏱️  {_failure_hint}")
-
+                    
                     if retry_count >= max_retries:
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
-                            agent._buffer_status(
-                                f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback..."
-                            )
+                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt
-                            )
+                                agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
+                            _retry.consecutive_rate_limit_hits = 0
                             continue
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
-                        agent._emit_status(
-                            f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up."
-                        )
-                        logger.error(
-                            f"{agent.log_prefix}Invalid API response after {max_retries} retries."
-                        )
+                        agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
+                        logger.error(f"{agent.log_prefix}Invalid API response after {max_retries} retries.")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                         return {
@@ -1812,27 +1700,18 @@ def _run_conversation_impl(
                             "error": _final_response,
                             "failed": True  # Mark as failure for filtering
                         }
-
+                    
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
-                    wait_time = jittered_backoff(
-                        retry_count, base_delay=5.0, max_delay=120.0
-                    )
-                    agent._buffer_vprint(
-                        f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})..."
-                    )
-                    logger.warning(
-                        f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}"
-                    )
-
+                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                    agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
+                    logger.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
+                    
                     # Sleep in small increments to stay responsive to interrupts
                     sleep_end = time.time() + wait_time
                     _backoff_touch_counter = 0
                     while time.time() < sleep_end:
                         if agent._interrupt_requested:
-                            agent._vprint(
-                                f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.",
-                                force=True,
-                            )
+                            agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
@@ -1864,11 +1743,15 @@ def _run_conversation_impl(
                         incomplete_reason = incomplete_details.get("reason")
                     else:
                         incomplete_reason = getattr(incomplete_details, "reason", None)
-                    if status == "incomplete" and incomplete_reason in {
-                        "max_output_tokens",
-                        "length",
-                    }:
-                        finish_reason = "length"
+                    if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
+                        # Responses API max-output exhaustion is a normal
+                        # Codex incomplete turn.  Let the Codex-specific
+                        # continuation path below append the incomplete
+                        # assistant state and retry, instead of routing to
+                        # the generic chat-completions length rollback that
+                        # emits "Response truncated due to output length
+                        # limit" and stops gateway turns.
+                        finish_reason = "incomplete"
                     else:
                         finish_reason = "stop"
                 elif agent.api_mode == "anthropic_messages":
@@ -1916,18 +1799,12 @@ def _run_conversation_impl(
                             response, strip_tool_prefix=agent._is_anthropic_oauth
                         )
                     else:
-                        _refusal_result = _refusal_transport.normalize_response(
-                            response
-                        )
-                    _refusal_text = (
-                        getattr(_refusal_result, "content", None) or ""
-                    ).strip()
+                        _refusal_result = _refusal_transport.normalize_response(response)
+                    _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
                     # Some refusals carry the explanation only in the reasoning
                     # channel; fall back to it so the user sees *something*.
                     if not _refusal_text:
-                        _refusal_text = (
-                            agent._extract_reasoning(_refusal_result) or ""
-                        ).strip()
+                        _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
 
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
@@ -1937,8 +1814,7 @@ def _run_conversation_impl(
                         api_start_time=api_start_time,
                         api_kwargs=api_kwargs,
                         error_type="ContentPolicyBlocked",
-                        error_message=_refusal_text
-                        or "model declined to respond (content_filter)",
+                        error_message=_refusal_text or "model declined to respond (content_filter)",
                         status_code=None,
                         retry_count=retry_count,
                         max_retries=max_retries,
@@ -1961,11 +1837,11 @@ def _run_conversation_impl(
                         )
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
+                        _retry.consecutive_rate_limit_hits = 0
                         continue
 
                     agent._flush_status_buffer()
@@ -1977,9 +1853,7 @@ def _run_conversation_impl(
                     logger.warning(
                         "%sModel declined to respond (finish_reason=content_filter). "
                         "model=%s provider=%s refusal=%s",
-                        agent.log_prefix,
-                        agent.model,
-                        agent.provider,
+                        agent.log_prefix, agent.model, agent.provider,
                         _refusal_log or "(no text)",
                     )
                     agent._emit_status(
@@ -2038,14 +1912,8 @@ def _run_conversation_impl(
                         _trunc_result = _trunc_transport.normalize_response(response)
                     _trunc_msg = _trunc_result
 
-                    _trunc_content = (
-                        getattr(_trunc_msg, "content", None) if _trunc_msg else None
-                    )
-                    _trunc_has_tool_calls = (
-                        bool(getattr(_trunc_msg, "tool_calls", None))
-                        if _trunc_msg
-                        else False
-                    )
+                    _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
+                    _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
 
                     # ── Detect thinking-budget exhaustion ──────────────
                     # When the model spends ALL output tokens on reasoning
@@ -2060,9 +1928,8 @@ def _run_conversation_impl(
                     # truncations that deserve continuation retries, not as
                     # thinking-budget exhaustion.
                     _has_think_tags = bool(
-                        _trunc_content
-                        and re.search(
-                            r"<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)[^>]*>",
+                        _trunc_content and re.search(
+                            r'<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)[^>]*>',
                             _trunc_content,
                             re.IGNORECASE,
                         )
@@ -2071,12 +1938,7 @@ def _run_conversation_impl(
                         not _trunc_has_tool_calls
                         and _has_think_tags
                         and (
-                            (
-                                _trunc_content is not None
-                                and not agent._has_content_after_think_block(
-                                    _trunc_content
-                                )
-                            )
+                            (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
                             or _trunc_content is None
                         )
                     )
@@ -2114,11 +1976,7 @@ def _run_conversation_impl(
                             "error": _exhaust_error,
                         }
 
-                    if agent.api_mode in {
-                        "chat_completions",
-                        "bedrock_converse",
-                        "anthropic_messages",
-                    }:
+                    if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
                         # ── Content-filter stream stall → fallback (#32421) ──
                         # When the provider's output-layer safety filter (e.g.
@@ -2160,6 +2018,7 @@ def _run_conversation_impl(
                                 retry_count = 0
                                 compression_attempts = 0
                                 _retry.primary_recovery_attempted = False
+                                _retry.consecutive_rate_limit_hits = 0
                                 _retry.restart_with_rebuilt_messages = True
                                 break
                             # No fallback available — fall through to normal
@@ -2172,19 +2031,14 @@ def _run_conversation_impl(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
-                            interim_msg = agent._build_assistant_message(
-                                assistant_message, finish_reason
-                            )
+                            interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                             messages.append(interim_msg)
                             if assistant_message.content:
-                                truncated_response_parts.append(
-                                    assistant_message.content
-                                )
+                                truncated_response_parts.append(assistant_message.content)
 
                             if length_continue_retries < 4:
                                 _is_partial_stream_stub = (
-                                    getattr(response, "id", "")
-                                    == PARTIAL_STREAM_STUB_ID
+                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                                 )
                                 _dropped_tools = getattr(
                                     response, "_dropped_tool_names", None
@@ -2222,9 +2076,7 @@ def _run_conversation_impl(
                                 _retry.restart_with_length_continuation = True
                                 break
 
-                            partial_response = agent._strip_think_blocks(
-                                "".join(truncated_response_parts)
-                            ).strip()
+                            partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
@@ -2236,11 +2088,7 @@ def _run_conversation_impl(
                                 "error": "Response remained truncated after 4 continuation attempts",
                             }
 
-                    if agent.api_mode in {
-                        "chat_completions",
-                        "bedrock_converse",
-                        "anthropic_messages",
-                    }:
+                    if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
                         if assistant_message is not None and _trunc_has_tool_calls:
                             _is_stub_stall = (
@@ -2273,9 +2121,7 @@ def _run_conversation_impl(
                                 if _tc_requested_cap is not None:
                                     _tc_boost = max(_tc_boost, _tc_requested_cap)
                                 _tc_boost_cap = max(32768, _tc_requested_cap or 0)
-                                agent._ephemeral_max_output_tokens = min(
-                                    _tc_boost, _tc_boost_cap
-                                )
+                                agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
                                 # Don't append the broken response to messages;
                                 # just re-run the same API call from the current
                                 # message state, giving the model another chance.
@@ -2310,12 +2156,8 @@ def _run_conversation_impl(
 
                     # If we have prior messages, roll back to last complete state
                     if len(messages) > 1:
-                        agent._vprint(
-                            f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn"
-                        )
-                        rolled_back_messages = agent._get_messages_up_to_last_assistant(
-                            messages
-                        )
+                        agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
+                        rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
 
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
@@ -2326,15 +2168,12 @@ def _run_conversation_impl(
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": "Response truncated due to output length limit",
+                            "error": "Response truncated due to output length limit"
                         }
                     else:
                         # First message was truncated - mark as failed
                         agent._flush_status_buffer()
-                        agent._vprint(
-                            f"{agent.log_prefix}❌ First response truncated - cannot recover",
-                            force=True,
-                        )
+                        agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": "First response truncated due to output length limit",
@@ -2342,11 +2181,11 @@ def _run_conversation_impl(
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
-                            "error": "First response truncated due to output length limit",
+                            "error": "First response truncated due to output length limit"
                         }
-
+                
                 # Track actual token usage from response for context management
-                if hasattr(response, "usage") and response.usage:
+                if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
                         provider=agent.provider,
@@ -2414,15 +2253,9 @@ def _run_conversation_impl(
                     # from the error message), not guessed probe tiers.
                     if getattr(agent.context_compressor, "_context_probed", False):
                         ctx = agent.context_compressor.context_length
-                        if getattr(
-                            agent.context_compressor,
-                            "_context_probe_persistable",
-                            False,
-                        ):
+                        if getattr(agent.context_compressor, "_context_probe_persistable", False):
                             save_context_length(agent.model, agent.base_url, ctx)
-                            agent._safe_print(
-                                f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}"
-                            )
+                            agent._safe_print(f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}")
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False
 
@@ -2433,25 +2266,18 @@ def _run_conversation_impl(
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-                    agent.session_cache_write_tokens += (
-                        canonical_usage.cache_write_tokens
-                    )
+                    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
-                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100 * canonical_usage.cache_read_tokens / prompt_tokens:.0f}%)"
+                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
-                        agent.session_api_calls,
-                        agent.model,
-                        agent.provider or "unknown",
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens,
-                        api_duration,
-                        _cache_pct,
+                        agent.session_api_calls, agent.model, agent.provider or "unknown",
+                        prompt_tokens, completion_tokens, total_tokens,
+                        api_duration, _cache_pct,
                     )
 
                     # On the MoA path, agent.model/provider are the virtual
@@ -2531,8 +2357,7 @@ def _run_conversation_impl(
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
-                                if cost_result.status == "included"
-                                else None,
+                                if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
                             )
@@ -2542,16 +2367,12 @@ def _run_conversation_impl(
                             # the root cause of undercounted analytics.
                             logger.debug(
                                 "Token persistence failed (session=%s, tokens=%d): %s",
-                                agent.session_id,
-                                total_tokens,
-                                e,
+                                agent.session_id, total_tokens, e,
                             )
-
+                    
                     if agent.verbose_logging:
-                        logging.debug(
-                            f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}"
-                        )
-
+                        logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
+                    
                     # Surface cache hit stats for any provider that reports
                     # them — not just those where we inject cache_control
                     # markers.  OpenAI/Kimi/DeepSeek/Qwen all do automatic
@@ -2573,7 +2394,7 @@ def _run_conversation_impl(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
-
+                
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
@@ -2586,7 +2407,6 @@ def _run_conversation_impl(
                 if agent.provider == "nous":
                     try:
                         from agent.nous_rate_guard import clear_nous_rate_limit
-
                         clear_nous_rate_limit()
                     except Exception:
                         pass
@@ -2600,9 +2420,7 @@ def _run_conversation_impl(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
                 api_elapsed = time.time() - api_start_time
-                agent._vprint(
-                    f"{agent.log_prefix}⚡ Interrupted during API call.", force=True
-                )
+                agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
                 interrupted = True
                 # Preserve any assistant text already streamed to the user
                 # before the stop landed. Dropping it leaves history with no
@@ -2640,18 +2458,16 @@ def _run_conversation_impl(
                 # first to strip surrogates, then once more for pure
                 # ASCII-only locale sanitization if needed.
                 # -----------------------------------------------------------
-                if (
-                    isinstance(api_error, UnicodeEncodeError)
-                    and getattr(agent, "_unicode_sanitization_passes", 0) < 2
-                ):
+                if isinstance(api_error, UnicodeEncodeError) and getattr(agent, '_unicode_sanitization_passes', 0) < 2:
                     _err_str = str(api_error).lower()
                     _is_ascii_codec = "'ascii'" in _err_str or "ascii" in _err_str
                     # Detect surrogate errors — utf-8 codec refusing to
                     # encode U+D800..U+DFFF.  The error text is:
                     #   "'utf-8' codec can't encode characters in position
                     #    N-M: surrogates not allowed"
-                    _is_surrogate_error = "surrogate" in _err_str or (
-                        "'utf-8'" in _err_str and not _is_ascii_codec
+                    _is_surrogate_error = (
+                        "surrogate" in _err_str
+                        or ("'utf-8'" in _err_str and not _is_ascii_codec)
                     )
                     # Sanitize surrogates from both the canonical `messages`
                     # list AND `api_messages` (the API-copy, which may carry
@@ -2682,11 +2498,11 @@ def _run_conversation_impl(
                         agent._unicode_sanitization_passes += 1
                         if _surrogates_found:
                             agent._buffer_vprint(
-                                f"⚠️  Stripped invalid surrogate characters from messages. Retrying..."
+                                "⚠️  Stripped invalid surrogate characters from messages. Retrying..."
                             )
                         else:
                             agent._buffer_vprint(
-                                f"⚠️  Surrogate encoding error — retrying after full-payload sanitization..."
+                                "⚠️  Surrogate encoding error — retrying after full-payload sanitization..."
                             )
                         continue
                     if _is_ascii_codec:
@@ -2709,9 +2525,7 @@ def _run_conversation_impl(
                             _sanitize_structure_non_ascii(api_kwargs)
                         _prefill_sanitized = False
                         if isinstance(getattr(agent, "prefill_messages", None), list):
-                            _prefill_sanitized = _sanitize_messages_non_ascii(
-                                agent.prefill_messages
-                            )
+                            _prefill_sanitized = _sanitize_messages_non_ascii(agent.prefill_messages)
 
                         _tools_sanitized = False
                         if isinstance(getattr(agent, "tools", None), list):
@@ -2724,12 +2538,8 @@ def _run_conversation_impl(
                                 active_system_prompt = _sanitized_system
                                 agent._cached_system_prompt = _sanitized_system
                                 _system_sanitized = True
-                        if isinstance(
-                            getattr(agent, "ephemeral_system_prompt", None), str
-                        ):
-                            _sanitized_ephemeral = _strip_non_ascii(
-                                agent.ephemeral_system_prompt
-                            )
+                        if isinstance(getattr(agent, "ephemeral_system_prompt", None), str):
+                            _sanitized_ephemeral = _strip_non_ascii(agent.ephemeral_system_prompt)
                             if _sanitized_ephemeral != agent.ephemeral_system_prompt:
                                 agent.ephemeral_system_prompt = _sanitized_ephemeral
                                 _system_sanitized = True
@@ -2741,9 +2551,7 @@ def _run_conversation_impl(
                             else None
                         )
                         if isinstance(_default_headers, dict):
-                            _headers_sanitized = _sanitize_structure_non_ascii(
-                                _default_headers
-                            )
+                            _headers_sanitized = _sanitize_structure_non_ascii(_default_headers)
 
                         # Sanitize the API key — non-ASCII characters in
                         # credentials (e.g. ʋ instead of v from a bad
@@ -2761,16 +2569,12 @@ def _run_conversation_impl(
                             _clean_key = _strip_non_ascii(_raw_key)
                             if _clean_key != _raw_key:
                                 agent.api_key = _clean_key
-                                if isinstance(
-                                    getattr(agent, "_client_kwargs", None), dict
-                                ):
+                                if isinstance(getattr(agent, "_client_kwargs", None), dict):
                                     agent._client_kwargs["api_key"] = _clean_key
                                 # Also update the live client — it holds its
                                 # own copy of api_key which auth_headers reads
                                 # dynamically on every request.
-                                if getattr(
-                                    agent, "client", None
-                                ) is not None and hasattr(agent.client, "api_key"):
+                                if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
                                     agent.client.api_key = _clean_key
                                 _credential_sanitized = True
                                 agent._vprint(
@@ -2824,11 +2628,9 @@ def _run_conversation_impl(
                 # provider wordings are observed in the wild.
                 _err_body = ""
                 try:
-                    _err_body = str(
-                        getattr(api_error, "body", None)
-                        or getattr(api_error, "message", None)
-                        or str(api_error)
-                    )
+                    _err_body = str(getattr(api_error, "body", None) or
+                                    getattr(api_error, "message", None) or
+                                    str(api_error))
                 except Exception:
                     pass
                 _err_status = getattr(api_error, "status_code", None)
@@ -2897,11 +2699,7 @@ def _run_conversation_impl(
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Server rejected image content — "
                         f"switching to text-only mode for this session"
-                        + (
-                            ". Stripped images from history and retrying."
-                            if _imgs_removed
-                            else "."
-                        ),
+                        + (". Stripped images from history and retrying." if _imgs_removed else "."),
                         force=True,
                     )
                     continue
@@ -2911,11 +2709,7 @@ def _run_conversation_impl(
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)
-                _ctx_len = (
-                    getattr(_compressor, "context_length", 200000)
-                    if _compressor
-                    else 200000
-                )
+                _ctx_len = getattr(_compressor, "context_length", 200000) if _compressor else 200000
                 classified = classify_api_error(
                     api_error,
                     provider=getattr(agent, "provider", "") or "",
@@ -2926,12 +2720,9 @@ def _run_conversation_impl(
                 )
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
-                    classified.reason.value,
-                    classified.status_code,
-                    classified.retryable,
-                    classified.should_compress,
-                    classified.should_rotate_credential,
-                    classified.should_fallback,
+                    classified.reason.value, classified.status_code,
+                    classified.retryable, classified.should_compress,
+                    classified.should_rotate_credential, classified.should_fallback,
                 )
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
@@ -2966,17 +2757,13 @@ def _run_conversation_impl(
                         )
                         continue
 
-                recovered_with_pool, _retry.has_retried_429 = (
-                    agent._recover_with_credential_pool(
-                        status_code=status_code,
-                        has_retried_429=_retry.has_retried_429,
-                        classified_reason=classified.reason,
-                        error_context=error_context,
-                    )
+                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
+                    status_code=status_code,
+                    has_retried_429=_retry.has_retried_429,
+                    classified_reason=classified.reason,
+                    error_context=error_context,
                 )
                 if recovered_with_pool:
-                    # A fresh credential means the next 429 is a new story —
-                    # don't let the pre-rotation hits trip the fail-fast (#704).
                     _retry.consecutive_rate_limit_hits = 0
                     continue
 
@@ -3016,8 +2803,7 @@ def _run_conversation_impl(
                 # of this session so future tool results preemptively
                 # downgrade, and retry once.  See issue #27344.
                 if (
-                    classified.reason
-                    == FailoverReason.multimodal_tool_content_unsupported
+                    classified.reason == FailoverReason.multimodal_tool_content_unsupported
                     and not _retry.multimodal_tool_content_retry_attempted
                 ):
                     _retry.multimodal_tool_content_retry_attempted = True
@@ -3044,8 +2830,7 @@ def _run_conversation_impl(
                 # proposed unconditional omit so capable subscriptions
                 # don't silently lose the capability).
                 if (
-                    classified.reason
-                    == FailoverReason.oauth_long_context_beta_forbidden
+                    classified.reason == FailoverReason.oauth_long_context_beta_forbidden
                     and agent.api_mode == "anthropic_messages"
                     and agent._is_anthropic_oauth
                     and not _retry.oauth_1m_beta_retry_attempted
@@ -3073,12 +2858,8 @@ def _run_conversation_impl(
                 ):
                     _retry.codex_auth_retry_attempted = True
                     if agent._try_refresh_codex_client_credentials(force=True):
-                        _label = (
-                            "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
-                        )
-                        agent._buffer_vprint(
-                            f"🔐 {_label} auth refreshed after 401. Retrying request..."
-                        )
+                        _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
+                        agent._buffer_vprint(f"🔐 {_label} auth refreshed after 401. Retrying request...")
                         continue
                 if (
                     agent.api_mode == "chat_completions"
@@ -3098,47 +2879,30 @@ def _run_conversation_impl(
                 ):
                     _retry.nous_auth_retry_attempted = True
                     if agent._try_refresh_nous_client_credentials(force=True):
-                        print(
-                            f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request..."
-                        )
+                        print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info.
                     # Most common causes: Portal OAuth expired/revoked,
                     # account out of credits, or agent key blocked.
                     from hermes_constants import display_hermes_home as _dhh_fn
-
                     _dhh = _dhh_fn()
                     _body_text = ""
                     try:
-                        _body = getattr(api_error, "body", None) or getattr(
-                            api_error, "response", None
-                        )
+                        _body = getattr(api_error, "body", None) or getattr(api_error, "response", None)
                         if _body is not None:
                             _body_text = str(_body)[:200]
                     except Exception:
                         pass
-                    print(
-                        f"{agent.log_prefix}🔐 Nous 401 — Portal authentication failed."
-                    )
+                    print(f"{agent.log_prefix}🔐 Nous 401 — Portal authentication failed.")
                     if _body_text:
                         print(f"{agent.log_prefix}   Response: {_body_text}")
                     if not _print_nous_entitlement_guidance(agent, "Nous model access"):
-                        print(
-                            f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked."
-                        )
+                        print(f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked.")
                     print(f"{agent.log_prefix}   Troubleshooting:")
-                    print(
-                        f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous"
-                    )
-                    print(
-                        f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com"
-                    )
-                    print(
-                        f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json"
-                    )
-                    print(
-                        f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter"
-                    )
+                    print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
+                    print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
+                    print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
+                    print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
                 if (
                     agent.provider == "copilot"
                     and status_code == 401
@@ -3146,79 +2910,45 @@ def _run_conversation_impl(
                 ):
                     _retry.copilot_auth_retry_attempted = True
                     if agent._try_refresh_copilot_client_credentials():
-                        agent._buffer_vprint(
-                            f"🔐 Copilot credentials refreshed after 401. Retrying request..."
-                        )
+                        agent._buffer_vprint("🔐 Copilot credentials refreshed after 401. Retrying request...")
                         continue
                 if (
                     agent.api_mode == "anthropic_messages"
                     and status_code == 401
-                    and hasattr(agent, "_anthropic_api_key")
+                    and hasattr(agent, '_anthropic_api_key')
                     and not _retry.anthropic_auth_retry_attempted
                 ):
                     _retry.anthropic_auth_retry_attempted = True
                     from agent.anthropic_adapter import _is_oauth_token
                     from agent.azure_identity_adapter import is_token_provider
-
                     if agent._try_refresh_anthropic_client_credentials():
-                        print(
-                            f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request..."
-                        )
+                        print(f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info
                     key = agent._anthropic_api_key
-                    print(
-                        f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed."
-                    )
+                    print(f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed.")
                     if is_token_provider(key):
                         # Azure Foundry Entra ID — the bearer token is
                         # minted per-request by an httpx event hook on a
                         # custom http_client passed to the SDK. The 401
                         # means Azure rejected the JWT (RBAC role missing,
                         # az login expired, IMDS unreachable, etc.).
-                        print(
-                            f"{agent.log_prefix}   Auth method: Microsoft Entra ID (httpx event hook)"
-                        )
-                        print(
-                            f"{agent.log_prefix}   Run `hermes doctor` for credential-chain diagnostics, or"
-                        )
-                        print(
-                            f"{agent.log_prefix}   `az login` if your developer session expired."
-                        )
+                        print(f"{agent.log_prefix}   Auth method: Microsoft Entra ID (httpx event hook)")
+                        print(f"{agent.log_prefix}   Run `hermes doctor` for credential-chain diagnostics, or")
+                        print(f"{agent.log_prefix}   `az login` if your developer session expired.")
                     else:
-                        auth_method = (
-                            "Bearer (OAuth/setup-token)"
-                            if _is_oauth_token(key)
-                            else "x-api-key (API key)"
-                        )
+                        auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
                         print(f"{agent.log_prefix}   Auth method: {auth_method}")
-                        print(
-                            f"{agent.log_prefix}   Token prefix: {key[:12]}..."
-                            if isinstance(key, str) and len(key) > 12
-                            else f"{agent.log_prefix}   Token: (empty or short)"
-                        )
+                        print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
                     print(f"{agent.log_prefix}   Troubleshooting:")
                     from hermes_constants import display_hermes_home as _dhh_fn
-
                     _dhh = _dhh_fn()
-                    print(
-                        f"{agent.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens"
-                    )
-                    print(
-                        f"{agent.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values"
-                    )
-                    print(
-                        f"{agent.log_prefix}     • For API keys: verify at https://platform.claude.com/settings/keys"
-                    )
-                    print(
-                        f"{agent.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry"
-                    )
-                    print(
-                        f'{agent.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN ""'
-                    )
-                    print(
-                        f'{agent.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY ""'
-                    )
+                    print(f"{agent.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
+                    print(f"{agent.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
+                    print(f"{agent.log_prefix}     • For API keys: verify at https://platform.claude.com/settings/keys")
+                    print(f"{agent.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
+                    print(f"{agent.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
+                    print(f"{agent.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
 
                 # Thinking block signature recovery.
                 #
@@ -3267,8 +2997,7 @@ def _run_conversation_impl(
                         "%sThinking block signature recovery: stripped "
                         "reasoning_details from %d api_messages "
                         "(canonical messages unchanged)",
-                        agent.log_prefix,
-                        _api_stripped,
+                        agent.log_prefix, _api_stripped,
                     )
                     continue
 
@@ -3331,13 +3060,11 @@ def _run_conversation_impl(
                     _retry.llama_cpp_grammar_retry_attempted = True
                     try:
                         from tools.schema_sanitizer import strip_pattern_and_format
-
                         _, _stripped = strip_pattern_and_format(agent.tools)
                     except Exception as _strip_exc:  # pragma: no cover — defensive
                         logger.warning(
                             "%sllama.cpp grammar recovery: strip helper failed: %s",
-                            agent.log_prefix,
-                            _strip_exc,
+                            agent.log_prefix, _strip_exc,
                         )
                         _stripped = 0
                     if _stripped:
@@ -3349,8 +3076,7 @@ def _run_conversation_impl(
                         logger.warning(
                             "%sllama.cpp grammar recovery: stripped %d "
                             "pattern/format keyword(s) from tool schemas",
-                            agent.log_prefix,
-                            _stripped,
+                            agent.log_prefix, _stripped,
                         )
                         continue
                     # No keywords found to strip — fall through to normal
@@ -3361,111 +3087,12 @@ def _run_conversation_impl(
                         agent.log_prefix,
                     )
 
-                # ── Fail fast for non-retryable client errors (#366) ─────
-                # The classifier already flags 401/403/404 (and other
-                # deterministic client errors) as retryable=False.  Instead
-                # of incrementing retry_count and waiting through backoff,
-                # try fallback once and, if unavailable, surface a clear
-                # diagnostic and abort immediately.
-                if (
-                    not classified.retryable
-                    and not classified.should_compress
-                    and classified.reason
-                    not in {
-                        FailoverReason.rate_limit,
-                        FailoverReason.overloaded,
-                        FailoverReason.context_overflow,
-                        FailoverReason.payload_too_large,
-                        FailoverReason.long_context_tier,
-                        FailoverReason.thinking_signature,
-                    }
-                    and not _retry.fail_fast_attempted
-                ):
-                    _retry.fail_fast_attempted = True
-                    _nr_provider = (getattr(agent, "provider", "") or "").strip()
-                    _nr_model = (getattr(agent, "model", "") or "").strip()
-                    _nr_base = str(getattr(agent, "base_url", "") or "").rstrip("/")
-                    _nr_status = getattr(api_error, "status_code", None)
-                    _nr_reason_label = classified.reason.value
-                    _nr_summary = agent._summarize_api_error(api_error)
-                    if agent._has_pending_fallback():
-                        agent._buffer_status(
-                            f"⚠️ Non-retryable error ({_nr_reason_label}, HTTP {_nr_status}) — trying fallback..."
-                        )
-                    if agent._try_activate_fallback(
-                        reason=classified.reason, api_error=api_error
-                    ):
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.fail_fast_attempted = False
-                        continue
-                    # No fallback — dump, flush diagnostics, and abort.
-                    if api_kwargs is not None:
-                        agent._dump_api_request_debug(
-                            api_kwargs,
-                            reason="non_retryable_client_error",
-                            error=api_error,
-                        )
-                    agent._flush_status_buffer()
-                    agent._emit_status(
-                        f"❌ Non-retryable error (HTTP {_nr_status}): {_nr_summary}"
-                    )
-                    agent._vprint(
-                        f"{agent.log_prefix}❌ Non-retryable client error (HTTP {_nr_status}). Aborting.",
-                        force=True,
-                    )
-                    agent._vprint(
-                        f"{agent.log_prefix}   🔌 Provider: {_nr_provider}  Model: {_nr_model}",
-                        force=True,
-                    )
-                    agent._vprint(
-                        f"{agent.log_prefix}   🌐 Endpoint: {_nr_base}", force=True
-                    )
-                    if classified.reason == FailoverReason.model_not_found:
-                        agent._vprint(
-                            f"{agent.log_prefix}   💡 Model '{_nr_model}' was not found. "
-                            "Check the model ID or configure a fallback provider.",
-                            force=True,
-                        )
-                    elif classified.reason in {
-                        FailoverReason.billing,
-                        FailoverReason.auth,
-                    }:
-                        _print_billing_or_entitlement_guidance(
-                            agent,
-                            capability="model access",
-                            provider=_nr_provider,
-                            base_url=_nr_base,
-                            model=_nr_model,
-                        )
-                    else:
-                        agent._vprint(
-                            f"{agent.log_prefix}   💡 This type of error won't be fixed by retrying.",
-                            force=True,
-                        )
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": None,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "failed": True,
-                        # Use the summarized error, not str(api_error): a 403
-                        # Cloudflare challenge body is ~60 KB of raw HTML and
-                        # must not leak into result['error'] (it gets delivered
-                        # to chat). Matches the other non-retryable paths.
-                        # See test_nonretryable_error_html_summary.
-                        "error": _nr_summary,
-                        "failure_reason": classified.reason.value,
-                    }
-
                 retry_count += 1
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
                 )
-
+                
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
                 _error_summary = agent._summarize_api_error(api_error)
@@ -3482,9 +3109,7 @@ def _run_conversation_impl(
                 _base = getattr(agent, "base_url", "unknown")
                 _model = getattr(agent, "model", "unknown")
                 _status_code_str = f" [HTTP {status_code}]" if status_code else ""
-                agent._buffer_vprint(
-                    f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}"
-                )
+                agent._buffer_vprint(f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}")
                 agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
                 agent._buffer_vprint(f"   🌐 Endpoint: {_base}")
                 agent._buffer_vprint(f"   📝 Error: {_error_summary}")
@@ -3493,24 +3118,25 @@ def _run_conversation_impl(
                     _err_body_str = str(_err_body)[:300] if _err_body else None
                     if _err_body_str:
                         agent._buffer_vprint(f"   📋 Details: {_err_body_str}")
-                agent._buffer_vprint(
-                    f"   ⏱️  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens"
-                )
+                agent._buffer_vprint(f"   ⏱️  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens")
 
                 # Actionable hint for OpenRouter "no tool endpoints" error.
                 # Buffered like the rest of the retry trace — surfaced only
                 # if every retry+fallback exhausts.  Avoids spamming users
                 # who recover automatically via fallback.
-                if agent._is_openrouter_url() and "support tool use" in error_msg:
+                if (
+                    agent._is_openrouter_url()
+                    and "support tool use" in error_msg
+                ):
                     agent._buffer_vprint(
                         f"   💡 No OpenRouter providers for {_model} support tool calling with your current settings."
                     )
                     if agent.providers_allowed:
                         agent._buffer_vprint(
-                            f"      Your provider_routing.only restriction is filtering out tool-capable providers."
+                            "      Your provider_routing.only restriction is filtering out tool-capable providers."
                         )
                         agent._buffer_vprint(
-                            f"      Try removing the restriction or adding providers that support tools for this model."
+                            "      Try removing the restriction or adding providers that support tools for this model."
                         )
                     agent._buffer_vprint(
                         f"      Check which providers support tools: https://openrouter.ai/models/{_model}"
@@ -3518,10 +3144,7 @@ def _run_conversation_impl(
 
                 # Check for interrupt before deciding to retry
                 if agent._interrupt_requested:
-                    agent._vprint(
-                        f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.",
-                        force=True,
-                    )
+                    agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
@@ -3533,7 +3156,7 @@ def _run_conversation_impl(
                         "completed": False,
                         "interrupted": True,
                     }
-
+                
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
                 # A 413 is a payload-size error — the correct response is to
                 # compress history and retry, not abort immediately.
@@ -3560,8 +3183,9 @@ def _run_conversation_impl(
                     FailoverReason.payload_too_large,
                     FailoverReason.context_overflow,
                 }
-                if classified.reason in _overflow_reasons and not getattr(
-                    agent, "compression_enabled", True
+                if (
+                    classified.reason in _overflow_reasons
+                    and not getattr(agent, "compression_enabled", True)
                 ):
                     agent._flush_status_buffer()
                     agent._vprint(
@@ -3634,8 +3258,7 @@ def _run_conversation_impl(
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
                         messages, active_system_prompt = agent._compress_context(
-                            messages,
-                            system_message,
+                            messages, system_message,
                             approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
@@ -3668,6 +3291,18 @@ def _run_conversation_impl(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
+                # Z.AI Coding Plan GLM-5.2 overload 429s classify as
+                # `overloaded` (to spare the credential pool), but `overloaded`
+                # is excluded from `is_rate_limited` — the gate for the adaptive
+                # Z.AI backoff below. Detect the overload directly so its
+                # long-backoff schedule runs, and raise the retry ceiling so the
+                # long tier (30/60/90/120s) is reachable. See
+                # zai_coding_overload_retry_ceiling() for the ceiling rationale.
+                _is_zai_coding_overload = is_zai_coding_overload_error(
+                    base_url=str(_base), model=_model, error=api_error
+                )
+                if _is_zai_coding_overload:
+                    max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited
                     or (_is_transport_failure and retry_count >= 2)
@@ -3675,8 +3310,7 @@ def _run_conversation_impl(
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
                     # still recover.  See _pool_may_recover_from_rate_limit
-                    # for the single-credential-pool and CloudCode-quota
-                    # exceptions.  Fixes #11314 and #13636.
+                    # for the single-credential-pool exception.  Fixes #11314.
                     #
                     # Exception: an upstream-aggregator 429 — the credential
                     # pool can't help when the *upstream* model (DeepSeek,
@@ -3687,8 +3321,6 @@ def _run_conversation_impl(
                         False if _is_upstream
                         else _ra()._pool_may_recover_from_rate_limit(
                             agent._credential_pool,
-                            provider=agent.provider,
-                            base_url=getattr(agent, "base_url", None),
                         )
                     )
                     if not pool_may_recover:
@@ -3709,20 +3341,13 @@ def _run_conversation_impl(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
                             )
                         else:
-                            agent._buffer_status(
-                                "⚠️ Rate limited — switching to fallback provider..."
-                            )
-                        if agent._try_activate_fallback(
-                            reason=classified.reason, api_error=api_error
-                        ):
+                            agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                        if agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt
-                            )
+                                agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
-                            # New provider — restart the consecutive-429
-                            # fail-fast count from zero (#704).
                             _retry.consecutive_rate_limit_hits = 0
                             continue
 
@@ -3751,15 +3376,13 @@ def _run_conversation_impl(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
                     )
-                    if agent._try_activate_fallback(
-                        reason=classified.reason, api_error=api_error
-                    ):
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
+                        _retry.consecutive_rate_limit_hits = 0
                         continue
 
                 # ── Nous Portal: record rate limit & skip retries ─────
@@ -3794,10 +3417,10 @@ def _run_conversation_impl(
                             is_genuine_nous_rate_limit,
                             record_nous_rate_limit,
                         )
-
                         _err_resp = getattr(api_error, "response", None)
                         _err_hdrs = (
-                            getattr(_err_resp, "headers", None) if _err_resp else None
+                            getattr(_err_resp, "headers", None)
+                            if _err_resp else None
                         )
                         _genuine_nous_rate_limit = is_genuine_nous_rate_limit(
                             headers=_err_hdrs,
@@ -3926,17 +3549,9 @@ def _run_conversation_impl(
                     if compression_attempts > max_compression_attempts:
                         # Terminal — surface the buffered retry trace.
                         agent._flush_status_buffer()
-                        agent._vprint(
-                            f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.",
-                            force=True,
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.",
-                            force=True,
-                        )
-                        logger.error(
-                            f"{agent.log_prefix}413 compression failed after {max_compression_attempts} attempts."
-                        )
+                        agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
+                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                        logger.error(f"{agent.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -3949,16 +3564,12 @@ def _run_conversation_impl(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(
-                        f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}..."
-                    )
+                    agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     messages, active_system_prompt = agent._compress_context(
-                        messages,
-                        system_message,
-                        approx_tokens=approx_tokens,
+                        messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
                     conversation_history = conversation_history_after_compression(
@@ -3972,17 +3583,11 @@ def _run_conversation_impl(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (
-                        new_tokens > 0 and new_tokens < original_tokens * 0.95
-                    ):
+                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
                         if len(messages) < original_len:
-                            agent._buffer_status(
-                                f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying..."
-                            )
+                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
                         else:
-                            agent._buffer_status(
-                                f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying..."
-                            )
+                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -4000,17 +3605,9 @@ def _run_conversation_impl(
                         # Terminal — surface buffered context so the user
                         # sees what compression attempts were made.
                         agent._flush_status_buffer()
-                        agent._vprint(
-                            f"{agent.log_prefix}❌ Payload too large and cannot compress further.",
-                            force=True,
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.",
-                            force=True,
-                        )
-                        logger.error(
-                            f"{agent.log_prefix}413 payload too large. Cannot compress further."
-                        )
+                        agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
+                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                        logger.error(f"{agent.log_prefix}413 payload too large. Cannot compress further.")
                         agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
                         return {
@@ -4063,17 +3660,9 @@ def _run_conversation_impl(
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
                             agent._flush_status_buffer()
-                            agent._vprint(
-                                f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.",
-                                force=True,
-                            )
-                            agent._vprint(
-                                f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.",
-                                force=True,
-                            )
-                            logger.error(
-                                f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts."
-                            )
+                            agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
+                            agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                            logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                             return {
@@ -4138,16 +3727,14 @@ def _run_conversation_impl(
                     # turn a user-configured 1M window into 256K/128K/64K.
                     new_ctx = get_context_length_from_provider_error(error_msg, old_ctx)
                     _provider_lower = (getattr(agent, "provider", "") or "").lower()
-                    _base_lower = (
-                        (getattr(agent, "base_url", "") or "").rstrip("/").lower()
+                    _base_lower = (getattr(agent, "base_url", "") or "").rstrip("/").lower()
+                    is_minimax_provider = (
+                        _provider_lower in {"minimax", "minimax-cn"}
+                        or _base_lower.startswith((
+                            "https://api.minimax.io/anthropic",
+                            "https://api.minimaxi.com/anthropic",
+                        ))
                     )
-                    is_minimax_provider = _provider_lower in {
-                        "minimax",
-                        "minimax-cn",
-                    } or _base_lower.startswith((
-                        "https://api.minimax.io/anthropic",
-                        "https://api.minimaxi.com/anthropic",
-                    ))
                     minimax_delta_only_overflow = (
                         is_minimax_provider
                         and new_ctx is None
@@ -4155,9 +3742,7 @@ def _run_conversation_impl(
                     )
 
                     if new_ctx is not None:
-                        agent._buffer_vprint(
-                            f"Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})"
-                        )
+                        agent._buffer_vprint(f"Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})")
                         compressor.update_model(
                             model=agent.model,
                             context_length=new_ctx,
@@ -4172,9 +3757,7 @@ def _run_conversation_impl(
                         if hasattr(compressor, "_context_probed"):
                             compressor._context_probed = True
                             compressor._context_probe_persistable = True
-                        agent._buffer_vprint(
-                            f"⚠️  Context length exceeded — using provider limit: {old_ctx:,} → {new_ctx:,} tokens"
-                        )
+                        agent._buffer_vprint(f"⚠️  Context length exceeded — using provider limit: {old_ctx:,} → {new_ctx:,} tokens")
                     elif minimax_delta_only_overflow:
                         agent._buffer_vprint(
                             f"Provider reported overflow amount only; "
@@ -4189,17 +3772,9 @@ def _run_conversation_impl(
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
                         agent._flush_status_buffer()
-                        agent._vprint(
-                            f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.",
-                            force=True,
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.",
-                            force=True,
-                        )
-                        logger.error(
-                            f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts."
-                        )
+                        agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
+                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                        logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -4212,16 +3787,12 @@ def _run_conversation_impl(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(
-                        f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})..."
-                    )
+                    agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     messages, active_system_prompt = agent._compress_context(
-                        messages,
-                        system_message,
-                        approx_tokens=approx_tokens,
+                        messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
                     )
                     conversation_history = conversation_history_after_compression(
@@ -4235,36 +3806,20 @@ def _run_conversation_impl(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if (
-                        len(messages) < original_len
-                        or (new_tokens > 0 and new_tokens < original_tokens * 0.95)
-                        or (new_ctx and new_ctx < old_ctx)
-                    ):
+                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
                         if len(messages) < original_len:
-                            agent._buffer_status(
-                                f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying..."
-                            )
+                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
-                            agent._buffer_status(
-                                f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying..."
-                            )
+                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
                         # Can't compress further and already at minimum tier
                         agent._flush_status_buffer()
-                        agent._vprint(
-                            f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.",
-                            force=True,
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.",
-                            force=True,
-                        )
-                        logger.error(
-                            f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further."
-                        )
+                        agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
+                        agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
+                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
                         return {
@@ -4338,8 +3893,7 @@ def _run_conversation_impl(
                     or (
                         not classified.retryable
                         and not classified.should_compress
-                        and classified.reason
-                        not in {
+                        and classified.reason not in {
                             FailoverReason.rate_limit,
                             FailoverReason.overloaded,
                             FailoverReason.context_overflow,
@@ -4351,41 +3905,6 @@ def _run_conversation_impl(
                 ) and not is_context_length_error
 
                 if is_client_error:
-                    # ── Model 404 self-correct (#348) — try suffix variants of
-                    #    the SAME model before switching providers. A bare model
-                    #    id (no ``:suffix``) that 404s often resolves once
-                    #    suffixed (``glm-4`` → ``glm-4:cloud``). Try each untried
-                    #    variant once; only on exhaustion do we fall through to
-                    #    the provider fallback / abort below. Variants are derived
-                    #    from the ORIGINAL id so a mutated ``agent.model`` from a
-                    #    prior attempt doesn't shrink the candidate set.
-                    if classified.reason == FailoverReason.model_not_found:
-                        _mnf_base = getattr(agent, "_model_404_base", None)
-                        _mnf_tried = getattr(agent, "_model_404_tried", None)
-                        # Fresh model (first 404, or the user switched models
-                        # mid-session) → restart the variant search from it so a
-                        # stale base never narrows the candidates.
-                        if _mnf_tried is None or (agent.model or "") not in _mnf_tried:
-                            _mnf_base = agent.model or ""
-                            _mnf_tried = {_mnf_base}
-                        _variant = next_untried_model_variant(_mnf_base, _mnf_tried)
-                        if _variant is not None:
-                            _mnf_tried.add(_variant)
-                            agent._model_404_base = _mnf_base
-                            agent._model_404_tried = _mnf_tried
-                            agent._buffer_status(
-                                f"⚠️ Model '{agent.model}' not found — trying '{_variant}'..."
-                            )
-                            agent._vprint(
-                                f"{agent.log_prefix}   💡 Model not found; self-correcting "
-                                f"to suffixed variant '{_variant}'.",
-                                force=True,
-                            )
-                            agent.model = _variant
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
-                            continue
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
                     # announce the attempt when a fallback chain actually
@@ -4394,26 +3913,22 @@ def _run_conversation_impl(
                     # abort silently (#35314, #17446).
                     if agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
-                            agent._buffer_status(
-                                "⚠️ Provider safety filter blocked this request — trying fallback..."
-                            )
+                            agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                        elif classified.reason == FailoverReason.ssl_cert_verification:
+                            agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
-                            agent._buffer_status(
-                                f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback..."
-                            )
+                            agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
+                        _retry.consecutive_rate_limit_hits = 0
                         continue
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
-                            api_kwargs,
-                            reason="non_retryable_client_error",
-                            error=api_error,
+                            api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
                     # Terminal — flush buffered context so the user sees
                     # what was tried before the abort.
@@ -4430,36 +3945,27 @@ def _run_conversation_impl(
                             f"❌ Provider safety filter blocked this request: "
                             f"{_nonretryable_summary}"
                         )
+                    elif classified.reason == FailoverReason.ssl_cert_verification:
+                        agent._emit_status(
+                            f"❌ TLS certificate verification failed: "
+                            f"{_nonretryable_summary}"
+                        )
                     else:
                         agent._emit_status(
                             f"❌ Non-retryable error (HTTP {status_code}): "
                             f"{_nonretryable_summary}"
                         )
-                    agent._vprint(
-                        f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.",
-                        force=True,
-                    )
-                    agent._vprint(
-                        f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}",
-                        force=True,
-                    )
-                    agent._vprint(
-                        f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True
-                    )
+                    agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
+                    agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
+                    agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
-                    if (
-                        classified.is_auth
-                        or classified.reason == FailoverReason.billing
-                    ):
-                        if (
-                            classified.reason == FailoverReason.billing
-                            and _print_billing_or_entitlement_guidance(
-                                agent,
-                                capability="model access",
-                                provider=_provider,
-                                base_url=str(_base),
-                                model=_model,
-                            )
+                    if classified.is_auth or classified.reason == FailoverReason.billing:
+                        if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
+                            agent,
+                            capability="model access",
+                            provider=_provider,
+                            base_url=str(_base),
+                            model=_model,
                         ):
                             pass
                         elif _provider == "nous" and _print_nous_entitlement_guidance(
@@ -4467,91 +3973,34 @@ def _run_conversation_impl(
                             "Nous model access",
                         ):
                             pass
-                        elif (
-                            _provider in {"openai-codex", "xai-oauth", "nous"}
-                            and status_code == 401
-                        ):
+                        elif _provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
                             if _provider == "openai-codex":
-                                agent._vprint(
-                                    f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been",
-                                    force=True,
-                                )
-                                agent._vprint(
-                                    f"{agent.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:",
-                                    force=True,
-                                )
-                                agent._vprint(
-                                    f"{agent.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.",
-                                    force=True,
-                                )
-                                agent._vprint(
-                                    f"{agent.log_prefix}      2. Then run `hermes auth` to re-authenticate.",
-                                    force=True,
-                                )
+                                agent._vprint(f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
+                                agent._vprint(f"{agent.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
+                                agent._vprint(f"{agent.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
+                                agent._vprint(f"{agent.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
                             elif _provider == "xai-oauth":
-                                agent._vprint(
-                                    f"{agent.log_prefix}   💡 xAI OAuth token was rejected (HTTP 401). To fix:",
-                                    force=True,
-                                )
-                                agent._vprint(
-                                    f"{agent.log_prefix}      re-authenticate with xAI Grok OAuth (SuperGrok / Premium+) from `hermes model`.",
-                                    force=True,
-                                )
+                                agent._vprint(f"{agent.log_prefix}   💡 xAI OAuth token was rejected (HTTP 401). To fix:", force=True)
+                                agent._vprint(f"{agent.log_prefix}      re-authenticate with xAI Grok OAuth (SuperGrok / Premium+) from `hermes model`.", force=True)
                             else:  # nous
-                                agent._vprint(
-                                    f"{agent.log_prefix}   💡 Nous Portal OAuth token was rejected (HTTP 401). Your token may be",
-                                    force=True,
-                                )
-                                agent._vprint(
-                                    f"{agent.log_prefix}      expired, revoked, or your account may be out of credits. To fix:",
-                                    force=True,
-                                )
-                                agent._vprint(
-                                    f"{agent.log_prefix}      1. Re-authenticate: hermes portal",
-                                    force=True,
-                                )
-                                agent._vprint(
-                                    f"{agent.log_prefix}      2. Check your portal account: https://portal.nousresearch.com",
-                                    force=True,
-                                )
+                                agent._vprint(f"{agent.log_prefix}   💡 Nous Portal OAuth token was rejected (HTTP 401). Your token may be", force=True)
+                                agent._vprint(f"{agent.log_prefix}      expired, revoked, or your account may be out of credits. To fix:", force=True)
+                                agent._vprint(f"{agent.log_prefix}      1. Re-authenticate: hermes portal", force=True)
+                                agent._vprint(f"{agent.log_prefix}      2. Check your portal account: https://portal.nousresearch.com", force=True)
                                 # ``:free`` is OpenRouter slug syntax; Nous Portal will reject
                                 # the model name even after a successful re-auth.
                                 if isinstance(_model, str) and _model.endswith(":free"):
-                                    agent._vprint(
-                                        f"{agent.log_prefix}      ⚠️  Note: `{_model}` looks like an OpenRouter slug (`:free` suffix).",
-                                        force=True,
-                                    )
-                                    agent._vprint(
-                                        f"{agent.log_prefix}         Nous Portal won't recognize that model name. Either switch to a",
-                                        force=True,
-                                    )
-                                    agent._vprint(
-                                        f"{agent.log_prefix}         Nous catalog model, or run `/model openrouter:{_model}` to use OpenRouter.",
-                                        force=True,
-                                    )
+                                    agent._vprint(f"{agent.log_prefix}      ⚠️  Note: `{_model}` looks like an OpenRouter slug (`:free` suffix).", force=True)
+                                    agent._vprint(f"{agent.log_prefix}         Nous Portal won't recognize that model name. Either switch to a", force=True)
+                                    agent._vprint(f"{agent.log_prefix}         Nous catalog model, or run `/model openrouter:{_model}` to use OpenRouter.", force=True)
                         else:
-                            agent._vprint(
-                                f"{agent.log_prefix}   💡 Your API key was rejected by the provider. Check:",
-                                force=True,
-                            )
-                            agent._vprint(
-                                f"{agent.log_prefix}      • Is the key valid? Run: hermes setup",
-                                force=True,
-                            )
-                            agent._vprint(
-                                f"{agent.log_prefix}      • Does your account have access to {_model}?",
-                                force=True,
-                            )
+                            agent._vprint(f"{agent.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
+                            agent._vprint(f"{agent.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
+                            agent._vprint(f"{agent.log_prefix}      • Does your account have access to {_model}?", force=True)
                             if base_url_host_matches(str(_base), "openrouter.ai"):
-                                agent._vprint(
-                                    f"{agent.log_prefix}      • Check credits: https://openrouter.ai/settings/credits",
-                                    force=True,
-                                )
+                                agent._vprint(f"{agent.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                     else:
-                        agent._vprint(
-                            f"{agent.log_prefix}   💡 This type of error won't be fixed by retrying.",
-                            force=True,
-                        )
+                        agent._vprint(f"{agent.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
                     # Content-policy blocks deserve their own actionable
                     # guidance — neither "fix your API key" nor "retry won't
                     # help" tells the user what to actually do. The provider
@@ -4574,17 +4023,50 @@ def _run_conversation_impl(
                             f"{agent.log_prefix}        hermes fallback add   (interactive picker — same as `hermes model`)",
                             force=True,
                         )
-                    logger.error(
-                        f"{agent.log_prefix}Non-retryable client error: {api_error}"
-                    )
+                    # TLS certificate failures are environment problems, not
+                    # provider/prompt problems — tell the user exactly which
+                    # knobs fix each common cause. Inspired by Claude Code
+                    # v2.1.199's immediate SSL fix hints.
+                    if classified.reason == FailoverReason.ssl_cert_verification:
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 The TLS certificate chain could not be verified. This fails the same",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      way on every retry — fix the environment, then try again:",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Corporate TLS-inspecting proxy? Point Python at its CA bundle:",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}        export SSL_CERT_FILE=/path/to/corp-ca.pem  (also REQUESTS_CA_BUNDLE)",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Missing/stale system CA store? Install/refresh it:",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}        pip install --upgrade certifi   (macOS: run 'Install Certificates.command')",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Self-signed local endpoint (llama.cpp, LM Studio, vLLM)? Use http://",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}        for localhost, or add the server's cert to your trust store.",
+                            force=True,
+                        )
+                    logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
                     # session even larger, causing the same failure on the
                     # next attempt. (#1630)
-                    if status_code == 400 and (
-                        approx_tokens > 50000 or len(api_messages) > 80
-                    ):
+                    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
                             f"for large failed session to prevent growth loop.",
@@ -4619,13 +4101,8 @@ def _run_conversation_impl(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if (
-                        not _retry.primary_recovery_attempted
-                        and agent._try_recover_primary_transport(
-                            api_error,
-                            retry_count=retry_count,
-                            max_retries=max_retries,
-                        )
+                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                        api_error, retry_count=retry_count, max_retries=max_retries,
                     ):
                         _retry.primary_recovery_attempted = True
                         retry_count = 0
@@ -4639,25 +4116,21 @@ def _run_conversation_impl(
                         continue
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
-                        agent._buffer_status(
-                            f"⚠️ Max retries ({max_retries}) exhausted — trying fallback..."
-                        )
+                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
+                        _retry.consecutive_rate_limit_hits = 0
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
-                        agent._emit_status(
-                            f"❌ Billing or credits exhausted — {_final_summary}"
-                        )
+                        agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
                         _billing_guidance = _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
@@ -4672,35 +4145,23 @@ def _run_conversation_impl(
                             model=_model,
                         )
                     elif is_rate_limited:
-                        agent._emit_status(
-                            f"❌ Rate limited after {max_retries} retries — {_final_summary}"
-                        )
+                        agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
                     else:
-                        agent._emit_status(
-                            f"❌ API failed after {max_retries} retries — {_final_summary}"
-                        )
-                    agent._vprint(
-                        f"{agent.log_prefix}   💀 Final error: {_final_summary}",
-                        force=True,
-                    )
+                        agent._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
+                    agent._vprint(f"{agent.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                     # Detect SSE stream-drop pattern (e.g. "Network
                     # connection lost") and surface actionable guidance.
                     # This typically happens when the model generates a
                     # very large tool call (write_file with huge content)
                     # and the proxy/CDN drops the stream mid-response.
-                    _is_stream_drop = not getattr(
-                        api_error, "status_code", None
-                    ) and any(
-                        p in error_msg
-                        for p in (
-                            "connection lost",
-                            "connection reset",
-                            "connection closed",
-                            "network connection",
-                            "network error",
-                            "terminated",
-                        )
+                    _is_stream_drop = (
+                        not getattr(api_error, "status_code", None)
+                        and any(p in error_msg for p in (
+                            "connection lost", "connection reset",
+                            "connection closed", "network connection",
+                            "network error", "terminated",
+                        ))
                     )
                     if _is_stream_drop:
                         agent._vprint(
@@ -4779,25 +4240,16 @@ def _run_conversation_impl(
 
                     logger.error(
                         "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
-                        agent.log_prefix,
-                        max_retries,
-                        _final_summary,
-                        _provider,
-                        _model,
-                        len(api_messages),
-                        f"{approx_tokens:,}",
+                        agent.log_prefix, max_retries, _final_summary,
+                        _provider, _model, len(api_messages), f"{approx_tokens:,}",
                     )
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
-                            api_kwargs,
-                            reason="max_retries_exhausted",
-                            error=api_error,
+                            api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
                     agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.billing:
-                        _final_response = (
-                            f"Billing or credits exhausted: {_final_summary}"
-                        )
+                        _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
                     else:
@@ -4844,26 +4296,22 @@ def _run_conversation_impl(
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
                 if is_rate_limited:
-                    _resp_headers = getattr(
-                        getattr(api_error, "response", None), "headers", None
-                    )
+                    _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
                     if _resp_headers and hasattr(_resp_headers, "get"):
-                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get(
-                            "Retry-After"
-                        )
+                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
                         if _ra_raw:
-                            # Fork parser (#369): handles integer seconds AND
-                            # HTTP-date Retry-After values, capped at 300s. Kept
-                            # over upstream's inline min(float(...), 120) because
-                            # it tolerates date-form headers the cruder parser
-                            # silently dropped.
-                            _retry_after = extract_retry_after_seconds(_ra_raw)
+                            try:
+                                # Cap at 10 minutes. Anthropic Tier 1 input-token
+                                # buckets reset in ~171s, so a 120s cap caused us to
+                                # retry before the actual reset window and re-trip the
+                                # limit. 600s covers all realistic provider reset
+                                # windows while still rejecting pathological values. (#26293)
+                                _retry_after = min(float(_ra_raw), 600)
+                            except (TypeError, ValueError):
+                                pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
-                if is_rate_limited and not _retry_after:
-                    # Upstream (#50663): Z.AI Coding overload 429s get a
-                    # progressively longer adaptive schedule instead of the
-                    # normal short exponential. No-op for every other provider.
+                if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
                         base_url=str(_base),
@@ -4871,16 +4319,14 @@ def _run_conversation_impl(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited:
+                if is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
-                    if _retry_after:
-                        _rate_limit_status = f"⏱️ Rate limited on {getattr(agent, 'provider', 'unknown')}/{getattr(agent, 'model', 'unknown')}. Waiting {wait_time:.1f}s (Retry-After: {_retry_after:.1f}s, attempt {retry_count + 1}/{max_retries}){_policy_note}..."
-                    else:
-                        _rate_limit_status = f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
+                    _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
+                    _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
                     # Z.AI Coding waits are different: they can last minutes, so surface
                     # progress immediately instead of making the TUI look frozen.
@@ -4889,9 +4335,7 @@ def _run_conversation_impl(
                     else:
                         agent._buffer_status(_rate_limit_status)
                 else:
-                    agent._buffer_status(
-                        f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})..."
-                    )
+                    agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
                     "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
                     wait_time,
@@ -4907,10 +4351,7 @@ def _run_conversation_impl(
                 _backoff_touch_counter = 0
                 while time.time() < sleep_end:
                     if agent._interrupt_requested:
-                        agent._vprint(
-                            f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.",
-                            force=True,
-                        )
+                        agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
@@ -4931,7 +4372,7 @@ def _run_conversation_impl(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
-
+        
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
@@ -4980,9 +4421,7 @@ def _run_conversation_impl(
         # the `response` variable is still None. Break out cleanly.
         if response is None:
             _turn_exit_reason = "all_retries_exhausted_no_response"
-            print(
-                f"{agent.log_prefix}❌ All API retries exhausted with no successful response."
-            )
+            print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
             agent._persist_session(messages, conversation_history)
             break
 
@@ -4994,18 +4433,14 @@ def _run_conversation_impl(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
-
+            
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
             # of a plain string, which crashes downstream .strip() calls.
-            if assistant_message.content is not None and not isinstance(
-                assistant_message.content, str
-            ):
+            if assistant_message.content is not None and not isinstance(assistant_message.content, str):
                 raw = assistant_message.content
                 if isinstance(raw, dict):
-                    assistant_message.content = (
-                        raw.get("text", "") or raw.get("content", "") or json.dumps(raw)
-                    )
+                    assistant_message.content = raw.get("text", "") or raw.get("content", "") or json.dumps(raw)
                 elif isinstance(raw, list):
                     # Multimodal content list — extract text parts
                     parts = []
@@ -5025,7 +4460,6 @@ def _run_conversation_impl(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-
                 if has_hook("post_api_request"):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
@@ -5066,98 +4500,73 @@ def _run_conversation_impl(
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:
-                    agent._vprint(
-                        f"{agent.log_prefix}🤖 Assistant: {assistant_message.content}"
-                    )
+                    agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content}")
                 else:
-                    agent._vprint(
-                        f"{agent.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}"
-                    )
+                    agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if assistant_message.content and agent.tool_progress_callback:
+            if (assistant_message.content and agent.tool_progress_callback):
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
-                    r"</?(?:REASONING_SCRATCHPAD|think|reasoning)>", "", _think_text
+                    r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                 ).strip()
                 # For subagents: relay first line to parent display (existing behaviour).
                 # For all agents with a structured callback: emit reasoning.available event.
-                first_line = _think_text.split("\n")[0][:80] if _think_text else ""
-                if first_line and getattr(agent, "_delegate_depth", 0) > 0:
+                first_line = _think_text.split('\n')[0][:80] if _think_text else ""
+                if first_line and getattr(agent, '_delegate_depth', 0) > 0:
                     try:
                         agent.tool_progress_callback("_thinking", first_line)
                     except Exception:
                         pass
                 elif _think_text:
                     try:
-                        agent.tool_progress_callback(
-                            "reasoning.available", "_thinking", _think_text[:500], None
-                        )
+                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
                     except Exception:
                         pass
-
+            
             # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
             # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
             if has_incomplete_scratchpad(assistant_message.content or ""):
                 agent._incomplete_scratchpad_retries += 1
-
-                agent._buffer_vprint(
-                    f"⚠️  Incomplete <REASONING_SCRATCHPAD> detected (opened but never closed)"
-                )
-
+                
+                agent._buffer_vprint("⚠️  Incomplete <REASONING_SCRATCHPAD> detected (opened but never closed)")
+                
                 if agent._incomplete_scratchpad_retries <= 2:
-                    agent._buffer_vprint(
-                        f"🔄 Retrying API call ({agent._incomplete_scratchpad_retries}/2)..."
-                    )
+                    agent._buffer_vprint(f"🔄 Retrying API call ({agent._incomplete_scratchpad_retries}/2)...")
                     # Don't add the broken message, just retry
                     continue
                 else:
                     # Max retries - discard this turn and save as partial
                     agent._flush_status_buffer()
-                    agent._vprint(
-                        f"{agent.log_prefix}❌ Max retries (2) for incomplete scratchpad. Saving as partial.",
-                        force=True,
-                    )
+                    agent._vprint(f"{agent.log_prefix}❌ Max retries (2) for incomplete scratchpad. Saving as partial.", force=True)
                     agent._incomplete_scratchpad_retries = 0
-
-                    rolled_back_messages = agent._get_messages_up_to_last_assistant(
-                        messages
-                    )
+                    
+                    rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
-
+                    
                     return {
                         "final_response": "Incomplete REASONING_SCRATCHPAD after 2 retries",
                         "messages": rolled_back_messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "partial": True,
-                        "error": "Incomplete REASONING_SCRATCHPAD after 2 retries",
+                        "error": "Incomplete REASONING_SCRATCHPAD after 2 retries"
                     }
-
+            
             # Reset incomplete scratchpad counter on clean response
             agent._incomplete_scratchpad_retries = 0
 
             if agent.api_mode == "codex_responses" and finish_reason == "incomplete":
                 agent._codex_incomplete_retries += 1
 
-                interim_msg = agent._build_assistant_message(
-                    assistant_message, finish_reason
-                )
+                interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                 interim_has_content = bool((interim_msg.get("content") or "").strip())
-                interim_has_reasoning = (
-                    bool(interim_msg.get("reasoning", "").strip())
-                    if isinstance(interim_msg.get("reasoning"), str)
-                    else False
-                )
-                interim_has_codex_reasoning = bool(
-                    interim_msg.get("codex_reasoning_items")
-                )
-                interim_has_codex_message_items = bool(
-                    interim_msg.get("codex_message_items")
-                )
+                interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
+                interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
+                interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
 
                 if (
                     interim_has_content
@@ -5173,26 +4582,16 @@ def _run_conversation_impl(
                     # while visible content/reasoning are unchanged), compare
                     # those opaque payloads too so we don't silently drop the
                     # newer continuation state.
-                    last_codex_items = (
-                        last_msg.get("codex_reasoning_items")
-                        if isinstance(last_msg, dict)
-                        else None
-                    )
+                    last_codex_items = last_msg.get("codex_reasoning_items") if isinstance(last_msg, dict) else None
                     interim_codex_items = interim_msg.get("codex_reasoning_items")
-                    last_codex_message_items = (
-                        last_msg.get("codex_message_items")
-                        if isinstance(last_msg, dict)
-                        else None
-                    )
+                    last_codex_message_items = last_msg.get("codex_message_items") if isinstance(last_msg, dict) else None
                     interim_codex_message_items = interim_msg.get("codex_message_items")
                     duplicate_interim = (
                         isinstance(last_msg, dict)
                         and last_msg.get("role") == "assistant"
                         and last_msg.get("finish_reason") == "incomplete"
-                        and (last_msg.get("content") or "")
-                        == (interim_msg.get("content") or "")
-                        and (last_msg.get("reasoning") or "")
-                        == (interim_msg.get("reasoning") or "")
+                        and (last_msg.get("content") or "") == (interim_msg.get("content") or "")
+                        and (last_msg.get("reasoning") or "") == (interim_msg.get("reasoning") or "")
                         and last_codex_items == interim_codex_items
                         and last_codex_message_items == interim_codex_message_items
                     )
@@ -5202,9 +4601,7 @@ def _run_conversation_impl(
 
                 if agent._codex_incomplete_retries < 3:
                     if not agent.quiet_mode:
-                        agent._vprint(
-                            f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)"
-                        )
+                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
                     agent._session_messages = messages
                     continue
 
@@ -5220,33 +4617,26 @@ def _run_conversation_impl(
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
-
+            
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
-                    agent._vprint(
-                        f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)..."
-                    )
-
+                    agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
+                
                 if agent.verbose_logging:
                     for tc in assistant_message.tool_calls:
-                        logging.debug(
-                            f"Tool call: {tc.function.name} with args: {tc.function.arguments[:200]}..."
-                        )
-
+                        logging.debug(f"Tool call: {tc.function.name} with args: {tc.function.arguments[:200]}...")
+                
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
-                            print(
-                                f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'"
-                            )
+                            print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
                 invalid_tool_calls = [
-                    tc.function.name
-                    for tc in assistant_message.tool_calls
+                    tc.function.name for tc in assistant_message.tool_calls
                     if tc.function.name not in agent.valid_tool_names
                 ]
                 if invalid_tool_calls:
@@ -5256,21 +4646,12 @@ def _run_conversation_impl(
                     # Return helpful error to model — model can agent-correct next turn
                     available = ", ".join(sorted(agent.valid_tool_names))
                     invalid_name = invalid_tool_calls[0]
-                    invalid_preview = (
-                        invalid_name[:80] + "..."
-                        if len(invalid_name) > 80
-                        else invalid_name
-                    )
-                    agent._buffer_vprint(
-                        f"⚠️  Unknown tool '{invalid_preview}' — sending error to model for agent-correction ({agent._invalid_tool_retries}/3)"
-                    )
+                    invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
+                    agent._buffer_vprint(f"⚠️  Unknown tool '{invalid_preview}' — sending error to model for agent-correction ({agent._invalid_tool_retries}/3)")
 
                     if agent._invalid_tool_retries >= 3:
                         agent._flush_status_buffer()
-                        agent._vprint(
-                            f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.",
-                            force=True,
-                        )
+                        agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                         agent._invalid_tool_retries = 0
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Model generated invalid tool call: {invalid_preview}"
@@ -5283,9 +4664,7 @@ def _run_conversation_impl(
                             "error": _final_response
                         }
 
-                    assistant_msg = agent._build_assistant_message(
-                        assistant_message, finish_reason
-                    )
+                    assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     messages.append(assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
@@ -5323,7 +4702,7 @@ def _run_conversation_impl(
                     continue
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
-
+                
                 # Validate tool call arguments are valid JSON
                 # Handle empty strings as empty objects (common model quirk)
                 invalid_json_args = []
@@ -5343,7 +4722,7 @@ def _run_conversation_impl(
                         json.loads(args)
                     except json.JSONDecodeError as e:
                         invalid_json_args.append((tc.function.name, str(e)))
-
+                
                 if invalid_json_args:
                     # Check if the invalid JSON is due to truncation rather
                     # than a model formatting mistake.  Routers sometimes
@@ -5378,39 +4757,27 @@ def _run_conversation_impl(
                     agent._invalid_json_retries += 1
 
                     tool_name, error_msg = invalid_json_args[0]
-                    agent._buffer_vprint(
-                        f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}"
-                    )
+                    agent._buffer_vprint(f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
 
                     if agent._invalid_json_retries < 3:
-                        agent._buffer_vprint(
-                            f"🔄 Retrying API call ({agent._invalid_json_retries}/3)..."
-                        )
+                        agent._buffer_vprint(f"🔄 Retrying API call ({agent._invalid_json_retries}/3)...")
                         # Don't add anything to messages, just retry the API call
                         continue
                     else:
                         # Instead of returning partial, inject tool error results so the model can recover.
                         # Using tool results (not user messages) preserves role alternation.
-                        agent._buffer_vprint(
-                            f"⚠️  Injecting recovery tool results for invalid JSON..."
-                        )
+                        agent._buffer_vprint("⚠️  Injecting recovery tool results for invalid JSON...")
                         agent._invalid_json_retries = 0  # Reset for next attempt
-
+                        
                         # Append the assistant message with its (broken) tool_calls
-                        recovery_assistant = agent._build_assistant_message(
-                            assistant_message, finish_reason
-                        )
+                        recovery_assistant = agent._build_assistant_message(assistant_message, finish_reason)
                         messages.append(recovery_assistant)
-
+                        
                         # Respond with tool error results for each tool call
                         invalid_names = {name for name, _ in invalid_json_args}
                         for tc in assistant_message.tool_calls:
                             if tc.function.name in invalid_names:
-                                err = next(
-                                    e
-                                    for n, e in invalid_json_args
-                                    if n == tc.function.name
-                                )
+                                err = next(e for n, e in invalid_json_args if n == tc.function.name)
                                 tool_result = (
                                     f"Error: Invalid JSON arguments. {err}. "
                                     f"For tools with no required parameters, use an empty object: {{}}. "
@@ -5425,7 +4792,7 @@ def _run_conversation_impl(
                                 "content": tool_result,
                             })
                         continue
-
+                
                 # Reset retry counter on successful JSON validation
                 agent._invalid_json_retries = 0
 
@@ -5437,10 +4804,8 @@ def _run_conversation_impl(
                     assistant_message.tool_calls
                 )
 
-                assistant_msg = agent._build_assistant_message(
-                    assistant_message, finish_reason
-                )
-
+                assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                
                 # If this turn has both content AND tool_calls, capture the content
                 # as a fallback final response. Common pattern: model delivers its
                 # answer and calls memory/skill tools as a side-effect in the same
@@ -5454,10 +4819,7 @@ def _run_conversation_impl(
                     # (search_files, read_file, write_file, terminal, ...),
                     # keep output visible so the user sees progress.
                     _HOUSEKEEPING_TOOLS = frozenset({
-                        "memory",
-                        "todo",
-                        "skill_manage",
-                        "session_search",
+                        "memory", "todo", "skill_manage", "session_search",
                     })
                     _all_housekeeping = all(
                         tc.function.name in _HOUSEKEEPING_TOOLS
@@ -5470,7 +4832,7 @@ def _run_conversation_impl(
                         clean = agent._strip_think_blocks(turn_content).strip()
                         if clean:
                             agent._vprint(f"  ┊ 💬 {clean}")
-
+                
                 # Pop thinking-only prefill message(s) before appending
                 # (tool-call path — same rationale as the final-response path).
                 _had_prefill = False
@@ -5525,9 +4887,7 @@ def _run_conversation_impl(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
+                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -5571,7 +4931,7 @@ def _run_conversation_impl(
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
-
+                
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the
                 # actual context size the provider reported plus the
@@ -5608,36 +4968,34 @@ def _run_conversation_impl(
                         messages, tools=agent.tools or None
                     )
 
-                if agent.compression_enabled and _compressor.should_compress(
-                    _real_tokens
-                ):
+                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
-                        messages,
-                        system_message,
+                        messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
+                
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
-
+                
                 # Continue loop for next response
                 continue
-
+            
             else:
                 # No tool calls - this is the final response
                 final_response = assistant_message.content or ""
-
+                
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
                 # status messages.  _mute_post_response was set during a
                 # prior housekeeping tool turn and should not silence the
                 # final response path.
                 agent._mute_post_response = False
-
+                
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
                     # ── Partial stream recovery ─────────────────────
@@ -5650,9 +5008,7 @@ def _run_conversation_impl(
                     )
                     if agent._has_content_after_think_block(_partial_streamed):
                         _turn_exit_reason = "partial_stream_recovery"
-                        _recovered = agent._strip_think_blocks(
-                            _partial_streamed
-                        ).strip()
+                        _recovered = agent._strip_think_blocks(_partial_streamed).strip()
                         logger.info(
                             "Partial stream content delivered (%d chars) "
                             "— using as final response",
@@ -5680,17 +5036,11 @@ def _run_conversation_impl(
                     # likely mid-task narration ("I'll scan the directory...") and
                     # the empty follow-up means the model choked — let the
                     # post-tool nudge below handle that instead of exiting early.
-                    fallback = getattr(agent, "_last_content_with_tools", None)
-                    if fallback and getattr(
-                        agent, "_last_content_tools_all_housekeeping", False
-                    ):
+                    fallback = getattr(agent, '_last_content_with_tools', None)
+                    if fallback and getattr(agent, '_last_content_tools_all_housekeeping', False):
                         _turn_exit_reason = "fallback_prior_turn_content"
-                        logger.info(
-                            "Empty follow-up after tool calls — using prior turn content as final response"
-                        )
-                        agent._emit_status(
-                            "↻ Empty response after tool calls — using earlier content as final answer"
-                        )
+                        logger.info("Empty follow-up after tool calls — using prior turn content as final response")
+                        agent._emit_status("↻ Empty response after tool calls — using earlier content as final answer")
                         agent._last_content_with_tools = None
                         agent._last_content_tools_all_housekeeping = False
                         agent._empty_content_retries = 0
@@ -5726,7 +5076,7 @@ def _run_conversation_impl(
                     # after tool calls route to prefill instead of nudge.
                     _has_inline_thinking = bool(
                         re.search(
-                            r"<think>|<thinking>|<reasoning>",
+                            r'<think>|<thinking>|<reasoning>',
                             final_response or "",
                             re.IGNORECASE,
                         )
@@ -5754,9 +5104,7 @@ def _run_conversation_impl(
                         #   tool(result) → assistant("(empty)") → user(nudge)
                         # Without this, we'd have tool → user which most
                         # APIs reject as an invalid sequence.
-                        _nudge_msg = agent._build_assistant_message(
-                            assistant_message, finish_reason
-                        )
+                        _nudge_msg = agent._build_assistant_message(assistant_message, finish_reason)
                         _nudge_msg["content"] = "(empty)"
                         _nudge_msg["_empty_recovery_synthetic"] = True
                         messages.append(_nudge_msg)
@@ -5814,21 +5162,19 @@ def _run_conversation_impl(
                     # always populate reasoning fields via OpenRouter,
                     # so the old `not _has_structured` guard blocked
                     # retries for every reasoning model after prefill.
-                    _truly_empty = not agent._strip_think_blocks(final_response).strip()
+                    _truly_empty = not agent._strip_think_blocks(
+                        final_response
+                    ).strip()
                     _prefill_exhausted = (
-                        _has_structured and agent._thinking_prefill_retries >= 2
+                        _has_structured
+                        and agent._thinking_prefill_retries >= 2
                     )
-                    if (
-                        _truly_empty
-                        and (not _has_structured or _prefill_exhausted)
-                        and agent._empty_content_retries < 3
-                    ):
+                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
                         agent._empty_content_retries += 1
                         logger.warning(
                             "Empty response (no content or reasoning) — "
                             "retry %d/3 (model=%s)",
-                            agent._empty_content_retries,
-                            agent.model,
+                            agent._empty_content_retries, agent.model,
                         )
                         agent._buffer_status(
                             f"⚠️ Empty response from model — retrying "
@@ -5846,8 +5192,7 @@ def _run_conversation_impl(
                         logger.warning(
                             "Empty response after %d retries — "
                             "attempting fallback (model=%s, provider=%s)",
-                            agent._empty_content_retries,
-                            agent.model,
+                            agent._empty_content_retries, agent.model,
                             agent.provider,
                         )
                         agent._buffer_status(
@@ -5856,8 +5201,7 @@ def _run_conversation_impl(
                         )
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt
-                            )
+                                agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
                             agent._buffer_status(
                                 f"↻ Switched to fallback: {agent.model} "
@@ -5866,8 +5210,7 @@ def _run_conversation_impl(
                             logger.info(
                                 "Fallback activated after empty responses: "
                                 "now using %s on %s",
-                                agent.model,
-                                agent.provider,
+                                agent.model, agent.provider,
                             )
                             continue
 
@@ -5880,9 +5223,7 @@ def _run_conversation_impl(
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
                     agent._drop_trailing_empty_response_scaffolding(messages)
-                    assistant_msg = agent._build_assistant_message(
-                        assistant_message, finish_reason
-                    )
+                    assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     assistant_msg["content"] = "(empty)"
                     # This is a user-facing failure sentinel for the gateway,
                     # not real assistant content. Persisting it makes later
@@ -5893,16 +5234,11 @@ def _run_conversation_impl(
                     messages.append(assistant_msg)
 
                     if reasoning_text:
-                        reasoning_preview = (
-                            reasoning_text[:500] + "..."
-                            if len(reasoning_text) > 500
-                            else reasoning_text
-                        )
+                        reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
                         logger.warning(
                             "Reasoning-only response (no visible content) "
                             "after exhausting retries and fallback. "
-                            "Reasoning: %s",
-                            reasoning_preview,
+                            "Reasoning: %s", reasoning_preview,
                         )
                         agent._emit_status(
                             "⚠️ Model produced reasoning but no visible "
@@ -5913,22 +5249,18 @@ def _run_conversation_impl(
                             "Empty response (no content or reasoning) "
                             "after %d retries. No fallback available. "
                             "model=%s provider=%s",
-                            agent._empty_content_retries,
-                            agent.model,
+                            agent._empty_content_retries, agent.model,
                             agent.provider,
                         )
                         agent._emit_status(
                             "❌ Model returned no content after all retries"
-                            + (
-                                " and fallback attempts."
-                                if agent._fallback_chain
-                                else ". No fallback providers configured."
-                            )
+                            + (" and fallback attempts." if agent._fallback_chain else
+                               ". No fallback providers configured.")
                         )
 
                     final_response = "(empty)"
                     break
-
+                
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
@@ -5953,9 +5285,7 @@ def _run_conversation_impl(
                     )
                 ):
                     codex_ack_continuations += 1
-                    interim_msg = agent._build_assistant_message(
-                        assistant_message, "incomplete"
-                    )
+                    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
                     messages.append(interim_msg)
                     agent._emit_interim_assistant_message(interim_msg)
 
@@ -5976,12 +5306,10 @@ def _run_conversation_impl(
                     final_response = "".join(truncated_response_parts) + final_response
                     truncated_response_parts = []
                     length_continue_retries = 0
-
+                
                 final_response = agent._strip_think_blocks(final_response).strip()
-
-                final_msg = agent._build_assistant_message(
-                    assistant_message, finish_reason
-                )
+                
+                final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending either a final response or a
@@ -6044,7 +5372,6 @@ def _run_conversation_impl(
                     # terminal. Keep a debug breadcrumb in agent.log for tracing.
                     logger.debug("verification stop-loop nudge issued (attempt %d)",
                                  agent._verification_stop_nudges)
-                    agent._emit_status("↻ Verification required before finishing")
                     continue
 
                 # User verification-loop gate: when the agent edited code this
@@ -6099,18 +5426,14 @@ def _run_conversation_impl(
                     continue
 
                 messages.append(final_msg)
-
+                
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
-                    agent._safe_print(
-                        f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)"
-                    )
+                    agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
-
+            
         except Exception as e:
-            error_msg = (
-                f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
-            )
+            error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
                 print(f"❌ {error_msg}")
             except (OSError, ValueError):
@@ -6123,7 +5446,7 @@ def _run_conversation_impl(
             # recover the call site.  logger.exception() includes the
             # traceback automatically and emits at ERROR.
             logger.exception("Outer loop error in API call #%d", api_call_count)
-
+            
             # If an assistant message with tool_calls was already appended,
             # the API expects a role="tool" result for every tool_call_id.
             # Fill in error results for any that weren't answered yet.
@@ -6136,12 +5459,11 @@ def _run_conversation_impl(
                 if msg.get("role") == "assistant" and msg.get("tool_calls"):
                     answered_ids = {
                         m["tool_call_id"]
-                        for m in messages[idx + 1 :]
+                        for m in messages[idx + 1:]
                         if isinstance(m, dict) and m.get("role") == "tool"
                     }
                     for tc in msg["tool_calls"]:
-                        if not tc or not isinstance(tc, dict):
-                            continue
+                        if not tc or not isinstance(tc, dict): continue
                         if tc["id"] not in answered_ids:
                             err_msg = {
                                 "role": "tool",
@@ -6151,7 +5473,7 @@ def _run_conversation_impl(
                             }
                             messages.append(err_msg)
                 break
-
+            
             # Non-tool errors don't need a synthetic message injected.
             # The error is already printed to the user (line above), and
             # the retry loop continues.  Injecting a fake user/assistant
@@ -6161,19 +5483,16 @@ def _run_conversation_impl(
             # If we're near the limit, break to avoid infinite loops
             if api_call_count >= agent.max_iterations - 1:
                 _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
-                final_response = (
-                    f"I apologize, but I encountered repeated errors: {error_msg}"
-                )
+                final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                 # Append as assistant so the history stays valid for
                 # session resume (avoids consecutive user messages).
                 messages.append({"role": "assistant", "content": final_response})
                 break
-
+    
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-
     return finalize_turn(
         agent,
         final_response=final_response,
@@ -6189,6 +5508,7 @@ def _run_conversation_impl(
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
     )
+
 
 
 __all__ = ["run_conversation"]

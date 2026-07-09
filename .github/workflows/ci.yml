@@ -220,10 +220,17 @@ jobs:
 
       - name: Save baseline cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: cp ci-timings.json ci-timings-baseline.json
+        run: |
+          # Degraded runs (API rate-limited) produce no ci-timings.json —
+          # skip rather than fail, and never cache an empty baseline.
+          if [ -f ci-timings.json ]; then
+            cp ci-timings.json ci-timings-baseline.json
+          else
+            echo "No timings JSON this run — skipping baseline update"
+          fi
 
       - name: Upload baseline to cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('ci-timings-baseline.json') != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ci-timings-baseline.json
