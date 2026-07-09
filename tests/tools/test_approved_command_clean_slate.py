@@ -112,15 +112,6 @@ def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
     set_interrupt(False, thread_id=t.ident)
 
 
-@pytest.mark.xfail(
-    reason="DEEP-CORE (upstream sync v2026.7.7.2): the fork's interrupt-kill path "
-    "returns rc=130 without upstream's '[Command interrupted]' output marker, so "
-    "upstream's audit-note enrichment (terminal_tool.py:2949) doesn't fire. The "
-    "command IS correctly interrupted (rc=130) — only the note wording differs. "
-    "Aligning the fork interrupt path with the marker is owner deep-core terminal "
-    "reconciliation — see .evolution/upstream-sync-v2026.7.7.2-conflict-report.md",
-    strict=False,
-)
 def test_approved_note_enriched_not_misleading_on_interrupt(monkeypatch, tmp_path):
     """On a genuine post-start interrupt of an approved command, the note must
     read '...approved by the user, then interrupted.' — the bare

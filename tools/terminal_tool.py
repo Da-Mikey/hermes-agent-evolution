@@ -2833,7 +2833,15 @@ def terminal_tool(
                             "terminal_streak": streak,
                         }
                         if approval_note:
-                            result_dict["approval"] = approval_note
+                            # An approved command interrupted mid-run exits 130
+                            # with the executor's marker — never imply success in
+                            # the audit note (matches the rc==0 enrichment below).
+                            if returncode == 130 and "[Command interrupted]" in output:
+                                result_dict["approval"] = (
+                                    approval_note.rstrip(".") + ", then interrupted."
+                                )
+                            else:
+                                result_dict["approval"] = approval_note
                         if exit_note:
                             result_dict["exit_code_meaning"] = exit_note
                         rec = streak_recommendation(streak)
