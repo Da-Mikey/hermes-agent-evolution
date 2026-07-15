@@ -1,15 +1,36 @@
 {
+  "35707014121417b5": {
+    "date": "2026-07-15",
+    "status": "considered",
+    "title": "Advanced Multi-Agent Collaboration and Autonomous Optimization"
+  },
   "585043aa0e7d2b08": {
     "date": "2026-06-30",
     "issue": null,
     "status": "considered",
     "title": "CrewAI Symlink Path Traversal \u2014 audit Hermes skill loading for similar vulnerability pattern"
   },
+  "62ede8fd8e72891b": {
+    "date": "2026-07-15",
+    "issue": "36",
+    "status": "filed",
+    "title": "[IMPROVEMENT] Prompt Compression for Token Cost Reduction"
+  },
   "7402dacc7bdf80e3": {
     "date": "2026-07-15",
     "issue": null,
     "status": "considered",
     "title": "Claude Code v2.1.193 \u2014 Shell Classification + Memory Pressure Reaping"
+  },
+  "8352d0af6bf1983a": {
+    "date": "2026-07-15",
+    "status": "considered",
+    "title": "Spec-Driven Development with Coding Agents"
+  },
+  "8427511f5f7c2057": {
+    "date": "2026-07-15",
+    "status": "considered",
+    "title": "Mitigation of Steganography in Multi-Agent Systems"
   },
   "9d3b306e23799bbe": {
     "date": "2026-06-30",
@@ -22,6 +43,17 @@
     "issue": "22",
     "status": "filed",
     "title": "[FEATURE] MCP Python SDK v2 Migration \u2014 Tracking and Planning"
+  },
+  "c2b8ad62e54a42be": {
+    "date": "2026-07-15",
+    "issue": "37",
+    "status": "filed",
+    "title": "[IMPROVEMENT] Enhanced Memory Management for Autonomous Agents"
+  },
+  "cc84cf1b5a4c757c": {
+    "date": "2026-07-15",
+    "status": "considered",
+    "title": "Autonomous LLM Fine-Tuning"
   },
   "d6219e2eb1526a37": {
     "date": "2026-07-06",
