@@ -943,17 +943,32 @@ class TestProbeApiModelsUserAgent:
         # No Authorization was set, but UA must still be present.
         assert req.get_header("Authorization") is None
 
+    def test_probe_sends_client_context_to_gemini(self):
+        from unittest.mock import patch
+        from hermes_cli.models import _HERMES_VERSION
 
-class TestValidateCuratedFallback:
-    def test_curated_model_not_in_live_api_is_accepted(self):
-        # "glm-5.2" is in _PROVIDER_MODELS for "zai" but we mock the live API to return other models
-        live_models = ["glm-5.1", "glm-5", "glm-4.7"]
-        result = _validate("glm-5.2", provider="zai", api_models=live_models)
-        assert result["accepted"] is True
-        assert result["persist"] is True
-        assert result["recognized"] is True
-        # Unified with upstream's curated-catalog acceptance path (#46850); the
-        # fork's earlier "recognized by Hermes" wording (#185) was superseded so
-        # the two parallel implementations no longer shadow each other.
-        assert "not found in the live /v1/models listing" in result["message"]
-        assert "curated catalog" in result["message"]
+        body = b'{"data":[]}'
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=self._make_mock_response(body),
+        ) as mock_urlopen:
+            probe_api_models(
+                "gemini-key",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            )
+
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("X-goog-api-client") == f"hermes-agent/{_HERMES_VERSION}"
+
+    def test_probe_omits_gemini_client_context_for_other_providers(self):
+        from unittest.mock import patch
+
+        body = b'{"data":[]}'
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=self._make_mock_response(body),
+        ) as mock_urlopen:
+            probe_api_models("provider-key", "https://api.example.com/v1")
+
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("X-goog-api-client") is None

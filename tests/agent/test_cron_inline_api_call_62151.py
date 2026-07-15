@@ -18,6 +18,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from run_agent import AIAgent
+
 from agent.chat_completion_helpers import (
     direct_api_call,
     interruptible_api_call,
@@ -38,11 +40,20 @@ def _make_agent(*, platform="cron"):
     return agent
 
 
-def test_should_use_direct_api_call_only_for_cron_platform():
+def test_should_use_direct_api_call_only_for_cron_openai_wire():
     assert should_use_direct_api_call(_make_agent(platform="cron")) is True
     assert should_use_direct_api_call(_make_agent(platform="cli")) is False
     assert should_use_direct_api_call(_make_agent(platform="telegram")) is False
     assert should_use_direct_api_call(_make_agent(platform=None)) is False
+
+    for api_mode in ("codex_responses", "anthropic_messages", "bedrock_converse"):
+        agent = _make_agent(platform="cron")
+        agent.api_mode = api_mode
+        assert should_use_direct_api_call(agent) is False
+
+    moa = _make_agent(platform="cron")
+    moa.provider = "moa"
+    assert should_use_direct_api_call(moa) is False
 
 
 def test_direct_api_call_runs_inline_and_closes_client():
@@ -83,6 +94,46 @@ def test_interruptible_api_call_routes_cron_inline_no_worker_thread():
 
     assert resp.id == "first"
     assert ran_on["tid"] == caller_tid  # no daemon worker thread
+
+
+def test_direct_api_call_interrupt_aborts_active_client_and_raises():
+    """Cron's outer watchdog interrupts from another thread while inline."""
+    agent = _make_agent()
+    client_ready = threading.Event()
+    release_request = threading.Event()
+    fake_client = MagicMock()
+
+    def _create(**_kwargs):
+        client_ready.set()
+        return fake_client
+
+    def _request(**_kwargs):
+        assert release_request.wait(timeout=2)
+        raise RuntimeError("socket closed")
+
+    fake_client.chat.completions.create.side_effect = _request
+    agent._create_request_openai_client.side_effect = _create
+    result = {}
+
+    def _run():
+        try:
+            direct_api_call(agent, {"model": "m", "messages": []})
+        except Exception as exc:
+            result["exception"] = exc
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    assert client_ready.wait(timeout=1)
+    assert callable(agent._active_request_abort)
+    AIAgent.interrupt(agent, "cron timeout")
+    agent._abort_request_openai_client.assert_called_once_with(
+        fake_client, reason="interrupt_abort"
+    )
+    release_request.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert isinstance(result.get("exception"), InterruptedError)
+    assert agent._active_request_abort is None
 
 
 def test_interruptible_streaming_api_call_routes_cron_via_nonstream_method():

@@ -79,17 +79,13 @@ class TestFetchOpenRouterModels:
             ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
         ]
 
+
     def test_falls_back_to_static_snapshot_on_fetch_failure(self, monkeypatch):
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        # Fork adaptation: our OPENROUTER_MODELS snapshot intentionally lags the
-        # live catalog manifest (we backported only the security cluster, not the
-        # model-list churn). Force the remote manifest unavailable so this test
-        # deterministically exercises the in-repo static-snapshot fallback rather
-        # than a live manifest fetch that no longer matches OPENROUTER_MODELS.
-        with (
-            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None),
-            patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=OSError("boom")),
-        ):
+        # Pin the remote manifest out too — otherwise the fallback silently
+        # depends on whatever the deployed catalog currently contains.
+        with patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None), \
+             patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=OSError("boom")):
             models = fetch_openrouter_models(force_refresh=True)
 
         assert models == OPENROUTER_MODELS

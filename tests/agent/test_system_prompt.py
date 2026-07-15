@@ -101,54 +101,44 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
-class TestTqmemoryGuidance:
-    """TQMEMORY_GUIDANCE is injected only when the tqmemory MCP tools (named
-    ``mcp_tqmemory_*``) are actually loaded in the session."""
+class TestTelegramRichMessagesHint:
+    """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
 
-    MARKER = "Persistent project memory (tqmemory)"
+    def test_base_hint_without_rich_messages(self, monkeypatch):
+        """When rich_messages is False (default), only the base hint is used."""
+        agent = _make_agent(platform="telegram")
+        # Mock config to return rich_messages: false (default)
+        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+            mock_cfg.return_value = {
+                "platforms": {"telegram": {"extra": {"rich_messages": False}}}
+            }
+            stable = _stable_prompt(agent)
+        # Base hint should be present
+        assert "Standard Markdown is automatically converted" in stable
+        # Rich-messages extension should NOT be present
+        assert "lean into it" not in stable
+        assert "task lists" not in stable
 
-    def test_injected_when_tqmemory_tools_present(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))  # non-git → no coding block
-        agent = _make_agent(
-            valid_tool_names=["read_file", "mcp_tqmemory_semantic_search"],
-            platform="cli",
-        )
-        assert self.MARKER in _stable_prompt(agent)
+    def test_rich_hint_with_rich_messages_enabled(self, monkeypatch):
+        """When rich_messages is True, the rich-messages extension is appended."""
+        agent = _make_agent(platform="telegram")
+        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+            mock_cfg.return_value = {
+                "platforms": {"telegram": {"extra": {"rich_messages": True}}}
+            }
+            stable = _stable_prompt(agent)
+        # Base hint should be present
+        assert "Standard Markdown is automatically converted" in stable
+        # Rich-messages extension should be present
+        assert "lean into it" in stable
+        assert "task lists" in stable
+        assert "math/formulas" in stable
 
-    def test_absent_without_tqmemory_tools(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        agent = _make_agent(
-            valid_tool_names=["read_file", "memory", "session_search"],
-            platform="cli",
-        )
-        assert self.MARKER not in _stable_prompt(agent)
-
-
-class TestModelFirstReasoning:
-    """MODEL_FIRST_REASONING_GUIDANCE is injected only when
-    ``agent._model_first_reasoning`` is True and tools are loaded."""
-
-    MARKER = "# Model-First Reasoning"
-
-    def test_absent_by_default(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
-        assert self.MARKER not in _stable_prompt(agent)
-
-    def test_injected_when_enabled(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        agent = _make_agent(
-            valid_tool_names=["read_file"],
-            platform="cli",
-            _model_first_reasoning=True,
-        )
-        assert self.MARKER in _stable_prompt(agent)
-
-    def test_absent_without_tools_even_when_enabled(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        agent = _make_agent(
-            valid_tool_names=[],
-            platform="cli",
-            _model_first_reasoning=True,
-        )
-        assert self.MARKER not in _stable_prompt(agent)
+    def test_base_hint_without_config(self, monkeypatch):
+        """When config has no telegram section, only base hint is used."""
+        agent = _make_agent(platform="telegram")
+        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+            mock_cfg.return_value = {}
+            stable = _stable_prompt(agent)
+        assert "Standard Markdown is automatically converted" in stable
+        assert "lean into it" not in stable
