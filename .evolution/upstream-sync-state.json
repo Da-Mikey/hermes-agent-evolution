@@ -1,9 +1,95 @@
 {
-  "synced_through_commit": "298bb93d397faffc64aa5cfd58cbd707561d292a",
+  "synced_through_commit": "d986bb0c6de6bcffda4981e83652284d481a90f4",
   "synced_through_tag": "v2026.6.5",
   "synced_through_date": "2026-06-05",
-  "our_version": "0.16.0",
-  "synced_at": "2026-06-13",
-  "deferred": [],
-  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it — so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review."
+  "our_version": "0.18.2",
+  "synced_at": "2026-07-15",
+  "deferred": [
+    {
+      "sha": "984e6cb5b8bbfc7f0b1c18a3ec3c599ad98614cb",
+      "summary": "feat(whatsapp): add WhatsApp Business Cloud API adapter",
+      "reason": "conflict — gateway/platforms, hermes_cli, tests all evolved"
+    },
+    {
+      "sha": "e80754647c90c0320ddd89e36c4b8ac1e738b87b",
+      "summary": "style(desktop): render in-thread tool codicons as filled glyphs",
+      "reason": "conflict — desktop app components evolved"
+    },
+    {
+      "sha": "984e69ff623b84249d126118d6a5298750c7103b",
+      "summary": "Auto-restart gateway after Telegram QR onboarding",
+      "reason": "conflict — web_server.py and web UI evolved"
+    },
+    {
+      "sha": "fa32af886fa89acec2584ea6ad2b9ca173b82e4b",
+      "summary": "fix: dedupe concurrent gateway restarts + surface restart outcome in onboarding UI",
+      "reason": "conflict — web_server.py evolved"
+    },
+    {
+      "sha": "c1308ebf3f0f5b6a13363836420b6d078d04da61",
+      "summary": "style(desktop): filled SVG glyphs for in-thread tool icons",
+      "reason": "conflict — desktop components evolved"
+    },
+    {
+      "sha": "38273676eab0185d068143c3deaa5a259d857f8b",
+      "summary": "fix(desktop): carve sticky user bubbles out of the titlebar drag region",
+      "reason": "conflict — desktop thread.tsx deleted in our HEAD"
+    },
+    {
+      "sha": "f222bd26e7ad7f5804a894fc9f9a0738ea5d4053",
+      "summary": "Merge pull request #43430 from NousResearch/bb/desktop-tool-codicons-filled",
+      "reason": "merge — children (commits 2,5) already accounted for individually"
+    },
+    {
+      "sha": "cd9a9cd8e5e12daed968360f70d28e749c6c1fa0",
+      "summary": "fix(gateway): Slack approval UX in threads — block-size overflow + typed-prefix instruction text (#43444)",
+      "reason": "conflict — gateway/platforms/base.py and slack adapter evolved"
+    },
+    {
+      "sha": "a5c32cdf3055c1047bf08e1beb0334ad92672063",
+      "summary": "fix(update): self-heal a venv left half-built by an interrupted install (#42172)",
+      "reason": "conflict — hermes_cli/main.py and test evolved"
+    },
+    {
+      "sha": "70d5d7e39b566090944688623f5bbea89e21b967",
+      "summary": "fix(memory,skills): repair write-approval inline prompt, gateway staging, and gateway /skills review (#43452)",
+      "reason": "conflict — gateway/run.py, tools/memory_tool.py, slash_commands evolved"
+    },
+    {
+      "sha": "5718811de0960a4aa46f528b1c6a14f31ed60012",
+      "summary": "feat(tts): add Gemini persona prompt file",
+      "reason": "conflict — TTS tool, config, and docs evolved"
+    },
+    {
+      "sha": "189ffe7362c8a1381acb7c9e77d1970aa2566a43",
+      "summary": "test: port voice-reply suffix assertions, fix change-detector cap test, add AUTHOR_MAP entry",
+      "reason": "conflict — scripts/release.py evolved"
+    },
+    {
+      "sha": "4c797d0e23c12ffdfd9d34ce032e5e335094b2e9",
+      "summary": "fix(desktop): hide Windows console children launched by GUI",
+      "reason": "conflict — electron bootstrap-runner.cjs, main.cjs, package.json evolved"
+    },
+    {
+      "sha": "a72bb03757c0c925c686f9774eefc8dc5a77b329",
+      "summary": "fix(docker): optimize image size — .dockerignore, drop dev deps, split build layers (#38749)",
+      "reason": "conflict — Dockerfile and .dockerignore evolved"
+    },
+    {
+      "sha": "3bfbb3f2a0255acfd2cf8e18d702c0b291808047",
+      "summary": "change(tooling): typecheck in CI, update ts to 6",
+      "reason": "conflict — workflows, package.json files, nix/lib.nix evolved"
+    },
+    {
+      "sha": "90f4b3040dccc36963930ec9796ed1743c7742a8",
+      "summary": "change(tooling): remove react-compiler eslint, update concurrently",
+      "reason": "conflict — package-lock.json, nix/lib.nix evolved"
+    },
+    {
+      "sha": "d986bb0c6de6bcffda4981e83652284d481a90f4",
+      "summary": "feat(dashboard): full-featured profile builder (model + skills + MCPs) (#39084)",
+      "reason": "conflict — web_server.py, web UI components evolved"
+    }
+  ],
+  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it — so nothing in the window is ever silently skipped. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review."
 }
