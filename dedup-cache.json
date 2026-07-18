@@ -4,6 +4,12 @@
     "status": "considered",
     "title": "Advanced Multi-Agent Collaboration and Autonomous Optimization"
   },
+  "53913a1f67a25e45": {
+    "date": "2026-07-16",
+    "issue": "40",
+    "status": "filed",
+    "title": "[IMPROVEMENT] Change Manifest with Self-Declared Predictions for Forge Edits"
+  },
   "585043aa0e7d2b08": {
     "date": "2026-06-30",
     "issue": null,
@@ -15,6 +21,12 @@
     "issue": "36",
     "status": "filed",
     "title": "[IMPROVEMENT] Prompt Compression for Token Cost Reduction"
+  },
+  "665920a0f6a9ab8f": {
+    "date": "2026-07-16",
+    "issue": "41",
+    "status": "filed",
+    "title": "[IMPROVEMENT] Harness Evolution Evaluation Against Test-Time Scaling Baselines"
   },
   "7402dacc7bdf80e3": {
     "date": "2026-07-15",
@@ -66,6 +78,12 @@
     "issue": null,
     "status": "considered",
     "title": "Backport Hermes Agent upstream bugfixes for cronjob schedule alias and Anthropic headers"
+  },
+  "eb806aebc98729b0": {
+    "date": "2026-07-16",
+    "issue": "39",
+    "status": "filed",
+    "title": "[FEATURE] Agentic Harness Engineering with Observability-Driven Evolution"
   },
   "f59fabde701756ab": {
     "date": "2026-07-15",

@@ -1,0 +1,94 @@
+{
+  "date": "2026-07-16",
+  "rejected": [
+    {
+      "issue_number": 24,
+      "reason_code": "already-exists",
+      "reason": "SessionDB reading path (state.db messages table, added in #399/#623) already captures successful sessions alongside error-triggered dumps. introspection_extract.py reads from SessionDB which stores >90% of sessions regardless of success/failure.",
+      "closed": true
+    },
+    {
+      "issue_number": 30,
+      "reason_code": "out-of-scope",
+      "reason": "Investigation meta-issue that duplicates the existing evolution introspection pipeline, which already tracks refusals as a signal and generates concrete implementation issues.",
+      "closed": true
+    },
+    {
+      "issue_number": 31,
+      "reason_code": "out-of-scope",
+      "reason": "Investigation meta-issue. The evolution introspection pipeline already surfaces tool_failure signals per tool and generates concrete implementation issues from them.",
+      "closed": true
+    },
+    {
+      "issue_number": 32,
+      "reason_code": "out-of-scope",
+      "reason": "Most general of the 'investigate' cluster — 'widespread failures in core operational tools' without a concrete implementation proposal. Introspection pipeline already extracts tool_failure signals by tool name.",
+      "closed": true
+    }
+  ],
+  "selected_for_implementation": [
+    {
+      "issue_number": 34,
+      "title": "[PERFORMANCE] High Frequency of Timeouts (Provider and Tool Execution)",
+      "priority_score": 1.875,
+      "impact_score": 1.0,
+      "effort_score": 0.6,
+      "estimated_hours": 16,
+      "selected_reason": "score"
+    },
+    {
+      "issue_number": 40,
+      "title": "[IMPROVEMENT] Change Manifest with Self-Declared Predictions for Forge Edits",
+      "priority_score": 1.874,
+      "impact_score": 0.9,
+      "effort_score": 0.3,
+      "estimated_hours": 8,
+      "selected_reason": "score"
+    },
+    {
+      "issue_number": 41,
+      "title": "[IMPROVEMENT] Harness Evolution Evaluation Against Test-Time Scaling Baselines",
+      "priority_score": 1.818,
+      "impact_score": 0.7,
+      "effort_score": 0.2,
+      "estimated_hours": 4,
+      "selected_reason": "score"
+    },
+    {
+      "issue_number": 39,
+      "title": "[FEATURE] Agentic Harness Engineering with Observability-Driven Evolution",
+      "priority_score": 1.812,
+      "impact_score": 0.9,
+      "effort_score": 0.4,
+      "estimated_hours": 12,
+      "selected_reason": "score"
+    },
+    {
+      "issue_number": 26,
+      "title": "[UX] No adaptive tool-failure strategy — agent repeats the same failing tool 10-58 times consecutively",
+      "priority_score": 1.669,
+      "impact_score": 0.7,
+      "effort_score": 0.35,
+      "estimated_hours": 8,
+      "selected_reason": "score"
+    },
+    {
+      "issue_number": 37,
+      "title": "[IMPROVEMENT] Enhanced Memory Management for Autonomous Agents",
+      "priority_score": 1.587,
+      "impact_score": 0.85,
+      "effort_score": 0.6,
+      "estimated_hours": 16,
+      "selected_reason": "score"
+    },
+    {
+      "issue_number": 36,
+      "title": "[IMPROVEMENT] Prompt Compression for Token Cost Reduction",
+      "priority_score": 1.575,
+      "impact_score": 0.8,
+      "effort_score": 0.5,
+      "estimated_hours": 12,
+      "selected_reason": "score"
+    }
+  ]
+}
