@@ -1781,6 +1781,14 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        "tts_audio_tags": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
