@@ -1198,6 +1198,45 @@ class ShellFileOperations(FileOperations):
     # READ Implementation
     # =========================================================================
 
+    def _diagnose_path_access(self, path: str) -> str:
+        """Gather diagnostic info when a file exists but cannot be read.
+
+        Runs ``ls -dl`` on the path and its parent directory, then reports
+        the current user and identity so the agent (and user) can see exactly
+        what prevents access.
+        """
+        parts: list[str] = []
+        parent = os.path.dirname(path.rstrip("/")) or "."
+
+        # Parent directory metadata
+        parent_ls = self._exec(
+            f"ls -dl {self._escape_shell_arg(parent)} 2>&1",
+        )
+        if parent_ls.exit_code == 0 and parent_ls.stdout.strip():
+            parts.append(f"parent ({parent}): {parent_ls.stdout.strip()}")
+
+        # File metadata (works even if file is unreadable to the user)
+        file_ls = self._exec(
+            f"ls -dl {self._escape_shell_arg(path)} 2>&1",
+        )
+        if file_ls.exit_code == 0 and file_ls.stdout.strip():
+            parts.append(f"file: {file_ls.stdout.strip()}")
+        else:
+            parts.append(
+                f"file: not found or inaccessible — "
+                f"{file_ls.stdout.strip()}"
+            )
+
+        # Current user context
+        whoami = self._exec("whoami")
+        if whoami.exit_code == 0 and whoami.stdout.strip():
+            parts.append(f"user: {whoami.stdout.strip()}")
+        id_out = self._exec("id")
+        if id_out.exit_code == 0 and id_out.stdout.strip():
+            parts.append(f"id: {id_out.stdout.strip()}")
+
+        return " | ".join(parts)
+
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
         """
         Read a file with pagination, binary detection, and line numbers.
@@ -1216,12 +1255,31 @@ class ShellFileOperations(FileOperations):
         offset, limit = normalize_read_pagination(offset, limit)
 
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
+        # NOTE: 2>/dev/null is intentionally omitted so error text flows through
+        # to _exec's stderr→stdout merge and we can distinguish "No such file"
+        # from "Permission denied" downstream (#51).
+        stat_cmd = f"wc -c < {self._escape_shell_arg(path)}"
         stat_result = self._exec(stat_cmd)
 
         if stat_result.exit_code != 0:
-            # File not found - try to suggest similar files
-            return self._suggest_similar_files(path)
+            # Distinguish access-denied from not-found so the agent gets
+            # diagnostic info instead of the generic "suggest similar files"
+            # path, which is only appropriate for ENOENT (#51).
+            err_text = (stat_result.stdout or "").lower()
+            if "permission denied" in err_text:
+                diag = self._diagnose_path_access(path)
+                return ReadResult(
+                    error=(
+                        f"Cannot read '{path}': Permission denied. "
+                        f"{diag}"
+                    ),
+                )
+            if "no such file" in err_text or "cannot access" in err_text:
+                return self._suggest_similar_files(path)
+            # Fallback for any other error (e.g. EISDIR, EIO)
+            return ReadResult(
+                error=f"Cannot read '{path}': {stat_result.stdout.strip()}",
+            )
 
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         try:
@@ -1415,10 +1473,25 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
+        # NOTE: 2>/dev/null intentionally omitted — same diagnosis pattern
+        # as read_file (#51).
+        stat_cmd = f"wc -c < {self._escape_shell_arg(path)}"
         stat_result = self._exec(stat_cmd)
         if stat_result.exit_code != 0:
-            return self._suggest_similar_files(path)
+            err_text = (stat_result.stdout or "").lower()
+            if "permission denied" in err_text:
+                diag = self._diagnose_path_access(path)
+                return ReadResult(
+                    error=(
+                        f"Cannot read '{path}': Permission denied. "
+                        f"{diag}"
+                    ),
+                )
+            if "no such file" in err_text or "cannot access" in err_text:
+                return self._suggest_similar_files(path)
+            return ReadResult(
+                error=f"Cannot read '{path}': {stat_result.stdout.strip()}",
+            )
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         try:
             file_size = int(stat_output.strip())
