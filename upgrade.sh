@@ -157,9 +157,24 @@ fi
 # track (.venv/, node_modules/, bin/hermes shim, hermes_cli/web_dist/) is
 # untracked and survives `git checkout -f` untouched.
 docker_inplace_upgrade() {
+    if [ -z "$VENV_DIR" ] || [ -z "$PY" ]; then
+        echo "❌ Could not locate the virtualenv this Hermes runs from."
+        hermes_layout_report
+        echo ""
+        echo "   Nothing was changed. Please report the block above."
+        exit 1
+    fi
+    if [ "$IS_EDITABLE" != "1" ]; then
+        # Regular install: the code is in site-packages, so there is no source
+        # tree to swap. Hand off to the reinstall path, which turns this into an
+        # editable checkout of the fork inside the same virtualenv.
+        container_reinstall_from_fork
+        return 0
+    fi
+
     echo "🐳 In-container upgrade — swapping the source tree in place"
     echo "   Install tree: $INSTALL_DIR"
-    echo "   Virtualenv:   ${VENV_DIR:-(none)}"
+    echo "   Virtualenv:   $VENV_DIR"
     echo ""
     echo "⚠️  This writes into the container's WRITABLE LAYER."
     echo "    'docker restart' keeps it. Recreating the container from the image"
@@ -175,24 +190,6 @@ docker_inplace_upgrade() {
     if ! command -v git >/dev/null 2>&1; then
         echo "❌ git is not available in this image — cannot fetch the fork."
         echo "   Install it first (apt-get update && apt-get install -y git) and re-run."
-        exit 1
-    fi
-    if [ -z "$VENV_DIR" ] || [ -z "$PY" ]; then
-        echo "❌ Could not locate the virtualenv this Hermes runs from."
-        hermes_layout_report
-        echo ""
-        echo "   Nothing was changed. Please report the block above."
-        exit 1
-    fi
-    if [ "$IS_EDITABLE" != "1" ]; then
-        echo "❌ This Hermes is NOT an editable install — its code lives inside"
-        echo "   site-packages, so there is no source tree to swap."
-        hermes_layout_report
-        echo ""
-        echo "   Install the fork into the same virtualenv instead:"
-        echo "     $PY -m pip install --force-reinstall \\"
-        echo "       'hermes-agent @ git+$FORK_URL@main'"
-        echo "   then restart the container. Nothing was changed."
         exit 1
     fi
     if [ ! -w "$INSTALL_DIR" ]; then
@@ -307,11 +304,121 @@ docker_inplace_upgrade() {
     DOCKER_INPLACE=1
 }
 
-if [ "$INSTALL_METHOD" = "docker" ] || { [ -f /.dockerenv ] && [ ! -d "$INSTALL_DIR/.git" ]; }; then
-    if [ "$IN_CONTAINER" = "1" ]; then
-        docker_inplace_upgrade
+# Some containers ship Hermes as a REGULAR (non-editable) install: the code
+# sits in <venv>/lib/pythonX.Y/site-packages and there is no source tree to
+# swap. Convert that into a git checkout of the fork installed EDITABLE into
+# the same virtualenv — the package is replaced, the dependency set is left
+# alone (--no-deps), and every later upgrade becomes a plain `git pull`.
+container_reinstall_from_fork() {
+    SRC_DIR="${HERMES_HOME:-/opt}/hermes-evolution"
+    echo "🐳 In-container upgrade — installing the fork into $VENV_DIR"
+    echo "   Virtualenv:  $VENV_DIR"
+    echo "   Fork source: $SRC_DIR"
+    echo ""
+    echo "⚠️  This writes into the container's writable layer (and \$HERMES_HOME if"
+    echo "    that is where the source lands). Recreating the container from the"
+    echo "    image reverts the install — that is also your rollback."
+    echo ""
+
+    if [ "$(id -u)" != "0" ] && [ ! -w "$VENV_DIR" ]; then
+        echo "❌ $VENV_DIR is not writable. Re-run as root: docker exec -u 0 -it <container> bash"
+        exit 1
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        echo "❌ git is not available in this image — cannot fetch the fork."
+        echo "   Install it first: apt-get update && apt-get install -y git"
+        exit 1
+    fi
+
+    # Pick an installer. uv first (no bootstrap needed), then pip, then the two
+    # standard ways of getting pip into a venv that was built without it.
+    INSTALLER=""
+    if command -v uv >/dev/null 2>&1; then
+        INSTALLER="uv"
+    elif "$PY" -m pip --version >/dev/null 2>&1; then
+        INSTALLER="pip"
     else
-        cat <<EOF
+        echo "🔧 No pip in this virtualenv — bootstrapping one..."
+        if "$PY" -m ensurepip --upgrade >/dev/null 2>&1 && "$PY" -m pip --version >/dev/null 2>&1; then
+            INSTALLER="pip"
+        elif curl -fsSL https://bootstrap.pypa.io/get-pip.py 2>/dev/null | "$PY" - >/dev/null 2>&1 \
+             && "$PY" -m pip --version >/dev/null 2>&1; then
+            INSTALLER="pip"
+        fi
+    fi
+    if [ -z "$INSTALLER" ]; then
+        echo "❌ No way to install packages into $VENV_DIR (no uv, no pip, and"
+        echo "   bootstrapping pip failed)."
+        hermes_layout_report
+        echo ""
+        echo "   Install uv (curl -LsSf https://astral.sh/uv/install.sh | sh) and re-run."
+        echo "   Nothing was changed."
+        exit 1
+    fi
+    echo "🔧 Installer: $INSTALLER"
+
+    # Fetch the fork. Network first — a failure here leaves the install intact.
+    if [ -d "$SRC_DIR/.git" ]; then
+        echo "⬇️  Updating the existing fork checkout at $SRC_DIR..."
+        git -C "$SRC_DIR" remote set-url origin "$FORK_URL"
+        git -C "$SRC_DIR" fetch --depth=1 origin main
+        git -C "$SRC_DIR" checkout -f -B main FETCH_HEAD
+    else
+        echo "⬇️  Cloning the fork into $SRC_DIR..."
+        rm -rf "$SRC_DIR"
+        git clone --depth=1 "$FORK_URL" "$SRC_DIR"
+    fi
+    git -C "$SRC_DIR" remote get-url upstream >/dev/null 2>&1 \
+        || git -C "$SRC_DIR" remote add upstream "$UPSTREAM_URL"
+
+    # --no-deps on purpose: the container's dependency set already satisfies
+    # upstream Hermes, and resolving the full tree here could pull compilers
+    # and native builds the image has no toolchain for. Drift is reported below.
+    echo "📦 Installing the fork editable into the virtualenv (--no-deps)..."
+    if [ "$INSTALLER" = "uv" ]; then
+        uv pip install --python "$PY" --no-deps -e "$SRC_DIR" \
+            || { echo "❌ uv install failed — nothing was replaced, the old install is intact."; exit 1; }
+    else
+        "$PY" -m pip install --no-deps -e "$SRC_DIR" \
+            || { echo "❌ pip install failed — nothing was replaced, the old install is intact."; exit 1; }
+    fi
+
+    # Prove the swap took, and that the CLI still starts.
+    NEW_SRC="$("$PY" -c 'import hermes_cli, os; print(os.path.dirname(os.path.dirname(os.path.abspath(hermes_cli.__file__))))' 2>/dev/null || echo)"
+    if [ "$NEW_SRC" != "$SRC_DIR" ]; then
+        echo "⚠️  hermes_cli still resolves to '$NEW_SRC', not '$SRC_DIR'."
+        echo "    An older copy in site-packages may be shadowing the new one:"
+        echo "      $PY -m pip uninstall -y hermes-agent   # then re-run this command"
+    fi
+    if "$VENV_DIR/bin/hermes" --version >/dev/null 2>&1; then
+        echo "✅ Now on the fork: $(git -C "$SRC_DIR" rev-parse --short HEAD)"
+    else
+        echo ""
+        echo "⚠️  '$VENV_DIR/bin/hermes --version' fails — the fork likely needs a"
+        echo "    package this virtualenv doesn't have. Install the missing deps:"
+        if [ "$INSTALLER" = "uv" ]; then
+            echo "      uv pip install --python $PY -e $SRC_DIR"
+        else
+            echo "      $PY -m pip install -e $SRC_DIR"
+        fi
+        echo "    (same command without --no-deps). Roll back by recreating the container."
+    fi
+
+    # From here the rest of the script operates on the fork checkout.
+    INSTALL_DIR="$SRC_DIR"
+    if [ -x /command/s6-setuidgid ] && id hermes >/dev/null 2>&1; then
+        RUN_AS="/command/s6-setuidgid hermes"
+    fi
+    DOCKER_INPLACE=1
+}
+
+if [ "$IN_CONTAINER" = "1" ] && { [ "$INSTALL_METHOD" = "docker" ] || [ -f /.dockerenv ]; }; then
+    # Explicitly asked for the container path: take it whether or not the tree
+    # already has a .git. A second run must not fall through to `hermes update`,
+    # which refuses on anything stamped docker and would abort under `set -e`.
+    docker_inplace_upgrade
+elif [ "$INSTALL_METHOD" = "docker" ] || { [ -f /.dockerenv ] && [ ! -d "$INSTALL_DIR/.git" ]; }; then
+    cat <<EOF
 ❌ This is a Docker install — it has no git working tree to switch remotes on
    (.git is excluded from the image build context).
 
@@ -338,8 +445,7 @@ Two ways forward:
 Your data is safe either way: config, sessions and memories live on the
 \$HERMES_HOME volume (/opt/data in the container) and no path here touches it.
 EOF
-        exit 1
-    fi
+    exit 1
 fi
 
 if [ ! -d "$INSTALL_DIR/.git" ]; then
@@ -376,7 +482,15 @@ if [ -d "$HOME_DIR" ]; then
     BACKUP="$HOME_DIR.backup.$(date +%Y%m%d_%H%M%S)"
     # Non-fatal: a full disk (or a big session history on a small container
     # layer) must not abort the upgrade under `set -e`.
-    if cp -r "$HOME_DIR" "$BACKUP" 2>/dev/null; then
+    # The fork checkout may live inside $HERMES_HOME so it survives container
+    # recreates — copying it (and older backups) on every run would bloat the
+    # volume, so exclude both. tar is present in every image that has a shell;
+    # cp is the fallback.
+    if command -v tar >/dev/null 2>&1 &&
+       (cd "$HOME_DIR" && tar --exclude=./hermes-evolution --exclude='./*.backup.*' -cf - .) 2>/dev/null |
+       (mkdir -p "$BACKUP" && cd "$BACKUP" && tar -xf -) 2>/dev/null; then
+        echo "✅ Backup: $BACKUP"
+    elif cp -r "$HOME_DIR" "$BACKUP" 2>/dev/null; then
         echo "✅ Backup: $BACKUP"
     else
         rm -rf "$BACKUP" 2>/dev/null || true
