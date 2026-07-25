@@ -46,31 +46,85 @@ if ! command -v hermes >/dev/null 2>&1; then
     echo "✅ Fresh install complete — continuing with evolution setup."
 fi
 HERMES_BIN="$(readlink -f "$(command -v hermes)" 2>/dev/null || command -v hermes)"
-# Newer installs ship a bash shim (not a symlink — #21454), so readlink alone
-# lands on the shim itself. Parse its `exec "<venv>/bin/hermes"` target.
+# Newer installs ship a shim script (not a symlink — #21454), so readlink alone
+# lands on the shim itself. Resolve the real venv binary it points at.
+# Two shim styles exist in the wild:
+#   * `exec "<venv>/bin/hermes" "$@"`            — the plain install shim
+#   * `REAL=/opt/hermes/.venv/bin/hermes` + a later `exec "$S6_SUID" hermes
+#     "$REAL"` — the Docker privilege-drop shim (docker/hermes-exec-shim.sh)
+# Matching only `^exec "` picked `$S6_SUID` out of the Docker shim (an
+# unexpanded literal), silently left HERMES_BIN as the shim and resolved
+# INSTALL_DIR to /opt. Instead: scan every absolute .../bin/hermes path the
+# file mentions (comments included) and take the first that is executable and
+# is not the shim itself.
 case "$HERMES_BIN" in
-    */venv/bin/hermes) : ;;
+    */venv/bin/hermes|*/.venv/bin/hermes) : ;;
     *)
-        SHIM_TARGET="$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$HERMES_BIN" 2>/dev/null | head -n 1)"
-        if [ -n "$SHIM_TARGET" ] && [ -x "$SHIM_TARGET" ]; then
-            HERMES_BIN="$SHIM_TARGET"
-        fi
+        for CAND in $(grep -oE '/[A-Za-z0-9._/-]+/bin/hermes' "$HERMES_BIN" 2>/dev/null); do
+            [ "$CAND" = "$HERMES_BIN" ] && continue
+            if [ -x "$CAND" ]; then
+                HERMES_BIN="$CAND"
+                break
+            fi
+        done
         ;;
 esac
 INSTALL_DIR="$(dirname "$(dirname "$(dirname "$HERMES_BIN")")")"
+
+# 1b. Docker installs can't be upgraded from inside the container ----------
+# The published image excludes `.git` from the build context (see
+# .dockerignore), so there is no working tree to switch remotes on — exactly
+# what `hermes update` itself refuses to do for docker installs. Detect it
+# BEFORE the git check below so the user gets the right remediation instead
+# of a misleading "not a git checkout".
+INSTALL_METHOD=""
+if [ -f "$INSTALL_DIR/.install_method" ]; then
+    INSTALL_METHOD="$(tr -d '[:space:]' < "$INSTALL_DIR/.install_method" | tr '[:upper:]' '[:lower:]')"
+fi
+if [ "$INSTALL_METHOD" = "docker" ] || { [ -f /.dockerenv ] && [ ! -d "$INSTALL_DIR/.git" ]; }; then
+    cat <<EOF
+❌ This is a Docker install — upgrade.sh cannot switch it from inside the container.
+
+The published image ships without a git working tree (.git is excluded from the
+build context), so there are no remotes to repoint. Build an image from the fork
+on the HOST instead, then recreate the container:
+
+  git clone $FORK_URL
+  cd hermes-agent-evolution
+  docker build -t hermes-agent-evolution:latest .
+
+  # point your compose file / run command at that image, then:
+  docker compose up -d --force-recreate
+
+Your data survives: config, sessions and memories live on the \$HERMES_HOME
+volume (/opt/data in the container) and are untouched by an image swap.
+
+After the container is running on the fork's image, finish evolution setup with:
+  docker exec -it <container> bash -lc 'cd /opt/hermes && python scripts/register_evolution_cron.py'
+EOF
+    exit 1
+fi
+
 if [ ! -d "$INSTALL_DIR/.git" ]; then
     # Last resort: the default location install.sh uses.
     FALLBACK="${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
-    if [ -d "$FALLBACK/.git" ] && [ -x "$FALLBACK/venv/bin/hermes" ]; then
+    if [ -d "$FALLBACK/.git" ] && { [ -x "$FALLBACK/venv/bin/hermes" ] || [ -x "$FALLBACK/.venv/bin/hermes" ]; }; then
         INSTALL_DIR="$FALLBACK"
-        HERMES_BIN="$FALLBACK/venv/bin/hermes"
+        if [ -x "$FALLBACK/venv/bin/hermes" ]; then
+            HERMES_BIN="$FALLBACK/venv/bin/hermes"
+        else
+            HERMES_BIN="$FALLBACK/.venv/bin/hermes"
+        fi
     else
         echo "❌ $INSTALL_DIR is not a git checkout — cannot switch remotes."
-        echo "   (Expected layout <INSTALL_DIR>/venv/bin/hermes.)"
+        echo "   (Expected layout <INSTALL_DIR>/venv/bin/hermes or <INSTALL_DIR>/.venv/bin/hermes.)"
         exit 1
     fi
 fi
-PY="$INSTALL_DIR/venv/bin/python"
+# Both layouts exist: `venv/` (install.sh) and `.venv/` (uv / Docker builds).
+VENV_DIR="$INSTALL_DIR/venv"
+[ -d "$VENV_DIR" ] || VENV_DIR="$INSTALL_DIR/.venv"
+PY="$VENV_DIR/bin/python"
 HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
 echo "📂 Install dir: $INSTALL_DIR"
 echo "📂 Data dir:    $HOME_DIR"

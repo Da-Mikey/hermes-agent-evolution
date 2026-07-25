@@ -47,6 +47,33 @@ memory, and settings stay exactly as they were.
 
 ### Troubleshooting
 
+#### Running Hermes in Docker? Don't run `upgrade.sh` inside the container
+
+The published container image is built **without** a git working tree (`.git` is
+excluded from the build context), so there are no remotes to repoint from the
+inside — the same reason `hermes update` refuses to run there. The script now
+detects this and tells you what to do instead of failing with a confusing
+"not a git checkout" message.
+
+Upgrade a Docker install from the **host**, by building an image from this fork:
+
+```bash
+git clone https://github.com/Lexus2016/hermes-agent-evolution.git
+cd hermes-agent-evolution
+docker build -t hermes-agent-evolution:latest .
+
+# point your compose file / run command at that image, then:
+docker compose up -d --force-recreate
+```
+
+Your config, chats and memory live on the `$HERMES_HOME` volume (`/opt/data`
+inside the container) and survive the image swap untouched. After the container
+comes up on the fork's image, register the evolution jobs once:
+
+```bash
+docker exec -it <container> bash -lc 'cd /opt/hermes && python scripts/register_evolution_cron.py'
+```
+
 #### Windows Defender or antivirus flags `uv.exe` as malware
 
 If your antivirus (Bitdefender, Windows Defender, etc.) quarantines `uv.exe` from the Hermes `bin` folder (`%LOCALAPPDATA%\hermes\bin\uv.exe`), this is a **false positive**. The file is Astral's `uv` — the Rust Python package manager Hermes bundles to manage its Python environment. ML-based antivirus engines commonly flag unsigned Rust binaries that download and install packages.
