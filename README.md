@@ -47,15 +47,13 @@ memory, and settings stay exactly as they were.
 
 ### Troubleshooting
 
-#### Running Hermes in Docker? Don't run `upgrade.sh` inside the container
+#### Running Hermes in Docker?
 
-The published container image is built **without** a git working tree (`.git` is
-excluded from the build context), so there are no remotes to repoint from the
-inside — the same reason `hermes update` refuses to run there. The script now
-detects this and tells you what to do instead of failing with a confusing
-"not a git checkout" message.
+The container image is built **without** a git working tree (`.git` is excluded
+from the build context), so there are no remotes to repoint from the inside —
+the same reason `hermes update` refuses to run there. You have two options.
 
-Upgrade a Docker install from the **host**, by building an image from this fork:
+**A. Rebuild the image on the host** — durable, survives container recreate:
 
 ```bash
 git clone https://github.com/Lexus2016/hermes-agent-evolution.git
@@ -66,13 +64,34 @@ docker build -t hermes-agent-evolution:latest .
 docker compose up -d --force-recreate
 ```
 
-Your config, chats and memory live on the `$HERMES_HOME` volume (`/opt/data`
-inside the container) and survive the image swap untouched. After the container
-comes up on the fork's image, register the evolution jobs once:
+**B. Upgrade the running container in place** — when you only have a shell
+inside it (NAS or panel deployments, no host docker, no build daemon):
 
 ```bash
-docker exec -it <container> bash -lc 'cd /opt/hermes && python scripts/register_evolution_cron.py'
+docker exec -u 0 -it <container> bash
+curl -fsSL https://raw.githubusercontent.com/Lexus2016/hermes-agent-evolution/main/upgrade.sh | bash -s -- --in-container
+docker restart <container>   # or let the script bounce the s6 service
 ```
+
+This works because the image installs Hermes as an **editable** checkout
+(`uv pip install -e .`), so the virtualenv imports straight out of
+`/opt/hermes` — replacing the source tree *is* the upgrade. The script turns
+`/opt/hermes` into a real git checkout of this fork; everything the repo does
+not track (`.venv/`, `node_modules/`, the `bin/hermes` shim,
+`hermes_cli/web_dist/`) is left untouched.
+
+Two caveats for option B:
+
+- The change lives in the container's **writable layer**. `docker restart`
+  keeps it; recreating the container from the image (`compose up
+  --force-recreate`, an image pull) reverts to stock Hermes — which is also
+  your rollback. Re-run the command to reapply.
+- There is **no daily self-update** inside the container (the image ships no
+  cron). Re-run the same command whenever you want the latest commit; after
+  the first run it is a fast `git fetch`.
+
+In both cases your config, chats and memory live on the `$HERMES_HOME` volume
+(`/opt/data`) and are never touched.
 
 #### Windows Defender or antivirus flags `uv.exe` as malware
 

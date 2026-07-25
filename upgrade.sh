@@ -20,13 +20,19 @@ FORK_URL="https://github.com/Lexus2016/hermes-agent-evolution.git"
 UPSTREAM_URL="https://github.com/nousresearch/hermes-agent.git"
 WITH_AUTO_UPDATE=1
 WITH_STAR=1
+IN_CONTAINER=0
 for arg in "$@"; do
     case "$arg" in
         --no-auto-update) WITH_AUTO_UPDATE=0 ;;
         --no-star)        WITH_STAR=0 ;;
-        *) echo "Unknown option: $arg (use --no-auto-update / --no-star)" >&2; exit 2 ;;
+        --in-container)   IN_CONTAINER=1 ;;
+        *) echo "Unknown option: $arg (use --no-auto-update / --no-star / --in-container)" >&2; exit 2 ;;
     esac
 done
+DOCKER_INPLACE=0
+# Command prefix used to run data-dir writes as the unprivileged `hermes` user
+# inside the container (see docker_inplace_upgrade).  Empty everywhere else.
+RUN_AS=""
 
 echo "🧬 Hermes Evolution — upgrade existing Hermes onto the fork"
 echo "=========================================================="
@@ -71,38 +77,145 @@ case "$HERMES_BIN" in
 esac
 INSTALL_DIR="$(dirname "$(dirname "$(dirname "$HERMES_BIN")")")"
 
-# 1b. Docker installs can't be upgraded from inside the container ----------
+# 1b. Docker installs ------------------------------------------------------
 # The published image excludes `.git` from the build context (see
 # .dockerignore), so there is no working tree to switch remotes on — exactly
-# what `hermes update` itself refuses to do for docker installs. Detect it
-# BEFORE the git check below so the user gets the right remediation instead
-# of a misleading "not a git checkout".
+# what `hermes update` itself refuses to do for docker installs.  Detect it
+# BEFORE the git check below so the user gets a real remediation instead of a
+# misleading "not a git checkout".
 INSTALL_METHOD=""
 if [ -f "$INSTALL_DIR/.install_method" ]; then
     INSTALL_METHOD="$(tr -d '[:space:]' < "$INSTALL_DIR/.install_method" | tr '[:upper:]' '[:lower:]')"
 fi
+
+# In-place upgrade of a RUNNING container, for operators who only have a shell
+# inside it (NAS/panel deployments, no host docker, no build daemon).
+#
+# Why this is safe to do at all: the image installs Hermes EDITABLE
+# (`uv pip install --no-deps -e .` in the Dockerfile), so `<tree>/.venv`
+# imports straight out of /opt/hermes.  Replacing the source tree IS the
+# upgrade — no wheel rebuild, no venv surgery.  Everything the repo does not
+# track (.venv/, node_modules/, bin/hermes shim, hermes_cli/web_dist/) is
+# untracked and survives `git checkout -f` untouched.
+docker_inplace_upgrade() {
+    echo "🐳 In-container upgrade — swapping the source tree in place"
+    echo "   Install tree: $INSTALL_DIR"
+    echo ""
+    echo "⚠️  This writes into the container's WRITABLE LAYER."
+    echo "    'docker restart' keeps it. Recreating the container from the image"
+    echo "    (compose up --force-recreate, image pull) reverts to the original —"
+    echo "    that is also your rollback. Re-run this command to reapply."
+    echo ""
+
+    if [ "$(id -u)" != "0" ]; then
+        echo "❌ Needs root inside the container (the code tree is root-owned)."
+        echo "   Re-run with: docker exec -u 0 -it <container> bash"
+        exit 1
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        echo "❌ git is not available in this image — cannot fetch the fork."
+        exit 1
+    fi
+    if [ ! -w "$INSTALL_DIR" ]; then
+        echo "❌ $INSTALL_DIR is not writable (read-only rootfs?) — cannot upgrade in place."
+        exit 1
+    fi
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "❌ No virtualenv at $VENV_DIR — unexpected image layout, aborting."
+        exit 1
+    fi
+
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        echo "ℹ️  Already a git checkout (re-run) — fetching the latest fork commit."
+    else
+        echo "📦 Converting $INSTALL_DIR into a git checkout of the fork..."
+        git -C "$INSTALL_DIR" init -q
+        # The image bakes permissions with --chmod, so mode-only diffs would
+        # otherwise show up as spurious modifications on every later fetch.
+        git -C "$INSTALL_DIR" config core.fileMode false
+    fi
+    git -C "$INSTALL_DIR" remote remove origin >/dev/null 2>&1 || true
+    git -C "$INSTALL_DIR" remote add origin "$FORK_URL"
+    git -C "$INSTALL_DIR" remote remove upstream >/dev/null 2>&1 || true
+    git -C "$INSTALL_DIR" remote add upstream "$UPSTREAM_URL"
+
+    echo "⬇️  Fetching the fork (shallow)..."
+    git -C "$INSTALL_DIR" fetch --depth=1 origin main
+    echo "🔀 Checking the fork out over the image's sources..."
+    git -C "$INSTALL_DIR" checkout -f -B main FETCH_HEAD
+    git -C "$INSTALL_DIR" branch --set-upstream-to=origin/main main >/dev/null 2>&1 || true
+
+    # Entry points and package metadata can move between versions — refresh the
+    # editable link.  --no-deps keeps it to a metadata rewrite: no resolution,
+    # no network, no chance of disturbing the image's sealed dependency set.
+    echo "🔗 Refreshing the editable install..."
+    if command -v uv >/dev/null 2>&1; then
+        (cd "$INSTALL_DIR" && VIRTUAL_ENV="$VENV_DIR" uv pip install --no-cache-dir --no-deps -e . >/dev/null 2>&1) \
+            || echo "⚠️  Editable refresh failed — the source swap itself still applies."
+    else
+        "$VENV_DIR/bin/python" -m pip install --no-deps -e "$INSTALL_DIR" >/dev/null 2>&1 \
+            || echo "⚠️  Editable refresh skipped (no uv/pip in the image)."
+    fi
+
+    # A fork commit may pull in a dependency the sealed image venv doesn't
+    # carry.  Surface that here, not at the next gateway restart.
+    if "$VENV_DIR/bin/hermes" --version >/dev/null 2>&1; then
+        echo "✅ Now on the fork: $(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
+    else
+        echo ""
+        echo "⚠️  '$VENV_DIR/bin/hermes --version' fails after the swap — most likely a"
+        echo "    dependency added by the fork is missing from the image's virtualenv:"
+        echo "      cd $INSTALL_DIR && VIRTUAL_ENV=$VENV_DIR uv sync --frozen --extra all"
+        echo "    Or roll back by recreating the container from its image."
+    fi
+
+    # Writes below land in \$HERMES_HOME, which the supervised gateway reads as
+    # UID 10000. Doing them as root would leave root-owned files the gateway
+    # can't read — the exact failure docker/hermes-exec-shim.sh exists to
+    # prevent. Drop privileges the same way the shim does.
+    if [ -x /command/s6-setuidgid ] && id hermes >/dev/null 2>&1; then
+        RUN_AS="/command/s6-setuidgid hermes"
+    fi
+    DOCKER_INPLACE=1
+}
+
 if [ "$INSTALL_METHOD" = "docker" ] || { [ -f /.dockerenv ] && [ ! -d "$INSTALL_DIR/.git" ]; }; then
-    cat <<EOF
-❌ This is a Docker install — upgrade.sh cannot switch it from inside the container.
+    # $VENV_DIR is normally set after the git check below; the in-place path
+    # runs before it, so resolve it here.
+    VENV_DIR="$INSTALL_DIR/.venv"
+    [ -d "$VENV_DIR" ] || VENV_DIR="$INSTALL_DIR/venv"
+    if [ "$IN_CONTAINER" = "1" ]; then
+        docker_inplace_upgrade
+    else
+        cat <<EOF
+❌ This is a Docker install — it has no git working tree to switch remotes on
+   (.git is excluded from the image build context).
 
-The published image ships without a git working tree (.git is excluded from the
-build context), so there are no remotes to repoint. Build an image from the fork
-on the HOST instead, then recreate the container:
+Two ways forward:
 
-  git clone $FORK_URL
-  cd hermes-agent-evolution
-  docker build -t hermes-agent-evolution:latest .
+  A. Rebuild the image on the HOST — durable, survives container recreate:
 
-  # point your compose file / run command at that image, then:
-  docker compose up -d --force-recreate
+       git clone $FORK_URL
+       cd hermes-agent-evolution
+       docker build -t hermes-agent-evolution:latest .
+       # point your compose file / run command at that image, then:
+       docker compose up -d --force-recreate
 
-Your data survives: config, sessions and memories live on the \$HERMES_HOME
-volume (/opt/data in the container) and are untouched by an image swap.
+  B. Upgrade THIS RUNNING container in place — no host access, no image build:
 
-After the container is running on the fork's image, finish evolution setup with:
-  docker exec -it <container> bash -lc 'cd /opt/hermes && python scripts/register_evolution_cron.py'
+       curl -fsSL https://raw.githubusercontent.com/Lexus2016/hermes-agent-evolution/main/upgrade.sh | bash -s -- --in-container
+
+     The image installs Hermes as an editable checkout, so swapping the source
+     tree takes effect immediately. Run it as root inside the container
+     (docker exec -u 0). The change lives in the container's writable layer:
+     'docker restart' keeps it, recreating the container from the image reverts
+     it — re-run the same command to reapply.
+
+Your data is safe either way: config, sessions and memories live on the
+\$HERMES_HOME volume (/opt/data in the container) and no path here touches it.
 EOF
-    exit 1
+        exit 1
+    fi
 fi
 
 if [ ! -d "$INSTALL_DIR/.git" ]; then
@@ -133,7 +246,15 @@ echo "📂 Data dir:    $HOME_DIR"
 #    bloat when the script is re-run).
 if [ -d "$HOME_DIR" ]; then
     BACKUP="$HOME_DIR.backup.$(date +%Y%m%d_%H%M%S)"
-    cp -r "$HOME_DIR" "$BACKUP" && echo "✅ Backup: $BACKUP"
+    # Non-fatal: a full disk (or a big session history on a small container
+    # layer) must not abort the upgrade under `set -e`.
+    if cp -r "$HOME_DIR" "$BACKUP" 2>/dev/null; then
+        echo "✅ Backup: $BACKUP"
+    else
+        rm -rf "$BACKUP" 2>/dev/null || true
+        echo "⚠️  Could not back up $HOME_DIR (out of space?) — continuing; the"
+        echo "    upgrade below does not write into it destructively."
+    fi
     ls -dt "$HOME_DIR".backup.* 2>/dev/null | tail -n +4 | while read -r old; do
         rm -rf "$old" && echo "   pruned old backup: $old"
     done
@@ -157,16 +278,25 @@ rm -f "$INSTALL_DIR"/skills/evolution/analysis.md \
       "$INSTALL_DIR"/skills/evolution/upstream-sync.md 2>/dev/null || true
 
 # 5. Update onto the fork (official, fork-aware, with rollback) -------------
-echo ""
-echo "🔄 Running hermes update (pulls the fork; preserves evolution)..."
-PRE_HEAD="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || echo none)"
-hermes update --yes
-POST_HEAD="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || echo none)"
 CODE_CHANGED=0
-if [ "$PRE_HEAD" != "$POST_HEAD" ]; then
+if [ "$DOCKER_INPLACE" = "1" ]; then
+    # The in-place path already put the fork's sources on disk. `hermes update`
+    # deliberately refuses to run on a docker install (it would exit 1 and abort
+    # this script under `set -e`), so skip it here.
     CODE_CHANGED=1
+    echo ""
+    echo "ℹ️  Skipping 'hermes update' — the in-place checkout above already did it."
 else
-    echo "ℹ️  No code change — already current (re-run is harmless)."
+    echo ""
+    echo "🔄 Running hermes update (pulls the fork; preserves evolution)..."
+    PRE_HEAD="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || echo none)"
+    hermes update --yes
+    POST_HEAD="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || echo none)"
+    if [ "$PRE_HEAD" != "$POST_HEAD" ]; then
+        CODE_CHANGED=1
+    else
+        echo "ℹ️  No code change — already current (re-run is harmless)."
+    fi
 fi
 
 # 5b. Ensure Turbo-Quant Memory (tqmemory) on the documented install path ----
@@ -179,7 +309,7 @@ fi
 if [ "$CODE_CHANGED" = "0" ] && [ "${HERMES_NO_TQMEMORY:-0}" != "1" ]; then
     echo ""
     echo "🧠 Ensuring Turbo-Quant Memory (tqmemory)..."
-    HERMES_HOME="$HOME_DIR" "$PY" -c "import sys; sys.path.insert(0, '$INSTALL_DIR'); from hermes_cli.tqmemory_setup import reconcile_tqmemory; reconcile_tqmemory()" 2>&1 | tail -2 \
+    HERMES_HOME="$HOME_DIR" $RUN_AS "$PY" -c "import sys; sys.path.insert(0, '$INSTALL_DIR'); from hermes_cli.tqmemory_setup import reconcile_tqmemory; reconcile_tqmemory()" 2>&1 | tail -2 \
         || echo "ℹ️  tqmemory setup skipped (optional)."
 fi
 
@@ -194,16 +324,23 @@ if [ -f "$MAN" ]; then
     grep -v "^evolution-" "$MAN" > "$MAN.tmp" 2>/dev/null && mv "$MAN.tmp" "$MAN" || true
 fi
 rm -rf "$HOME_DIR/skills/evolution"
-HERMES_HOME="$HOME_DIR" "$PY" -c "import sys; sys.path.insert(0,'$INSTALL_DIR'); from tools.skills_sync import sync_skills; sync_skills()" >/dev/null 2>&1 \
+HERMES_HOME="$HOME_DIR" $RUN_AS "$PY" -c "import sys; sys.path.insert(0,'$INSTALL_DIR'); from tools.skills_sync import sync_skills; sync_skills()" >/dev/null 2>&1 \
     || echo "⚠️  skills re-seed reported issues (check: hermes skills list)"
 
 # 7. Register evolution cron jobs into the native scheduler -----------------
 echo "⏰ Registering evolution cron jobs..."
-HERMES_HOME="$HOME_DIR" "$PY" "$INSTALL_DIR/scripts/register_evolution_cron.py" 2>&1 | tail -1 \
+HERMES_HOME="$HOME_DIR" $RUN_AS "$PY" "$INSTALL_DIR/scripts/register_evolution_cron.py" 2>&1 | tail -1 \
     || echo "⚠️  cron registration reported issues"
 
 # 8. Schedule the daily self-update ---------------------------------------
-if [ "$WITH_AUTO_UPDATE" = "1" ]; then
+if [ "$WITH_AUTO_UPDATE" = "1" ] && [ "$DOCKER_INPLACE" = "1" ]; then
+    # install_auto_update.sh schedules `hermes update` via crontab, and the
+    # published image ships neither cron nor a writable-by-hermes code tree —
+    # `hermes update` refuses on a docker install anyway. Re-running this
+    # command is the update path for an in-place container.
+    echo "ℹ️  Daily auto-update not scheduled (no cron in the container image)."
+    echo "    To update later, re-run the same one-liner with --in-container."
+elif [ "$WITH_AUTO_UPDATE" = "1" ]; then
     echo "🔁 Scheduling daily self-update..."
     bash "$INSTALL_DIR/scripts/install_auto_update.sh" >/dev/null 2>&1 \
         && echo "✅ Daily 'hermes update' scheduled" \
@@ -213,7 +350,17 @@ fi
 # 9. Heal the command symlink; restart gateway ONLY if code actually changed
 #    (avoids needlessly interrupting a running gateway on a no-op re-run).
 hermes doctor --fix >/dev/null 2>&1 || true
-if [ "$CODE_CHANGED" = "1" ] && hermes gateway status >/dev/null 2>&1; then
+if [ "$DOCKER_INPLACE" = "1" ]; then
+    # s6 supervises the gateway; bounce the service rather than spawning a
+    # second one. Falls back to telling the operator to restart the container.
+    if [ -x /command/s6-svc ] && [ -d /run/service/main-hermes ]; then
+        /command/s6-svc -r /run/service/main-hermes 2>/dev/null \
+            && echo "✅ Gateway service restarted (picked up new code)" \
+            || echo "⚠️  Could not bounce the s6 service — run: docker restart <container>"
+    else
+        echo "ℹ️  Restart the container to load the new code: docker restart <container>"
+    fi
+elif [ "$CODE_CHANGED" = "1" ] && hermes gateway status >/dev/null 2>&1; then
     # When no systemd/launchd service is installed (macOS default), `hermes
     # gateway restart` falls back to running the gateway in the FOREGROUND —
     # it never returns and would block this script forever. Detach it: with a
@@ -251,4 +398,14 @@ else
 fi
 echo ""
 echo "Next (optional): set GITHUB_TOKEN in $HOME_DIR/.env for research/issues jobs."
-echo "Your Hermes now runs Hermes Evolution and self-updates daily. 🧬🚀"
+if [ "$DOCKER_INPLACE" = "1" ]; then
+    echo "Your container now runs Hermes Evolution. 🧬🚀"
+    echo ""
+    echo "Two things to remember about an in-place container upgrade:"
+    echo "  • It lives in the container's writable layer. 'docker restart' keeps it;"
+    echo "    recreating the container from the image reverts to stock Hermes."
+    echo "  • There is no daily self-update here — re-run the same command with"
+    echo "    --in-container whenever you want the latest evolution commit."
+else
+    echo "Your Hermes now runs Hermes Evolution and self-updates daily. 🧬🚀"
+fi
