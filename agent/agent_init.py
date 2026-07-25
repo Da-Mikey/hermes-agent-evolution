@@ -1625,6 +1625,12 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Experimental experience-bank injection toggle.  Default False.  When
+    # True, distilled execution patterns from the evolution experience bank
+    # are injected into the context tier at session start (once per session —
+    # prompt-cache safe).  Zero token cost when the bank is empty.
+    agent._experience_injection = bool(_agent_section.get("experience_injection", False))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

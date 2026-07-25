@@ -1,0 +1,28 @@
+name: evolution-experience-harvest
+# Every 4h at :53 — off the :00/:30 marks and offset from the LLM stages
+# (research/analysis/implementation) so the deterministic harvest never
+# competes with an expensive stage for the scheduler tick. Runs the
+# experience-bank harvest AND inline distillation (one job, not two).
+schedule: "53 1,5,9,13,17,21 * * *"
+enabled: true
+mode: PRIVATE
+
+# Deterministic harvest — NO LLM agent. The script IS the job. It scans the
+# SQLite SessionDB for sessions finished since the last run (dedup via
+# evolution/experience/harvest_state.json), appends one controlled-vocabulary
+# ExperienceEntry per new session to evolution/experience/entries.jsonl, then
+# invokes distillation inline when anything was appended. See
+# scripts/evolution_experience_harvest.py and agent/experience_bank.py.
+no_agent: true
+script: evolution_experience_harvest.py
+
+# Keep on disk for the owner + evolution-introspection to read the bank;
+# nothing is delivered to channels (a harvest summary is not an alert).
+deliver: local
+
+prompt: |
+  Deterministic experience-bank harvest (no LLM). Appends one per-session
+  diagnosis entry (strong-signal-only failure verdicts, honest-null dimension
+  attribution, controlled-vocabulary analysis) to
+  evolution/experience/entries.jsonl and runs pattern distillation inline.
+  See scripts/evolution_experience_harvest.py and agent/experience_bank.py.

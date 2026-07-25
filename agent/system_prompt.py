@@ -514,6 +514,27 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
+    # Distilled execution patterns from the experience bank (experimental;
+    # config agent.experience_injection, default False).  Resolved ONCE here
+    # at session construction — never re-read per turn, so the prompt stays
+    # byte-stable for the session's lifetime (prompt-cache invariant).
+    #
+    # Resume safety: a resumed session does NOT re-run this build path when a
+    # stored prompt exists — _restore_or_build_system_prompt()
+    # (agent/conversation_loop.py) reuses the session DB's stored
+    # system_prompt verbatim, so injection can never alter a restored prompt.
+    # When there is no usable stored prompt the resume path rebuilds from
+    # scratch, which behaves exactly like context files above (they can also
+    # change between runs) — pre-existing, acceptable behavior.
+    if getattr(agent, "_experience_injection", False):
+        try:
+            from agent.experience_bank import format_patterns_prompt
+            _exp_block = format_patterns_prompt()
+            if _exp_block:
+                context_parts.append(_exp_block)
+        except Exception:
+            pass  # experience bank must never block prompt build
+
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 

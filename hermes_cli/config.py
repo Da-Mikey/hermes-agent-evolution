@@ -1174,6 +1174,14 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Experimental: inject distilled execution patterns from the evolution
+        # experience bank (arXiv:2607.14159-inspired) into the context tier of
+        # the system prompt at session start.  Resolved once per session, so
+        # the prompt stays byte-stable for the session's lifetime (prompt-
+        # cache invariant).  Costs zero tokens when the bank is empty.  Off by
+        # default — enable after reviewing the patterns the bank has actually
+        # distilled (evolution/experience/patterns.json under HERMES_HOME).
+        "experience_injection": False,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP
