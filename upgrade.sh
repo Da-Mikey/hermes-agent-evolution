@@ -139,11 +139,60 @@ docker_inplace_upgrade() {
     git -C "$INSTALL_DIR" remote remove upstream >/dev/null 2>&1 || true
     git -C "$INSTALL_DIR" remote add upstream "$UPSTREAM_URL"
 
+    # New files must stay readable for the UID-10000 gateway. Inheriting a
+    # restrictive umask (027/077 is common on NAS/panel shells) would create
+    # root-only files and the gateway would hit EACCES on its own code.
+    umask 022
+
+    # The container reads two things out of this tree AT BOOT, not just at
+    # runtime: ENTRYPOINT is `/init /opt/hermes/docker/main-wrapper.sh`, and
+    # the cont-init hook execs docker/stage2-hook.sh. If a fork commit changes
+    # them in a way the older s6 layer in /etc/s6-overlay doesn't expect, the
+    # RUNNING container stays fine but the NEXT boot can fail. Snapshot them
+    # and diff after the swap so that risk is visible instead of latent.
+    BOOT_BAK="$INSTALL_DIR/.preupgrade-boot"
+    rm -rf "$BOOT_BAK" 2>/dev/null || true
+    mkdir -p "$BOOT_BAK"
+    cp -r "$INSTALL_DIR/docker" "$BOOT_BAK/docker" 2>/dev/null || true
+    LOCK_BEFORE="$(cksum "$INSTALL_DIR/uv.lock" 2>/dev/null | awk '{print $1}' || echo none)"
+
     echo "⬇️  Fetching the fork (shallow)..."
+    # Network first, working-tree mutation second: a failed fetch leaves the
+    # container completely untouched.
     git -C "$INSTALL_DIR" fetch --depth=1 origin main
     echo "🔀 Checking the fork out over the image's sources..."
     git -C "$INSTALL_DIR" checkout -f -B main FETCH_HEAD
     git -C "$INSTALL_DIR" branch --set-upstream-to=origin/main main >/dev/null 2>&1 || true
+    # Note: files the old image had and the fork does not are left in place as
+    # untracked. `git clean` is deliberately NOT run — it would also delete
+    # things the repo never tracked but the container needs (the bin/hermes
+    # shim, .playwright browsers, the build stamp).
+
+    # Boot-contract drift (see BOOT_BAK above).
+    if command -v diff >/dev/null 2>&1 && [ -d "$BOOT_BAK/docker" ]; then
+        if ! diff -rq "$BOOT_BAK/docker" "$INSTALL_DIR/docker" >/dev/null 2>&1; then
+            echo ""
+            echo "⚠️  The fork changes files under docker/ that this image executes at BOOT"
+            echo "    (main-wrapper.sh / stage2-hook.sh / s6-rc.d). The running container is"
+            echo "    unaffected, but the next container start uses the NEW ones against the"
+            echo "    OLD /etc/s6-overlay layer. Review before you restart the container:"
+            echo "      diff -r $BOOT_BAK/docker $INSTALL_DIR/docker"
+            echo "    Originals are kept in $BOOT_BAK for a manual restore."
+            echo ""
+        fi
+    fi
+
+    # Dependency drift: --no-deps below deliberately never touches the image's
+    # sealed dependency set, so a fork that added or bumped a package would
+    # otherwise fail later at import time.
+    LOCK_AFTER="$(cksum "$INSTALL_DIR/uv.lock" 2>/dev/null | awk '{print $1}' || echo none)"
+    if [ "$LOCK_BEFORE" != "$LOCK_AFTER" ]; then
+        echo "⚠️  uv.lock differs from the image's — the fork may need packages this"
+        echo "    virtualenv doesn't have. The smoke test below catches the obvious"
+        echo "    breakage; an optional adapter (Matrix, Telegram, …) can still fail"
+        echo "    later with ModuleNotFoundError. Fix with:"
+        echo "      cd $INSTALL_DIR && VIRTUAL_ENV=$VENV_DIR uv sync --frozen --extra all"
+    fi
 
     # Entry points and package metadata can move between versions — refresh the
     # editable link.  --no-deps keeps it to a metadata rewrite: no resolution,
@@ -352,11 +401,22 @@ fi
 hermes doctor --fix >/dev/null 2>&1 || true
 if [ "$DOCKER_INPLACE" = "1" ]; then
     # s6 supervises the gateway; bounce the service rather than spawning a
-    # second one. Falls back to telling the operator to restart the container.
+    # second one. `s6-svc -r` only QUEUES the restart, so confirm the service
+    # actually came back up — a fork commit that breaks startup must not look
+    # like a successful upgrade.
     if [ -x /command/s6-svc ] && [ -d /run/service/main-hermes ]; then
-        /command/s6-svc -r /run/service/main-hermes 2>/dev/null \
-            && echo "✅ Gateway service restarted (picked up new code)" \
-            || echo "⚠️  Could not bounce the s6 service — run: docker restart <container>"
+        if /command/s6-svc -r /run/service/main-hermes 2>/dev/null; then
+            sleep 5
+            if [ -x /command/s6-svstat ] && /command/s6-svstat /run/service/main-hermes 2>/dev/null | grep -q '^up'; then
+                echo "✅ Gateway service restarted and running"
+            else
+                echo "⚠️  The gateway did NOT come back up after the restart."
+                echo "    Inspect: s6-svstat /run/service/main-hermes"
+                echo "    Roll back by recreating the container from its image."
+            fi
+        else
+            echo "⚠️  Could not bounce the s6 service — run: docker restart <container>"
+        fi
     else
         echo "ℹ️  Restart the container to load the new code: docker restart <container>"
     fi
