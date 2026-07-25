@@ -68,6 +68,44 @@ class TestStoredPromptReuse:
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
 
+    def test_present_row_restores_exact_experience_snapshot(self):
+        """A restored prompt also restores its session-stable experience block.
+
+        Відновлений промпт також відновлює незмінний знімок досвіду сеансу.
+        """
+        block = (
+            "## Learned execution patterns\n"
+            "- [tool] Guidance from session start. (evidence: 3)"
+        )
+        stored = f"Stable prefix\n\n{block}\n\nConversation started: today"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        agent._experience_injection = True
+        agent._experience_block = None
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._experience_block == block
+        assert agent._cached_system_prompt == stored
+
+    def test_legacy_prompt_without_experience_freezes_empty_snapshot(self):
+        """Legacy sessions must not inject today's bank during a later rebuild.
+
+        Старі сеанси не повинні додавати поточний банк під час перезбирання.
+        """
+        stored = "Legacy prompt\n\nConversation started: today"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        agent._experience_injection = True
+        agent._experience_block = None
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._experience_block == ""
+        assert agent._cached_system_prompt == stored
+
     def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
         """Stored prompts are cache gold unless their runtime identity is stale.
 

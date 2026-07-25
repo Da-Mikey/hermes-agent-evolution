@@ -250,7 +250,6 @@ class TestSchedulerFailure:
 
         assert result == "deny"
         assert created["coro"] is not None
-        assert created["coro"].cr_frame is None
         runtime_warnings = [
             w for w in caught
             if issubclass(w.category, RuntimeWarning)

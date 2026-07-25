@@ -333,9 +333,13 @@ class TestSchedulerIntegration:
             },
         )
 
-    def test_preflight_success_continues_to_agent(self, tmp_path):
+    def test_evolution_bypasses_scheduler_provider_preflight(self, tmp_path):
         from cron.scheduler import _run_job_impl
 
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: cfg-model\n  provider: anthropic\n",
+            encoding="utf-8",
+        )
         job = self._make_job("analysis")
         with (
             patch("cron.scheduler._get_hermes_home", return_value=tmp_path),
@@ -343,96 +347,28 @@ class TestSchedulerIntegration:
             patch("dotenv.load_dotenv"),
             patch("hermes_state.SessionDB", return_value=MagicMock()),
             patch(
-                "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value={
-                    "api_key": "test-key",
-                    "base_url": "https://example.invalid/v1",
-                    "provider": "openrouter",
-                    "api_mode": "chat_completions",
-                    "model": "openrouter/model",
-                },
-            ),
-            patch("cron.evolution_preflight.preflight_provider", return_value=None),
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as mock_resolve,
+            patch(
+                "cron.evolution_preflight.preflight_provider"
+            ) as mock_preflight,
             patch("run_agent.AIAgent") as mock_agent_cls,
         ):
             mock_agent = MagicMock()
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
-            success, output, final_response, error = _run_job_impl(job)
+            success, _output, final_response, error = _run_job_impl(job)
 
         assert success is True
-        assert final_response == "ok"
-        mock_agent_cls.assert_called_once()
-
-    def test_preflight_failure_with_digest_returns_stale_digest(self, tmp_path):
-        from cron.scheduler import _run_job_impl
-
-        stage_dir = tmp_path / "evolution" / "analysis"
-        stage_dir.mkdir(parents=True)
-        digest = stage_dir / "2026-06-23.json"
-        digest.write_text(json.dumps({"selected": ["#123"]}))
-
-        job = self._make_job("analysis")
-        with (
-            patch("cron.scheduler._get_hermes_home", return_value=tmp_path),
-            patch("cron.scheduler._resolve_origin", return_value=None),
-            patch("dotenv.load_dotenv"),
-            patch("hermes_state.SessionDB", return_value=MagicMock()),
-            patch(
-                "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value={
-                    "api_key": "test-key",
-                    "base_url": "https://example.invalid/v1",
-                    "provider": "openrouter",
-                    "api_mode": "chat_completions",
-                    "model": "openrouter/model",
-                },
-            ),
-            patch(
-                "cron.evolution_preflight.preflight_provider",
-                return_value="provider down",
-            ),
-            patch("run_agent.AIAgent") as mock_agent_cls,
-        ):
-            success, output, final_response, error = _run_job_impl(job)
-
-        assert success is True
-        assert final_response == "[SILENT]"
         assert error is None
-        assert "provider unreachable — stale digest fallback" in output
-        assert '"selected": ["#123"]' in output
-        mock_agent_cls.assert_not_called()
-
-    def test_preflight_failure_without_digest_fails_job(self, tmp_path):
-        from cron.scheduler import _run_job_impl
-
-        job = self._make_job("research")
-        with (
-            patch("cron.scheduler._get_hermes_home", return_value=tmp_path),
-            patch("cron.scheduler._resolve_origin", return_value=None),
-            patch("dotenv.load_dotenv"),
-            patch("hermes_state.SessionDB", return_value=MagicMock()),
-            patch(
-                "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value={
-                    "api_key": "test-key",
-                    "base_url": "https://example.invalid/v1",
-                    "provider": "openrouter",
-                    "api_mode": "chat_completions",
-                    "model": "openrouter/model",
-                },
-            ),
-            patch(
-                "cron.evolution_preflight.preflight_provider",
-                return_value="provider down",
-            ),
-            patch("run_agent.AIAgent") as mock_agent_cls,
-        ):
-            success, output, final_response, error = _run_job_impl(job)
-
-        assert success is False
-        assert error is not None and "No cached digest available" in error
-        mock_agent_cls.assert_not_called()
+        assert final_response == "ok"
+        mock_resolve.assert_not_called()
+        mock_preflight.assert_not_called()
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "cfg-model"
+        assert kwargs["provider"] == "anthropic"
+        assert kwargs["api_key"] is None
+        assert kwargs["base_url"] is None
 
     def test_non_evolution_job_skips_preflight(self, tmp_path):
         from cron.scheduler import _run_job_impl
@@ -468,110 +404,6 @@ class TestSchedulerIntegration:
         assert final_response == "ok"
         mock_preflight.assert_not_called()
         mock_agent_cls.assert_called_once()
-
-    def test_root_fix_runtime_model_synced_from_config_default(self, tmp_path):
-        """ROOT-FIX (#486): scheduler must sync the resolved model into
-        runtime["model"] before the pre-flight ping.
-
-        Reproduces the prod failure: resolve_runtime_provider() returns a
-        runtime WITHOUT a ``model`` key (it never sets one — the scheduler
-        resolves the model into a separate local variable and passes it to
-        AIAgent(model=...) directly). The job pins no model, but config.yaml
-        supplies model.default. Before the fix, preflight_provider() saw an
-        empty runtime["model"] and always returned "no model configured for
-        pre-flight ping". After the fix, runtime["model"] carries the resolved
-        config default.
-
-        We capture the runtime dict actually handed to preflight_provider and
-        assert it carries the config default model.
-        """
-        from cron.scheduler import _run_job_impl
-
-        # config.yaml provides the default model; job pins nothing.
-        (tmp_path / "config.yaml").write_text("model:\n  default: cfg-default-model\n")
-
-        captured = {}
-
-        def _capture_preflight(runtime, *, cfg=None):
-            # Snapshot what the scheduler passed in at call time.
-            captured["model"] = runtime.get("model")
-            captured["provider"] = runtime.get("provider")
-            return None  # report provider reachable -> continue to agent
-
-        job = self._make_job("analysis")
-        with (
-            patch("cron.scheduler._get_hermes_home", return_value=tmp_path),
-            patch("cron.scheduler._resolve_origin", return_value=None),
-            patch("dotenv.load_dotenv"),
-            patch("hermes_state.SessionDB", return_value=MagicMock()),
-            patch(
-                "hermes_cli.runtime_provider.resolve_runtime_provider",
-                # NOTE: deliberately NO "model" key — mirrors prod behavior.
-                return_value={
-                    "api_key": "test-key",
-                    "base_url": "https://example.invalid/v1",
-                    "provider": "openrouter",
-                    "api_mode": "chat_completions",
-                },
-            ),
-            patch(
-                "cron.evolution_preflight.preflight_provider",
-                side_effect=_capture_preflight,
-            ),
-            patch("run_agent.AIAgent") as mock_agent_cls,
-        ):
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _output, final_response, _error = _run_job_impl(job)
-
-        # The runtime handed to the ping must carry the config-default model,
-        # not the empty value resolve_runtime_provider() left it with.
-        assert captured.get("model") == "cfg-default-model"
-        assert captured.get("provider") == "openrouter"
-        # And with a healthy ping the job proceeds to the agent normally.
-        assert success is True
-        assert final_response == "ok"
-        mock_agent_cls.assert_called_once()
-        # The model passed to the agent must match the same resolved default.
-        _, agent_kwargs = mock_agent_cls.call_args
-        assert agent_kwargs["model"] == "cfg-default-model"
-
-        from cron.scheduler import _run_job_impl
-
-        (tmp_path / "config.yaml").write_text("cron:\n  preflight_enabled: false\n")
-        job = self._make_job("analysis")
-        with (
-            patch("cron.scheduler._get_hermes_home", return_value=tmp_path),
-            patch("cron.scheduler._resolve_origin", return_value=None),
-            patch("dotenv.load_dotenv"),
-            patch("hermes_state.SessionDB", return_value=MagicMock()),
-            patch(
-                "hermes_cli.runtime_provider.resolve_runtime_provider",
-                return_value={
-                    "api_key": "test-key",
-                    "base_url": "https://example.invalid/v1",
-                    "provider": "openrouter",
-                    "api_mode": "chat_completions",
-                    "model": "openrouter/model",
-                },
-            ),
-            patch(
-                "cron.evolution_preflight.preflight_provider",
-                return_value="provider down",
-            ) as mock_preflight,
-            patch("run_agent.AIAgent") as mock_agent_cls,
-        ):
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _output, final_response, _error = _run_job_impl(job)
-
-        assert success is True
-        assert final_response == "ok"
-        mock_preflight.assert_not_called()
-        mock_agent_cls.assert_called_once()
-
 
 class TestSchedulerHaltGate:
     """Scheduler-level wiring for the halt-state gate (#913): a job for a
@@ -660,6 +492,10 @@ class TestSchedulerHaltGate:
         from cron.scheduler import _run_job_impl
 
         self._write_halt_file(tmp_path)
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: cfg-model\n  provider: anthropic\n",
+            encoding="utf-8",
+        )
         job = self._make_job("integration")
         with (
             patch("cron.scheduler._get_hermes_home", return_value=tmp_path),
@@ -734,6 +570,10 @@ class TestSchedulerHaltGate:
         from cron.scheduler import _run_job_impl
 
         (tmp_path / "evolution").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: cfg-model\n  provider: anthropic\n",
+            encoding="utf-8",
+        )
         job = self._make_job("research")
         with (
             patch("cron.scheduler._get_hermes_home", return_value=tmp_path),

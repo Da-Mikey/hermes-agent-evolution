@@ -16,6 +16,8 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX
+from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.experience_bank import ExperiencePattern, save_patterns
 from run_agent import AIAgent
 import run_agent
 
@@ -699,6 +701,68 @@ class TestPreflightCompression:
 
         assert new_system_prompt == "rebuilt with fact B"
         build_prompt.assert_called_once_with("system prompt")
+
+    def test_resumed_experience_snapshot_survives_full_prompt_rebuild(self, agent):
+        """A -> resume -> B -> compression rebuild must keep experience A.
+
+        Повне перезбирання після відновлення має зберегти досвід A, а не B.
+        """
+        agent.compression_enabled = False
+        agent._experience_injection = True
+        save_patterns([
+            ExperiencePattern(
+                id="session-a",
+                dimension="tool",
+                category="network",
+                tool="web_search",
+                evidence_count=3,
+            )
+        ])
+        stored_prompt = agent._build_system_prompt(None)
+        assert "probe connectivity once" in stored_prompt
+
+        # Emulate /resume resetting session-scoped state before DB restore.
+        # Імітуємо скидання стану /resume перед відновленням із бази даних.
+        agent._experience_block = None
+        save_patterns([
+            ExperiencePattern(
+                id="session-b",
+                dimension="context",
+                category="not_found",
+                evidence_count=9,
+            )
+        ])
+        session_db = MagicMock()
+        session_db.get_session.return_value = {"system_prompt": stored_prompt}
+        agent._session_db = session_db
+        _restore_or_build_system_prompt(
+            agent,
+            None,
+            [{"role": "user", "content": "previous turn"}],
+        )
+        assert agent._cached_system_prompt == stored_prompt
+        assert "probe connectivity once" in agent._experience_block
+
+        # External memory forces compression down the full rebuild path.
+        # Зовнішня пам'ять примушує стиснення повністю перебудувати промпт.
+        agent._session_db = None
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = ""
+        with patch.object(
+            agent.context_compressor,
+            "compress",
+            return_value=[
+                {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}
+            ],
+        ):
+            _, rebuilt_prompt = agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                None,
+                approx_tokens=1234,
+            )
+
+        assert "probe connectivity once" in rebuilt_prompt
+        assert "verify it exists" not in rebuilt_prompt
 
     def test_compression_rebuilds_when_prompt_has_leftover_block_for_emptied_memory(self, agent):
         """A prompt still carrying a memory block after all entries were

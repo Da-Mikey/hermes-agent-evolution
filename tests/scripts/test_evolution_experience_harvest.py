@@ -195,6 +195,9 @@ class TestSessionSelection:
         db, db_path = _make_db(tmp_path)
         _add_session(db, "s-legacy", [_user(), _assistant()], ts=OLD)
         db.close()
+        assert eb.append_entry(
+            eb.ExperienceEntry(ts=OLD, session_id="s-legacy", success=True)
+        )
         assert eb.set_harvest_state(
             {"cursor_ts": OLD, "seen_ids": ["s-legacy"]}
         )
@@ -206,6 +209,7 @@ class TestSessionSelection:
         assert state["last_message_id"] > 0
         assert state["seen_ids"] == ["s-legacy"]
         assert len(state["seen_revisions"]) == 1
+        assert state["revision_state_version"] == 1
 
         imported = SessionDB(db_path=db_path)
         _add_session(
@@ -215,7 +219,92 @@ class TestSessionSelection:
             ts=OLD - 3600,
         )
         assert _harvest(imported, db_path)["entries_appended"] == 1
-        assert [entry.session_id for entry in _entries()] == ["s-after-upgrade"]
+        assert [entry.session_id for entry in _entries()] == [
+            "s-legacy",
+            "s-after-upgrade",
+        ]
+
+    def test_late_import_before_first_upgrade_is_harvested(self, tmp_path):
+        """The one-time migration must scan imports predating the upgrade.
+
+        Одноразова міграція має знайти імпорт, зроблений до оновлення.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-known", [_user(), _assistant()], ts=OLD)
+        _add_session(
+            db,
+            "s-imported-before-upgrade",
+            [_user(), _assistant()],
+            ts=OLD - 3600,
+        )
+        db.close()
+        assert eb.append_entry(
+            eb.ExperienceEntry(ts=OLD, session_id="s-known", success=True)
+        )
+        assert eb.set_harvest_state(
+            {"cursor_ts": OLD, "seen_ids": ["s-known"]}
+        )
+
+        migrated = eh.run_harvest(db_path=db_path, now=NOW)
+
+        assert migrated["entries_appended"] == 1
+        assert [entry.session_id for entry in _entries()] == [
+            "s-known",
+            "s-imported-before-upgrade",
+        ]
+        assert get_harvest_state()["revision_state_version"] == 1
+
+        # After migration, SQL is bounded again: the old import is excluded.
+        bounded = eh.run_harvest(db_path=db_path, now=NOW)
+        assert bounded["sessions_scanned"] == 1
+        assert bounded["entries_appended"] == 0
+
+    def test_reopened_revision_before_first_upgrade_is_harvested(self, tmp_path):
+        """A bare legacy seen_id must not hide a newer completion revision.
+
+        Старий seen_id не повинен приховати новішу завершену редакцію.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-reopened-before-upgrade", [_user(), _assistant()], ts=OLD)
+        db.close()
+        assert eb.append_entry(
+            eb.ExperienceEntry(
+                ts=OLD,
+                session_id="s-reopened-before-upgrade",
+                success=True,
+            )
+        )
+        assert eb.set_harvest_state(
+            {
+                "cursor_ts": OLD + 3600,
+                "seen_ids": ["s-reopened-before-upgrade"],
+            }
+        )
+
+        resumed = SessionDB(db_path=db_path)
+        resumed._conn.execute(
+            "UPDATE sessions SET ended_at=NULL WHERE id=?",
+            ("s-reopened-before-upgrade",),
+        )
+        resumed.append_message(
+            "s-reopened-before-upgrade", "user", content="Continue.", timestamp=OLD + 10
+        )
+        resumed.append_message(
+            "s-reopened-before-upgrade",
+            "assistant",
+            content="Completed again.",
+            timestamp=OLD + 20,
+        )
+        resumed._conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=?",
+            (OLD + 30, "s-reopened-before-upgrade"),
+        )
+
+        migrated = _harvest(resumed, db_path)
+
+        assert migrated["entries_appended"] == 1
+        assert [entry.ts for entry in _entries()] == [OLD, OLD + 30]
+        assert get_harvest_state()["revision_state_version"] == 1
 
     def test_changed_snapshot_is_not_marked_processed(self, tmp_path, monkeypatch):
         """A session reopened after get_messages remains eligible next run.
@@ -556,12 +645,53 @@ class TestDurability:
         first = eh.run_harvest(db_path=db_path, now=NOW)
         assert first["entries_appended"] == 1
         assert first["state_saved"] is False
+        assert "revision_state_version" not in get_harvest_state()
 
         monkeypatch.setattr(eh, "set_harvest_state", original)
         second = eh.run_harvest(db_path=db_path, now=NOW)
         assert second["entries_appended"] == 0
         assert len(_entries()) == 1
         assert "s-state-fail" in get_harvest_state()["seen_ids"]
+        assert get_harvest_state()["revision_state_version"] == 1
+
+    def test_failed_append_keeps_migration_incomplete_and_retry_heals(
+        self, tmp_path, monkeypatch
+    ):
+        """A partial migration is replayed without duplicating durable entries.
+
+        Часткова міграція повторюється без дублювання збережених записів.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-first", [_user(), _assistant()], ts=OLD)
+        _add_session(db, "s-second", [_user(), _assistant()], ts=OLD + 1)
+        db.close()
+        assert eb.set_harvest_state({"cursor_ts": OLD + 100, "seen_ids": []})
+
+        original = eh.append_entry
+        calls = 0
+
+        def fail_second(entry):
+            nonlocal calls
+            calls += 1
+            return original(entry) if calls == 1 else False
+
+        monkeypatch.setattr(eh, "append_entry", fail_second)
+        first = eh.run_harvest(db_path=db_path, now=NOW)
+
+        assert first["entries_appended"] == 1
+        assert first["write_failures"] == 1
+        assert "revision_state_version" not in get_harvest_state()
+        assert [entry.session_id for entry in _entries()] == ["s-first"]
+
+        monkeypatch.setattr(eh, "append_entry", original)
+        second = eh.run_harvest(db_path=db_path, now=NOW)
+
+        assert second["entries_appended"] == 1
+        assert [entry.session_id for entry in _entries()] == [
+            "s-first",
+            "s-second",
+        ]
+        assert get_harvest_state()["revision_state_version"] == 1
 
     def test_corrupt_stored_message_id_is_treated_as_legacy(self, tmp_path):
         """Malformed nested revision metadata must not crash the next harvest."""

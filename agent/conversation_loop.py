@@ -353,6 +353,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
+    if stored_prompt:
+        _restore_experience_block_from_prompt(agent, stored_prompt)
+
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
@@ -426,6 +429,41 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "miss the prefix cache.",
                 agent.session_id, exc,
             )
+
+
+_EXPERIENCE_BLOCK_HEADING = "## Learned execution patterns"
+_EXPERIENCE_PATTERN_LINE = re.compile(
+    r"^- \[[^\]\r\n]+\] .+ \(evidence: [1-9][0-9]*\)$"
+)
+
+
+def _restore_experience_block_from_prompt(agent, stored_prompt: str) -> None:
+    """Restore the session's exact experience snapshot from its stored prompt.
+
+    Відновлює точний знімок досвіду сеансу зі збереженого промпту.
+
+    A legacy prompt without the block freezes an empty snapshot. This prevents
+    a later compression rebuild from injecting patterns learned after the
+    session started while keeping the persisted prompt schema unchanged.
+
+    Старий промпт без блока фіксує порожній знімок. Тому пізніше перезбирання
+    після стиснення не додасть шаблони, вивчені вже після початку сеансу.
+    """
+    if not vars(agent).get("_experience_injection", False):
+        return
+
+    restored_block = ""
+    for section in stored_prompt.split("\n\n"):
+        lines = section.splitlines()
+        if (
+            len(lines) > 1
+            and lines[0] == _EXPERIENCE_BLOCK_HEADING
+            and all(_EXPERIENCE_PATTERN_LINE.fullmatch(line) for line in lines[1:])
+        ):
+            restored_block = section
+            break
+
+    agent._experience_block = restored_block
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:

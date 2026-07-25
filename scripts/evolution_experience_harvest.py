@@ -83,6 +83,9 @@ _CURSOR_OVERLAP_S = 15 * 60.0
 #: Cap on the dedup id list kept in harvest_state.json.
 _SEEN_IDS_CAP = 5000
 
+#: State schema marker written only after the one-time legacy revision scan.
+_REVISION_STATE_VERSION = 1
+
 #: Strong failure markers, mirrored from the agent loop (do not paraphrase —
 #: these strings are what actually lands in persisted session messages):
 #: * ``agent/conversation_loop.py`` loop-guard hard stops append a final
@@ -129,6 +132,8 @@ def _iter_session_rows(
     db: Any,
     cursor_ts: float = 0.0,
     last_message_id: int = 0,
+    *,
+    full_scan: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return completed session rows in monotonic completion order.
 
@@ -148,14 +153,14 @@ def _iter_session_rows(
         "LEFT JOIN messages m ON m.session_id = s.id "
         "WHERE s.ended_at IS NOT NULL "
         "GROUP BY s.id "
-        "HAVING s.ended_at > ? OR source_last_message_id > ? "
-        "ORDER BY s.ended_at ASC, s.id ASC"
     )
+    params: tuple[Any, ...] = ()
+    if not full_scan:
+        sql += "HAVING s.ended_at > ? OR source_last_message_id > ? "
+        params = (cursor_ts - _CURSOR_OVERLAP_S, last_message_id)
+    sql += "ORDER BY s.ended_at ASC, s.id ASC"
     with db._lock:
-        rows = db._conn.execute(
-            sql,
-            (cursor_ts - _CURSOR_OVERLAP_S, last_message_id),
-        ).fetchall()
+        rows = db._conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -176,15 +181,6 @@ def _session_snapshot(db: Any, session_id: str) -> Optional[tuple[float, int]]:
     if row is None or row["ended_at"] is None:
         return None
     return float(row["ended_at"]), int(row["source_last_message_id"])
-
-
-def _max_message_id(db: Any) -> int:
-    """Return the database-wide monotonic message cursor."""
-    with db._lock:
-        row = db._conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS max_id FROM messages"
-        ).fetchone()
-    return int(row["max_id"])
 
 
 def _revision_key(session_id: str, ended_at: float, last_message_id: int) -> str:
@@ -443,7 +439,6 @@ def run_harvest(
         cursor_ts = float(state.get("cursor_ts", 0.0) or 0.0)
     except (TypeError, ValueError):
         cursor_ts = 0.0
-    has_message_cursor = "last_message_id" in state
     try:
         last_message_id = int(state.get("last_message_id", 0) or 0)
     except (TypeError, ValueError):
@@ -457,8 +452,12 @@ def run_harvest(
         for value in (state.get("seen_revisions") or [])
         if isinstance(value, str)
     ]
-    has_revision_state = "seen_revisions" in state
     seen_revision_set = set(seen_revisions)
+    try:
+        revision_state_version = int(state.get("revision_state_version", 0) or 0)
+    except (TypeError, ValueError):
+        revision_state_version = 0
+    migration_needed = revision_state_version < _REVISION_STATE_VERSION
     existing_entries = list(iter_entries())
     existing_revision_keys = set()
     legacy_entry_revisions = set()
@@ -476,20 +475,22 @@ def run_harvest(
 
     db = SessionDB(db_path=db_path, read_only=True)
     try:
-        # A legacy state has no message cursor. Bootstrap it to the current DB
-        # maximum so the upgrade remains bounded; future imports receive larger
-        # AUTOINCREMENT ids and are detected normally. / Старий стан не має
-        # курсора повідомлень: початкове значення беремо з поточного максимуму,
-        # щоб оновлення не сканувало всю історію.
-        state_needs_upgrade = cursor_ts > 0 and not has_message_cursor
-        if state_needs_upgrade:
-            last_message_id = _max_message_id(db)
-        rows = _iter_session_rows(db, cursor_ts, last_message_id)
+        # Legacy state cannot identify which completion a bare seen_id covered.
+        # Scan all ended rows once, then mark the revision migration complete.
+        # Старий seen_id не визначає конкретне завершення, тому один раз
+        # переглядаємо всі завершені рядки й лише потім завершуємо міграцію.
+        rows = _iter_session_rows(
+            db,
+            cursor_ts,
+            last_message_id,
+            full_scan=migration_needed,
+        )
 
         processed_max_ts = cursor_ts
         processed_max_message_id = last_message_id
         new_seen_revisions: List[str] = []
         new_seen_ids: List[str] = []
+        migration_pass_complete = True
         for row in rows:
             summary["sessions_scanned"] += 1
             session_id = str(row.get("id") or "")
@@ -501,23 +502,10 @@ def run_harvest(
                 session_id, ended_at, source_last_message_id
             )
             if revision_key in seen_revision_set:
-                continue
-            # Legacy bare ids only suppress rows covered by both legacy cursors.
-            # A newer message id or completion time is a new revision.
-            if (
-                not has_revision_state
-                and session_id in seen_set
-                and ended_at <= cursor_ts
-                and source_last_message_id <= last_message_id
-            ):
-                # Upgrade a legacy bare id into its exact current revision.
-                # Перетворити старий ідентифікатор на точну поточну редакцію.
                 processed_max_ts = max(processed_max_ts, ended_at)
                 processed_max_message_id = max(
                     processed_max_message_id, source_last_message_id
                 )
-                new_seen_revisions.append(revision_key)
-                new_seen_ids.append(session_id)
                 continue
             # Heal a prior state-write failure without duplicating the entry.
             # Відновити стан після помилки запису без дублювання редакції.
@@ -542,6 +530,7 @@ def run_harvest(
                 ended_at,
                 source_last_message_id,
             ):
+                migration_pass_complete = False
                 continue
 
             # Nothing-to-learn skip: no unrecovered errors AND no verdict
@@ -576,6 +565,7 @@ def run_harvest(
             )
             if not append_entry(entry):
                 summary["write_failures"] += 1
+                migration_pass_complete = False
                 break
             summary["sessions_harvested"] += 1
             summary["entries_appended"] += 1
@@ -588,21 +578,28 @@ def run_harvest(
 
         # Persist both monotonic cursors and exact completed revisions.
         # Зберегти обидва монотонні курсори та точні завершені редакції.
-        if new_seen_revisions or state_needs_upgrade:
+        state_changed = (
+            bool(new_seen_revisions)
+            or migration_needed
+            or processed_max_ts != cursor_ts
+            or processed_max_message_id != last_message_id
+        )
+        if state_changed:
             merged_seen = seen_ids + [
                 s for s in new_seen_ids if s not in seen_set
             ]
             merged_revisions = seen_revisions + [
                 key for key in new_seen_revisions if key not in seen_revision_set
             ]
-            summary["state_saved"] = set_harvest_state(
-                {
-                    "cursor_ts": processed_max_ts,
-                    "last_message_id": processed_max_message_id,
-                    "seen_ids": merged_seen[-_SEEN_IDS_CAP:],
-                    "seen_revisions": merged_revisions[-_SEEN_IDS_CAP:],
-                }
-            )
+            next_state = {
+                "cursor_ts": processed_max_ts,
+                "last_message_id": processed_max_message_id,
+                "seen_ids": merged_seen[-_SEEN_IDS_CAP:],
+                "seen_revisions": merged_revisions[-_SEEN_IDS_CAP:],
+            }
+            if not migration_needed or migration_pass_complete:
+                next_state["revision_state_version"] = _REVISION_STATE_VERSION
+            summary["state_saved"] = set_harvest_state(next_state)
     finally:
         try:
             db.close()

@@ -2314,7 +2314,19 @@ def _deliver_result(
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        def _run_standalone_delivery():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    cleaned_delivery_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                )
+                            )
+
+                        future = pool.submit(_run_standalone_delivery)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -3813,12 +3825,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             str(_job_approval) if _job_approval else ""
         )
 
-        # Model resolution precedence: per-job override > HERMES_MODEL env >
-        # config.yaml ``model:`` (string or ``{default: ...}``). The per-job
-        # value is intentionally re-read from storage every tick so a
-        # ``cronjob action=update model=...`` after a failed run takes effect
-        # on the next tick — there is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        # Evolution routes are intentionally unpinned: only config.yaml supplies
+        # their primary model/provider and AIAgent owns credential resolution and
+        # every fallback. Other cron jobs keep the historical precedence below.
+        agent_owns_routing = bool(stage)
+        model = (
+            ""
+            if agent_owns_routing
+            else job.get("model") or os.getenv("HERMES_MODEL") or ""
+        )
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -3844,7 +3859,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
-                if not job.get("model"):
+                if agent_owns_routing or not job.get("model"):
                     if isinstance(_model_cfg, str):
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
@@ -3861,6 +3876,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
         if not (isinstance(model, str) and model.strip()):
+            if agent_owns_routing:
+                raise RuntimeError(
+                    f"Evolution cron job '{job_name}' has no model configured in "
+                    "config.yaml. Set a default with `hermes model <name>`."
+                )
             raise RuntimeError(
                 f"Cron job '{job_name}' has no model configured "
                 f"(job.model={job.get('model')!r}, "
@@ -3957,140 +3977,98 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             else ""
         )
         primary_provider_for_drift = (
-            str(job.get("provider") or "").strip().lower()
+            ("" if agent_owns_routing else str(job.get("provider") or "").strip().lower())
             or configured_provider_for_drift
             or None
         )
-        try:
-            # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
-            # already prefers persisted config over stale shell/env overrides when
-            # no explicit provider is requested. Passing the env var here short-
-            # circuits that precedence and can resurrect old providers (for
-            # example DeepSeek) for cron jobs that do not pin provider/model.
-            runtime_kwargs = {
-                "requested": job.get("provider"),
-                # Derive provider-specific api_mode from the model this job
-                # will actually run (per-job pin > env > config default), not
-                # the stale persisted default — mirrors the fallback path
-                # below, which already passes its fb_model.
-                "target_model": model,
-            }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
-            runtime = resolve_runtime_provider(**runtime_kwargs)
-            primary_provider_for_drift = (
-                str(runtime.get("provider") or "").strip().lower()
-                or primary_provider_for_drift
-            )
-        except AuthError as auth_exc:
-            # Primary provider auth failed — try each configured provider/model
-            # pair atomically. Keeping the primary model while changing only the
-            # provider can silently route a paid GPT model through OpenRouter.
-            primary_provider_for_drift = (
-                str(getattr(auth_exc, "provider", "") or "").strip().lower()
-                or primary_provider_for_drift
-            )
-            logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
-            fb_list = get_fallback_chain(_cfg)
-            runtime = None
-            for entry in fb_list:
-                if not isinstance(entry, dict):
-                    continue
-                fb_provider = str(entry.get("provider") or "").strip()
-                fb_model = str(entry.get("model") or "").strip()
-                if not fb_provider or not fb_model:
-                    continue
-                try:
-                    from hermes_cli.fallback_config import resolve_entry_api_key
-
-                    fb_kwargs = {
-                        "requested": fb_provider,
-                        "target_model": fb_model,
-                    }
-                    if entry.get("base_url"):
-                        fb_kwargs["explicit_base_url"] = entry["base_url"]
-                    fb_api_key = resolve_entry_api_key(entry)
-                    if fb_api_key:
-                        fb_kwargs["explicit_api_key"] = fb_api_key
-                    runtime = resolve_runtime_provider(**fb_kwargs)
-                    model = fb_model
-                    logger.info(
-                        "Job '%s': fallback resolved to %s model %s",
-                        job_id,
-                        runtime.get("provider"),
-                        fb_model,
-                    )
-                    break
-                except Exception as fb_exc:
-                    logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
-            if runtime is None:
-                raise RuntimeError(
-                    format_runtime_provider_error(auth_exc)
-                ) from auth_exc
-        except Exception as exc:
-            message = format_runtime_provider_error(exc)
-            raise RuntimeError(message) from exc
-
-        # Evolution pipeline pre-flight: ping the resolved provider before we
-        # build an agent. If it fails, return the most recent on-disk digest
-        # so downstream evolution jobs still have stale-but-structured input
-        # instead of failing silently during retries. (#486)
-        #
-        # `stage` and the halt-state gate (#913) were already resolved
-        # earlier in this function, right after the no_agent short-circuit —
-        # before SessionDB/AIAgent construction, prerun scripts, and this
-        # provider resolution — so a halted job never reaches this point.
-        if stage and evolution_preflight._preflight_enabled(_cfg):
-            # ROOT-FIX (#486): resolve_runtime_provider() does NOT populate
-            # runtime["model"] — the model is resolved into the local ``model``
-            # variable above (job.model > HERMES_MODEL > config.yaml model.default)
-            # and passed separately to AIAgent(model=...). Without this sync the
-            # pre-flight ping saw an empty runtime["model"] and always bailed with
-            # "no model configured for pre-flight ping", so cached-digest fallback
-            # could never trigger on prod. Build a shallow copy carrying the
-            # resolved model for the ping rather than mutating ``runtime`` in
-            # place: ``runtime`` is a fresh, request-local dict from
-            # resolve_runtime_provider() today, but copying keeps the ping
-            # side-effect-free regardless. Never clobber a model the runtime may
-            # already carry (e.g. an ACP-resolved one).
-            preflight_runtime = (
-                runtime if runtime.get("model") else {**runtime, "model": model}
-            )
-            err = evolution_preflight.preflight_provider(preflight_runtime, cfg=_cfg)
-            if err:
+        runtime: Dict[str, Any] = {}
+        if not agent_owns_routing:
+            try:
+                # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
+                # already prefers persisted config over stale shell/env overrides when
+                # no explicit provider is requested. Passing the env var here short-
+                # circuits that precedence and can resurrect old providers (for
+                # example DeepSeek) for cron jobs that do not pin provider/model.
+                runtime_kwargs = {
+                    "requested": job.get("provider"),
+                    # Derive provider-specific api_mode from the model this job
+                    # will actually run (per-job pin > env > config default), not
+                    # the stale persisted default — mirrors the fallback path
+                    # below, which already passes its fb_model.
+                    "target_model": model,
+                }
+                if job.get("base_url"):
+                    runtime_kwargs["explicit_base_url"] = job.get("base_url")
+                runtime = resolve_runtime_provider(**runtime_kwargs)
+                primary_provider_for_drift = (
+                    str(runtime.get("provider") or "").strip().lower()
+                    or primary_provider_for_drift
+                )
+            except AuthError as auth_exc:
+                # Primary provider auth failed — try each configured provider/model
+                # pair atomically. Keeping the primary model while changing only the
+                # provider can silently route a paid GPT model through OpenRouter.
+                primary_provider_for_drift = (
+                    str(getattr(auth_exc, "provider", "") or "").strip().lower()
+                    or primary_provider_for_drift
+                )
                 logger.warning(
-                    "Job '%s' (evolution-%s): provider pre-flight failed: %s",
+                    "Job '%s': primary auth failed (%s), trying fallback",
                     job_id,
-                    stage,
-                    err,
+                    auth_exc,
                 )
-                digest = evolution_preflight.load_digest_as_fallback(
-                    stage, _get_hermes_home()
-                )
-                if digest is not None:
-                    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
-                    doc = (
-                        f"# Cron Job: {job_name}\n\n"
-                        f"**Job ID:** {job_id}\n"
-                        f"**Run Time:** {now_iso}\n"
-                        f"**Status:** provider unreachable — stale digest fallback\n\n"
-                        f"{digest}\n"
-                    )
-                    logger.info(
-                        "Job '%s' (evolution-%s): returning stale digest fallback",
-                        job_id,
-                        stage,
-                    )
-                    return True, doc, SILENT_MARKER, None
-                else:
-                    raise RuntimeError(
-                        f"Evolution pre-flight failed for '{stage}': {err}. No cached digest available."
-                    )
+                fb_list = get_fallback_chain(_cfg)
+                runtime = None
+                for entry in fb_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    fb_provider = str(entry.get("provider") or "").strip()
+                    fb_model = str(entry.get("model") or "").strip()
+                    if not fb_provider or not fb_model:
+                        continue
+                    try:
+                        from hermes_cli.fallback_config import resolve_entry_api_key
 
-        # Reasoning config from config.yaml (per-model override > global),
-        # resolved HERE — after provider auth/fallback — against the job's FINAL
-        # model so an auth fallback's model (``model = fb_model`` above) is
-        # honored (upstream v2026.7.20). cron.thinking (str) then layers
+                        fb_kwargs = {
+                            "requested": fb_provider,
+                            "target_model": fb_model,
+                        }
+                        if entry.get("base_url"):
+                            fb_kwargs["explicit_base_url"] = entry["base_url"]
+                        fb_api_key = resolve_entry_api_key(entry)
+                        if fb_api_key:
+                            fb_kwargs["explicit_api_key"] = fb_api_key
+                        runtime = resolve_runtime_provider(**fb_kwargs)
+                        model = fb_model
+                        logger.info(
+                            "Job '%s': fallback resolved to %s model %s",
+                            job_id,
+                            runtime.get("provider"),
+                            fb_model,
+                        )
+                        break
+                    except Exception as fb_exc:
+                        logger.debug(
+                            "Job '%s': fallback %s failed: %s",
+                            job_id,
+                            fb_provider,
+                            fb_exc,
+                        )
+                if runtime is None:
+                    raise RuntimeError(
+                        format_runtime_provider_error(auth_exc)
+                    ) from auth_exc
+            except Exception as exc:
+                message = format_runtime_provider_error(exc)
+                raise RuntimeError(message) from exc
+
+        # Evolution deliberately has no scheduler-side provider pre-flight: doing
+        # so would resolve the route before AIAgent and split fallback ownership.
+
+        # Reasoning config from config.yaml (per-model override > global). For
+        # ordinary cron this is resolved after scheduler auth/fallback against the
+        # final model; Evolution passes the primary config model into AIAgent.
+        # cron.thinking (str) then layers
         # cron-specific control on top (#431/#433): thinking is DISABLED by
         # default for cron to reduce provider timeouts (100% failure rate tracked
         # across 17 sessions).
@@ -4235,17 +4213,21 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         agent = AIAgent(
             model=model,
-            api_key=runtime.get("api_key"),
-            base_url=runtime.get("base_url"),
-            provider=runtime.get("provider"),
-            api_mode=runtime.get("api_mode"),
-            acp_command=runtime.get("command"),
-            acp_args=runtime.get("args"),
+            api_key=None if agent_owns_routing else runtime.get("api_key"),
+            base_url=None if agent_owns_routing else runtime.get("base_url"),
+            provider=(
+                configured_provider_for_drift
+                if agent_owns_routing
+                else runtime.get("provider")
+            ),
+            api_mode=None if agent_owns_routing else runtime.get("api_mode"),
+            acp_command=None if agent_owns_routing else runtime.get("command"),
+            acp_args=None if agent_owns_routing else runtime.get("args"),
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
-            credential_pool=credential_pool,
+            credential_pool=None if agent_owns_routing else credential_pool,
             providers_allowed=pr.get("only"),
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),

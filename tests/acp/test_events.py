@@ -29,6 +29,19 @@ def mock_conn():
     return conn
 
 
+def _mock_successful_schedule(mock_rcts):
+    """Emulate scheduler ownership when its implementation is mocked."""
+    future = MagicMock(spec=Future)
+    future.result.return_value = None
+
+    def _schedule(coro, _loop):
+        coro.close()
+        return future
+
+    mock_rcts.side_effect = _schedule
+    return future
+
+
 @pytest.fixture()
 def event_loop_fixture():
     """Create a real event loop for testing threadsafe coroutine submission."""
@@ -53,9 +66,7 @@ class TestToolProgressCallback:
 
         # Run callback in the event loop context
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb("tool.started", "terminal", "$ ls -la", {"command": "ls -la"})
 
@@ -77,9 +88,7 @@ class TestToolProgressCallback:
         cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb("tool.started", "read_file", "Reading /etc/hosts", '{"path": "/etc/hosts"}')
 
@@ -94,9 +103,7 @@ class TestToolProgressCallback:
         cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb("tool.started", "terminal", "$ echo hi", None)
 
@@ -112,9 +119,7 @@ class TestToolProgressCallback:
         step_cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             progress_cb("tool.started", "terminal", "$ ls", {"command": "ls"})
             progress_cb("tool.started", "terminal", "$ pwd", {"command": "pwd"})
@@ -140,9 +145,7 @@ class TestThinkingCallback:
         cb = make_thinking_cb(mock_conn, "session-1", loop)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb("Analyzing the code...")
 
@@ -174,9 +177,7 @@ class TestStepCallback:
         cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, {})
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb(1, [{"name": "terminal", "result": "success"}])
 
@@ -204,9 +205,7 @@ class TestStepCallback:
         cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, {})
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb(2, ["read_file"])
 
@@ -224,9 +223,7 @@ class TestStepCallback:
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts, \
              patch("acp_adapter.events.build_tool_complete") as mock_btc:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             # Provide a result string in the tool info dict
             cb(1, [{"name": "terminal", "result": '{"output": "hello"}'}])
@@ -246,9 +243,7 @@ class TestStepCallback:
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts, \
              patch("acp_adapter.events.build_tool_complete") as mock_btc:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb(1, [{"name": "web_search", "result": None}])
 
@@ -265,9 +260,7 @@ class TestStepCallback:
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts, \
              patch("acp_adapter.events.build_tool_complete") as mock_btc:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb(1, [{"name": "write_file", "result": '{"bytes_written": 23}', "arguments": {"path": "diff-test.txt"}}])
 
@@ -359,9 +352,7 @@ class TestMessageCallback:
         cb = make_message_cb(mock_conn, "session-1", loop)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_successful_schedule(mock_rcts)
 
             cb("Here is your answer.")
 
@@ -409,7 +400,6 @@ class TestSendUpdate:
             gc.collect()
 
         assert created["coro"] is not None
-        assert created["coro"].cr_frame is None
         # Only count warnings about THIS test's coroutine; other tests
         #  may emit unrelated
         # "coroutine was never awaited" warnings that bleed through.

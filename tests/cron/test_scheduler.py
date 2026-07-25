@@ -1908,6 +1908,95 @@ class TestRunJobConfigEnvVarExpansion:
         "api_mode": "chat_completions",
     }
 
+    def test_evolution_delegates_primary_and_fallback_routing_to_agent(
+        self, tmp_path
+    ):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: primary-model\n"
+            "  provider: anthropic\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: fallback-model\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "evolution-routing",
+            "name": "evolution-research",
+            "prompt": "research",
+            # A legacy persisted pin must not override config-level routing.
+            "model": "legacy-job-model",
+            "provider": "legacy-job-provider",
+        }
+
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=MagicMock()),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as mock_resolve,
+            patch("cron.evolution_preflight.preflight_provider") as mock_preflight,
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+            patch("run_agent.AIAgent") as mock_agent_cls,
+        ):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        mock_resolve.assert_not_called()
+        mock_preflight.assert_not_called()
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "primary-model"
+        assert kwargs["provider"] == "anthropic"
+        assert kwargs["api_key"] is None
+        assert kwargs["base_url"] is None
+        assert kwargs["credential_pool"] is None
+        assert kwargs["fallback_model"] == [
+            {"provider": "openrouter", "model": "fallback-model"}
+        ]
+
+    def test_non_evolution_keeps_scheduler_runtime_resolution(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: primary-model\n  provider: anthropic\n",
+            encoding="utf-8",
+        )
+        job = {"id": "ordinary-routing", "name": "daily-summary", "prompt": "hi"}
+
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=MagicMock()),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=self._RUNTIME,
+            ) as mock_resolve,
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+            patch("run_agent.AIAgent") as mock_agent_cls,
+        ):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        mock_resolve.assert_called_once_with(
+            requested=None,
+            target_model="primary-model",
+        )
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["api_key"] == self._RUNTIME["api_key"]
+        assert kwargs["base_url"] == self._RUNTIME["base_url"]
+        assert kwargs["provider"] == self._RUNTIME["provider"]
+
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
         """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_MODEL}\n")

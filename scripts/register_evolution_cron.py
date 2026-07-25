@@ -468,6 +468,19 @@ def main(argv: list[str]) -> int:
             )
             if want_sched != cur_sched:
                 changes["schedule"] = schedule
+            # EN: Routing fields never belong to an Evolution job, including
+            # deterministic no_agent jobs. Clear legacy values before the
+            # no_agent branch so every Evolution record has the same invariant.
+            # UK: Поля маршруту не належать жодному Evolution-завданню, зокрема
+            # детермінованим no_agent; очищаємо старі значення для всіх записів.
+            for field in (
+                "model",
+                "provider",
+                "model_snapshot",
+                "provider_snapshot",
+            ):
+                if cur.get(field) is not None:
+                    changes[field] = None
             if not no_agent:
                 if str(prompt) != (cur.get("prompt") or ""):
                     changes["prompt"] = str(prompt)
@@ -483,17 +496,6 @@ def main(argv: list[str]) -> int:
                     cur.get("enabled_toolsets") or []
                 ):
                     changes["enabled_toolsets"] = toolsets
-                # EN: Evolution jobs deliberately defer provider/model selection
-                # to AIAgent, including its fallback chain. UK: Вибір маршруту
-                # належить AIAgent разом із резервними моделями, не cron-запису.
-                for field in (
-                    "model",
-                    "provider",
-                    "model_snapshot",
-                    "provider_snapshot",
-                ):
-                    if cur.get(field) is not None:
-                        changes[field] = None
                 # Detect script changes (e.g. Hydra replacing access gate)
                 cur_script = str(cur.get("script") or "").strip()
                 yaml_script = str(spec.get("script") or "").strip()

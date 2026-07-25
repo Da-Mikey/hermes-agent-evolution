@@ -171,6 +171,57 @@ class TestNoAgentJobs:
         refreshed = stale.read_text()
         assert "stale old version" not in refreshed  # real script copied over
 
+    def test_existing_no_agent_job_clears_legacy_inference_fields(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _import_module()
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        self._write_watchdog_yaml(src_dir)
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        import cron.jobs as jobs_mod
+
+        schedule = jobs_mod.parse_schedule("47 7 * * *")
+        existing = {
+            "id": "watchdog-1",
+            "name": "evolution-watchdog",
+            "schedule": schedule,
+            "schedule_display": schedule["display"],
+            "no_agent": True,
+            "script": "evolution_watchdog.py",
+            "model": "legacy-model",
+            "provider": "legacy-provider",
+            "model_snapshot": "legacy-model",
+            "provider_snapshot": "legacy-provider",
+        }
+        calls = []
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [existing])
+        monkeypatch.setattr(
+            jobs_mod,
+            "update_job",
+            lambda job_id, updates: calls.append((job_id, updates)),
+        )
+
+        assert mod.main(["register_evolution_cron.py", str(src_dir)]) == 0
+        assert calls == [
+            (
+                "watchdog-1",
+                {
+                    "model": None,
+                    "provider": None,
+                    "model_snapshot": None,
+                    "provider_snapshot": None,
+                },
+            ),
+            (
+                "watchdog-1",
+                {"model_snapshot": None, "provider_snapshot": None},
+            ),
+        ]
+
 
 class TestReconcileExistingJob:
     """An edit to an already-registered evolution job's YAML must be applied via
