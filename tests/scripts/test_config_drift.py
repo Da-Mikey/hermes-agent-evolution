@@ -17,11 +17,10 @@ def _import_module():
     return mod
 
 
-class TestConfigDriftValidation:
-    """Config-drift validation (#938): warn when agent-stage jobs have both
-    model and provider unpinned. no_agent jobs are excluded."""
+class TestDynamicInferenceRouting:
+    """Evolution stages delegate provider/model and fallbacks to AIAgent."""
 
-    def test_warns_when_unpinned(self, tmp_path, monkeypatch, capsys):
+    def test_unpinned_stage_is_silent(self, tmp_path, monkeypatch, capsys):
         mod = _import_module()
         src_dir = tmp_path / "cron-src"
         src_dir.mkdir()
@@ -49,10 +48,9 @@ class TestConfigDriftValidation:
 
         assert rc == 0
         captured = capsys.readouterr()
-        assert "unpinned" in captured.err
-        assert "evolution-analysis" in captured.err
+        assert "unpinned" not in captured.err
 
-    def test_silent_when_pinned_or_no_agent(self, tmp_path, monkeypatch, capsys):
+    def test_rejects_per_stage_model_and_provider(self, tmp_path, monkeypatch, capsys):
         mod = _import_module()
         src_dir = tmp_path / "cron-src"
         src_dir.mkdir()
@@ -88,11 +86,13 @@ class TestConfigDriftValidation:
 
         rc = mod.main(["register_evolution_cron.py", str(src_dir)])
 
-        assert rc == 0
+        assert rc == 2
         captured = capsys.readouterr()
-        assert "unpinned" not in captured.err
+        assert "model/provider are not supported" in captured.out
 
-    def test_mixed_jobs(self, tmp_path, monkeypatch, capsys):
+    def test_mixed_jobs_fail_when_any_stage_hardcodes_route(
+        self, tmp_path, monkeypatch, capsys
+    ):
         mod = _import_module()
         src_dir = tmp_path / "cron-src"
         src_dir.mkdir()
@@ -126,7 +126,6 @@ class TestConfigDriftValidation:
 
         rc = mod.main(["register_evolution_cron.py", str(src_dir)])
 
-        assert rc == 0
+        assert rc == 2
         captured = capsys.readouterr()
-        assert "evolution-analysis" in captured.err
-        assert "evolution-research" not in captured.err
+        assert "evolution-research" in captured.out

@@ -202,6 +202,8 @@ class TestReconcileExistingJob:
             "prompt": "sync upstream",
             "skills": mod._normalize_skills(["evolution/upstream-sync"]),
             "enabled_toolsets": mod._normalize_toolsets(["web", "file", "terminal"]),
+            "provider_snapshot": "openrouter",
+            "model_snapshot": "baseline-model",
         }
 
     def _wire(self, mod, jobs_mod, monkeypatch, tmp_path, existing):
@@ -238,10 +240,13 @@ class TestReconcileExistingJob:
 
         assert rc == 0
         assert calls["job_id"] == "job-123"
-        # only the schedule changed → only the schedule is updated
-        assert calls["updates"] == {"schedule": "0 8 * * 1,3,5"}
+        assert calls["updates"] == {
+            "schedule": "0 8 * * 1,3,5",
+            "model_snapshot": None,
+            "provider_snapshot": None,
+        }
 
-    def test_unchanged_job_is_left_alone(self, tmp_path, monkeypatch):
+    def test_unchanged_job_clears_inference_snapshots(self, tmp_path, monkeypatch):
         mod = _import_module()
         import cron.jobs as jobs_mod
 
@@ -254,7 +259,29 @@ class TestReconcileExistingJob:
         rc = mod.main(["register_evolution_cron.py", str(src_dir)])
 
         assert rc == 0
-        assert calls == {}  # no update_job call — nothing changed
+        assert calls["updates"] == {
+            "model_snapshot": None,
+            "provider_snapshot": None,
+        }
+
+    def test_unchanged_legacy_job_keeps_dynamic_inference(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _import_module()
+        import cron.jobs as jobs_mod
+
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        self._write_agent_yaml(src_dir, "0 8 * * 1,3,5")
+        existing = self._existing(mod, jobs_mod, "0 8 * * 1,3,5")
+        existing.pop("provider_snapshot")
+        existing.pop("model_snapshot")
+        calls = self._wire(mod, jobs_mod, monkeypatch, tmp_path, existing)
+
+        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
+
+        assert rc == 0
+        assert calls == {}
 
     def _write_agent_yaml_no_skills(self, src_dir, schedule):
         # An agent job whose YAML omits skills:/toolsets: entirely — the
@@ -306,7 +333,11 @@ class TestReconcileExistingJob:
         rc = mod.main(["register_evolution_cron.py", str(src_dir)])
 
         assert rc == 0
-        assert calls["updates"] == {"script": "evolution_analysis_gate.sh"}
+        assert calls["updates"] == {
+            "script": "evolution_analysis_gate.sh",
+            "model_snapshot": None,
+            "provider_snapshot": None,
+        }
         home = tmp_path / "hermes-home"
         installed = home / "scripts" / "evolution_analysis_gate.sh"
         assert installed.is_file(), (
@@ -335,192 +366,135 @@ class TestReconcileExistingJob:
         assert rc == 0  # did NOT crash on list(None)
         # Only the schedule reconciles; the registered skills/toolsets must be
         # preserved (not clobbered to []) when the YAML omits them.
-        assert calls["updates"] == {"schedule": "0 8 * * 1,3,5"}
-
-
-class TestModelProviderAllocation:
-    """Per-stage model allocation (#905): a stage YAML may set optional
-    model:/provider: keys to pin that stage to a specific model (e.g. a
-    cheaper/mid-tier model for research/analysis, leaving implementation
-    unpinned on the deployment's frontier default). Both fields are
-    independent, optional, and pass straight through to
-    cron.jobs.create_job/update_job unchanged — this class only tests that
-    the registrar reads and wires them correctly, mirroring the
-    skills/toolsets reconcile semantics above (None means leave as-is)."""
-
-    def _write_yaml(self, src_dir, extra="", schedule="0 9 * * *"):
-        (src_dir / "cheap-stage.yaml").write_text(
-            "name: evolution-cheap-stage\n"
-            f'schedule: "{schedule}"\n'
-            "enabled: true\n"
-            'prompt: "do the thing"\n' + extra
-        )
-
-    def test_create_job_passes_model_and_provider_when_set(self, tmp_path, monkeypatch):
-        mod = _import_module()
-        src_dir = tmp_path / "cron-src"
-        src_dir.mkdir()
-        self._write_yaml(src_dir, "model: glm-5-flash\nprovider: zai\n")
-        home = tmp_path / "hermes-home"
-        home.mkdir()
-        monkeypatch.setenv("HERMES_HOME", str(home))
-
-        captured = {}
-
-        def fake_create_job(**kwargs):
-            captured.update(kwargs)
-            return {"id": "job-1", "name": kwargs["name"]}
-
-        import cron.jobs as jobs_mod
-
-        monkeypatch.setattr(jobs_mod, "create_job", fake_create_job)
-        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [])
-
-        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
-
-        assert rc == 0
-        assert captured["model"] == "glm-5-flash"
-        assert captured["provider"] == "zai"
-
-    def test_create_job_omits_model_and_provider_leaves_them_none(
-        self, tmp_path, monkeypatch
-    ):
-        """A YAML with no model:/provider: keys must produce the exact same
-        create_job call as before #905 (both None) — the unpinned, back-compat
-        default that follows the deployment's global config."""
-        mod = _import_module()
-        src_dir = tmp_path / "cron-src"
-        src_dir.mkdir()
-        self._write_yaml(src_dir)  # no model:/provider: keys
-        home = tmp_path / "hermes-home"
-        home.mkdir()
-        monkeypatch.setenv("HERMES_HOME", str(home))
-
-        captured = {}
-
-        def fake_create_job(**kwargs):
-            captured.update(kwargs)
-            return {"id": "job-1", "name": kwargs["name"]}
-
-        import cron.jobs as jobs_mod
-
-        monkeypatch.setattr(jobs_mod, "create_job", fake_create_job)
-        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [])
-
-        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
-
-        assert rc == 0
-        assert captured["model"] is None
-        assert captured["provider"] is None
-
-    def _existing(self, jobs_mod, schedule, model=None, provider=None):
-        sched = jobs_mod.parse_schedule(schedule)
-        job = {
-            "id": "job-9",
-            "name": "evolution-cheap-stage",
-            "schedule": sched,
-            "schedule_display": sched.get("display"),
-            "prompt": "do the thing",
+        assert calls["updates"] == {
+            "schedule": "0 8 * * 1,3,5",
+            "model_snapshot": None,
+            "provider_snapshot": None,
         }
-        if model is not None:
-            job["model"] = model
-        if provider is not None:
-            job["provider"] = provider
-        return job
 
-    def _wire(self, jobs_mod, monkeypatch, tmp_path, existing):
+
+class TestDynamicInferenceRouting:
+    """Evolution stages leave primary and fallback routing to AIAgent."""
+
+    def test_rejects_per_stage_model_or_provider(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        (src_dir / "stage.yaml").write_text(
+            "name: evolution-stage\n"
+            'schedule: "0 9 * * *"\n'
+            'prompt: "do the thing"\n'
+            "model: forbidden-model\n"
+            "provider: forbidden-provider\n"
+        )
         home = tmp_path / "hermes-home"
-        (home / "scripts").mkdir(parents=True)
+        home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [existing])
+
+        import cron.jobs as jobs_mod
+
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [])
         monkeypatch.setattr(
             jobs_mod,
             "create_job",
-            lambda **kw: (_ for _ in ()).throw(AssertionError("must not create")),
+            lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not create")),
         )
-        calls = {}
+
+        assert mod.main(["register_evolution_cron.py", str(src_dir)]) == 2
+
+    def test_existing_pins_and_snapshots_are_cleared(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        (src_dir / "stage.yaml").write_text(
+            "name: evolution-stage\n"
+            'schedule: "0 9 * * *"\n'
+            'prompt: "do the thing"\n'
+        )
+        home = tmp_path / "hermes-home"
+        (home / "scripts").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        import cron.jobs as jobs_mod
+
+        schedule = jobs_mod.parse_schedule("0 9 * * *")
+        existing = {
+            "id": "job-1",
+            "name": "evolution-stage",
+            "schedule": schedule,
+            "schedule_display": schedule["display"],
+            "prompt": "do the thing",
+            "model": "old-model",
+            "provider": "old-provider",
+            "model_snapshot": "old-model",
+            "provider_snapshot": "old-provider",
+        }
+        calls = []
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [existing])
         monkeypatch.setattr(
             jobs_mod,
             "update_job",
-            lambda job_id, updates: (
-                calls.update(job_id=job_id, updates=updates) or {**existing, **updates}
+            lambda job_id, updates: calls.append((job_id, updates)),
+        )
+
+        assert mod.main(["register_evolution_cron.py", str(src_dir)]) == 0
+        assert calls == [
+            (
+                "job-1",
+                {
+                    "model": None,
+                    "provider": None,
+                    "model_snapshot": None,
+                    "provider_snapshot": None,
+                },
             ),
+            ("job-1", {"model_snapshot": None, "provider_snapshot": None}),
+        ]
+
+    def test_real_storage_clears_recomputed_snapshots(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        (src_dir / "stage.yaml").write_text(
+            "name: evolution-stage\n"
+            'schedule: "0 9 * * *"\n'
+            'prompt: "do the thing"\n'
         )
-        return calls
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(mod, "_ensure_evolution_labels", lambda *a, **k: [])
+        monkeypatch.setattr(mod, "_install_access_gate", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_install_evolution_helpers", lambda *a, **k: [])
 
-    def test_reconcile_updates_model_when_changed(self, tmp_path, monkeypatch):
-        mod = _import_module()
         import cron.jobs as jobs_mod
 
-        src_dir = tmp_path / "cron-src"
-        src_dir.mkdir()
-        self._write_yaml(src_dir, "model: glm-5-flash\n")
-        existing = self._existing(jobs_mod, "0 9 * * *", model="old-model")
-        calls = self._wire(jobs_mod, monkeypatch, tmp_path, existing)
-
-        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
-
-        assert rc == 0
-        assert calls["updates"] == {"model": "glm-5-flash"}
-
-    def test_reconcile_updates_provider_when_changed(self, tmp_path, monkeypatch):
-        mod = _import_module()
-        import cron.jobs as jobs_mod
-
-        src_dir = tmp_path / "cron-src"
-        src_dir.mkdir()
-        self._write_yaml(src_dir, "provider: zai\n")
-        existing = self._existing(jobs_mod, "0 9 * * *", provider="old-provider")
-        calls = self._wire(jobs_mod, monkeypatch, tmp_path, existing)
-
-        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
-
-        assert rc == 0
-        assert calls["updates"] == {"provider": "zai"}
-
-    def test_reconcile_unchanged_model_and_provider_trigger_no_update(
-        self, tmp_path, monkeypatch
-    ):
-        mod = _import_module()
-        import cron.jobs as jobs_mod
-
-        src_dir = tmp_path / "cron-src"
-        src_dir.mkdir()
-        self._write_yaml(src_dir, "model: glm-5-flash\nprovider: zai\n")
-        existing = self._existing(
-            jobs_mod, "0 9 * * *", model="glm-5-flash", provider="zai"
+        monkeypatch.setattr(jobs_mod, "get_hermes_home", lambda: home)
+        schedule = jobs_mod.parse_schedule("0 9 * * *")
+        jobs_mod.save_jobs(
+            [
+                {
+                    "id": "job-1",
+                    "name": "evolution-stage",
+                    "schedule": schedule,
+                    "schedule_display": schedule["display"],
+                    "prompt": "do the thing",
+                    "model": "old-model",
+                    "provider": "old-provider",
+                    "model_snapshot": "old-model",
+                    "provider_snapshot": "old-provider",
+                    "enabled": True,
+                    "state": "scheduled",
+                }
+            ]
         )
-        calls = self._wire(jobs_mod, monkeypatch, tmp_path, existing)
 
-        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
-
-        assert rc == 0
-        assert calls == {}  # nothing changed anywhere -> no update_job call
-
-    def test_reconcile_omitted_model_and_provider_preserve_pinned_values(
-        self, tmp_path, monkeypatch
-    ):
-        """A YAML that never mentions model:/provider: must NOT clear an
-        already-pinned job back to unpinned — mirrors the skills/toolsets
-        back-compat guarantee in TestReconcileExistingJob above."""
-        mod = _import_module()
-        import cron.jobs as jobs_mod
-
-        src_dir = tmp_path / "cron-src"
-        src_dir.mkdir()
-        # Changed schedule (so update_job IS called), but no model:/provider:.
-        self._write_yaml(src_dir)
-        existing = self._existing(
-            jobs_mod, "0 8 * * *", model="pinned-model", provider="pinned-provider"
-        )
-        calls = self._wire(jobs_mod, monkeypatch, tmp_path, existing)
-
-        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
-
-        assert rc == 0
-        assert calls["updates"] == {"schedule": "0 9 * * *"}
-        assert "model" not in calls["updates"]
-        assert "provider" not in calls["updates"]
+        assert mod.main(["register_evolution_cron.py", str(src_dir)]) == 0
+        stored = jobs_mod.load_jobs()[0]
+        assert stored["model"] is None
+        assert stored["provider"] is None
+        assert stored["model_snapshot"] is None
+        assert stored["provider_snapshot"] is None
 
 
 class TestFindVenvPython:
@@ -627,6 +601,7 @@ class TestEnsureEvolutionLabels:
     def test_already_existing_label_is_confirmed(self, tmp_path, monkeypatch):
         mod = _import_module()
         calls = []
+        monkeypatch.setattr(mod.shutil, "which", lambda name: "/usr/bin/gh")
 
         def fake_run(cmd, **kwargs):
             class _Result:
@@ -651,6 +626,7 @@ class TestEnsureEvolutionLabels:
     def test_real_failure_is_warning_not_fatal(self, tmp_path, monkeypatch, capsys):
         mod = _import_module()
         bad_label = None
+        monkeypatch.setattr(mod.shutil, "which", lambda name: "/usr/bin/gh")
 
         def fake_run(cmd, **kwargs):
             class _Result:
@@ -668,6 +644,23 @@ class TestEnsureEvolutionLabels:
         captured = capsys.readouterr()
         assert "warning: could not create label" in captured.err
         assert bad_label in captured.err
+
+    def test_missing_gh_warns_once_without_spawning(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        mod = _import_module()
+        monkeypatch.setattr(mod.shutil, "which", lambda name: None)
+        calls = []
+        monkeypatch.setattr(
+            "subprocess.run", lambda *args, **kwargs: calls.append((args, kwargs))
+        )
+
+        ensured = mod._ensure_evolution_labels(tmp_path, dry_run=False)
+
+        assert ensured == []
+        assert calls == []
+        captured = capsys.readouterr()
+        assert captured.err.count("gh CLI is not installed") == 1
 
 
 def _import_lint_module():

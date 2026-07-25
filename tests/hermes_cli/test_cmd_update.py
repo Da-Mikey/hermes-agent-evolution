@@ -754,6 +754,101 @@ class TestCmdUpdateProfileSkillSync:
         assert default_p.path in synced_paths
 
 
+class TestEvolutionCronUpdateReconcile:
+    """Existing Evolution profiles self-heal without opting in other profiles."""
+
+    @staticmethod
+    def _write_jobs(profile_path, names):
+        cron_dir = profile_path / "cron"
+        cron_dir.mkdir(parents=True)
+        (cron_dir / "jobs.json").write_text(
+            __import__("json").dumps(
+                {"version": 1, "jobs": [{"name": name} for name in names]}
+            ),
+            encoding="utf-8",
+        )
+
+    def test_skips_profiles_without_evolution_opt_in(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        project = tmp_path / "repo"
+        (project / "scripts").mkdir(parents=True)
+        (project / "scripts" / "register_evolution_cron.py").write_text("# registrar")
+        (project / "cron" / "evolution").mkdir(parents=True)
+        profile = SimpleNamespace(name="default", path=tmp_path / "home")
+        self._write_jobs(profile.path, ["daily-backup"])
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", project)
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [profile])
+        run_calls = []
+        monkeypatch.setattr(hm.subprocess, "run", lambda *a, **kw: run_calls.append((a, kw)))
+
+        assert hm._reconcile_existing_evolution_cron_jobs() == []
+        assert run_calls == []
+
+    def test_reconciles_only_opted_in_profile_with_explicit_home(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        project = tmp_path / "repo"
+        registrar = project / "scripts" / "register_evolution_cron.py"
+        registrar.parent.mkdir(parents=True)
+        registrar.write_text("# registrar")
+        (project / "cron" / "evolution").mkdir(parents=True)
+        opted = SimpleNamespace(name="default", path=tmp_path / "default")
+        plain = SimpleNamespace(name="work", path=tmp_path / "work")
+        self._write_jobs(opted.path, ["evolution-research"])
+        self._write_jobs(plain.path, ["daily-backup"])
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="[evolution-cron] registered=1 reconciled=0 failed=0\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", project)
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [opted, plain])
+        monkeypatch.setattr(hm.subprocess, "run", fake_run)
+
+        assert hm._reconcile_existing_evolution_cron_jobs() == ["default"]
+        assert len(calls) == 1
+        cmd, kwargs = calls[0]
+        assert cmd == [hm.sys.executable, str(registrar)]
+        assert kwargs["cwd"] == project
+        assert kwargs["env"]["HERMES_HOME"] == str(opted.path)
+
+    def test_registrar_failure_is_non_fatal(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli import main as hm
+
+        project = tmp_path / "repo"
+        registrar = project / "scripts" / "register_evolution_cron.py"
+        registrar.parent.mkdir(parents=True)
+        registrar.write_text("# registrar")
+        (project / "cron" / "evolution").mkdir(parents=True)
+        profile = SimpleNamespace(name="default", path=tmp_path / "home")
+        self._write_jobs(profile.path, ["evolution-research"])
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", project)
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [profile])
+        monkeypatch.setattr(
+            hm.subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(
+                cmd, 2, stdout="failed=1\n", stderr="registrar warning\n"
+            ),
+        )
+
+        assert hm._reconcile_existing_evolution_cron_jobs() == []
+        captured = capsys.readouterr()
+        assert "failed / не вдалося" in captured.out
+        assert "registrar warning" in captured.err
+
+
 class TestCmdUpdateBranchFlag:
     """``hermes update --branch <name>`` targets the requested branch.
 

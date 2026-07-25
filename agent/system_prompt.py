@@ -515,9 +515,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             context_parts.append(context_files_prompt)
 
     # Distilled execution patterns from the experience bank (experimental;
-    # config agent.experience_injection, default False).  Resolved ONCE here
-    # at session construction — never re-read per turn, so the prompt stays
-    # byte-stable for the session's lifetime (prompt-cache invariant).
+    # config agent.experience_injection, default False). Resolved once per
+    # session and cached on the agent; reset_session_state clears it at a real
+    # conversation boundary, while compression rebuilds reuse identical bytes.
+    # Блок обчислюється раз на сесію: межа розмови очищає його, а перебудова
+    # після стиснення повторно використовує ті самі байти.
     #
     # Resume safety: a resumed session does NOT re-run this build path when a
     # stored prompt exists — _restore_or_build_system_prompt()
@@ -527,13 +529,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # scratch, which behaves exactly like context files above (they can also
     # change between runs) — pre-existing, acceptable behavior.
     if getattr(agent, "_experience_injection", False):
-        try:
-            from agent.experience_bank import format_patterns_prompt
-            _exp_block = format_patterns_prompt()
-            if _exp_block:
-                context_parts.append(_exp_block)
-        except Exception:
-            pass  # experience bank must never block prompt build
+        _exp_block = getattr(agent, "_experience_block", None)
+        if _exp_block is None:
+            try:
+                from agent.experience_bank import format_patterns_prompt
+                _exp_block = format_patterns_prompt(
+                    valid_tool_names=agent.valid_tool_names
+                )
+            except Exception:
+                _exp_block = ""  # experience bank must never block prompt build
+            try:
+                agent._experience_block = _exp_block
+            except Exception:
+                pass
+        if _exp_block:
+            context_parts.append(_exp_block)
 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []

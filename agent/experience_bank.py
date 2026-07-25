@@ -41,14 +41,17 @@ stays complete against the enum.
 
 from __future__ import annotations
 
+import errno
 import json
+import math
 import os
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Collection, Dict, Iterator, List, Optional, Sequence
 
 from hermes_constants import get_hermes_home
 
@@ -58,12 +61,14 @@ __all__ = [
     "HARNESS_DIMENSIONS",
     "CATEGORY_TO_DIMENSION",
     "CONFIDENCE_LEVELS",
+    "GUIDANCE_TEMPLATES",
     "ExperienceEntry",
     "ExperiencePattern",
     "pattern_id",
     "entries_path",
     "patterns_path",
     "harvest_state_path",
+    "experience_lock",
     "append_entry",
     "iter_entries",
     "load_patterns",
@@ -108,7 +113,52 @@ CATEGORY_TO_DIMENSION: Dict[str, Optional[str]] = {
 #: Allowed values for :attr:`ExperienceEntry.confidence`.
 CONFIDENCE_LEVELS: tuple = ("high", "low")
 
+#: Canonical code-owned prompt templates per ``(dimension, category)``.
+#:
+#: ``patterns.json`` is data, not trusted instructions.  The distiller stores
+#: rendered copies for human inspection, but the system-prompt path always
+#: reconstructs guidance from this map.  Unknown pairs and unsafe tool names
+#: are omitted from the prompt.
+#: ``patterns.json`` є даними, а не довіреними інструкціями. Шлях системного
+#: промпта завжди відтворює пораду з цієї мапи й відкидає небезпечні значення.
+GUIDANCE_TEMPLATES: Dict[tuple[str, str], tuple[str, str]] = {
+    ("tool", "network"): (
+        "`{tool}` fails with network errors (DNS, connection refused, unreachable host)",
+        "When `{tool}` fails with a network error, probe connectivity once with a "
+        "minimal request before retrying; if the endpoint is down, switch to an "
+        "alternative source or report the outage instead of retrying the same call.",
+    ),
+    ("tool", "permission"): (
+        "`{tool}` fails with permission / 403 / access-denied errors",
+        "When `{tool}` returns a permission error, do not retry the same call — "
+        "identify the missing credential or scope (API key, token, file mode), fix "
+        "or ask the user for it, then retry once with the corrected access.",
+    ),
+    ("tool", "timeout"): (
+        "`{tool}` calls time out",
+        "When `{tool}` calls time out, reduce the command's scope (narrower search, "
+        "smaller batch, explicit timeout flag) instead of retrying the same invocation.",
+    ),
+    ("context", "not_found"): (
+        "A referenced file path or resource does not exist",
+        "Before referencing a path or resource, verify it exists (list the parent "
+        "directory or search for it first); when something is not found, re-locate "
+        "the current target instead of retrying the same path.",
+    ),
+    ("output", "syntax_error"): (
+        "Generated output fails to parse (syntax error, malformed JSON/code)",
+        "When output fails to parse, validate structure before emitting — run a "
+        "syntax check on code, serialize JSON/YAML with a library rather than "
+        "hand-writing it — and regenerate the malformed fragment instead of "
+        "appending to it.",
+    ),
+}
+
 _SECONDS_PER_DAY = 86400.0
+_SAFE_TOOL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789_"
+)
+_WINDOWS_LOCK_CONTENTION_ERRORS = frozenset({33, 36})
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +186,85 @@ def harvest_state_path() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Shared cross-platform process lock
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def experience_lock() -> Iterator[bool]:
+    """Acquire the shared experience-bank lock without blocking.
+
+    Yields ``True`` when acquired and ``False`` when another process owns the
+    lock or the platform lock cannot be opened.  POSIX uses ``flock`` and
+    Windows uses ``msvcrt.locking``; both imports are lazy so this module stays
+    importable on every supported platform.
+
+    Отримує спільне блокування без очікування. Повертає ``False``, якщо його
+    тримає інший процес; POSIX використовує ``flock``, Windows — ``msvcrt``.
+    """
+    path = _experience_dir() / ".experience.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+b")
+    except OSError as exc:
+        _warn(f"failed to open experience lock {path}: {exc}")
+        yield False
+        return
+
+    acquired = False
+    unlock = None
+    try:
+        if os.name == "nt":
+            try:
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+
+                def unlock() -> None:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except ImportError as exc:
+                _warn(f"Windows experience locking is unavailable: {exc}")
+                acquired = False
+            except OSError as exc:
+                if not _is_lock_contention(exc):
+                    _warn(f"failed to acquire Windows experience lock {path}: {exc}")
+                acquired = False
+        else:
+            try:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+
+                def unlock() -> None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except BlockingIOError:
+                acquired = False
+            except ImportError as exc:
+                _warn(f"POSIX experience locking is unavailable: {exc}")
+                acquired = False
+            except OSError as exc:
+                if not _is_lock_contention(exc):
+                    _warn(f"failed to acquire POSIX experience lock {path}: {exc}")
+                acquired = False
+
+        yield acquired
+    finally:
+        if acquired and unlock is not None:
+            try:
+                unlock()
+            except OSError:
+                pass
+        handle.close()
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -159,6 +288,37 @@ def _coerce_dimension(dim: Any) -> Optional[str]:
     if isinstance(dim, str) and dim in HARNESS_DIMENSIONS:
         return dim
     return None
+
+
+def _finite_float(value: Any) -> float:
+    """Return a finite float, falling back to zero for malformed stored data.
+
+    Повертає скінченне число або нуль для пошкоджених збережених даних.
+    """
+    try:
+        result = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) else 0.0
+
+
+def _stored_entry_timestamp(value: Any) -> float:
+    """Parse a stored entry timestamp, rejecting text that is not numeric.
+
+    Non-finite numeric values are sanitized, while unrelated malformed text
+    still marks the JSONL record as corrupt for ``iter_entries`` to skip.
+    Нескінченні числа очищуються, а довільний текст лишається пошкодженням.
+    """
+    result = float(value or 0.0)
+    return result if math.isfinite(result) else 0.0
+
+
+def _is_lock_contention(exc: OSError) -> bool:
+    """Return whether a Windows lock error represents ordinary contention."""
+    return (
+        exc.errno in (errno.EACCES, errno.EAGAIN)
+        or getattr(exc, "winerror", None) in _WINDOWS_LOCK_CONTENTION_ERRORS
+    )
 
 
 @dataclass
@@ -226,7 +386,7 @@ class ExperienceEntry:
         """Serialize to a JSON-compatible dictionary."""
         return {
             "v": self.v,
-            "ts": self.ts,
+            "ts": _finite_float(self.ts),
             "session_id": self.session_id,
             "platform": self.platform,
             "model": self.model,
@@ -276,7 +436,7 @@ class ExperienceEntry:
             v = 1
         return cls(
             v=v,
-            ts=float(d.get("ts", 0.0) or 0.0),
+            ts=_stored_entry_timestamp(d.get("ts")),
             session_id=str(d.get("session_id", "")),
             platform=str(d.get("platform", "")),
             model=str(d.get("model", "")),
@@ -351,8 +511,8 @@ class ExperiencePattern:
             "trigger": self.trigger,
             "guidance": self.guidance,
             "evidence_count": self.evidence_count,
-            "first_seen": self.first_seen,
-            "last_seen": self.last_seen,
+            "first_seen": _finite_float(self.first_seen),
+            "last_seen": _finite_float(self.last_seen),
         }
 
     @classmethod
@@ -366,10 +526,7 @@ class ExperiencePattern:
             return str(d.get(key, "") or "")
 
         def _f(key: str) -> float:
-            try:
-                return float(d.get(key, 0.0) or 0.0)
-            except (TypeError, ValueError):
-                return 0.0
+            return _finite_float(d.get(key))
 
         def _i(key: str, default: int = 0) -> int:
             try:
@@ -404,11 +561,15 @@ def _warn(message: str) -> None:
         pass
 
 
-def _atomic_write_json(path: Path, payload: Any) -> None:
+def _atomic_write_json(path: Path, payload: Any) -> bool:
     """Write *payload* as JSON to *path* atomically (tmp file + os.replace).
 
-    Never raises on OSError — logs to stderr and swallows, since callers may
-    run inside prompt-critical paths' ecosystem.
+    Returns whether the replacement succeeded.  Never raises on OSError —
+    logs to stderr and returns ``False``, since callers may run inside
+    prompt-critical paths' ecosystem.
+
+    Повертає успіх заміни. Помилки OSError не піднімаються, а журналюються з
+    результатом ``False``, бо виклик може бути на критичному шляху промпта.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -419,38 +580,88 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2)
                 fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp_name, path)
+            if os.name != "nt":
+                # Persist the directory entry after replace on POSIX.
+                # Після заміни зберігаємо запис каталогу на POSIX.
+                dir_fd = os.open(
+                    path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except BaseException:
             try:
                 os.unlink(tmp_name)
             except OSError:
                 pass
             raise
-    except OSError as exc:
+        return True
+    except (OSError, TypeError, ValueError) as exc:
         _warn(f"failed to write {path}: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
 # Entries (append-only per-session diagnoses)
 # ---------------------------------------------------------------------------
 
-def append_entry(entry: ExperienceEntry) -> None:
+def append_entry(entry: ExperienceEntry) -> bool:
     """Append one entry as a JSON line to ``entries.jsonl``.
 
-    The directory is created on demand.  A single small ``write()`` of one
-    line is atomic enough on POSIX for our single-writer cron harvester; if
-    concurrent writers ever appear, revisit with a lock file.
+    The directory is created on demand.  The encoded line is appended with
+    exactly one low-level ``os.write()``.  A short write or failed ``fsync``
+    truncates the file back to its original length before returning failure.
 
-    Never raises on OSError — logs to stderr and swallows.
+    Returns whether the complete line was written.  Never raises on OSError —
+    logs to stderr and returns ``False``.
+
+    Повертає, чи повний рядок записано. OSError не піднімається: функція
+    журналює помилку й повертає ``False``.
     """
     path = entries_path()
+    fd: Optional[int] = None
+    original_length: Optional[int] = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(entry.to_dict(), separators=(",", ":"))
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        data = (
+            json.dumps(entry.to_dict(), separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        original_length = os.fstat(fd).st_size
+        written = os.write(fd, data)
+        if written != len(data):
+            raise OSError(
+                errno.EIO,
+                f"short write: wrote {written} of {len(data)} bytes",
+            )
+        os.fsync(fd)
+        return True
     except OSError as exc:
+        if fd is not None and original_length is not None:
+            try:
+                # Keep every complete pre-existing line after a failed append.
+                # Зберігаємо всі повні попередні рядки після невдалого дописування.
+                os.ftruncate(fd, original_length)
+                os.fsync(fd)
+            except OSError as rollback_exc:
+                _warn(f"failed to roll back {path}: {rollback_exc}")
         _warn(f"failed to append entry to {path}: {exc}")
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                _warn(f"failed to close entry log {path}: {exc}")
 
 
 def iter_entries(since_ts: Optional[float] = None) -> Iterator[ExperienceEntry]:
@@ -541,18 +752,48 @@ def load_patterns(
     return patterns
 
 
-def save_patterns(patterns: Sequence[ExperiencePattern]) -> None:
+def save_patterns(patterns: Sequence[ExperiencePattern]) -> bool:
     """Rewrite ``patterns.json`` with the given patterns (atomic write).
 
-    Never raises on OSError — logs to stderr and swallows.
+    Returns whether the atomic replacement succeeded.  Never raises on
+    OSError.
+
+    Повертає успіх атомарної заміни та не піднімає OSError.
     """
     payload = [p.to_dict() for p in patterns]
-    _atomic_write_json(patterns_path(), payload)
+    return _atomic_write_json(patterns_path(), payload)
+
+
+def _render_pattern_guidance(
+    pattern: ExperiencePattern,
+    valid_tool_names: Collection[str],
+) -> Optional[str]:
+    """Return trusted guidance reconstructed from the canonical template.
+
+    Повертає довірену пораду, відтворену з канонічного шаблону.
+    """
+    template = GUIDANCE_TEMPLATES.get((pattern.dimension, pattern.category))
+    if template is None:
+        return None
+    tool = pattern.tool
+    if tool is not None and (
+        len(tool) > 64
+        or any(ch not in _SAFE_TOOL_CHARS for ch in tool)
+        or tool not in valid_tool_names
+    ):
+        return None
+    guidance = template[1]
+    if "{tool}" not in guidance:
+        return guidance
+    if not tool:
+        return None
+    return guidance.format(tool=tool)
 
 
 def format_patterns_prompt(
     patterns: Optional[Sequence[ExperiencePattern]] = None,
     *,
+    valid_tool_names: Optional[Collection[str]] = None,
     max_patterns: int = 5,
     max_chars: int = 1200,
 ) -> str:
@@ -565,7 +806,9 @@ def format_patterns_prompt(
 
         - [<dimension>] <guidance> (evidence: <n>)
 
-    Ordering is fully deterministic: evidence_count descending, then
+    Tool-scoped patterns are emitted only when their tool is present in the
+    explicit *valid_tool_names* allow-list.  Ordering is fully deterministic:
+    evidence_count descending, then
     last_seen descending, then id ascending as the final tie-breaker.  At
     most *max_patterns* lines are emitted, and the whole block is truncated
     to *max_chars* on a line boundary — the trailing partial line is
@@ -575,17 +818,28 @@ def format_patterns_prompt(
         patterns = load_patterns()
     if not patterns:
         return ""
+    enabled_tools = frozenset(valid_tool_names or ())
 
     ordered = sorted(
         patterns,
-        key=lambda p: (-p.evidence_count, -p.last_seen, p.id),
-    )[: max(0, max_patterns)]
+        key=lambda p: (-p.evidence_count, -_finite_float(p.last_seen), p.id),
+    )
     if not ordered:
         return ""
 
     lines = ["## Learned execution patterns"]
     for p in ordered:
-        lines.append(f"- [{p.dimension}] {p.guidance} (evidence: {p.evidence_count})")
+        if len(lines) > max(0, max_patterns):
+            break
+        if p.evidence_count <= 0:
+            continue
+        guidance = _render_pattern_guidance(p, enabled_tools)
+        if guidance is None:
+            continue
+        lines.append(f"- [{p.dimension}] {guidance} (evidence: {p.evidence_count})")
+
+    if len(lines) == 1:
+        return ""
 
     block = "\n".join(lines)
     if len(block) > max_chars:
@@ -620,6 +874,9 @@ def get_harvest_state() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def set_harvest_state(state: Dict[str, Any]) -> None:
-    """Persist the harvest dedup cursor (atomic write).  Never raises."""
-    _atomic_write_json(harvest_state_path(), dict(state))
+def set_harvest_state(state: Dict[str, Any]) -> bool:
+    """Persist the harvest dedup cursor atomically and return success.
+
+    Атомарно зберігає курсор усунення дублів і повертає результат.
+    """
+    return _atomic_write_json(harvest_state_path(), dict(state))

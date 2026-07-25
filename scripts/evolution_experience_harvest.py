@@ -3,11 +3,12 @@
 
 Runs as a ``no_agent`` cron job (deterministic, no model calls).  Scans the
 SQLite SessionDB (``hermes_state.py``) for sessions that finished since the
-last run and appends ONE :class:`ExperienceEntry` per new session to
+last run and appends ONE :class:`ExperienceEntry` per completed session revision to
 ``<HERMES_HOME>/evolution/experience/entries.jsonl`` — the per-case layer of
 the MemoHarness-inspired experience bank (see ``agent/experience_bank.py``,
-which owns the schema).  When at least one entry was appended, distillation
-is invoked inline at the end (sibling ``evolution_experience_distill.py``).
+which owns the schema).  When the bank contains entries, distillation is
+invoked inline at the end (sibling ``evolution_experience_distill.py``), so a
+previous distillation failure heals even when the current pass appends nothing.
 
 Design-review constraints honored here:
 
@@ -17,17 +18,16 @@ Design-review constraints honored here:
   constants below), always with ``confidence="high"`` and an
   ``outcome_source`` naming the heuristic.  Everything else is
   ``success=None`` (unknown) or a low-confidence clean-completion heuristic.
-* **Honest-null dimension attribution.**  Only the unambiguous failure
-  categories (network / permission / not_found / syntax_error) get a
-  ``primary_dimension``; ambiguous ones (validation / timeout /
-  resource_limit) put their candidate dimensions in
-  ``secondary_dimensions`` and leave primary ``None``.
+* **Honest-null dimension attribution.**  Unambiguous failure categories get a
+  ``primary_dimension``.  A timeout from a concrete named tool is attributed to
+  ``tool``; a timeout with no trustworthy tool name remains honest-null.
 * **Controlled-vocabulary analysis.**  The ``analysis`` field is built
   exclusively from tool names (character-scrubbed), FailureCategory value
   strings, and integer counts — raw user/model/tool text is NEVER copied
   into an entry (anti-injection + anti-secret-leak).
-* **One cron job + flock.**  A non-blocking ``flock`` guards against
-  overlapping runs; distillation rides on this job, not a second one.
+* **One cron job + shared lock.**  A non-blocking cross-platform lock guards
+  both harvest and distillation; distillation rides on this job, not a second
+  one.
 
 Failure detection matches Hermes' own markers: tool-error results are found
 with the SAME predicate the live agent loop uses
@@ -35,10 +35,14 @@ with the SAME predicate the live agent loop uses
 ``evolution.lib.root_cause_diagnosis.ErrorClassifier`` — nothing invented
 here.
 
-Sessions whose last activity is < 30 minutes old are skipped (possibly
-still running — never harvest in-progress sessions).  Dedup between runs
-uses the harvest-state cursor (``cursor_ts`` with a 15-minute overlap) plus
-a ``seen_ids`` list capped at the most recent 5000 ids.
+Only rows with ``ended_at`` are eligible.  Dedup tracks completed revisions
+(``session_id`` + ``ended_at`` + maximum ``messages.id``), not bare
+session ids.  The state keeps monotonic time and message-id cursors, allowing a
+reopened session or a late historical import to be harvested exactly once.
+
+Обробляються лише рядки з ``ended_at``. Завершена редакція визначається
+ідентифікатором сесії, часом завершення та найбільшим номером повідомлення.
+Це дає змогу один раз зібрати повторно завершену сесію або пізній імпорт.
 
 Exit codes: 0 always for the lock-contention no-op and clean runs; 1 only
 for an unexpected top-level failure (the cron scheduler surfaces it).
@@ -46,7 +50,6 @@ for an unexpected top-level failure (the cron scheduler surfaces it).
 
 from __future__ import annotations
 
-import fcntl
 import json
 import sys
 import time
@@ -61,7 +64,9 @@ from agent.experience_bank import (  # noqa: E402
     CATEGORY_TO_DIMENSION,
     ExperienceEntry,
     append_entry,
+    experience_lock,
     get_harvest_state,
+    iter_entries,
     set_harvest_state,
 )
 from evolution.lib.root_cause_diagnosis import ErrorClassifier  # noqa: E402
@@ -70,9 +75,6 @@ from hermes_constants import get_hermes_home  # noqa: E402
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-#: Sessions with activity newer than this may still be running — skip them.
-_ACTIVE_SESSION_GRACE_S = 30 * 60.0
 
 #: Look-behind overlap so a session that straddles the previous cursor is
 #: re-examined (dedup happens via seen_ids).
@@ -123,33 +125,89 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-def _iter_session_rows(db: Any) -> List[Dict[str, Any]]:
-    """Return one metadata row per session, including last message time.
+def _iter_session_rows(
+    db: Any,
+    cursor_ts: float = 0.0,
+    last_message_id: int = 0,
+) -> List[Dict[str, Any]]:
+    """Return completed session rows in monotonic completion order.
 
     Uses a single aggregate query instead of list_sessions_rich so child
     (subagent) sessions are included and no compression projection hides
     rows — the harvester wants EVERY session, not a user-facing listing.
+
+    Повертає завершені сесії у монотонному порядку завершення, включно з
+    дочірніми сесіями, без проєкції для інтерфейсу користувача.
     """
     sql = (
         "SELECT s.id, s.source, s.model, s.started_at, s.ended_at, "
         "s.end_reason, s.message_count, s.tool_call_count, "
-        "(SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id) "
-        "  AS last_msg_ts "
-        "FROM sessions s"
+        "COALESCE(MAX(m.id), 0) "
+        "AS source_last_message_id "
+        "FROM sessions s "
+        "LEFT JOIN messages m ON m.session_id = s.id "
+        "WHERE s.ended_at IS NOT NULL "
+        "GROUP BY s.id "
+        "HAVING s.ended_at > ? OR source_last_message_id > ? "
+        "ORDER BY s.ended_at ASC, s.id ASC"
     )
     with db._lock:
-        rows = db._conn.execute(sql).fetchall()
+        rows = db._conn.execute(
+            sql,
+            (cursor_ts - _CURSOR_OVERLAP_S, last_message_id),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
-def _last_active(row: Dict[str, Any]) -> float:
-    """Best-effort last-activity timestamp for a session row."""
-    candidates = [
-        row.get("started_at") or 0.0,
-        row.get("ended_at") or 0.0,
-        row.get("last_msg_ts") or 0.0,
-    ]
-    return float(max(candidates))
+def _session_snapshot(db: Any, session_id: str) -> Optional[tuple[float, int]]:
+    """Return the current completed-session snapshot, or None if reopened.
+
+    Повертає поточний знімок завершеної сесії або ``None``, якщо її відкрили.
+    """
+    sql = (
+        "SELECT s.ended_at, "
+        "COALESCE(MAX(m.id), 0) "
+        "AS source_last_message_id "
+        "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+        "WHERE s.id = ? GROUP BY s.id"
+    )
+    with db._lock:
+        row = db._conn.execute(sql, (session_id,)).fetchone()
+    if row is None or row["ended_at"] is None:
+        return None
+    return float(row["ended_at"]), int(row["source_last_message_id"])
+
+
+def _max_message_id(db: Any) -> int:
+    """Return the database-wide monotonic message cursor."""
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM messages"
+        ).fetchone()
+    return int(row["max_id"])
+
+
+def _revision_key(session_id: str, ended_at: float, last_message_id: int) -> str:
+    """Serialize a completed-session revision into a stable state key."""
+    return json.dumps(
+        [session_id, float(ended_at), int(last_message_id)],
+        separators=(",", ":"),
+    )
+
+
+def _entry_message_id(entry: ExperienceEntry) -> Optional[int]:
+    """Return a valid stored source message id, or None for legacy/corrupt data.
+
+    Повертає коректний номер повідомлення або ``None`` для старих чи
+    пошкоджених даних.
+    """
+    raw = entry.stats.get("source_last_message_id")
+    if raw is None:
+        return None
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +223,18 @@ def _scrub_tool_name(name: Any) -> str:
 
 
 def _message_text(msg: Dict[str, Any]) -> str:
-    """Return a message's content as a plain string ("" when not textual)."""
+    """Return deterministic text for string or structured message content.
+
+    Повертає детермінований текст для рядкового або структурованого вмісту.
+    """
     content = msg.get("content")
     if isinstance(content, str):
         return content
+    if isinstance(content, (dict, list)):
+        try:
+            return json.dumps(content, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return ""
     return ""
 
 
@@ -196,14 +262,12 @@ def analyze_session(messages: List[Dict[str, Any]], ended: bool) -> Dict[str, An
     failures: List[tuple] = []  # (index, tool, category)
     for idx, msg in enumerate(tool_msgs):
         tool = _scrub_tool_name(msg.get("tool_name"))
-        content = msg.get("content")
+        content = _message_text(msg)
         is_error, _suffix = _detect_tool_failure(
-            str(msg.get("tool_name") or ""), content if isinstance(content, str) else None
+            str(msg.get("tool_name") or ""), content
         )
         if is_error:
-            category = ErrorClassifier().classify(
-                content if isinstance(content, str) else ""
-            )
+            category = ErrorClassifier().classify(content)
             failures.append((idx, tool, category.value))
         else:
             last_success_idx[tool] = idx
@@ -240,10 +304,23 @@ def analyze_session(messages: List[Dict[str, Any]], ended: bool) -> Dict[str, An
         if msg.get("role") == "assistant":
             final_assistant = _message_text(msg).strip()
             break
-    hit_max_iterations = any(
-        m.get("role") == "user" and _MAX_ITER_MARKER in _message_text(m)
-        for m in messages
-    )
+    hit_max_iterations = False
+    if messages:
+        last_idx = len(messages) - 1
+        for idx, message in enumerate(messages):
+            if (
+                message.get("role") == "user"
+                and _MAX_ITER_MARKER in _message_text(message)
+                and (
+                    idx == last_idx
+                    or (
+                        idx == last_idx - 1
+                        and messages[last_idx].get("role") == "assistant"
+                    )
+                )
+            ):
+                hit_max_iterations = True
+                break
 
     success: Optional[bool] = None
     outcome_source = ""
@@ -253,7 +330,8 @@ def analyze_session(messages: List[Dict[str, Any]], ended: bool) -> Dict[str, An
         outcome_source = "heuristic:loop_guard_hard_stop"
         terminal_reason = "loop_guard_hard_stop"
     elif final_assistant.startswith(_APOLOGY_PREFIX):
-        success, confidence = False, "high"
+        success = False
+        confidence = "high" if total_unrecovered > 0 else "low"
         outcome_source = "heuristic:unhandled_exception"
         terminal_reason = "unhandled_exception"
     elif hit_max_iterations:
@@ -273,6 +351,12 @@ def analyze_session(messages: List[Dict[str, Any]], ended: bool) -> Dict[str, An
     secondary_dimensions: List[str] = []
     if dominant_category in _UNAMBIGUOUS_CATEGORIES:
         primary_dimension = CATEGORY_TO_DIMENSION.get(dominant_category)
+    elif dominant_category == "timeout" and dominant_tool != "unknown":
+        # A timeout from a concrete tool is actionable tool evidence; an
+        # unknown tool stays honest-null. / Таймаут конкретного інструмента є
+        # доказом для виміру tool; невідомий інструмент лишається без атрибуції.
+        primary_dimension = "tool"
+        secondary_dimensions = ["generation", "orchestration"]
     elif dominant_category in _AMBIGUOUS_SECONDARY:
         secondary_dimensions = list(_AMBIGUOUS_SECONDARY[dominant_category])
     # "unknown" (and no unrecovered errors) -> both stay empty/None.
@@ -319,7 +403,7 @@ def _maybe_distill() -> Optional[Dict[str, Any]]:
     try:
         from evolution_experience_distill import run_distillation
 
-        result = run_distillation()
+        result = run_distillation(acquire_lock=False)
         return result if isinstance(result, dict) else {"result": str(result)}
     except Exception as exc:
         print(
@@ -336,7 +420,7 @@ def run_harvest(
     """Run one harvest pass.  Returns the summary dict main() prints.
 
     Import-safe and unit-testable: *db_path* / *now* inject the seams;
-    distillation is invoked inline when at least one entry was appended.
+    distillation is invoked inline whenever the bank contains entries.
     """
     from hermes_state import SessionDB
 
@@ -347,6 +431,8 @@ def run_harvest(
         "sessions_scanned": 0,
         "sessions_harvested": 0,
         "entries_appended": 0,
+        "write_failures": 0,
+        "state_saved": True,
         "distill": None,
     }
     if not db_path.exists():
@@ -357,48 +443,123 @@ def run_harvest(
         cursor_ts = float(state.get("cursor_ts", 0.0) or 0.0)
     except (TypeError, ValueError):
         cursor_ts = 0.0
+    has_message_cursor = "last_message_id" in state
+    try:
+        last_message_id = int(state.get("last_message_id", 0) or 0)
+    except (TypeError, ValueError):
+        last_message_id = 0
     seen_ids: List[str] = [
         str(s) for s in (state.get("seen_ids") or []) if isinstance(s, str)
     ]
     seen_set = set(seen_ids)
+    seen_revisions: List[str] = [
+        str(value)
+        for value in (state.get("seen_revisions") or [])
+        if isinstance(value, str)
+    ]
+    has_revision_state = "seen_revisions" in state
+    seen_revision_set = set(seen_revisions)
+    existing_entries = list(iter_entries())
+    existing_revision_keys = set()
+    legacy_entry_revisions = set()
+    for entry in existing_entries:
+        entry_message_id = _entry_message_id(entry)
+        if entry_message_id is None:
+            legacy_entry_revisions.add((entry.session_id, entry.ts))
+        else:
+            existing_revision_keys.add(
+                _revision_key(entry.session_id, entry.ts, entry_message_id)
+            )
+    # Entries written before revision tracking can still heal a failed state
+    # write when their session and ended_at match. / Старі записи без номера
+    # повідомлення дедуплікуються за сесією та часом завершення.
 
     db = SessionDB(db_path=db_path, read_only=True)
     try:
-        rows = _iter_session_rows(db)
+        # A legacy state has no message cursor. Bootstrap it to the current DB
+        # maximum so the upgrade remains bounded; future imports receive larger
+        # AUTOINCREMENT ids and are detected normally. / Старий стан не має
+        # курсора повідомлень: початкове значення беремо з поточного максимуму,
+        # щоб оновлення не сканувало всю історію.
+        state_needs_upgrade = cursor_ts > 0 and not has_message_cursor
+        if state_needs_upgrade:
+            last_message_id = _max_message_id(db)
+        rows = _iter_session_rows(db, cursor_ts, last_message_id)
 
         processed_max_ts = cursor_ts
-        new_seen: List[str] = []
+        processed_max_message_id = last_message_id
+        new_seen_revisions: List[str] = []
+        new_seen_ids: List[str] = []
         for row in rows:
             summary["sessions_scanned"] += 1
             session_id = str(row.get("id") or "")
             if not session_id:
                 continue
-            last_active = _last_active(row)
-            # Skip possibly-active sessions — never harvest in-progress work.
-            if last_active > now - _ACTIVE_SESSION_GRACE_S:
+            ended_at = float(row["ended_at"])
+            source_last_message_id = int(row["source_last_message_id"])
+            revision_key = _revision_key(
+                session_id, ended_at, source_last_message_id
+            )
+            if revision_key in seen_revision_set:
                 continue
-            # Skip sessions at/before the previous cursor window.
-            if last_active <= cursor_ts - _CURSOR_OVERLAP_S:
+            # Legacy bare ids only suppress rows covered by both legacy cursors.
+            # A newer message id or completion time is a new revision.
+            if (
+                not has_revision_state
+                and session_id in seen_set
+                and ended_at <= cursor_ts
+                and source_last_message_id <= last_message_id
+            ):
+                # Upgrade a legacy bare id into its exact current revision.
+                # Перетворити старий ідентифікатор на точну поточну редакцію.
+                processed_max_ts = max(processed_max_ts, ended_at)
+                processed_max_message_id = max(
+                    processed_max_message_id, source_last_message_id
+                )
+                new_seen_revisions.append(revision_key)
+                new_seen_ids.append(session_id)
                 continue
-            # Skip sessions already harvested.
-            if session_id in seen_set:
+            # Heal a prior state-write failure without duplicating the entry.
+            # Відновити стан після помилки запису без дублювання редакції.
+            if (
+                revision_key in existing_revision_keys
+                or (session_id, ended_at) in legacy_entry_revisions
+            ):
+                processed_max_ts = max(processed_max_ts, ended_at)
+                processed_max_message_id = max(
+                    processed_max_message_id, source_last_message_id
+                )
+                new_seen_revisions.append(revision_key)
+                new_seen_ids.append(session_id)
                 continue
-
-            summary["sessions_harvested"] += 1
-            processed_max_ts = max(processed_max_ts, last_active)
-            new_seen.append(session_id)
 
             messages = db.get_messages(session_id)
-            verdict = analyze_session(messages, ended=row.get("ended_at") is not None)
+            verdict = analyze_session(messages, ended=True)
+            # Reopen/append race guard: never mark a snapshot that changed
+            # while messages were being read. / Не позначати знімок, який
+            # змінився під час читання повідомлень.
+            if _session_snapshot(db, session_id) != (
+                ended_at,
+                source_last_message_id,
+            ):
+                continue
 
             # Nothing-to-learn skip: no unrecovered errors AND no verdict
             # either way (success=None).  Clean successes (True) and every
             # failure verdict (False) ARE appended.
             if not verdict["has_unrecovered"] and verdict["success"] is None:
+                summary["sessions_harvested"] += 1
+                processed_max_ts = max(processed_max_ts, ended_at)
+                processed_max_message_id = max(
+                    processed_max_message_id, source_last_message_id
+                )
+                new_seen_revisions.append(revision_key)
+                new_seen_ids.append(session_id)
                 continue
 
+            verdict["stats"]["source_last_message_id"] = source_last_message_id
             entry = ExperienceEntry(
-                ts=now,
+                ts=ended_at,
                 session_id=session_id,
                 platform=str(row.get("source") or ""),
                 model=str(row.get("model") or ""),
@@ -413,17 +574,33 @@ def run_harvest(
                 analysis=verdict["analysis"],
                 stats=verdict["stats"],
             )
-            append_entry(entry)
+            if not append_entry(entry):
+                summary["write_failures"] += 1
+                break
+            summary["sessions_harvested"] += 1
             summary["entries_appended"] += 1
+            processed_max_ts = max(processed_max_ts, ended_at)
+            processed_max_message_id = max(
+                processed_max_message_id, source_last_message_id
+            )
+            new_seen_revisions.append(revision_key)
+            new_seen_ids.append(session_id)
 
-        # Persist the dedup cursor: advance to the newest processed session,
-        # extend seen_ids and cap to the most recent ids.
-        if new_seen:
-            merged_seen = seen_ids + [s for s in new_seen if s not in seen_set]
-            set_harvest_state(
+        # Persist both monotonic cursors and exact completed revisions.
+        # Зберегти обидва монотонні курсори та точні завершені редакції.
+        if new_seen_revisions or state_needs_upgrade:
+            merged_seen = seen_ids + [
+                s for s in new_seen_ids if s not in seen_set
+            ]
+            merged_revisions = seen_revisions + [
+                key for key in new_seen_revisions if key not in seen_revision_set
+            ]
+            summary["state_saved"] = set_harvest_state(
                 {
                     "cursor_ts": processed_max_ts,
+                    "last_message_id": processed_max_message_id,
                     "seen_ids": merged_seen[-_SEEN_IDS_CAP:],
+                    "seen_revisions": merged_revisions[-_SEEN_IDS_CAP:],
                 }
             )
     finally:
@@ -432,7 +609,7 @@ def run_harvest(
         except Exception:
             pass
 
-    if summary["entries_appended"] > 0:
+    if existing_entries or summary["entries_appended"] > 0:
         summary["distill"] = _maybe_distill()
 
     return summary
@@ -442,32 +619,15 @@ def run_harvest(
 # Lock + main
 # ---------------------------------------------------------------------------
 
-def _acquire_lock(lock_path: Path):
-    """Non-blocking flock.  Returns the open file handle, or None if held."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        fh.close()
-        return None
-    return fh
-
-
 def main(argv: List[str]) -> int:
-    lock_path = get_hermes_home() / "evolution" / "experience" / ".harvest.lock"
-    lock_fh = _acquire_lock(lock_path)
-    if lock_fh is None:
-        print("[experience-harvest] another harvest is running; exiting")
-        return 0
-    try:
+    with experience_lock() as acquired:
+        if not acquired:
+            print(
+                "[experience-harvest] another bank operation is running; exiting / "
+                "інша операція банку вже виконується; вихід"
+            )
+            return 0
         summary = run_harvest()
-    finally:
-        try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock_fh.close()
     # Deterministic no_agent job: one compact JSON summary line so the run
     # log shows what happened; empty work still prints zeros.
     print(json.dumps(summary, sort_keys=True))

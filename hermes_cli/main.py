@@ -9817,6 +9817,89 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         pass
 
 
+def _reconcile_existing_evolution_cron_jobs() -> list[str]:
+    """Refresh Evolution cron only for profiles that previously opted in.
+
+    EN: An existing ``evolution-*`` job is the durable opt-in signal. This
+    avoids creating scheduled jobs in unrelated profiles while still healing
+    missed registrations and deploying newly added stages/scripts.
+
+    UK: Наявне завдання ``evolution-*`` є сталою ознакою згоди. Так ми не
+    створюємо розклад у сторонніх профілях, але відновлюємо пропущену
+    реєстрацію та встановлюємо нові етапи/скрипти.
+    """
+    registrar = PROJECT_ROOT / "scripts" / "register_evolution_cron.py"
+    definitions = PROJECT_ROOT / "cron" / "evolution"
+    if not registrar.is_file() or not definitions.is_dir():
+        return []
+
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        profiles = list_profiles()
+    except Exception as exc:
+        logger.debug("Could not enumerate profiles for Evolution cron reconcile: %s", exc)
+        return []
+
+    opted_in = []
+    for profile in profiles:
+        jobs_path = Path(profile.path) / "cron" / "jobs.json"
+        try:
+            payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+            jobs = payload.get("jobs", []) if isinstance(payload, dict) else payload
+            if not isinstance(jobs, list):
+                continue
+            if any(
+                str(job.get("name", "")).strip().startswith("evolution-")
+                for job in jobs
+                if isinstance(job, dict)
+            ):
+                opted_in.append(profile)
+        except (OSError, ValueError, TypeError):
+            continue
+
+    if not opted_in:
+        return []
+
+    print()
+    print("→ Reconciling enabled Evolution schedules / Узгодження розкладів Evolution...")
+    reconciled: list[str] = []
+    for profile in opted_in:
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(profile.path)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(registrar)],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"  ⚠ {profile.name}: Evolution cron reconcile failed / "
+                f"не вдалося узгодити cron: {exc}"
+            )
+            continue
+
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        summary = (result.stdout or "").strip().splitlines()
+        if result.returncode == 0:
+            reconciled.append(profile.name)
+            detail = summary[0] if summary else "ok"
+            print(f"  ✓ {profile.name}: {detail}")
+        else:
+            detail = summary[-1] if summary else f"exit {result.returncode}"
+            print(
+                f"  ⚠ {profile.name}: Evolution cron reconcile failed / "
+                f"не вдалося узгодити cron: {detail}"
+            )
+    return reconciled
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -10283,6 +10366,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
                 print("✓ Already up to date!")
+            # EN: A no-op update must still heal an earlier missed Evolution
+            # registration. UK: Навіть без змін виправляємо раніше пропущену
+            # реєстрацію Evolution.
+            _reconcile_existing_evolution_cron_jobs()
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
@@ -10804,6 +10891,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as exc:
             # Never let the cron safety net break an otherwise-good update.
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
+
+        # EN: Deploy new/revised Evolution stages after migrations and cron
+        # restore, before gateways restart. UK: Розгортаємо нові/оновлені
+        # етапи Evolution після міграцій і відновлення cron, до перезапуску.
+        _reconcile_existing_evolution_cron_jobs()
 
         print()
         if node_failures:

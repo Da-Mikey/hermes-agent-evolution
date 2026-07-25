@@ -8,9 +8,7 @@ storage path.  All runs pass an explicit ``now`` — nothing here depends on
 the wall clock.
 """
 
-import fcntl
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -20,8 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from agent import experience_bank as eb  # noqa: E402
 from agent.experience_bank import ExperienceEntry, ExperiencePattern  # noqa: E402
-from hermes_constants import get_hermes_home  # noqa: E402
-
 import evolution_experience_distill as dist  # noqa: E402
 
 
@@ -55,12 +51,6 @@ def _seed_diverse(count: int = 3, **overrides) -> None:
         kwargs = dict(session_id=f"s{i}", ts=NOW - (i + 1) * DAY)
         kwargs.update(overrides)
         eb.append_entry(_entry(**kwargs))
-
-
-def _lock_fd():
-    lock_dir = get_hermes_home() / "evolution" / "experience"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    return os.open(lock_dir / ".distill.lock", os.O_RDWR | os.O_CREAT)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +89,7 @@ def test_same_session_repeats_do_not_create_pattern():
 
     stats = dist.run_distillation(now=NOW)
 
-    assert stats["evidence_entries"] == 3
+    assert stats["evidence_entries"] == 1
     assert stats["clusters"] == 1
     assert stats["patterns_written"] == 0
     assert eb.load_patterns() == []
@@ -133,10 +123,43 @@ def test_honest_null_entries_are_unattributed_not_patterns():
 
     stats = dist.run_distillation(now=NOW)
 
-    assert stats["evidence_entries"] == 5
-    assert stats["unattributed"] == 5
+    assert stats["evidence_entries"] == 3
+    assert stats["unattributed"] == 3
     assert stats["clusters"] == 0
     assert stats["patterns_written"] == 0
+
+
+def test_only_latest_session_revision_counts_as_evidence():
+    """Successful resumed revisions replace earlier failures as evidence.
+
+    Успішні пізніші редакції замінюють ранні помилки у наборі доказів.
+    """
+    for i in range(3):
+        eb.append_entry(
+            _entry(
+                session_id=f"s{i}",
+                ts=NOW - 3 * DAY,
+                stats={"source_last_message_id": 10 + i},
+            )
+        )
+        eb.append_entry(
+            _entry(
+                session_id=f"s{i}",
+                ts=NOW - DAY,
+                success=True,
+                stats={"source_last_message_id": 20 + i},
+            )
+        )
+
+    stats = dist.run_distillation(now=NOW)
+
+    assert stats["entries_seen"] == 6
+    assert stats["evidence_entries"] == 0
+    assert stats["patterns_written"] == 0
+    assert eb.load_patterns() == []
+    # Compaction operates on the raw log, so all in-window revisions survive.
+    # Ущільнення працює із сирим журналом, тому актуальні редакції зберігаються.
+    assert len(list(eb.iter_entries())) == 6
 
 
 def test_combo_without_template_emits_no_pattern():
@@ -282,12 +305,9 @@ def test_locked_run_skips_and_writes_nothing():
     _seed_diverse(3)
     entries_before = eb.entries_path().read_bytes()
 
-    fd = _lock_fd()
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    try:
+    with eb.experience_lock() as acquired:
+        assert acquired is True
         stats = dist.run_distillation(now=NOW)
-    finally:
-        os.close(fd)
 
     assert stats["skipped"] == "locked"
     assert not eb.patterns_path().exists()
@@ -300,11 +320,17 @@ def test_lock_released_after_run():
     assert "skipped" not in stats
 
     # The lock is free again: a second party can take it immediately.
-    fd = _lock_fd()
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        pytest.fail("distiller leaked its lock")
+    # Блокування знову вільне: інший процес може одразу його отримати.
+    with eb.experience_lock() as acquired:
+        assert acquired is True
+
+
+def test_pattern_write_failure_is_reported(monkeypatch):
+    _seed_diverse(3)
+    monkeypatch.setattr(dist, "save_patterns", lambda _patterns: False)
+    stats = dist.run_distillation(now=NOW)
+    assert stats["patterns_written"] == 0
+    assert stats["write_failures"] == 1
 
 
 # ---------------------------------------------------------------------------

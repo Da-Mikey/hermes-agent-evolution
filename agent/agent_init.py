@@ -1630,6 +1630,10 @@ def init_agent(
     # are injected into the context tier at session start (once per session —
     # prompt-cache safe).  Zero token cost when the bank is empty.
     agent._experience_injection = bool(_agent_section.get("experience_injection", False))
+    # Session-scoped cache stored on the agent. Empty string is resolved;
+    # None means the bank has not been read for this session yet.
+    # Сесійний кеш на агенті: порожній рядок уже обчислено, None — ще ні.
+    agent._experience_block: Optional[str] = None
 
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt

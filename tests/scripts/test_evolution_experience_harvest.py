@@ -1,6 +1,5 @@
 """Tests for scripts/evolution_experience_harvest.py — deterministic harvest."""
 
-import fcntl
 import json
 import sys
 import time
@@ -11,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 import evolution_experience_harvest as eh  # noqa: E402
+from agent import experience_bank as eb  # noqa: E402
 from agent.experience_bank import get_harvest_state, iter_entries  # noqa: E402
 from hermes_state import SessionDB  # noqa: E402
 
@@ -90,7 +90,9 @@ class TestSessionSelection:
     def test_active_session_skipped(self, tmp_path):
         db, db_path = _make_db(tmp_path)
         recent = time.time()
-        _add_session(db, "s-active", [_user(), _assistant()], ts=recent)
+        _add_session(
+            db, "s-active", [_user(), _assistant()], ended=False, ts=recent
+        )
         summary = _harvest(db, db_path, now=time.time())
         assert summary["entries_appended"] == 0
         assert _entries() == []
@@ -111,6 +113,187 @@ class TestSessionSelection:
         state = get_harvest_state()
         assert state["cursor_ts"] == OLD
         assert "s-clean" in state["seen_ids"]
+        assert state["last_message_id"] > 0
+        assert len(state["seen_revisions"]) == 1
+
+    def test_reopened_session_with_new_messages_is_new_revision(self, tmp_path):
+        """A resumed and re-ended session is harvested once per completion.
+
+        Повторно відкрита й завершена сесія збирається один раз на редакцію.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-reopened", [_user(), _assistant("First end.")])
+        first = _harvest(db, db_path)
+        assert first["entries_appended"] == 1
+
+        resumed = SessionDB(db_path=db_path)
+        resumed._conn.execute(
+            "UPDATE sessions SET ended_at=NULL WHERE id=?", ("s-reopened",)
+        )
+        resumed.append_message(
+            "s-reopened", "user", content="Continue.", timestamp=OLD + 10
+        )
+        resumed.append_message(
+            "s-reopened", "assistant", content="Second end.", timestamp=OLD + 20
+        )
+        resumed.end_session("s-reopened", "cli_close")
+        resumed._conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=?",
+            (OLD + 30, "s-reopened"),
+        )
+
+        second = _harvest(resumed, db_path)
+        assert second["entries_appended"] == 1
+        revisions = _entries()
+        assert [entry.session_id for entry in revisions] == [
+            "s-reopened",
+            "s-reopened",
+        ]
+        assert revisions[0].stats["source_last_message_id"] < revisions[1].stats[
+            "source_last_message_id"
+        ]
+        assert len(get_harvest_state()["seen_revisions"]) == 2
+
+        third = eh.run_harvest(db_path=db_path, now=NOW)
+        assert third["entries_appended"] == 0
+        assert len(_entries()) == 2
+
+    def test_late_historical_import_is_found_by_message_id_cursor(self, tmp_path):
+        """A newly imported old completion is not hidden by the time cursor.
+
+        Новий історичний імпорт не губиться за часовим курсором.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-current", [_user(), _assistant()], ts=OLD)
+        assert _harvest(db, db_path)["entries_appended"] == 1
+
+        imported = SessionDB(db_path=db_path)
+        _add_session(
+            imported,
+            "s-imported",
+            [_user("historical"), _assistant("imported")],
+            ts=OLD - 3600,
+        )
+        second = _harvest(imported, db_path)
+
+        assert second["entries_appended"] == 1
+        assert {entry.session_id for entry in _entries()} == {
+            "s-current",
+            "s-imported",
+        }
+        state = get_harvest_state()
+        assert state["cursor_ts"] == OLD
+        assert state["last_message_id"] >= max(
+            entry.stats["source_last_message_id"] for entry in _entries()
+        )
+
+    def test_legacy_state_bootstraps_bounded_message_cursor(self, tmp_path):
+        """Old cursor_ts/seen_ids state upgrades without replaying history.
+
+        Старий стан оновлюється без повторного збору всієї історії.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-legacy", [_user(), _assistant()], ts=OLD)
+        db.close()
+        assert eb.set_harvest_state(
+            {"cursor_ts": OLD, "seen_ids": ["s-legacy"]}
+        )
+
+        upgraded = eh.run_harvest(db_path=db_path, now=NOW)
+        assert upgraded["entries_appended"] == 0
+        state = get_harvest_state()
+        assert state["cursor_ts"] == OLD
+        assert state["last_message_id"] > 0
+        assert state["seen_ids"] == ["s-legacy"]
+        assert len(state["seen_revisions"]) == 1
+
+        imported = SessionDB(db_path=db_path)
+        _add_session(
+            imported,
+            "s-after-upgrade",
+            [_user(), _assistant()],
+            ts=OLD - 3600,
+        )
+        assert _harvest(imported, db_path)["entries_appended"] == 1
+        assert [entry.session_id for entry in _entries()] == ["s-after-upgrade"]
+
+    def test_changed_snapshot_is_not_marked_processed(self, tmp_path, monkeypatch):
+        """A session reopened after get_messages remains eligible next run.
+
+        Сесія, відкрита після get_messages, лишається доступною наступного разу.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-race", [_user(), _assistant()])
+        db.close()
+
+        original = SessionDB.get_messages
+        changed = False
+
+        def reopening_get_messages(self, session_id, *args, **kwargs):
+            nonlocal changed
+            messages = original(self, session_id, *args, **kwargs)
+            if not changed:
+                changed = True
+                writer = SessionDB(db_path=db_path)
+                writer._conn.execute(
+                    "UPDATE sessions SET ended_at=NULL WHERE id=?", (session_id,)
+                )
+                writer.close()
+            return messages
+
+        monkeypatch.setattr(SessionDB, "get_messages", reopening_get_messages)
+        first = eh.run_harvest(db_path=db_path, now=NOW)
+        assert first["entries_appended"] == 0
+        assert get_harvest_state().get("seen_revisions", []) == []
+
+        monkeypatch.setattr(SessionDB, "get_messages", original)
+        writer = SessionDB(db_path=db_path)
+        writer.append_message(
+            "s-race", "assistant", content="Ended later.", timestamp=OLD + 1
+        )
+        writer._conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=?", (OLD + 2, "s-race")
+        )
+        second = _harvest(writer, db_path)
+        assert second["entries_appended"] == 1
+
+    def test_unfinished_session_is_not_seen_then_harvests_after_end(self, tmp_path):
+        """An unfinished row remains eligible after it is later completed.
+
+        Незавершений запис лишається доступним після подальшого завершення.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-resume", [_user()], ended=False)
+        first = _harvest(db, db_path)
+        assert first["entries_appended"] == 0
+        assert "s-resume" not in get_harvest_state().get("seen_ids", [])
+
+        resumed = SessionDB(db_path=db_path)
+        resumed.append_message(
+            "s-resume", "assistant", content="Completed later.", timestamp=OLD
+        )
+        resumed.end_session("s-resume", "cli_close")
+        resumed._conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=?", (OLD, "s-resume")
+        )
+        second = _harvest(resumed, db_path)
+        assert second["entries_appended"] == 1
+        assert "s-resume" in get_harvest_state()["seen_ids"]
+
+    def test_rows_are_ordered_by_completion_time(self, tmp_path):
+        db, _db_path = _make_db(tmp_path)
+        _add_session(db, "long", [_user(), _assistant()], ts=100.0)
+        _add_session(db, "short", [_user(), _assistant()], ts=200.0)
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=?", (300.0, "long")
+        )
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=?", (250.0, "short")
+        )
+        assert [row["id"] for row in eh._iter_session_rows(db)] == [
+            "short",
+            "long",
+        ]
 
 
 class TestVerdicts:
@@ -149,7 +332,7 @@ class TestVerdicts:
         assert entry.outcome_source == "heuristic:loop_guard_hard_stop"
         assert entry.terminal_reason == "loop_guard_hard_stop"
 
-    def test_unhandled_exception_is_strong_failure(self, tmp_path):
+    def test_apology_without_error_evidence_is_low_confidence(self, tmp_path):
         db, db_path = _make_db(tmp_path)
         _add_session(
             db,
@@ -165,9 +348,50 @@ class TestVerdicts:
         _harvest(db, db_path)
         (entry,) = _entries()
         assert entry.success is False
-        assert entry.confidence == "high"
+        assert entry.confidence == "low"
         assert entry.outcome_source == "heuristic:unhandled_exception"
         assert entry.terminal_reason == "unhandled_exception"
+
+    def test_apology_with_unrecovered_error_is_strong_failure(self, tmp_path):
+        db, db_path = _make_db(tmp_path)
+        _add_session(
+            db,
+            "s-crash-evidence",
+            [
+                _user(),
+                _tool_error("terminal", {"exit_code": 1, "error": "boom"}),
+                _assistant(
+                    "I apologize, but I encountered an error while processing "
+                    "the model response: boom"
+                ),
+            ],
+        )
+        _harvest(db, db_path)
+        (entry,) = _entries()
+        assert entry.success is False
+        assert entry.confidence == "high"
+
+    def test_mid_conversation_max_iteration_quote_is_not_failure(self):
+        verdict = eh.analyze_session(
+            [
+                _user(eh._MAX_ITER_MARKER),
+                _assistant("That text is only a quote."),
+                _user("Continue normally."),
+                _assistant("Done."),
+            ],
+            ended=True,
+        )
+        assert verdict["success"] is True
+        assert verdict["outcome_source"] == "heuristic:clean_completion"
+
+    def test_terminal_max_iteration_marker_is_strong_failure(self):
+        verdict = eh.analyze_session(
+            [_user(eh._MAX_ITER_MARKER), _assistant("Partial summary.")],
+            ended=True,
+        )
+        assert verdict["success"] is False
+        assert verdict["confidence"] == "high"
+        assert verdict["outcome_source"] == "heuristic:max_iterations_exhausted"
 
     def test_recovered_only_errors_are_never_a_failure(self, tmp_path):
         db, db_path = _make_db(tmp_path)
@@ -190,7 +414,7 @@ class TestVerdicts:
 
 
 class TestDimensionAttribution:
-    def test_timeout_dominant_honest_null(self, tmp_path):
+    def test_named_tool_timeout_maps_to_tool(self, tmp_path):
         db, db_path = _make_db(tmp_path)
         _add_session(
             db,
@@ -208,9 +432,30 @@ class TestDimensionAttribution:
         (entry,) = _entries()
         assert entry.failure_category == "timeout"
         assert entry.tool == "terminal"
-        assert entry.primary_dimension is None
-        assert entry.secondary_dimensions == ["tool", "generation", "orchestration"]
+        assert entry.primary_dimension == "tool"
+        assert entry.secondary_dimensions == ["generation", "orchestration"]
         assert entry.success is None  # unrecovered errors, no strong signal
+
+    def test_unknown_tool_timeout_stays_honest_null(self):
+        verdict = eh.analyze_session(
+            [
+                _user(),
+                _tool_error(
+                    "",
+                    json.dumps({"exit_code": 124, "error": "command timed out"}),
+                ),
+                _assistant("I could not finish in time."),
+            ],
+            ended=True,
+        )
+        assert verdict["failure_category"] == "timeout"
+        assert verdict["tool"] == "unknown"
+        assert verdict["primary_dimension"] is None
+        assert verdict["secondary_dimensions"] == [
+            "tool",
+            "generation",
+            "orchestration",
+        ]
 
     def test_not_found_maps_to_context(self, tmp_path):
         db, db_path = _make_db(tmp_path)
@@ -257,6 +502,87 @@ class TestDimensionAttribution:
             entry.analysis,
         )
 
+    def test_structured_tool_content_is_classified(self):
+        verdict = eh.analyze_session(
+            [
+                _user(),
+                _tool_error(
+                    "read_file",
+                    {"success": False, "error": "File not found: /x/y.py"},
+                ),
+                _assistant("The file was missing."),
+            ],
+            ended=True,
+        )
+        assert verdict["has_unrecovered"] is True
+        assert verdict["failure_category"] == "not_found"
+        assert verdict["primary_dimension"] == "context"
+
+
+class TestDurability:
+    def test_entry_uses_session_end_time(self, tmp_path):
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-time", [_user(), _assistant()], ts=OLD)
+        _harvest(db, db_path)
+        (entry,) = _entries()
+        assert entry.ts == OLD
+
+    def test_failed_append_is_not_counted_or_marked_seen(
+        self, tmp_path, monkeypatch
+    ):
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-write-fail", [_user(), _assistant()])
+        db.close()
+        monkeypatch.setattr(eh, "append_entry", lambda _entry: False)
+
+        summary = eh.run_harvest(db_path=db_path, now=NOW)
+
+        assert summary["entries_appended"] == 0
+        assert summary["write_failures"] == 1
+        assert "s-write-fail" not in get_harvest_state().get("seen_ids", [])
+
+    def test_existing_entry_heals_failed_state_write_without_duplicate(
+        self, tmp_path, monkeypatch
+    ):
+        """The append log is a second dedup source when state persistence fails.
+
+        Журнал записів є другим джерелом усунення дублів при помилці стану.
+        """
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-state-fail", [_user(), _assistant()])
+        db.close()
+        original = eh.set_harvest_state
+        monkeypatch.setattr(eh, "set_harvest_state", lambda _state: False)
+        first = eh.run_harvest(db_path=db_path, now=NOW)
+        assert first["entries_appended"] == 1
+        assert first["state_saved"] is False
+
+        monkeypatch.setattr(eh, "set_harvest_state", original)
+        second = eh.run_harvest(db_path=db_path, now=NOW)
+        assert second["entries_appended"] == 0
+        assert len(_entries()) == 1
+        assert "s-state-fail" in get_harvest_state()["seen_ids"]
+
+    def test_corrupt_stored_message_id_is_treated_as_legacy(self, tmp_path):
+        """Malformed nested revision metadata must not crash the next harvest."""
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-bad-revision", [_user(), _assistant()], ts=OLD)
+        db.close()
+        assert eb.append_entry(
+            eb.ExperienceEntry(
+                ts=OLD,
+                session_id="s-bad-revision",
+                success=True,
+                stats={"source_last_message_id": "not-an-integer"},
+            )
+        )
+
+        summary = eh.run_harvest(db_path=db_path, now=NOW)
+
+        assert summary["entries_appended"] == 0
+        assert len(_entries()) == 1
+        assert "s-bad-revision" in get_harvest_state()["seen_ids"]
+
 
 class TestDistillation:
     @pytest.fixture()
@@ -266,8 +592,8 @@ class TestDistillation:
 
         calls = []
 
-        def run_distillation(now=None):
-            calls.append(now)
+        def run_distillation(now=None, *, acquire_lock=True):
+            calls.append((now, acquire_lock))
             return {"patterns": 2}
 
         module = types.ModuleType("evolution_experience_distill")
@@ -281,6 +607,7 @@ class TestDistillation:
         summary = _harvest(db, db_path)
         assert summary["entries_appended"] == 1
         assert len(fake_distill) == 1
+        assert fake_distill[0][1] is False
         assert summary["distill"] == {"patterns": 2}
 
     def test_distill_not_invoked_when_nothing_appended(self, tmp_path, fake_distill):
@@ -291,6 +618,29 @@ class TestDistillation:
         assert summary["distill"] is None
         assert fake_distill == []
 
+    def test_prior_distill_failure_retries_without_new_append(
+        self, tmp_path, fake_distill
+    ):
+        db, db_path = _make_db(tmp_path)
+        _add_session(db, "s-clean", [_user(), _assistant()])
+
+        mod = sys.modules["evolution_experience_distill"]
+        successful = mod.run_distillation
+
+        def raising(now=None, *, acquire_lock=True):
+            raise RuntimeError("first distill failed")
+
+        mod.run_distillation = raising
+        first = _harvest(db, db_path)
+        assert first["entries_appended"] == 1
+        assert first["distill"] is None
+
+        mod.run_distillation = successful
+        second = eh.run_harvest(db_path=db_path, now=NOW)
+        assert second["entries_appended"] == 0
+        assert second["distill"] == {"patterns": 2}
+        assert len(fake_distill) == 1
+
     def test_harvest_survives_distill_raising(self, tmp_path, fake_distill, capsys):
         db, db_path = _make_db(tmp_path)
         _add_session(db, "s-clean", [_user(), _assistant()])
@@ -300,7 +650,7 @@ class TestDistillation:
         mod = sys.modules["evolution_experience_distill"]
         original = mod.run_distillation
 
-        def raising(now=None):
+        def raising(now=None, *, acquire_lock=True):
             raise RuntimeError("distill boom")
 
         mod.run_distillation = raising
@@ -315,21 +665,13 @@ class TestDistillation:
 
 class TestLock:
     def test_second_concurrent_instance_exits_cleanly(self, tmp_path, capsys):
-        from hermes_constants import get_hermes_home
-
         db, db_path = _make_db(tmp_path)
         _add_session(db, "s-clean", [_user(), _assistant()])
         db.close()
 
-        lock_path = get_hermes_home() / "evolution" / "experience" / ".harvest.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        holder = open(lock_path, "a+", encoding="utf-8")
-        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
+        with eb.experience_lock() as acquired:
+            assert acquired is True
             rc = eh.main(["evolution_experience_harvest.py"])
-        finally:
-            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-            holder.close()
         assert rc == 0
-        assert "another harvest is running" in capsys.readouterr().out
+        assert "another bank operation is running" in capsys.readouterr().out
         assert _entries() == []

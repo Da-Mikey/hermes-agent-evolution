@@ -9,7 +9,8 @@ the single source of truth for the schema and storage layout) and rewrites
 
 Pipeline:
 
-1. **Evidence selection** — only entries with ``success is False`` AND
+1. **Evidence selection** — only the latest revision per session is eligible,
+   and only entries with ``success is False`` AND
    ``confidence == "high"`` AND ``ts`` inside the 90-day evidence window
    count as failure evidence.  Low-confidence heuristics and unknown
    outcomes (``success is None``) never cluster.
@@ -30,14 +31,16 @@ Pipeline:
 6. **Compaction** — ``entries.jsonl`` is atomically rewritten keeping only
    entries inside the 90-day window, bounding unbounded growth.
 
-Concurrency: a non-blocking ``fcntl.flock`` on ``.distill.lock`` next to the
-bank serializes overlapping cron runs; a locked run returns immediately with
+Concurrency: the shared cross-platform ``.experience.lock`` serializes both
+harvest and standalone distillation; a locked run returns immediately with
 ``{"skipped": "locked"}`` and writes nothing.
+
+Паралельність: спільне міжплатформне блокування ``.experience.lock`` серіалізує
+збір і окреме узагальнення; зайняте блокування повертає ``skipped: locked``.
 """
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sys
@@ -47,16 +50,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.experience_bank import (
+    GUIDANCE_TEMPLATES,
     ExperienceEntry,
     ExperiencePattern,
     entries_path,
+    experience_lock,
     iter_entries,
     load_patterns,
     pattern_id,
     save_patterns,
 )
-from hermes_constants import get_hermes_home
-
 #: How far back failure evidence may reach, relative to ``now``.
 EVIDENCE_WINDOW_DAYS = 90.0
 
@@ -71,83 +74,11 @@ MIN_DISTINCT_SESSIONS = 3
 
 _SECONDS_PER_DAY = 86400.0
 
-#: Deterministic (trigger, guidance) per (dimension, category).
-#:
-#: Only the unambiguous attributions get templates: network -> tool,
-#: permission -> tool, not_found -> context, syntax_error -> output.  Of the
-#: ambiguous categories, only (tool, timeout) is sound when the entry names a
-#: concrete failing tool — everything else (validation, resource_limit,
-#: orchestration-level timeouts, ...) is deliberately skipped: no pattern is
-#: better than a generic one.  Templates containing ``{tool}`` require a
-#: known tool; a tool-less cluster against such a template is ``no_template``.
-GUIDANCE_TEMPLATES: Dict[Tuple[str, str], Tuple[str, str]] = {
-    ("tool", "network"): (
-        "`{tool}` fails with network errors (DNS, connection refused, unreachable host)",
-        "When `{tool}` fails with a network error, probe connectivity once with a "
-        "minimal request before retrying; if the endpoint is down, switch to an "
-        "alternative source or report the outage instead of retrying the same call.",
-    ),
-    ("tool", "permission"): (
-        "`{tool}` fails with permission / 403 / access-denied errors",
-        "When `{tool}` returns a permission error, do not retry the same call — "
-        "identify the missing credential or scope (API key, token, file mode), fix "
-        "or ask the user for it, then retry once with the corrected access.",
-    ),
-    ("tool", "timeout"): (
-        "`{tool}` calls time out",
-        "When `{tool}` calls time out, reduce the command's scope (narrower search, "
-        "smaller batch, explicit timeout flag) instead of retrying the same invocation.",
-    ),
-    ("context", "not_found"): (
-        "A referenced file path or resource does not exist",
-        "Before referencing a path or resource, verify it exists (list the parent "
-        "directory or search for it first); when something is not found, re-locate "
-        "the current target instead of retrying the same path.",
-    ),
-    ("output", "syntax_error"): (
-        "Generated output fails to parse (syntax error, malformed JSON/code)",
-        "When output fails to parse, validate structure before emitting — run a "
-        "syntax check on code, serialize JSON/YAML with a library rather than "
-        "hand-writing it — and regenerate the malformed fragment instead of "
-        "appending to it.",
-    ),
-}
-
-
-# ---------------------------------------------------------------------------
-# Locking
-# ---------------------------------------------------------------------------
-
-def _lock_path() -> Path:
-    """Path of the distillation lock file, next to the bank files."""
-    return get_hermes_home() / "evolution" / "experience" / ".distill.lock"
-
-
-def _acquire_lock() -> Optional[int]:
-    """Take a non-blocking exclusive flock; return the fd, or None if held.
-
-    The caller must keep the fd open for the whole run and ``os.close`` it at
-    the end (closing releases the lock).
-    """
-    path = _lock_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError:
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return None
-    return fd
-
-
 # ---------------------------------------------------------------------------
 # Entries compaction (bounds entries.jsonl growth)
 # ---------------------------------------------------------------------------
 
-def _compact_entries(entries: List[ExperienceEntry], cutoff_ts: float) -> None:
+def _compact_entries(entries: List[ExperienceEntry], cutoff_ts: float) -> bool:
     """Atomically rewrite ``entries.jsonl`` keeping entries at/after *cutoff_ts*.
 
     Reads come from the already-parsed *entries* list (via ``iter_entries``),
@@ -155,10 +86,13 @@ def _compact_entries(entries: List[ExperienceEntry], cutoff_ts: float) -> None:
     separators ``append_entry`` uses, so an idempotent re-run is
     byte-identical.  Missing file: nothing to do.  OSError: warn to stderr
     and keep going — a failed compaction must not kill the cron job.
+
+    Атомарно лишає записи після межі часу. Відсутній файл є успіхом, а OSError
+    журналюється без падіння запланованого завдання.
     """
     path = entries_path()
     if not path.exists():
-        return
+        return True
     kept = [e for e in entries if e.ts >= cutoff_ts]
     try:
         fd, tmp_name = tempfile.mkstemp(
@@ -170,15 +104,28 @@ def _compact_entries(entries: List[ExperienceEntry], cutoff_ts: float) -> None:
                     fh.write(
                         json.dumps(entry.to_dict(), separators=(",", ":")) + "\n"
                     )
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp_name, path)
+            if os.name != "nt":
+                dir_fd = os.open(
+                    path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except BaseException:
             try:
                 os.unlink(tmp_name)
             except OSError:
                 pass
             raise
+        return True
     except OSError as exc:
         print(f"[evolution-distill] failed to compact {path}: {exc}", file=sys.stderr)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +142,7 @@ def _empty_stats() -> Dict[str, Any]:
         "unattributed": 0,
         "no_template": 0,
         "entries_pruned": 0,
+        "write_failures": 0,
     }
 
 
@@ -207,17 +155,43 @@ def _fill(template: str, tool: Optional[str]) -> Optional[str]:
     return template
 
 
+def _latest_session_revisions(
+    entries: List[ExperienceEntry],
+) -> List[ExperienceEntry]:
+    """Return only the newest completed revision for each session.
+
+    ``ts`` is the source ``ended_at``; the message id resolves equal-time
+    revisions, and append order is the final deterministic tie-breaker.
+
+    Повертає лише найновішу завершену редакцію кожної сесії. Час завершення є
+    головним ключем, номер повідомлення та порядок запису розв'язують нічию.
+    """
+    latest: Dict[str, Tuple[Tuple[float, int, int], ExperienceEntry]] = {}
+    for index, entry in enumerate(entries):
+        try:
+            message_id = int(entry.stats.get("source_last_message_id", 0) or 0)
+        except (TypeError, ValueError):
+            message_id = 0
+        rank = (entry.ts, message_id, index)
+        prior = latest.get(entry.session_id)
+        if prior is None or rank > prior[0]:
+            latest[entry.session_id] = (rank, entry)
+    return [latest[session_id][1] for session_id in sorted(latest)]
+
+
 def _distill(now: float, stats: Dict[str, Any]) -> Dict[str, Any]:
     evidence_cutoff = now - EVIDENCE_WINDOW_DAYS * _SECONDS_PER_DAY
     stale_cutoff = now - STALE_PATTERN_DAYS * _SECONDS_PER_DAY
 
     entries = list(iter_entries())
     stats["entries_seen"] = len(entries)
+    latest_entries = _latest_session_revisions(entries)
 
-    # 1. Evidence selection: only high-confidence failures inside the window.
+    # 1. Evidence selection: only the latest revision of each session may
+    # contribute. / Доказом може бути лише остання редакція кожної сесії.
     evidence = [
         e
-        for e in entries
+        for e in latest_entries
         if e.success is False and e.confidence == "high" and e.ts >= evidence_cutoff
     ]
     stats["evidence_entries"] = len(evidence)
@@ -288,36 +262,47 @@ def _distill(now: float, stats: Dict[str, Any]) -> Dict[str, Any]:
 
     # Stable-diff friendly file: sort by pattern id.
     final = [merged[pid] for pid in sorted(merged)]
-    save_patterns(final)
-    stats["patterns_written"] = len(final)
+    if save_patterns(final):
+        stats["patterns_written"] = len(final)
+    else:
+        stats["write_failures"] += 1
 
     # 6. Compact the entries log inside the evidence window.
-    _compact_entries(entries, evidence_cutoff)
-    stats["entries_pruned"] = stats["entries_seen"] - sum(
-        1 for e in entries if e.ts >= evidence_cutoff
-    )
+    if _compact_entries(entries, evidence_cutoff):
+        stats["entries_pruned"] = stats["entries_seen"] - sum(
+            1 for e in entries if e.ts >= evidence_cutoff
+        )
+    else:
+        stats["write_failures"] += 1
 
     return stats
 
 
-def run_distillation(now: float | None = None) -> dict:
+def run_distillation(
+    now: float | None = None,
+    *,
+    acquire_lock: bool = True,
+) -> dict:
     """Cluster failure entries into patterns. Returns stats dict.
 
-    *now* is injectable for tests (defaults to ``time.time()``).  When another
-    distiller holds the lock, returns immediately with ``"skipped": "locked"``
-    in the stats and writes nothing.
+    *now* is injectable for tests (defaults to ``time.time()``).  The public
+    default acquires the shared bank lock.  The harvester passes
+    ``acquire_lock=False`` because it already owns that same lock while calling
+    distillation inline.
+
+    *now* можна підмінити в тестах. Публічний виклик отримує спільне блокування,
+    а збирач передає ``acquire_lock=False``, бо вже володіє цим блокуванням.
     """
     if now is None:
         now = time.time()
     stats = _empty_stats()
-    lock_fd = _acquire_lock()
-    if lock_fd is None:
-        stats["skipped"] = "locked"
-        return stats
-    try:
+    if not acquire_lock:
         return _distill(now, stats)
-    finally:
-        os.close(lock_fd)
+    with experience_lock() as acquired:
+        if not acquired:
+            stats["skipped"] = "locked"
+            return stats
+        return _distill(now, stats)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

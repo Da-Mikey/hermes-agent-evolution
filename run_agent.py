@@ -754,6 +754,7 @@ class AIAgent:
         - API call count
         - Reasoning tokens
         - Estimated cost tracking
+        - Session-scoped experience prompt cache
         - Context compressor internal counters
 
         The method safely handles optional attributes (e.g., context compressor)
@@ -778,6 +779,13 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+
+        # The rendered experience block is stable within one conversation,
+        # but a reused agent must read the bank again for the next session.
+        # Блок досвіду незмінний у межах розмови, але повторно використаний
+        # агент має перечитати банк для наступної сесії.
+        if hasattr(self, "_experience_block"):
+            self._experience_block = None
 
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0

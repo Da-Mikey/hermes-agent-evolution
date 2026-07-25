@@ -20,29 +20,6 @@ skill's canonical name is ``evolution-research``. We normalize ``/`` -> ``-``
 so the scheduler resolves the real skill (``evolution/analysis`` ->
 ``evolution-analysis``, etc.).
 
-Per-stage model allocation (#905)
-----------------------------------
-A stage YAML may set optional ``model:`` / ``provider:`` keys to pin that
-stage to a specific model — e.g. a cheaper/mid-tier model for the broad,
-capability-flat research/analysis stages, leaving implementation on the
-deployment's main/frontier default. Both are independent and optional;
-omitting either leaves that axis unpinned (follows the global config
-default, same as today). This is a *static per-stage* pin, distinct from
-the *dynamic per-subtask* complexity routing added by #798
-(``evolution_draft_selector.route_cost_tier`` / ``model_hint`` on delegated
-worker tasks) — the two do not overlap.
-
-Caveat: ``model`` and ``provider`` reconcile independently (each only
-updates when its own YAML value differs from the stored one), matching the
-pre-existing skills/toolsets pattern below. cron.jobs.create_job/update_job
-already allow pinning either axis alone, with no cross-validation between
-them — that is inherited, not introduced here. If a stage's model and
-provider are both pinned, always edit both together when changing either;
-an edit that changes only one of the two while the job already has a
-mismatched value for the other risks an invalid model/provider combination
-at run time. The shipped stage YAMLs avoid this by leaving both commented
-out as a single paired block (see research.yaml / analysis.yaml).
-
 Usage
 -----
     python scripts/register_evolution_cron.py [--dry-run] [SRC_DIR]
@@ -53,6 +30,7 @@ Exit codes: 0 ok, 1 setup error, 2 one or more jobs failed to register.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -293,6 +271,16 @@ def _ensure_evolution_labels(repo_root: Path, dry_run: bool = False) -> list[str
     """
     import subprocess
 
+    if not dry_run and shutil.which("gh") is None:
+        print(
+            "[evolution-cron] warning: gh CLI is not installed; GitHub labels "
+            "were not created and GitHub-dependent Evolution stages cannot run. "
+            "/ gh CLI не встановлено; мітки GitHub не створено, а залежні від "
+            "GitHub етапи Evolution не зможуть працювати.",
+            file=sys.stderr,
+        )
+        return []
+
     created: list[str] = []
     for name, color, description in _EVOLUTION_LABELS:
         cmd = [
@@ -435,21 +423,19 @@ def main(argv: list[str]) -> int:
         if no_agent and not str(spec.get("script") or "").strip():
             failed.append((name, "no_agent job requires a 'script'"))
             continue
+        if str(spec.get("model") or "").strip() or str(spec.get("provider") or "").strip():
+            failed.append(
+                (
+                    name,
+                    "model/provider are not supported for Evolution jobs; "
+                    "AIAgent resolves the primary and fallback chain",
+                )
+            )
+            continue
 
         skills = _normalize_skills(spec.get("skills"))
         toolsets = _normalize_toolsets(spec.get("toolsets"))
         deliver = str(spec.get("deliver") or "local").strip()
-        # Per-stage model allocation (#905): an evolution stage may pin a
-        # cheaper/mid-tier model (research, analysis) while leaving others
-        # (implementation) on the deployment's main/frontier default. Both
-        # keys are optional and independent — omitting one leaves that axis
-        # unpinned (follows global config, same as today). Values pass
-        # through to cron.jobs.create_job/update_job unchanged; that layer
-        # already validates/normalizes and (#44585) drift-guards unpinned
-        # jobs against a later global default change.
-        model = str(spec.get("model") or "").strip() or None
-        provider = str(spec.get("provider") or "").strip() or None
-
         # Refuse to register (or reconcile) an agent job whose skills need a
         # toolset the job definition does not grant — the scheduled job could
         # only ever silently no-op (#702). Jobs that DECLARE no toolsets are
@@ -497,15 +483,17 @@ def main(argv: list[str]) -> int:
                     cur.get("enabled_toolsets") or []
                 ):
                     changes["enabled_toolsets"] = toolsets
-                # model/provider (#905): same "None means leave as-is" rule as
-                # skills/toolsets above — a YAML that doesn't mention model:/
-                # provider: must never clear an already-pinned job back to
-                # unpinned. The two reconcile independently (see module
-                # docstring caveat) — always edit both together in the YAML.
-                if model is not None and model != cur.get("model"):
-                    changes["model"] = model
-                if provider is not None and provider != cur.get("provider"):
-                    changes["provider"] = provider
+                # EN: Evolution jobs deliberately defer provider/model selection
+                # to AIAgent, including its fallback chain. UK: Вибір маршруту
+                # належить AIAgent разом із резервними моделями, не cron-запису.
+                for field in (
+                    "model",
+                    "provider",
+                    "model_snapshot",
+                    "provider_snapshot",
+                ):
+                    if cur.get(field) is not None:
+                        changes[field] = None
                 # Detect script changes (e.g. Hydra replacing access gate)
                 cur_script = str(cur.get("script") or "").strip()
                 yaml_script = str(spec.get("script") or "").strip()
@@ -517,6 +505,15 @@ def main(argv: list[str]) -> int:
                 updated.append((name, "DRY-RUN: " + ", ".join(sorted(changes))))
             else:
                 update_job(cur["id"], changes)
+                # EN: update_job recomputes snapshots when model/provider
+                # changes. Clear them in a separate write so Evolution keeps
+                # runtime routing fully under AIAgent. UK: update_job відновлює
+                # відбитки після зміни маршруту, тому очищаємо їх окремим записом.
+                if "model" in changes or "provider" in changes:
+                    update_job(
+                        cur["id"],
+                        {"model_snapshot": None, "provider_snapshot": None},
+                    )
                 updated.append((name, ", ".join(sorted(changes))))
             continue
 
@@ -554,8 +551,6 @@ def main(argv: list[str]) -> int:
                 skills=skills,
                 enabled_toolsets=toolsets,
                 deliver=deliver,
-                model=model,
-                provider=provider,
             )
             # Does the YAML define its own script? (Hydra gate, etc.)
             yaml_script = str(spec.get("script") or "").strip() if not no_agent else None
@@ -570,6 +565,10 @@ def main(argv: list[str]) -> int:
                 # Per-job gate script (Hydra, etc.) — installed and attached.
                 create_kwargs["script"] = yaml_script
             job = create_job(**create_kwargs)
+            update_job(
+                job["id"],
+                {"model_snapshot": None, "provider_snapshot": None},
+            )
             created.append((name, job["id"]))
             existing_names.add(name)
             if spec.get("enabled") is False:
@@ -594,60 +593,6 @@ def main(argv: list[str]) -> int:
         print(f"  = {name} (unchanged)")
     for name, err in failed:
         print(f"  ! {name}: {err}")
-
-    # Config-drift validation (#938): warn when an agent-stage job has BOTH
-    # model and provider unpinned (both None), meaning it inherits the global
-    # inference config and is vulnerable to config drift that caused a mass
-    # blackout in July 2026. no_agent jobs (deterministic scripts) do not use
-    # model/provider and are excluded from this check.
-    def _is_unpinned_yaml(yaml_path: Path) -> bool | None:
-        """Check if a YAML file defines an unpinned agent job.
-        Returns True if unpinned, False if pinned, None if no_agent or not found."""
-        if not yaml_path.exists():
-            return None
-        try:
-            spec = _load_yaml(yaml_path)
-        except Exception:
-            return None
-        if bool(spec.get("no_agent")):
-            return None
-        yaml_model = str(spec.get("model") or "").strip() or None
-        yaml_provider = str(spec.get("provider") or "").strip() or None
-        return yaml_model is None and yaml_provider is None
-
-    def _check_unpinned(name: str, src_dir: Path) -> bool:
-        """Check if a named job is unpinned in its YAML definition."""
-        stem = name.replace("evolution-", "")
-        yaml_path = src_dir / f"{stem}.yaml"
-        result = _is_unpinned_yaml(yaml_path)
-        if result is True:
-            return True
-        if result is None and not yaml_path.exists():
-            # Fallback: search all YAMLs
-            for candidate in sorted(src_dir.glob("*.yaml")):
-                r = _is_unpinned_yaml(candidate)
-                if r is not None:
-                    return r
-        return False
-
-    unpinned: list[str] = []
-    all_processed: list[str] = []
-    all_processed.extend(n for n, _ in created)
-    all_processed.extend(n for n, _ in updated)
-    all_processed.extend(skipped)  # skipped is list[str]
-    for name in all_processed:
-        if _check_unpinned(name, src_dir):
-            unpinned.append(name)
-
-    if unpinned:
-        print(
-            "[evolution-cron] warning: the following agent jobs have unpinned "
-            "model AND provider — they are vulnerable to global inference config "
-            "drift. Set model:/provider: in their YAML to pin them to a specific "
-            f"deployment model (see #938).\n"
-            f"  unpinned: {', '.join(sorted(set(unpinned)))}",
-            file=sys.stderr,
-        )
 
     return 2 if failed else 0
 

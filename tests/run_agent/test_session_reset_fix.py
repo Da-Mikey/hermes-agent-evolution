@@ -89,6 +89,24 @@ class TestResetSessionState:
             f"_user_turn_count must be 0 after reset; got: {agent._user_turn_count}"
         )
 
+    def test_experience_block_cleared_on_reset(self):
+        """A reused agent must load fresh patterns for the new session."""
+        agent = _make_minimal_agent()
+        agent._experience_block = "stale patterns from the previous session"
+
+        agent.reset_session_state()
+
+        assert agent._experience_block is None
+
+    def test_reset_without_experience_block_remains_backward_compatible(self):
+        """Legacy/minimal agents without the cache attribute must still reset."""
+        agent = _make_minimal_agent()
+        assert not hasattr(agent, "_experience_block")
+
+        agent.reset_session_state()
+
+        assert agent._user_turn_count == 0
+
     def test_both_fields_cleared_together(self):
         """Both stale fields are cleared in a single reset_session_state() call."""
         agent = _make_minimal_agent()
