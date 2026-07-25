@@ -75,7 +75,66 @@ case "$HERMES_BIN" in
         done
         ;;
 esac
-INSTALL_DIR="$(dirname "$(dirname "$(dirname "$HERMES_BIN")")")"
+
+# Layout detection, by evidence rather than by path arithmetic ---------------
+# `dirname` three times assumes <root>/venv/bin/hermes and silently produces
+# nonsense on any other layout (it resolved INSTALL_DIR=/opt on a real user's
+# container). Instead:
+#   1. find the virtualenv by its canonical marker, pyvenv.cfg;
+#   2. ask that interpreter where hermes_cli actually lives — for an editable
+#      install that IS the source tree, whatever it is named.
+# Path arithmetic stays only as the last-resort fallback.
+VENV_DIR=""
+BIN_PARENT="$(dirname "$(dirname "$HERMES_BIN")")"
+for CAND in "$(dirname "$(dirname "$HERMES_BIN")")" "$BIN_PARENT/.venv" "$BIN_PARENT/venv"; do
+    if [ -f "$CAND/pyvenv.cfg" ]; then VENV_DIR="$CAND"; break; fi
+done
+if [ -z "$VENV_DIR" ]; then
+    # One level down from the install root: <root>/<anything>/pyvenv.cfg
+    for CAND in "$BIN_PARENT"/*/pyvenv.cfg; do
+        [ -f "$CAND" ] && { VENV_DIR="$(dirname "$CAND")"; break; }
+    done
+fi
+PY=""
+for CAND in "$VENV_DIR/bin/python" "$VENV_DIR/bin/python3"; do
+    [ -n "$VENV_DIR" ] && [ -x "$CAND" ] && { PY="$CAND"; break; }
+done
+# Last resort: any python that can import hermes_cli.
+if [ -z "$PY" ]; then
+    for CAND in python3 python; do
+        if command -v "$CAND" >/dev/null 2>&1 && "$CAND" -c 'import hermes_cli' >/dev/null 2>&1; then
+            PY="$(command -v "$CAND")"
+            break
+        fi
+    done
+fi
+
+INSTALL_DIR=""
+IS_EDITABLE=0
+if [ -n "$PY" ]; then
+    INSTALL_DIR="$("$PY" -c 'import hermes_cli, os; print(os.path.dirname(os.path.dirname(os.path.abspath(hermes_cli.__file__))))' 2>/dev/null || echo)"
+    case "$INSTALL_DIR" in
+        # Inside site-packages => a regular (non-editable) install: there is no
+        # source tree to swap, so the in-place container path does not apply.
+        *"/site-packages"|*"/dist-packages") IS_EDITABLE=0 ;;
+        "")                                   : ;;
+        *)                                    IS_EDITABLE=1 ;;
+    esac
+fi
+if [ -z "$INSTALL_DIR" ]; then
+    INSTALL_DIR="$(dirname "$(dirname "$(dirname "$HERMES_BIN")")")"
+fi
+
+hermes_layout_report() {
+    echo ""
+    echo "🔎 Detected layout (paste this if you need to report the problem):"
+    echo "   command -v hermes : $(command -v hermes 2>/dev/null || echo '(not found)')"
+    echo "   resolved binary   : $HERMES_BIN"
+    echo "   virtualenv        : ${VENV_DIR:-(not found — no pyvenv.cfg near the binary)}"
+    echo "   interpreter       : ${PY:-(none could import hermes_cli)}"
+    echo "   source tree       : ${INSTALL_DIR:-(unknown)}"
+    echo "   editable install  : $IS_EDITABLE"
+}
 
 # 1b. Docker installs ------------------------------------------------------
 # The published image excludes `.git` from the build context (see
@@ -100,6 +159,7 @@ fi
 docker_inplace_upgrade() {
     echo "🐳 In-container upgrade — swapping the source tree in place"
     echo "   Install tree: $INSTALL_DIR"
+    echo "   Virtualenv:   ${VENV_DIR:-(none)}"
     echo ""
     echo "⚠️  This writes into the container's WRITABLE LAYER."
     echo "    'docker restart' keeps it. Recreating the container from the image"
@@ -114,6 +174,25 @@ docker_inplace_upgrade() {
     fi
     if ! command -v git >/dev/null 2>&1; then
         echo "❌ git is not available in this image — cannot fetch the fork."
+        echo "   Install it first (apt-get update && apt-get install -y git) and re-run."
+        exit 1
+    fi
+    if [ -z "$VENV_DIR" ] || [ -z "$PY" ]; then
+        echo "❌ Could not locate the virtualenv this Hermes runs from."
+        hermes_layout_report
+        echo ""
+        echo "   Nothing was changed. Please report the block above."
+        exit 1
+    fi
+    if [ "$IS_EDITABLE" != "1" ]; then
+        echo "❌ This Hermes is NOT an editable install — its code lives inside"
+        echo "   site-packages, so there is no source tree to swap."
+        hermes_layout_report
+        echo ""
+        echo "   Install the fork into the same virtualenv instead:"
+        echo "     $PY -m pip install --force-reinstall \\"
+        echo "       'hermes-agent @ git+$FORK_URL@main'"
+        echo "   then restart the container. Nothing was changed."
         exit 1
     fi
     if [ ! -w "$INSTALL_DIR" ]; then
@@ -229,10 +308,6 @@ docker_inplace_upgrade() {
 }
 
 if [ "$INSTALL_METHOD" = "docker" ] || { [ -f /.dockerenv ] && [ ! -d "$INSTALL_DIR/.git" ]; }; then
-    # $VENV_DIR is normally set after the git check below; the in-place path
-    # runs before it, so resolve it here.
-    VENV_DIR="$INSTALL_DIR/.venv"
-    [ -d "$VENV_DIR" ] || VENV_DIR="$INSTALL_DIR/venv"
     if [ "$IN_CONTAINER" = "1" ]; then
         docker_inplace_upgrade
     else
@@ -279,14 +354,18 @@ if [ ! -d "$INSTALL_DIR/.git" ]; then
         fi
     else
         echo "❌ $INSTALL_DIR is not a git checkout — cannot switch remotes."
-        echo "   (Expected layout <INSTALL_DIR>/venv/bin/hermes or <INSTALL_DIR>/.venv/bin/hermes.)"
+        hermes_layout_report
         exit 1
     fi
 fi
-# Both layouts exist: `venv/` (install.sh) and `.venv/` (uv / Docker builds).
-VENV_DIR="$INSTALL_DIR/venv"
-[ -d "$VENV_DIR" ] || VENV_DIR="$INSTALL_DIR/.venv"
-PY="$VENV_DIR/bin/python"
+# VENV_DIR/PY were resolved by evidence above (pyvenv.cfg + import location).
+# Only fill them in by name if that detection came up empty — e.g. a checkout
+# whose venv has not been created yet.
+if [ -z "$VENV_DIR" ]; then
+    VENV_DIR="$INSTALL_DIR/venv"
+    [ -d "$VENV_DIR" ] || VENV_DIR="$INSTALL_DIR/.venv"
+fi
+[ -n "$PY" ] || PY="$VENV_DIR/bin/python"
 HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
 echo "📂 Install dir: $INSTALL_DIR"
 echo "📂 Data dir:    $HOME_DIR"
