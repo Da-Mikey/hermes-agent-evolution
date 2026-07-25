@@ -371,16 +371,37 @@ container_reinstall_from_fork() {
     git -C "$SRC_DIR" remote get-url upstream >/dev/null 2>&1 \
         || git -C "$SRC_DIR" remote add upstream "$UPSTREAM_URL"
 
+    # An editable install UNINSTALLS the existing hermes-agent first, so a
+    # failure partway through (build backend unreachable, disk full) would
+    # leave the container with no Hermes at all. Record the current version so
+    # that case can be put back.
+    OLD_VER="$("$PY" -c 'import importlib.metadata as m; print(m.version("hermes-agent"))' 2>/dev/null || echo)"
+
     # --no-deps on purpose: the container's dependency set already satisfies
     # upstream Hermes, and resolving the full tree here could pull compilers
     # and native builds the image has no toolchain for. Drift is reported below.
     echo "📦 Installing the fork editable into the virtualenv (--no-deps)..."
+    INSTALL_OK=0
     if [ "$INSTALLER" = "uv" ]; then
-        uv pip install --python "$PY" --no-deps -e "$SRC_DIR" \
-            || { echo "❌ uv install failed — nothing was replaced, the old install is intact."; exit 1; }
+        uv pip install --python "$PY" --no-deps -e "$SRC_DIR" && INSTALL_OK=1
     else
-        "$PY" -m pip install --no-deps -e "$SRC_DIR" \
-            || { echo "❌ pip install failed — nothing was replaced, the old install is intact."; exit 1; }
+        "$PY" -m pip install --no-deps -e "$SRC_DIR" && INSTALL_OK=1
+    fi
+    if [ "$INSTALL_OK" != "1" ]; then
+        echo "❌ Installing the fork failed."
+        if [ -n "$OLD_VER" ] && ! "$PY" -c 'import hermes_cli' >/dev/null 2>&1; then
+            echo "↩️  hermes_cli no longer imports — restoring the original hermes-agent $OLD_VER..."
+            if [ "$INSTALLER" = "uv" ]; then
+                uv pip install --python "$PY" "hermes-agent==$OLD_VER" >/dev/null 2>&1 && echo "✅ Original restored."
+            else
+                "$PY" -m pip install "hermes-agent==$OLD_VER" >/dev/null 2>&1 && echo "✅ Original restored."
+            fi
+            "$PY" -c 'import hermes_cli' >/dev/null 2>&1 \
+                || echo "⚠️  Restore failed too — recreate the container from its image to recover."
+        else
+            echo "   The previous install still imports; nothing further was changed."
+        fi
+        exit 1
     fi
 
     # Prove the swap took, and that the CLI still starts.
