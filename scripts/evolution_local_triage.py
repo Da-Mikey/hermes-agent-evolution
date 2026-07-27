@@ -23,6 +23,19 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from evolution.lib.stage_result import StageResult
+
+    _HAS_STAGE_RESULT = True
+except ImportError:  # pragma: no cover - exercised by the standalone-copy tests
+    # This script runs standalone from the access gate and from cron, where the
+    # `evolution` package is frequently not importable (the gate copies just
+    # this file into a working directory; see #1304/#1314 for the same lesson in
+    # the harvest cron). Triage output is the contract here — the StageResult
+    # tuple is additive telemetry, so its absence must not stop the file from
+    # being written.
+    _HAS_STAGE_RESULT = False
+
 # Sidecar subdirectories to scan
 _SIDECAR_DIRS = ("issues", "introspection", "research")
 
@@ -140,6 +153,32 @@ def run_local_triage(evolution_dir: Path) -> dict:
         "rejected": [],
         "selected_for_implementation": selected,
     }
+
+    # Emit a StageResult at this boundary (AREX #1338 slice A).
+    #
+    # The envelope is attached to the same dict it describes, so its ``result``
+    # field is dropped here: keeping it would make output["stage_result"]
+    # ["result"] point back at output, and json.dumps raises
+    # "Circular reference detected" on exactly that. Dropping it also avoids
+    # serializing the whole triage payload twice. The rest of the tuple —
+    # evidence pointers, confidence, stage, timestamp — is what a consumer of
+    # this boundary actually needs; the result itself is the document it is
+    # attached to.
+    #
+    # Skipped when the evolution package is not importable (see the import
+    # guard above) — the triage output is the contract, this is telemetry.
+    if _HAS_STAGE_RESULT:
+        evidence = list(output["sidecars_read"].values())
+        stage_result = StageResult.wrap(
+            result=None,
+            evidence_pointers=[p for p in evidence if p],
+            confidence=50,
+            stage="local_triage",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        envelope = stage_result.to_dict()
+        envelope.pop("result", None)
+        output["stage_result"] = envelope
     return output
 
 
