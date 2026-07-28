@@ -222,6 +222,40 @@ def finalize_turn(
         _cleanup_errors.append(f"save_trajectory: {_save_err}")
         logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
+    # Capture the turn's TOOL CALLS for the evolution pipeline (#1363).
+    #
+    # Distinct from _save_trajectory above: that writes the full ShareGPT
+    # conversation including user prose, this writes call metadata only — tool
+    # name, redacted args, status, truncated result summary.
+    #
+    # Also opt-in, behind HERMES_EVOLUTION_CAPTURE and OFF by default. Redaction
+    # catches credential-shaped keys, not sensitive values in ordinary fields
+    # (a path with a username, an SQL string, an internal hostname all survive
+    # it), so writing on every turn of every interactive session unasked would
+    # be wrong even for metadata. capture_turn() checks the flag itself.
+    #
+    # It exists because the pipeline had no record of what the agent actually
+    # did: evolution_funnel's trajectory contains one entry naming itself.
+    # Seven issues wait on this input, and six PRs were closed for
+    # implementing against a synthetic substitute for it.
+    #
+    # Guarded like every other step here (#8049): a metrics write must never
+    # discard a completed turn's response.
+    try:
+        from agent.tool_call_capture import capture_turn
+
+        capture_turn(
+            messages,
+            session_id=getattr(agent, "session_id", "") or "",
+            task_descriptor=_summarize_user_message_for_log(user_message),
+            completed=completed,
+        )
+    except Exception as _capture_err:
+        _cleanup_errors.append(f"tool_call_capture: {_capture_err}")
+        logger.error(
+            "finalize_turn: tool-call capture failed: %s", _capture_err, exc_info=True
+        )
+
     # Clean up VM and browser for this task after conversation completes
     try:
         agent._cleanup_task_resources(effective_task_id)
