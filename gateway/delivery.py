@@ -55,9 +55,81 @@ def _is_silence_narration(content: Optional[str]) -> bool:
     return bool(_SILENCE_NARRATION.match(stripped))
 
 
-from .config import Platform, GatewayConfig
+from .config import Platform, GatewayConfig, PlatformConfig
 from .session import SessionSource
 from .dead_targets import DeadTargetRegistry
+
+
+@dataclass(frozen=True)
+class DeliveryTransport:
+    """Resolved live transport for one logical delivery platform."""
+
+    adapter: Any
+    config: Optional[PlatformConfig]
+    transport_platform: Platform
+
+    @property
+    def is_relay(self) -> bool:
+        return self.transport_platform == Platform.RELAY
+
+    async def send(
+        self,
+        logical_platform: Platform,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Send through this transport while preserving the logical platform."""
+        if self.is_relay:
+            return await self.adapter.send_for_platform(
+                logical_platform,
+                chat_id,
+                content,
+                metadata=metadata,
+            )
+        return await self.adapter.send(chat_id, content, metadata=metadata)
+
+
+def resolve_delivery_transport(
+    platform: Platform,
+    config: GatewayConfig,
+    adapters: Optional[Dict[Platform, Any]],
+) -> Optional[DeliveryTransport]:
+    """Resolve a logical platform to its live delivery transport.
+
+    A concrete native adapter always wins. Relay is eligible only when its
+    authenticated transport explicitly advertises that it fronts the logical
+    platform, which keeps restart-time delivery independent of per-chat caches
+    without letting Relay hijack unrelated platform targets.
+    """
+    live_adapters = adapters or {}
+    native = live_adapters.get(platform)
+    native_config = config.platforms.get(platform)
+    # Preserve DeliveryRouter's historical support for explicitly supplied live
+    # adapters with no config block, but never let an explicitly disabled native
+    # adapter shadow an enabled Relay transport.
+    if native is not None and (native_config is None or native_config.enabled):
+        return DeliveryTransport(
+            adapter=native,
+            config=native_config,
+            transport_platform=platform,
+        )
+
+    relay = live_adapters.get(Platform.RELAY)
+    relay_config = config.platforms.get(Platform.RELAY)
+    fronts_platform = getattr(relay, "fronts_platform", None)
+    if (
+        relay is not None
+        and (relay_config is None or relay_config.enabled)
+        and callable(fronts_platform)
+        and fronts_platform(platform)
+    ):
+        return DeliveryTransport(
+            adapter=relay,
+            config=relay_config,
+            transport_platform=Platform.RELAY,
+        )
+    return None
 
 
 def looks_like_telegram_private_chat_id(chat_id: Optional[str]) -> bool:
@@ -235,9 +307,13 @@ class DeliveryRouter:
     Handles the logic of resolving delivery targets and dispatching
     messages to the right platform adapters.
     """
-    
-    def __init__(self, config: GatewayConfig, adapters: Dict[Platform, Any] = None,
-                 dead_targets: Optional[DeadTargetRegistry] = None):
+
+    def __init__(
+        self,
+        config: GatewayConfig,
+        adapters: Dict[Platform, Any] = None,
+        dead_targets: Optional[DeadTargetRegistry] = None,
+    ):
         """
         Initialize the delivery router.
 
@@ -251,7 +327,7 @@ class DeliveryRouter:
         self.adapters = adapters or {}
         self.output_dir = get_hermes_home() / "cron" / "output"
         self.dead_targets = dead_targets or DeadTargetRegistry()
-    
+
     async def deliver(
         self,
         content: str,
@@ -289,7 +365,8 @@ class DeliveryRouter:
                 logger.info(
                     "Skipping delivery to known-dead target %s:%s "
                     "(send to it again to clear)",
-                    target.platform.value, target.chat_id,
+                    target.platform.value,
+                    target.chat_id,
                 )
                 results[target.to_string()] = {
                     "success": False,
@@ -305,11 +382,8 @@ class DeliveryRouter:
                     # Successful platform delivery — clear any stale dead flag.
                     if target.chat_id and not _send_result_failed(result):
                         self.dead_targets.clear(target.platform.value, target.chat_id)
-                
-                results[target.to_string()] = {
-                    "success": True,
-                    "result": result
-                }
+
+                results[target.to_string()] = {"success": True, "result": result}
             except Exception as e:
                 # A hard failure raises here. If the platform reported a
                 # whole-chat death, record it so future deliveries short-circuit.
@@ -317,14 +391,12 @@ class DeliveryRouter:
                     dead_kind = _classify_dead_from_error_text(str(e))
                     if dead_kind:
                         self.dead_targets.mark_dead(
-                            target.platform.value, target.chat_id,
+                            target.platform.value,
+                            target.chat_id,
                             reason=f"{dead_kind}: {str(e)[:120]}",
                         )
-                results[target.to_string()] = {
-                    "success": False,
-                    "error": str(e)
-                }
-        
+                results[target.to_string()] = {"success": False, "error": str(e)}
+
         return results
 
     def _deliver_local(
@@ -366,7 +438,7 @@ class DeliveryRouter:
         lines.append("")
         lines.append(content)
 
-        output_path.write_text("\n".join(lines))
+        output_path.write_text("\n".join(lines), encoding="utf-8")
 
         return {"path": str(output_path), "timestamp": timestamp}
 
@@ -376,7 +448,7 @@ class DeliveryRouter:
         out_dir = get_hermes_home() / "cron" / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{job_id}_{timestamp}.txt"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def _save_delivery_fallback(
@@ -428,10 +500,12 @@ class DeliveryRouter:
         self, target: DeliveryTarget, content: str, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
-        adapter = self.adapters.get(target.platform)
-
-        if not adapter:
+        transport = resolve_delivery_transport(
+            target.platform, self.config, self.adapters
+        )
+        if transport is None:
             raise ValueError(f"No adapter configured for {target.platform.value}")
+        adapter = transport.adapter
 
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
@@ -512,6 +586,13 @@ class DeliveryRouter:
             }
 
         send_metadata = dict(metadata or {})
+        if transport.is_relay:
+            home = self.config.get_home_channel(target.platform)
+            if home is not None and home.chat_id == target.chat_id:
+                if home.user_id:
+                    send_metadata["user_id"] = home.user_id
+                if home.scope_id:
+                    send_metadata["scope_id"] = home.scope_id
         is_named_telegram_private_topic = False
         named_telegram_private_topic_name: Optional[str] = None
         if target.thread_id:
@@ -570,8 +651,11 @@ class DeliveryRouter:
                 and not has_explicit_direct_topic
             ):
                 send_metadata["thread_id"] = target_thread_id
-        result = await adapter.send(
-            target.chat_id, content, metadata=send_metadata or None
+        result = await transport.send(
+            target.platform,
+            target.chat_id,
+            content,
+            metadata=send_metadata or None,
         )
         if _send_result_failed(result):
             if (
@@ -595,8 +679,11 @@ class DeliveryRouter:
                     )
                 send_metadata["thread_id"] = str(refreshed_thread_id)
                 send_metadata["telegram_dm_topic_created_for_send"] = True
-                result = await adapter.send(
-                    target.chat_id, content, metadata=send_metadata or None
+                result = await transport.send(
+                    target.platform,
+                    target.chat_id,
+                    content,
+                    metadata=send_metadata or None,
                 )
             if _send_result_failed(result):
                 # Delivery to the platform failed — save the content to a
