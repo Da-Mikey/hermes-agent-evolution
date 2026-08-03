@@ -19,6 +19,13 @@ SILENT_REPLY_TOKEN = "NO_REPLY"
 LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "[SILENT]",
     "SILENT",
+    # Cyrillic transliterations: this fork runs Ukrainian-language cron jobs,
+    # and models answering in Ukrainian emit the transliterated marker rather
+    # than the Latin one. They lived in cron/scheduler.py's own token set
+    # before the two lanes were unified here; folding them in keeps cron
+    # working and extends the same handling to the webhook lane.
+    "[СИЛЕНТ]",
+    "СИЛЕНТ",
     "NO_REPLY",
     "NO REPLY",
 })
