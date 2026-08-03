@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -31,8 +32,16 @@ LIVE_GATEWAY_SILENT_MARKERS = frozenset({
 })
 
 
+# Models occasionally pad the brackets — "[ SILENT ]", "[ СИЛЕНТ ]". The cron
+# lane normalised that away before the two lanes were unified here, and its
+# tests assert it, so the shared canonicaliser has to do the same. Only the
+# bracketed marker shape is collapsed; ordinary prose spacing is untouched.
+_PADDED_SILENCE_BRACKETS = re.compile(r"\[\s*([A-ZА-ЯЇІЄҐ_ ]+?)\s*\]")
+
+
 def _canonical_silence_candidate(text: str) -> str:
-    return " ".join(text.strip().upper().split())
+    collapsed = " ".join(text.strip().upper().split())
+    return _PADDED_SILENCE_BRACKETS.sub(lambda m: f"[{m.group(1).strip()}]", collapsed)
 
 
 def _strip_edge_silence_punctuation(text: str) -> str:

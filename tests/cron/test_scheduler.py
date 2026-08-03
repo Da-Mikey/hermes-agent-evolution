@@ -3017,7 +3017,10 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path):
+        def _script_stub(path, workdir=None):
+            # workdir is upstream's per-job subprocess cwd (v2026.7.30); the
+            # stub accepts and ignores it so this test keeps exercising the
+            # wake-gate, not the signature.
             nonlocal call_count
             call_count += 1
             return (True, "regular output")
