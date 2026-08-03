@@ -405,7 +405,6 @@ from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
 from hermes_cli.subcommands.setup import build_setup_parser
-from hermes_cli.subcommands.postinstall import build_postinstall_parser
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
 from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.login import build_login_parser
@@ -2899,27 +2898,6 @@ def cmd_setup(args):
     from hermes_cli.setup import run_setup_wizard
 
     run_setup_wizard(args)
-
-
-def cmd_postinstall(args):
-    """One-shot bootstrap for pip users: install non-Python deps + run setup."""
-    from hermes_cli.config import stamp_install_method
-    from hermes_cli.dep_ensure import ensure_dependency
-
-    stamp_install_method("pip")
-
-    print("⚕ Hermes post-install bootstrap")
-    print()
-
-    for dep in ("node", "browser", "ripgrep", "ffmpeg"):
-        ensure_dependency(dep)
-
-    if not _has_any_provider_configured():
-        print()
-        cmd_setup(args)
-    else:
-        print()
-        print("✓ Post-install complete.")
 
 
 def cmd_model(args):
@@ -12989,7 +12967,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
+        "model", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -13801,11 +13779,6 @@ def main():
     # setup command  (parser built in hermes_cli/subcommands/setup.py)
     # =========================================================================
     build_setup_parser(subparsers, cmd_setup=cmd_setup)
-
-    # =========================================================================
-    # postinstall command  (parser built in hermes_cli/subcommands/postinstall.py)
-    # =========================================================================
-    build_postinstall_parser(subparsers, cmd_postinstall=cmd_postinstall)
 
     # =========================================================================
     # whatsapp command  (parser built in hermes_cli/subcommands/whatsapp.py)

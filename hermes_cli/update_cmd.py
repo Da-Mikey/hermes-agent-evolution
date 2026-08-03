@@ -3980,6 +3980,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception:
             pass  # honcho plugin not installed or not configured
 
+        # Ensure Turbo-Quant Memory (tqmemory) is installed and registered in
+        # every profile, so the agent's out-of-window memory works in ALL
+        # sessions. Self-healing: a machine that missed MCP registration at
+        # install time recovers here on the next `hermes update` (including the
+        # daily auto-update cron), on every OS. Runs before the gateway restart
+        # below so the restarted gateway picks up the new mcp_servers entry.
+        # Idempotent + non-fatal — tqmemory is optional and must never break an
+        # update. Opt out with HERMES_NO_TQMEMORY=1 / memory.tqmemory_autoinstall.
+        try:
+            from hermes_cli.tqmemory_setup import reconcile_tqmemory
+
+            print()
+            print("→ Ensuring Turbo-Quant Memory (tqmemory) is configured...")
+            reconcile_tqmemory(quiet=False)
+        except Exception as e:
+            logger.debug("tqmemory reconcile during update failed: %s", e)
+
         # Check for config migrations
         print()
         print("→ Checking configuration for new options...")
