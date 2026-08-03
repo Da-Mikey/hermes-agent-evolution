@@ -21,47 +21,43 @@ if TYPE_CHECKING:  # avoid a circular import; policy_interceptors imports this m
     from agent.recheck_suppression import RecheckController
 
 
-IDEMPOTENT_TOOL_NAMES = frozenset(
-    {
-        "read_file",
-        "search_files",
-        "web_search",
-        "web_extract",
-        "session_search",
-        "browser_snapshot",
-        "browser_console",
-        "browser_get_images",
-        "mcp_filesystem_read_file",
-        "mcp_filesystem_read_text_file",
-        "mcp_filesystem_read_multiple_files",
-        "mcp_filesystem_list_directory",
-        "mcp_filesystem_list_directory_with_sizes",
-        "mcp_filesystem_directory_tree",
-        "mcp_filesystem_get_file_info",
-        "mcp_filesystem_search_files",
-    }
-)
+IDEMPOTENT_TOOL_NAMES = frozenset({
+    "read_file",
+    "search_files",
+    "web_search",
+    "web_extract",
+    "session_search",
+    "browser_snapshot",
+    "browser_console",
+    "browser_get_images",
+    "mcp_filesystem_read_file",
+    "mcp_filesystem_read_text_file",
+    "mcp_filesystem_read_multiple_files",
+    "mcp_filesystem_list_directory",
+    "mcp_filesystem_list_directory_with_sizes",
+    "mcp_filesystem_directory_tree",
+    "mcp_filesystem_get_file_info",
+    "mcp_filesystem_search_files",
+})
 
-MUTATING_TOOL_NAMES = frozenset(
-    {
-        "terminal",
-        "execute_code",
-        "write_file",
-        "patch",
-        "todo",
-        "memory",
-        "skill_manage",
-        "browser_click",
-        "browser_type",
-        "browser_press",
-        "browser_scroll",
-        "browser_navigate",
-        "send_message",
-        "cronjob",
-        "delegate_task",
-        "process",
-    }
-)
+MUTATING_TOOL_NAMES = frozenset({
+    "terminal",
+    "execute_code",
+    "write_file",
+    "patch",
+    "todo",
+    "memory",
+    "skill_manage",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_scroll",
+    "browser_navigate",
+    "send_message",
+    "cronjob",
+    "delegate_task",
+    "process",
+})
 
 # #974/#969/#970 — tools whose retry spirals are the system's largest failure
 # sources. Trace-miner evidence: terminal (1237 failures / 410 sessions),
@@ -83,27 +79,25 @@ MUTATING_TOOL_NAMES = frozenset(
 # had no circuit breaker — the agent blind-retried the same failing call up
 # to 13 consecutive times with no fallback. Extending the existing cap covers
 # the whole deferred-tool chain consistently with the core tools.
-_SPIRAL_PRONE_TOOLS = frozenset(
-    {
-        "terminal",
-        "execute_code",
-        "read_file",
-        "process",
-        "search_files",
-        "tool_call",
-        "tool_describe",
-        "memory",
-        # #1258 — patch tool failures: 255 failures in 7d. Patch failures are
-        # deterministic (no-match, ambiguous, identical-edit) — the model
-        # retries the same stale old_string without re-reading the file. The
-        # fallback directive ("use read_file to verify the exact text before
-        # patching, or use write_file") is already defined at line 751.
-        # Adding patch here activates the always-on spiral_failure_cap (default
-        # 5) that halts the turn regardless of hard_stop_enabled, bounding the
-        # retry spiral and forcing a strategy switch.
-        "patch",
-    }
-)
+_SPIRAL_PRONE_TOOLS = frozenset({
+    "terminal",
+    "execute_code",
+    "read_file",
+    "process",
+    "search_files",
+    "tool_call",
+    "tool_describe",
+    "memory",
+    # #1258 — patch tool failures: 255 failures in 7d. Patch failures are
+    # deterministic (no-match, ambiguous, identical-edit) — the model
+    # retries the same stale old_string without re-reading the file. The
+    # fallback directive ("use read_file to verify the exact text before
+    # patching, or use write_file") is already defined at line 751.
+    # Adding patch here activates the always-on spiral_failure_cap (default
+    # 5) that halts the turn regardless of hard_stop_enabled, bounding the
+    # retry spiral and forcing a strategy switch.
+    "patch",
+})
 
 # #1585 — number of consecutive successes required before a spiral-prone
 # tool's cross-turn failure streak decays by 1. The production terminal
@@ -154,8 +148,11 @@ class ToolCallGuardrailConfig:
     spiral_prone_tools: frozenset[str] = field(
         default_factory=lambda: _SPIRAL_PRONE_TOOLS
     )
-    idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
+    idempotent_tools: frozenset[str] = field(
+        default_factory=lambda: IDEMPOTENT_TOOL_NAMES
+    )
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
+    loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
@@ -172,30 +169,44 @@ class ToolCallGuardrailConfig:
 
         defaults = cls()
         return cls(
-            warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
-            hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
+            warnings_enabled=_as_bool(
+                data.get("warnings_enabled"), defaults.warnings_enabled
+            ),
+            hard_stop_enabled=_as_bool(
+                data.get("hard_stop_enabled"), defaults.hard_stop_enabled
+            ),
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
             ),
             same_tool_failure_warn_after=_positive_int(
-                warn_after.get("same_tool_failure", data.get("same_tool_failure_warn_after")),
+                warn_after.get(
+                    "same_tool_failure", data.get("same_tool_failure_warn_after")
+                ),
                 defaults.same_tool_failure_warn_after,
             ),
             no_progress_warn_after=_positive_int(
-                warn_after.get("idempotent_no_progress", data.get("no_progress_warn_after")),
+                warn_after.get(
+                    "idempotent_no_progress", data.get("no_progress_warn_after")
+                ),
                 defaults.no_progress_warn_after,
             ),
             exact_failure_block_after=_positive_int(
-                hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
+                hard_stop_after.get(
+                    "exact_failure", data.get("exact_failure_block_after")
+                ),
                 defaults.exact_failure_block_after,
             ),
             same_tool_failure_halt_after=_positive_int(
-                hard_stop_after.get("same_tool_failure", data.get("same_tool_failure_halt_after")),
+                hard_stop_after.get(
+                    "same_tool_failure", data.get("same_tool_failure_halt_after")
+                ),
                 defaults.same_tool_failure_halt_after,
             ),
             no_progress_block_after=_positive_int(
-                hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
+                hard_stop_after.get(
+                    "idempotent_no_progress", data.get("no_progress_block_after")
+                ),
                 defaults.no_progress_block_after,
             ),
             browser_failure_cap=_non_negative_int(
@@ -205,6 +216,54 @@ class ToolCallGuardrailConfig:
             spiral_failure_cap=_non_negative_int(
                 data.get("spiral_failure_cap"),
                 defaults.spiral_failure_cap,
+            ),
+            loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
+        )
+
+
+# Default session-wide caps, matching Claude Code's v2.1.212 runaway-loop
+# Per-turn (per-agent-loop) caps on runaway-prone tool calls. Counts reset at
+# the start of every agent loop (reset_for_turn), so the limit is "within a
+# single turn" rather than cumulative over the whole session. A single loop
+# issuing dozens of web searches or spawning dozens of subagents is already
+# pathological, so the defaults are deliberately low.
+_DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
+_DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+
+
+@dataclass(frozen=True)
+class LoopCapConfig:
+    """Per-turn caps on runaway-prone tool calls.
+
+    Inspired by Claude Code v2.1.212 (Week 29, July 2026), which added caps on
+    WebSearch calls and subagent spawns to stop runaway search / delegation
+    loops. Here the caps count *within a single agent loop* (one turn): the
+    counters reset in ``reset_for_turn`` at the start of every
+    ``run_conversation``, so a legitimate multi-turn session is never starved,
+    but a single turn that spirals into an unbounded search / delegation loop
+    is stopped.
+
+    Semantics differ from the per-turn loop *detector* above (which keys on
+    repeated identical/failing calls): these caps are a hard ceiling on the
+    total count of a tool within the turn and fire regardless of
+    ``hard_stop_enabled``. A value of ``0`` disables the cap (unlimited).
+    """
+
+    max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
+    max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
+        """Build config from the ``tool_loop_guardrails.loop_caps`` section."""
+        if not isinstance(data, Mapping):
+            return cls()
+        defaults = cls()
+        return cls(
+            max_web_searches=_non_negative_int(
+                data.get("max_web_searches"), defaults.max_web_searches
+            ),
+            max_subagents=_non_negative_int(
+                data.get("max_subagents"), defaults.max_subagents
             ),
         )
 
@@ -217,7 +276,9 @@ class ToolCallSignature:
     args_hash: str
 
     @classmethod
-    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
+    def from_call(
+        cls, tool_name: str, args: Mapping[str, Any] | None
+    ) -> "ToolCallSignature":
         canonical = canonical_tool_args(args or {})
         return cls(tool_name=tool_name, args_hash=_sha256(canonical))
 
@@ -303,7 +364,9 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     if tool_name == "memory":
         data = safe_json_loads(result)
         if isinstance(data, dict):
-            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
+            if data.get("success") is False and "exceed the limit" in data.get(
+                "error", ""
+            ):
                 return True, " [full]"
 
     # #1188 — mirror the bot_detection_warning check from _detect_tool_failure
@@ -368,12 +431,19 @@ class ToolCallGuardrailController:
         self._last_call_succeeded: bool = False
         if self.policy_registry is not None:
             self.policy_registry.reset_for_turn()
+        # Per-turn runaway-loop cap counters. Reset every turn (this method
+        # runs at the start of each run_conversation), so the caps bound a
+        # single agent loop rather than accumulating across the session.
+        self._turn_web_search_count = 0
+        self._turn_subagent_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
-    def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
+    def before_call(
+        self, tool_name: str, args: Mapping[str, Any] | None
+    ) -> ToolGuardrailDecision:
         # Policy interceptors run first and apply regardless of hard_stop_enabled:
         # a denied policy is a deterministic user rule, not a loop limit.
         if self.policy_registry is not None and self.policy_registry.enabled:
@@ -393,20 +463,23 @@ class ToolCallGuardrailController:
         # same failing call again.  reset_for_turn clears _halt_decision but
         # NOT _cross_turn_tool_failure_counts, so the streak survives.
         cross_turn_count = self._cross_turn_tool_failure_counts.get(tool_name, 0)
-        if (
-            cross_turn_count >= 1
-            and (
-                (self.config.spiral_failure_cap >= 1
-                 and tool_name in self.config.spiral_prone_tools
-                 and cross_turn_count >= self.config.spiral_failure_cap)
-                or
-                (self.config.browser_failure_cap >= 1
-                 and _is_browser_tool(tool_name)
-                 and cross_turn_count >= self.config.browser_failure_cap)
+        if cross_turn_count >= 1 and (
+            (
+                self.config.spiral_failure_cap >= 1
+                and tool_name in self.config.spiral_prone_tools
+                and cross_turn_count >= self.config.spiral_failure_cap
+            )
+            or (
+                self.config.browser_failure_cap >= 1
+                and _is_browser_tool(tool_name)
+                and cross_turn_count >= self.config.browser_failure_cap
             )
         ):
             directive = _fallback_directive_for(tool_name)
-            if _is_browser_tool(tool_name) and tool_name not in self.config.spiral_prone_tools:
+            if (
+                _is_browser_tool(tool_name)
+                and tool_name not in self.config.spiral_prone_tools
+            ):
                 code = "browser_tool_failure_cap"
                 cap = self.config.browser_failure_cap
             else:
@@ -465,6 +538,15 @@ class ToolCallGuardrailController:
                     count=0,
                     signature=signature,
                 )
+        # ── Per-turn runaway-loop caps ──────────────────────────────────
+        # These are hard ceilings on how many times a runaway-prone tool may
+        # be called within a single agent loop (turn). They apply regardless
+        # of hard_stop_enabled (which only governs the per-turn loop detector).
+        # We block BEFORE the call runs once the count is already at the cap,
+        # then increment for an allowed call so the (cap+1)-th is refused.
+        cap_block = self._check_loop_cap(tool_name, _coerce_args(args), signature)
+        if cap_block is not None:
+            return cap_block
 
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
@@ -544,7 +626,9 @@ class ToolCallGuardrailController:
             # each API turn, so without this cross-turn tracker the cap
             # only catches rare within-turn spirals (multiple calls in one
             # tool batch).  Here we carry the streak forward.
-            cross_turn_count = self._cross_turn_tool_failure_counts.get(tool_name, 0) + 1
+            cross_turn_count = (
+                self._cross_turn_tool_failure_counts.get(tool_name, 0) + 1
+            )
             self._cross_turn_tool_failure_counts[tool_name] = cross_turn_count
             # #1585 — a failure breaks the consecutive-success chain, so the
             # sustained-recovery counter restarts from zero.
@@ -615,7 +699,10 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
 
-            if self.config.hard_stop_enabled and effective_streak >= self.config.same_tool_failure_halt_after:
+            if (
+                self.config.hard_stop_enabled
+                and effective_streak >= self.config.same_tool_failure_halt_after
+            ):
                 decision = ToolGuardrailDecision(
                     action="halt",
                     code="same_tool_failure_halt",
@@ -631,7 +718,10 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
 
-            if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
+            if (
+                self.config.warnings_enabled
+                and exact_count >= self.config.exact_failure_warn_after
+            ):
                 return ToolGuardrailDecision(
                     action="warn",
                     code="repeated_exact_failure_warning",
@@ -646,7 +736,10 @@ class ToolCallGuardrailController:
                     fallback_directive=_fallback_directive_for(tool_name),
                 )
 
-            if self.config.warnings_enabled and effective_streak >= self.config.same_tool_failure_warn_after:
+            if (
+                self.config.warnings_enabled
+                and effective_streak >= self.config.same_tool_failure_warn_after
+            ):
                 return ToolGuardrailDecision(
                     action="warn",
                     code="same_tool_failure_warning",
@@ -657,7 +750,9 @@ class ToolCallGuardrailController:
                     fallback_directive=_fallback_directive_for(tool_name),
                 )
 
-            return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
+            return ToolGuardrailDecision(
+                tool_name=tool_name, count=exact_count, signature=signature
+            )
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
@@ -713,7 +808,10 @@ class ToolCallGuardrailController:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
 
-        if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
+        if (
+            self.config.warnings_enabled
+            and repeat_count >= self.config.no_progress_warn_after
+        ):
             return ToolGuardrailDecision(
                 action="warn",
                 code="idempotent_no_progress_warning",
@@ -727,12 +825,76 @@ class ToolCallGuardrailController:
                 signature=signature,
             )
 
-        return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+        return ToolGuardrailDecision(
+            tool_name=tool_name, count=repeat_count, signature=signature
+        )
 
     def _is_idempotent(self, tool_name: str) -> bool:
         if tool_name in self.config.mutating_tools:
             return False
         return tool_name in self.config.idempotent_tools
+
+    def _check_loop_cap(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any],
+        signature: ToolCallSignature,
+    ) -> ToolGuardrailDecision | None:
+        """Enforce and advance the per-turn runaway-loop counters.
+
+        Returns a ``block`` decision when the cap is already reached, otherwise
+        increments the relevant counter for the allowed call and returns
+        ``None``. A cap of 0 disables that limit entirely. Counters reset each
+        turn via ``reset_for_turn``.
+        """
+        caps = self.config.loop_caps
+
+        if tool_name == "web_search":
+            cap = caps.max_web_searches
+            if cap and self._turn_web_search_count >= cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_web_search_cap",
+                    message=(
+                        f"Blocked web_search: this turn has already made {cap} "
+                        "web searches, the per-turn limit. This looks like a "
+                        "runaway search loop. Work with the results you already "
+                        "have and give the user your answer."
+                    ),
+                    tool_name=tool_name,
+                    count=self._turn_web_search_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            self._turn_web_search_count += 1
+            return None
+
+        if tool_name == "delegate_task":
+            cap = caps.max_subagents
+            if not cap:
+                return None
+            spawn_count = _subagent_spawn_count(args)
+            if self._turn_subagent_count >= cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_subagent_cap",
+                    message=(
+                        f"Blocked delegate_task: this turn has already spawned "
+                        f"{self._turn_subagent_count} subagents (limit {cap}). "
+                        "This looks like a runaway delegation loop. Finish the "
+                        "work with the results you have and answer the user."
+                    ),
+                    tool_name=tool_name,
+                    count=self._turn_subagent_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            self._turn_subagent_count += spawn_count
+            return None
+
+        return None
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
@@ -762,8 +924,7 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
         return result
     label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
     suffix = (
-        f"\n\n[{label}: "
-        f"{decision.code}; count={decision.count}; {decision.message}]"
+        f"\n\n[{label}: {decision.code}; count={decision.count}; {decision.message}]"
     )
     if decision.fallback_directive:
         suffix += f"\n[Fallback directive: {decision.fallback_directive}]"
@@ -907,8 +1068,9 @@ def _positive_int(value: Any, default: int) -> int:
 
 
 def _non_negative_int(value: Any, default: int) -> int:
-    """Like ``_positive_int`` but allows ``0`` (used to DISABLE the browser
-    failure cap). Negative values fall back to the default."""
+    """Parse a session-cap value. 0 is a valid (disable) value; negatives and
+    junk fall back to the default. Used for caps where 0 means DISABLE (e.g.
+    the browser failure cap), unlike ``_positive_int``."""
     if value is None:
         return default
     try:
@@ -916,6 +1078,20 @@ def _non_negative_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
+    """How many subagents a single delegate_task call spawns.
+
+    delegate_task runs in one of two modes: a batch (``tasks`` is a non-empty
+    list, one child per item) or a single task (``goal``). Count the batch size
+    when present, otherwise 1, so the session subagent cap reflects real spawns
+    rather than delegate_task invocations.
+    """
+    tasks = args.get("tasks") if isinstance(args, Mapping) else None
+    if isinstance(tasks, list) and tasks:
+        return len(tasks)
+    return 1
 
 
 def _sha256(value: str) -> str:
