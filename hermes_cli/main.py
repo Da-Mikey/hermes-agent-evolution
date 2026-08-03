@@ -734,6 +734,84 @@ from hermes_cli import __version__, __release_date__
 # Provider model-selection wizard flows extracted to hermes_cli/model_setup_flows.py
 # (god-file decomposition Phase 2). Re-imported here so select_provider_and_model and
 # existing test monkeypatches (hermes_cli.main._model_flow_*) keep resolving unchanged.
+# Update-flow helpers live in hermes_cli/update_cmd.py since upstream split
+# them out of this module. Re-exported here because callers and tests still
+# import them from hermes_cli.main (upstream re-exports them the same way).
+from hermes_cli.update_cmd import (  # noqa: F401
+    _add_upstream_remote,
+    _atomic_replace_dir,
+    _capture_head_sha,
+    _cmd_update_check,
+    _cmd_update_impl,
+    _cold_start_windows_gateway_after_update,
+    _count_commits_between,
+    _detect_venv_python_processes,
+    _discard_lockfile_churn,
+    _discard_stashed_changes,
+    _ensure_acp_launcher,
+    _ensure_fhs_path_guard,
+    _ensure_uv_for_termux,
+    _finish_dashboard_update_cleanup,
+    _for_each_systemd_gateway_unit,
+    _format_concurrent_instances_message,
+    _format_time_ago,
+    _format_venv_python_holders_message,
+    _gateway_prompt,
+    _get_origin_url,
+    _has_upstream_remote,
+    _install_psutil_android_compat,
+    _invalidate_update_cache,
+    _is_android_python,
+    _is_fork,
+    _log_only_write,
+    _mark_skip_upstream_prompt,
+    _npm_bin_exists,
+    _npm_lockfile_changed,
+    _npm_manifest_paths,
+    _npm_manifests_digest,
+    _pause_windows_gateways_for_update,
+    _print_curator_first_run_notice,
+    _print_curator_recent_run_notice,
+    _print_fts_optimize_available_notice,
+    _print_stash_cleanup_guidance,
+    _record_npm_lockfile_hash,
+    _refresh_active_lazy_features,
+    _refresh_active_memory_provider_dependencies,
+    _refresh_windows_gateway_launchers,
+    _reload_updated_runtime_modules,
+    _resolve_pre_update_backup_mode,
+    _resolve_stash_selector,
+    _restore_stashed_changes,
+    _resume_windows_gateways_after_update,
+    _run_logged_subprocess,
+    _run_pre_update_backup,
+    _should_skip_upstream_prompt,
+    _stash_apply_failed_only_on_existing_untracked,
+    _stash_local_changes_if_needed,
+    _sync_fork_with_upstream,
+    _sync_with_upstream_if_needed,
+    _update_node_dependencies,
+    _update_via_zip,
+    _upgrade_pip_before_lazy_refresh,
+    _validate_critical_files_syntax,
+    _venv_core_imports_healthy,
+    _wait_for_windows_update_gateway_exit,
+    _warn_incomplete_gateway_fleet_restart,
+    _web_build_toolchain_ready,
+    _web_toolchain_roots,
+    _write_lazy_refresh_incomplete_marker,
+    _write_marker_file,
+    _write_update_incomplete_marker,
+    _write_update_planned_stop_marker,
+    _UPDATE_RUNTIME_RELOAD_MODULES,
+    _UPDATE_CRITICAL_FILES,
+    OFFICIAL_REPO_URLS,
+    OFFICIAL_REPO_URL,
+    SKIP_UPSTREAM_PROMPT_FILE,
+    _PRE_UPDATE_SNAPSHOT_KEEP,
+    _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+)
+
 from hermes_cli.model_setup_flows import (
     _prompt_auth_credentials_choice,
     _model_flow_openrouter,
@@ -15614,6 +15692,154 @@ def main():
     else:
         parser.print_help()
 
+
+
+# ── Helpers upstream added in v2026.7.30 ─────────────────────────────
+# Defined in upstream's hermes_cli/main.py rather than update_cmd.py, so the
+# re-export block above does not cover them. Carried over verbatim.
+
+def _size_delta_label(saved_mb: float) -> str:
+    """Human label for a before/after database size delta, in MB.
+
+    A negative delta means the file GREW — concurrent session writes during a
+    long optimize can outweigh what the rebuild freed. Printing
+    "reclaimed -163.0 MB" for that reads as data loss, so say "grew by"
+    instead.
+    """
+    if saved_mb >= 0:
+        return f"reclaimed {saved_mb:.1f} MB"
+    return f"grew by {-saved_mb:.1f} MB"
+
+
+def _read_ssh_session_token_file(path: str) -> str:
+    """Read and unlink a Desktop SSH token from its private runtime directory."""
+    if sys.platform == "win32":
+        from hermes_cli.windows_ssh_runtime import read_token
+
+        return read_token(path)
+
+    import stat as _stat
+    from pathlib import Path as _Path
+    from hermes_constants import get_hermes_home as _get_hermes_home
+
+    if not os.path.isabs(path):
+        raise SystemExit("--ssh-session-token-file must be absolute")
+
+    token_path = _Path(path)
+    token_root = _get_hermes_home() / "desktop-ssh"
+    try:
+        relative = token_path.relative_to(token_root)
+    except ValueError as exc:
+        raise SystemExit(
+            "--ssh-session-token-file must be under the desktop-ssh directory"
+        ) from exc
+    if len(relative.parts) != 2 or not re.fullmatch(r"[0-9a-f]{32}", relative.parts[0]):
+        raise SystemExit("--ssh-session-token-file has an invalid runtime path")
+    if not re.fullmatch(r"[0-9a-f]{16}\.token", relative.parts[1]):
+        raise SystemExit("--ssh-session-token-file has an invalid filename")
+
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = -1
+    directory_fd = -1
+    file_fd = -1
+    try:
+        try:
+            root_fd = os.open(token_root, directory_flags)
+            root_stat = os.fstat(root_fd)
+            if not _stat.S_ISDIR(root_stat.st_mode):
+                raise SystemExit("--ssh-session-token-file has an unsafe runtime root")
+            if hasattr(os, "getuid") and root_stat.st_uid != os.getuid():
+                raise SystemExit(
+                    "--ssh-session-token-file runtime root has the wrong owner"
+                )
+            directory_fd = os.open(relative.parts[0], directory_flags, dir_fd=root_fd)
+            directory_stat = os.fstat(directory_fd)
+            if not _stat.S_ISDIR(directory_stat.st_mode):
+                raise SystemExit(
+                    "--ssh-session-token-file has an unsafe parent directory"
+                )
+            if hasattr(os, "getuid") and directory_stat.st_uid != os.getuid():
+                raise SystemExit("--ssh-session-token-file parent has the wrong owner")
+            if (directory_stat.st_mode & 0o777) != 0o700:
+                raise SystemExit(
+                    "--ssh-session-token-file parent has unsafe permissions"
+                )
+            file_fd = os.open(relative.parts[1], file_flags, dir_fd=directory_fd)
+        except SystemExit:
+            raise
+        except OSError as exc:
+            if exc.errno == getattr(__import__("errno"), "ELOOP", -1):
+                raise SystemExit("--ssh-session-token-file is a symlink") from exc
+            raise SystemExit("--ssh-session-token-file is not accessible") from exc
+
+        file_stat = os.fstat(file_fd)
+        if not _stat.S_ISREG(file_stat.st_mode):
+            raise SystemExit("--ssh-session-token-file is not a regular file")
+        if file_stat.st_size != 64:
+            raise SystemExit("--ssh-session-token-file contains an invalid token")
+        if hasattr(os, "getuid") and file_stat.st_uid != os.getuid():
+            raise SystemExit("--ssh-session-token-file has the wrong owner")
+        if hasattr(os, "getuid") and (file_stat.st_mode & 0o777) & ~0o600:
+            raise SystemExit("--ssh-session-token-file has unsafe permissions")
+
+        with os.fdopen(file_fd, "r") as token_stream:
+            file_fd = -1
+            token = token_stream.read(65)
+
+        if not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise SystemExit("--ssh-session-token-file contains an invalid token")
+        return token
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if directory_fd >= 0:
+            try:
+                os.unlink(relative.parts[1], dir_fd=directory_fd)
+            except OSError:
+                pass
+            os.close(directory_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
+    """Materialize the deferred platform whose top-level CLI command matches.
+
+    Bundled platform plugins are cheap-registered as *deferred* entries to
+    avoid importing every gateway SDK during normal startup. A platform that
+    registers a top-level ``hermes <name>`` command (e.g. Photon ->
+    ``ctx.register_cli_command(name="photon", ...)``) only runs that side
+    effect when its module is imported. On the unknown-top-level-command slow
+    path, ``discover_plugins()`` records the deferred loader but does not
+    import it, so the CLI registration never happens and ``hermes photon``
+    fails with argparse ``invalid choice`` (issue #54678).
+
+    Resolving only the platform whose name matches the first positional token
+    keeps normal startup cheap while making the targeted command available.
+    """
+    if not command_name:
+        return
+    try:
+        from gateway.platform_registry import platform_registry
+
+        platform_registry.get(command_name)
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "Deferred platform CLI resolution failed for %s: %s",
+            command_name,
+            exc,
+        )
+
+
+_AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+_AGENT_SUBCOMMANDS = {
+    "cron": ("cron_command", {"run", "tick"}),
+    "gateway": ("gateway_command", {"run"}),
+    "mcp": ("mcp_action", {"serve"}),
+}
 
 if __name__ == "__main__":
     main()
