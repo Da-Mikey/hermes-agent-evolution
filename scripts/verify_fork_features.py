@@ -56,12 +56,16 @@ CODE_PATHS = [
 
 _MARKER_RE = re.compile(rb"#[0-9]{3,5}")
 
-# Upstream issue numbers are five digits and climbing (#68217); this fork's are
-# three or four (#102 .. #1640). A marker above this ceiling references an
-# upstream issue, so upstream owns it even when it currently appears in our
-# tree and not in theirs — which happens whenever upstream rewrites the comment
-# after our merge-base. Without the ceiling those show up as "fork features we
-# lost", which is the opposite of the truth.
+# A marker present at the MERGE-BASE predates the fork, so it is upstream's no
+# matter what — this is the exact test, and it is why ``snapshot`` takes a
+# --base. The numeric ceiling below is only a coarse fallback for when no base
+# ref is supplied: upstream issue numbers are five digits and climbing
+# (#68217), this fork's are three or four (#102 .. #1640).
+#
+# Both filters exist because "in our tree, not in upstream's HEAD" is NOT
+# sufficient on its own: upstream routinely rewrites a comment after our
+# merge-base, which makes their own marker look fork-only and reports a
+# feature loss that never happened.
 MAX_FORK_ISSUE = 9999
 
 
@@ -107,19 +111,22 @@ def _worktree_markers() -> set[str]:
 def cmd_snapshot(args: argparse.Namespace) -> int:
     fork_markers = _markers_in(args.fork)
     upstream_markers = _markers_in(args.upstream)
-    owned_markers = sorted(fork_markers - upstream_markers)
+    base_markers = _markers_in(args.base) if args.base else set()
+    owned_markers = sorted(fork_markers - upstream_markers - base_markers)
 
     fork_files = _files_in(args.fork)
     upstream_files = _files_in(args.upstream)
+    base_files = _files_in(args.base) if args.base else set()
     owned_files = sorted(
         f
-        for f in (fork_files - upstream_files)
+        for f in (fork_files - upstream_files - base_files)
         if any(f.startswith(p) for p in CODE_PATHS)
     )
 
     payload = {
         "fork_ref": args.fork,
         "upstream_ref": args.upstream,
+        "base_ref": args.base,
         "fork_head": _git("rev-parse", args.fork).strip(),
         "upstream_head": _git("rev-parse", args.upstream).strip(),
         "owned_markers": owned_markers,
@@ -176,6 +183,14 @@ def main() -> int:
     snap = sub.add_parser("snapshot", help="record what the fork owns")
     snap.add_argument("--fork", default="origin/main")
     snap.add_argument("--upstream", default="upstream/main")
+    snap.add_argument(
+        "--base",
+        default=None,
+        help=(
+            "merge-base ref. Anything present here predates the fork, so it is "
+            "upstream's — the exact ownership test. Strongly recommended."
+        ),
+    )
     snap.add_argument("-o", "--output", default=".evolution/fork-baseline.json")
     snap.set_defaults(func=cmd_snapshot)
 
