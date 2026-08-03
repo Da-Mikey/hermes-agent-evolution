@@ -110,12 +110,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
     # users never pay this import.
     "provider.azure_identity": ("azure-identity==1.25.3",),
-
     # ─── Web search backends ───────────────────────────────────────────────
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
-
     # ─── Monitoring ─────────────────────────────────────────────────────────
     # OTLP gateway monitoring export. Lazily installed on first use of
     # monitoring.gateway_health_export / monitoring.export.otlp. Tracks the
@@ -124,7 +122,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "opentelemetry-sdk==1.39.1",
         "opentelemetry-exporter-otlp-proto-http==1.39.1",
     ),
-
     # ─── TTS providers ─────────────────────────────────────────────────────
     # Pinned to exact versions to match pyproject.toml's no-ranges policy
     # (see comment at top of [project.dependencies]). When bumping, update
@@ -137,7 +134,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tts.mistral": ("mistralai==2.4.8",),
     "tts.edge": ("edge-tts==7.2.7",),
     "tts.elevenlabs": ("elevenlabs==1.59.0",),
-
     # ─── Speech-to-text providers ──────────────────────────────────────────
     "stt.mistral": ("mistralai==2.4.8",),
     "stt.faster_whisper": (
@@ -148,7 +144,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # SILK voice-note decoding (WeChat/QQ .silk voice messages). pilk is a
     # small silk-v3 codec binding; installed on first .silk transcription.
     "stt.silk": ("pilk==0.2.4",),
-
     # ─── Wake word ("Hey Hermes") engines ──────────────────────────────────
     # Keep in sync with the `wake` extra in pyproject.toml. openWakeWord is the
     # free, local default (ONNX runtime); Porcupine is the premium engine.
@@ -159,9 +154,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # It lives in its own feature because lazy-dep specs cannot carry PEP 508
     # environment markers (_spec_is_safe rejects ";"), so the platform gate is
     # applied by the caller instead.
-    "wake.openwakeword.tflite": (
-        "ai-edge-litert==2.1.6",
-    ),
+    "wake.openwakeword.tflite": ("ai-edge-litert==2.1.6",),
     "wake.openwakeword": (
         "openwakeword==0.6.0",
         "onnxruntime==1.27.0",
@@ -182,10 +175,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
-
     # ─── Image generation backends ─────────────────────────────────────────
     "image.fal": ("fal-client==0.13.1",),
-
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
     "memory.hindsight": ("hindsight-client==0.6.1",),
@@ -198,7 +189,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # instance and the provider silently reports itself unavailable.
     "memory.supermemory": ("supermemory==3.50.0",),
     "memory.mem0": ("mem0ai==2.0.10",),
-
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
     # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for
@@ -247,13 +237,14 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
-
+    "platform.teams": (
+        "microsoft-teams-apps==2.0.13.4",
+        "aiohttp==3.14.1",
+    ),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
     "terminal.daytona": ("daytona==0.155.0",),
     "terminal.vercel": ("vercel==0.7.2",),
-
     # ─── Skills ────────────────────────────────────────────────────────────
     "skill.google_workspace": (
         "google-api-python-client==2.194.0",
@@ -261,7 +252,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "google-auth-httplib2==0.3.1",
     ),
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
-
     # ─── Tools ─────────────────────────────────────────────────────────────
     # ACP adapter (VS Code / Zed / JetBrains integration)
     "tool.acp": ("agent-client-protocol==0.9.0",),
@@ -278,7 +268,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
     "tool.vision": ("Pillow==12.2.0",),
-
     # ─── Telemetry ─────────────────────────────────────────────────────────
     # Opt-in OpenTelemetry export (#167). Resolved at first use only when
     # telemetry.otel.enabled in config.yaml; the call site (hermes_telemetry
@@ -321,8 +310,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 # version range. Reject anything that looks like a URL, file path, or shell
 # metacharacter.
 _SAFE_SPEC = re.compile(
-    r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*"        # package name
-    r"(?:\[[A-Za-z0-9_,\-]+\])?"            # optional [extras]
+    r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*"  # package name
+    r"(?:\[[A-Za-z0-9_,\-]+\])?"  # optional [extras]
     r"(?:[<>=!~]=?[A-Za-z0-9_.\-+,*<>=!~]+)?"  # optional version specifier
     r"$"
 )
@@ -427,7 +416,9 @@ def _ensure_target_ready(target: Path) -> Optional[str]:
                 logger.info(
                     "Lazy install target %s was built for ABI %r but running "
                     "ABI is %r; wiping stale packages.",
-                    target, have, want,
+                    target,
+                    have,
+                    want,
                 )
                 for child in target.iterdir():
                     if child.is_dir() and not child.is_symlink():
@@ -468,6 +459,7 @@ def _activate_target_on_syspath(target: Path) -> None:
     # so a just-activated dir is visible to version() checks this process.
     try:
         import importlib
+
         importlib.invalidate_caches()
     except Exception:
         pass
@@ -512,6 +504,7 @@ def _allow_lazy_installs() -> bool:
     # (1) Config kill switch wins in every mode.
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config()
     except Exception:
         cfg = None
@@ -577,7 +570,7 @@ def _specifier_from_spec(spec: str) -> str:
     m = re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*(?:\[[A-Za-z0-9_,\-]+\])?", spec)
     if not m:
         return ""
-    return spec[m.end():]
+    return spec[m.end() :]
 
 
 def _is_satisfied(spec: str) -> bool:
@@ -669,6 +662,7 @@ def _core_constraints_file() -> Optional[Path]:
         return None
     try:
         import tempfile
+
         lines = []
         seen = set()
         for dist in distributions():
@@ -731,6 +725,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     try:
         venv_root = Path(sys.executable).parent.parent
         from tools.environments.local import hermes_subprocess_env
+
         uv_env = hermes_subprocess_env(inherit_credentials=False)
         uv_env["VIRTUAL_ENV"] = str(venv_root)
 
@@ -740,7 +735,12 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             try:
                 r = subprocess.run(
                     [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    env=uv_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
                 )
@@ -757,7 +757,11 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         try:
             probe = subprocess.run(
                 pip_cmd + ["--version"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
             )
@@ -767,18 +771,28 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             try:
                 subprocess.run(
                     [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
+                    check=True,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                return _InstallResult(False, "",
-                                      f"pip not available and ensurepip failed: {e}")
+                return _InstallResult(
+                    False, "", f"pip not available and ensurepip failed: {e}"
+                )
 
         try:
             r = subprocess.run(
                 pip_cmd + ["install", *target_args, *constraint_args, *specs],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
             )
@@ -844,14 +858,14 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     for spec in missing:
         if not _spec_is_safe(spec):
             raise FeatureUnavailable(
-                feature, missing,
-                f"refusing to install unsafe spec {spec!r}"
+                feature, missing, f"refusing to install unsafe spec {spec!r}"
             )
 
     if not _allow_lazy_installs():
         raise FeatureUnavailable(
-            feature, missing,
-            "lazy installs disabled (security.allow_lazy_installs=false)"
+            feature,
+            missing,
+            "lazy installs disabled (security.allow_lazy_installs=false)",
         )
 
     # Only show the interactive confirmation when we own a TTY and
@@ -865,6 +879,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     if "prompt_toolkit.application.current" in sys.modules:
         try:
             from prompt_toolkit.application.current import get_app_or_none
+
             _app = get_app_or_none()
             _pt_active = _app is not None and getattr(_app, "is_running", False)
         except Exception:
@@ -873,10 +888,14 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     if prompt and not _pt_active and sys.stdin.isatty() and sys.stdout.isatty():
         spec_list = ", ".join(missing)
         try:
-            answer = input(
-                f"\nFeature {feature!r} requires: {spec_list}\n"
-                f"Install into the active venv now? [Y/n] "
-            ).strip().lower()
+            answer = (
+                input(
+                    f"\nFeature {feature!r} requires: {spec_list}\n"
+                    f"Install into the active venv now? [Y/n] "
+                )
+                .strip()
+                .lower()
+            )
         except (EOFError, KeyboardInterrupt):
             answer = "n"
         if answer and answer not in {"y", "yes"}:
@@ -894,14 +913,14 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             # Clip to a readable size — pip can dump pages of resolution traces.
             snippet = snippet[-2000:]
         raise FeatureUnavailable(
-            feature, missing,
-            f"pip install failed: {snippet or 'no error output'}"
+            feature, missing, f"pip install failed: {snippet or 'no error output'}"
         )
 
     # Verify post-install. importlib.metadata caches per-process, so if we
     # just installed something the cache may not see it without a refresh.
     try:
         import importlib.metadata as _md
+
         if hasattr(_md, "_cache_clear"):
             _md._cache_clear()  # type: ignore[attr-defined]
     except Exception:
@@ -910,9 +929,10 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     still_missing = feature_missing(feature)
     if still_missing:
         raise FeatureUnavailable(
-            feature, still_missing,
+            feature,
+            still_missing,
             "install reported success but packages still not importable "
-            "(may require Python restart)"
+            "(may require Python restart)",
         )
 
     logger.info("Lazy install complete for feature %r", feature)
@@ -943,6 +963,7 @@ class InstallSpecsResult:
                    nothing was executed. ``reason`` explains why.
     ``command``  — human-readable description of what ran (for UIs/logs).
     """
+
     ok: bool
     blocked: bool = False
     reason: str = ""
@@ -951,7 +972,9 @@ class InstallSpecsResult:
     stderr: str = ""
 
 
-def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> InstallSpecsResult:
+def install_specs(
+    specs: list[str] | tuple[str, ...], *, timeout: int = 300
+) -> InstallSpecsResult:
     """Install arbitrary (validated) pip specs through the lazy-install pipeline.
 
     This is the environment-aware install path for callers whose package
@@ -983,7 +1006,8 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
     for spec in cleaned:
         if not _spec_is_safe(spec):
             return InstallSpecsResult(
-                ok=False, blocked=True,
+                ok=False,
+                blocked=True,
                 reason=f"refusing to install unsafe spec {spec!r}",
             )
 
@@ -1000,11 +1024,15 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
         return InstallSpecsResult(ok=False, blocked=True, reason=reason)
 
     target = _lazy_install_target()
-    display = "uv pip install " + (
-        f"--target {target} " if target is not None else ""
-    ) + " ".join(cleaned)
+    display = (
+        "uv pip install "
+        + (f"--target {target} " if target is not None else "")
+        + " ".join(cleaned)
+    )
 
-    logger.info("Installing pip specs %s (target=%s)", " ".join(cleaned), target or "venv")
+    logger.info(
+        "Installing pip specs %s (target=%s)", " ".join(cleaned), target or "venv"
+    )
     try:
         result = _venv_pip_install(cleaned, timeout=timeout)
     except Exception as exc:
@@ -1017,8 +1045,10 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
     # checks in this same process (dashboard rechecks availability inline).
     try:
         import importlib
+
         importlib.invalidate_caches()
         import importlib.metadata as _md
+
         if hasattr(_md, "_cache_clear"):
             _md._cache_clear()  # type: ignore[attr-defined]
     except Exception:

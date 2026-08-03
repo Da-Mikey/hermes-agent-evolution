@@ -213,6 +213,7 @@ _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({
     "singularity",
     "modal",
     "daytona",
+    "vercel_sandbox",
 })
 
 
@@ -442,7 +443,9 @@ def _resolve_path_for_task(
 
         if ntpath.isabs(expanded):
             return Path(ntpath.normpath(expanded))
-        joined = ntpath.join(str(_resolve_base_dir(task_id, container_paths=False)), expanded)
+        joined = ntpath.join(
+            str(_resolve_base_dir(task_id, container_paths=False)), expanded
+        )
         return Path(ntpath.normpath(joined))
 
     p = Path(expanded)
@@ -1082,6 +1085,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 if old_cwd:
                     try:
                         from tools.terminal_tool import record_session_cwd
+
                         record_session_cwd(raw_task_id, old_cwd)
                     except Exception:
                         pass
@@ -1126,6 +1130,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
             try:
                 from tools.terminal_tool import get_session_cwd
+
                 recorded_cwd = get_session_cwd(raw_task_id)
             except Exception:
                 recorded_cwd = None
@@ -1147,18 +1152,29 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     logger.info(
                         "Ignoring host/relative cwd override %r for %s backend "
                         "(won't exist in sandbox). Using %r instead.",
-                        cwd, env_type, config["cwd"],
+                        cwd,
+                        env_type,
+                        config["cwd"],
                     )
                 cwd = config["cwd"]
-            logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
+            logger.info(
+                "Creating new %s environment for task %s...", env_type, task_id[:8]
+            )
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
+            if env_type in {
+                "docker",
+                "singularity",
+                "modal",
+                "daytona",
+                "vercel_sandbox",
+            }:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get(
                         "docker_mount_cwd_to_workspace", False
@@ -1237,12 +1253,10 @@ def read_file_tool(
             else _resolve_base_dir(task_id)
         )
         if _is_blocked_device(path, base_dir=device_base):
-            return json.dumps({
-                "error": (
-                    f"Cannot read '{path}': this is a device file that would "
-                    "block or produce infinite output."
-                ),
-            })
+            return tool_error(
+                f"Cannot read '{path}': this is a device file that would "
+                "block or produce infinite output."
+            )
 
         _resolved = _resolve_path_for_task(path, task_id)
 
@@ -1317,12 +1331,10 @@ def read_file_tool(
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
-            return json.dumps({
-                "error": (
-                    f"Cannot read binary file '{path}' ({_ext}). "
-                    "Use vision_analyze for images, or terminal to inspect binary files."
-                ),
-            })
+            return tool_error(
+                f"Cannot read binary file '{path}' ({_ext}). "
+                "Use vision_analyze for images, or terminal to inspect binary files."
+            )
 
         # ── Hermes internal path guard ────────────────────────────────
         # Prevent prompt injection via catalog or hub metadata files,
@@ -1333,7 +1345,7 @@ def read_file_tool(
         # the Python process cwd, which can differ.
         block_error = get_read_block_error(str(_resolved))
         if block_error:
-            return json.dumps({"error": block_error})
+            return tool_error(block_error)
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -1379,21 +1391,16 @@ def read_file_tool(
                         _cap_read_tracker_data(task_data)
 
                     if hits >= 2:
-                        return json.dumps(
-                            {
-                                "error": (
-                                    f"BLOCKED: You have called read_file on this "
-                                    f"exact region {hits + 1} times and the file "
-                                    "has NOT changed. STOP calling read_file for "
-                                    "this path — the content from your earlier "
-                                    "read_file result in this conversation is "
-                                    "still current. Proceed with your task using "
-                                    "the information you already have."
-                                ),
-                                "path": path,
-                                "already_read": hits + 1,
-                            },
-                            ensure_ascii=False,
+                        return tool_error(
+                            f"BLOCKED: You have called read_file on this "
+                            f"exact region {hits + 1} times and the file "
+                            "has NOT changed. STOP calling read_file for "
+                            "this path — the content from your earlier "
+                            "read_file result in this conversation is "
+                            "still current. Proceed with your task using "
+                            "the information you already have.",
+                            path=path,
+                            already_read=hits + 1,
                         )
 
                     return json.dumps(
@@ -1559,17 +1566,12 @@ def read_file_tool(
 
         if count >= 4:
             # Hard block: stop returning content to break the loop
-            return json.dumps(
-                {
-                    "error": (
-                        f"BLOCKED: You have read this exact file region {count} times in a row. "
-                        "The content has NOT changed. You already have this information. "
-                        "STOP re-reading and proceed with your task."
-                    ),
-                    "path": path,
-                    "already_read": count,
-                },
-                ensure_ascii=False,
+            return tool_error(
+                f"BLOCKED: You have read this exact file region {count} times in a row. "
+                "The content has NOT changed. You already have this information. "
+                "STOP re-reading and proceed with your task.",
+                path=path,
+                already_read=count,
             )
         elif count >= 3:
             result_dict["_warning"] = (
@@ -1982,8 +1984,11 @@ def patch_tool(
                         _suggested = ""
                         try:
                             from tools.fuzzy_match import suggest_closest_match
+
                             if _gate_content:
-                                _suggested = suggest_closest_match(old_string, _gate_content)
+                                _suggested = suggest_closest_match(
+                                    old_string, _gate_content
+                                )
                         except Exception:
                             pass
                         _suggest_block = ""
@@ -2155,12 +2160,11 @@ def patch_tool(
             if is_no_match and mode == "replace" and path:
                 try:
                     from tools.fuzzy_match import suggest_closest_match
+
                     _rp = _path_to_resolved.get(path) or path
                     _fc = _read_file_content(_rp)
                     if _fc:
-                        _suggest = suggest_closest_match(
-                            old_string or "", _fc
-                        )
+                        _suggest = suggest_closest_match(old_string or "", _fc)
                         if _suggest:
                             _suggest_block = (
                                 "\n\nSuggested old_string "
@@ -2169,9 +2173,7 @@ def patch_tool(
                             )
                             _existing_hint = result_dict.get("_hint", "") or ""
                             if _existing_hint:
-                                result_dict["_hint"] = (
-                                    _existing_hint + _suggest_block
-                                )
+                                result_dict["_hint"] = _existing_hint + _suggest_block
                             else:
                                 result_dict["_hint"] = (
                                     "old_string not found. "
@@ -2227,7 +2229,9 @@ def _build_no_match_hint(
 
     _max = 10
     dirs = [c.name + "/" for c in children if c.is_dir() and not c.name.startswith(".")]
-    files_list = [c.name for c in children if c.is_file() and not c.name.startswith(".")]
+    files_list = [
+        c.name for c in children if c.is_file() and not c.name.startswith(".")
+    ]
     entries = dirs[:_max]
     remaining = _max - len(entries)
     if remaining > 0:
@@ -2303,17 +2307,12 @@ def search_tool(
             count = task_data["consecutive"]
 
         if count >= 4:
-            return json.dumps(
-                {
-                    "error": (
-                        f"BLOCKED: You have run this exact search {count} times in a row. "
-                        "The results have NOT changed. You already have this information. "
-                        "STOP re-searching and proceed with your task."
-                    ),
-                    "pattern": pattern,
-                    "already_searched": count,
-                },
-                ensure_ascii=False,
+            return tool_error(
+                f"BLOCKED: You have run this exact search {count} times in a row. "
+                "The results have NOT changed. You already have this information. "
+                "STOP re-searching and proceed with your task.",
+                pattern=pattern,
+                already_searched=count,
             )
 
         try:
@@ -2324,7 +2323,7 @@ def search_tool(
             str(resolved_path) if resolved_path else path
         )
         if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
+            return tool_error(block_error)
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
