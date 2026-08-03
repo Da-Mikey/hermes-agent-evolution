@@ -56,6 +56,14 @@ CODE_PATHS = [
 
 _MARKER_RE = re.compile(rb"#[0-9]{3,5}")
 
+# Upstream issue numbers are five digits and climbing (#68217); this fork's are
+# three or four (#102 .. #1640). A marker above this ceiling references an
+# upstream issue, so upstream owns it even when it currently appears in our
+# tree and not in theirs — which happens whenever upstream rewrites the comment
+# after our merge-base. Without the ceiling those show up as "fork features we
+# lost", which is the opposite of the truth.
+MAX_FORK_ISSUE = 9999
+
 
 def _git(*args: str) -> str:
     """Run a git command, returning stdout (empty string on failure)."""
@@ -68,6 +76,11 @@ def _git(*args: str) -> str:
         return ""
 
 
+def _fork_range(markers) -> set[str]:
+    """Keep only markers that could plausibly be this fork's own issues."""
+    return {m for m in markers if int(m.lstrip("#")) <= MAX_FORK_ISSUE}
+
+
 def _markers_in(ref: str) -> set[str]:
     """Issue markers (#1234) appearing anywhere under CODE_PATHS at *ref*."""
     raw = subprocess.run(
@@ -75,7 +88,7 @@ def _markers_in(ref: str) -> set[str]:
         capture_output=True,
         timeout=600,
     ).stdout
-    return {m.decode() for m in _MARKER_RE.findall(raw)}
+    return _fork_range(m.decode() for m in _MARKER_RE.findall(raw))
 
 
 def _files_in(ref: str) -> set[str]:
@@ -88,7 +101,7 @@ def _worktree_markers() -> set[str]:
         capture_output=True,
         timeout=600,
     ).stdout
-    return {m.decode() for m in _MARKER_RE.findall(raw)}
+    return _fork_range(m.decode() for m in _MARKER_RE.findall(raw))
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:

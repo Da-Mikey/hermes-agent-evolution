@@ -95,7 +95,6 @@
     "#1486",
     "#1488",
     "#1489",
-    "#14935",
     "#1495",
     "#1501",
     "#1504",
@@ -124,7 +123,6 @@
     "#175",
     "#176",
     "#185",
-    "#20494",
     "#213",
     "#214",
     "#215",
@@ -157,8 +155,6 @@
     "#319",
     "#320",
     "#323",
-    "#33906",
-    "#34491",
     "#347",
     "#348",
     "#365",
@@ -167,15 +163,11 @@
     "#431",
     "#432",
     "#433",
-    "#44444",
-    "#45542",
     "#467",
     "#516",
-    "#51646",
     "#517",
     "#522",
     "#562",
-    "#57604",
     "#577",
     "#578",
     "#606",
@@ -300,7 +292,6 @@
     "hermes_cli/a2a_client.py",
     "hermes_cli/a2a_server.py",
     "hermes_cli/corrections_cli.py",
-    "hermes_cli/subcommands/postinstall.py",
     "hermes_cli/tqmemory_setup.py",
     "plugins/security-guidance/secrets.py",
     "tools/agent_team.py",
@@ -314,5 +305,9 @@
     "tools/terminal_failure_classifier.py",
     "tools/tool_cache.py",
     "tools/tool_failure_classifier.py"
-  ]
+  ],
+  "_excluded": {
+    "upstream_numbered_markers": "Markers above #9999 reference upstream issues, not ours. They appeared fork-only only because upstream rewrote those comments after our merge-base.",
+    "hermes_cli/subcommands/postinstall.py": "Upstream deleted it in d84e11af4d ('rip out brew + pip/PyPI wheel support', #68217). We never edited this file \u2014 git log v2026.7.20..origin/main is empty for it \u2014 so the deletion is upstream's decision, not a lost fork feature."
+  }
 }
