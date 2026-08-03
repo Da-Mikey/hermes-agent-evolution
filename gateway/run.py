@@ -23188,3 +23188,35 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── Helpers upstream added in v2026.7.30 ──────────────────────────────
+# Carried over verbatim; this fork's copy of the file predates them.
+
+def _is_slack_ignored_channel(config: Any, chat_id: Any) -> bool:
+    """Check the generic Slack gateway blacklist for channel or thread IDs."""
+    channel_id = _slack_parent_channel_id(chat_id)
+    ignored = _slack_ignored_channels_from_gateway_config(config)
+    return bool(channel_id and ("*" in ignored or channel_id in ignored))
+
+
+def _slack_ignored_channels_from_gateway_config(config: Any) -> set[str]:
+    """Return Slack channels that the generic gateway must never dispatch.
+
+    The Slack adapter has the first-line drop, but this runner-level guard is
+    intentionally duplicated as a fail-safe. If a future Slack code path, test
+    hook, malformed event, or stale adapter instance bypasses the Slack plugin
+    adapter, ignored channels still cannot reach auth, pairing, sessions, or
+    the agent/home-channel prompt pipeline.
+    """
+    platform_cfg = getattr(config, "platforms", {}).get(Platform.SLACK)
+    raw = None
+    if platform_cfg is not None:
+        raw = getattr(platform_cfg, "extra", {}).get("ignored_channels")
+    if raw is None:
+        # Top-level ``slack.ignored_channels`` config flows through the
+        # plugin's YAML→env bridge (SLACK_IGNORED_CHANNELS) rather than
+        # PlatformConfig.extra — honor it here too (#46925).
+        raw = os.getenv("SLACK_IGNORED_CHANNELS") or None
+    return _csv_or_list_to_set(raw)
+
