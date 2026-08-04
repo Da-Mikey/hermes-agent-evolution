@@ -305,7 +305,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
         subcommands=("all",),
         busy_policy="dispatch",
     ),
-    CommandDef("status", "Show session, model, token, and context info", "Session"),
     CommandDef(
         "verify",
         "Run adversarial verification on the last agent response",

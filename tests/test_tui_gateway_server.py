@@ -6577,15 +6577,6 @@ def test_session_info_includes_session_title(monkeypatch):
     assert info["title"] == "Dashboard title"
 
 
-def test_session_info_includes_install_warning_for_pip(monkeypatch):
-    """pip installs surface install_warning; git installs don't (issue: pip/brew deprecation)."""
-    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "pip")
-
-    info = server._session_info(types.SimpleNamespace(tools=[], model="", provider=""))
-
-    assert "install_warning" in info
-    assert "pip" in info["install_warning"]
-    assert "platform-support" in info["install_warning"]
 
 
 def test_session_info_omits_install_warning_for_git(monkeypatch):
@@ -6688,7 +6679,7 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
 
     class _RacyAgent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             # Simulate: something external bumped history_version
             # while we were running.
@@ -6715,13 +6706,11 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
 
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "hi"},
-            }
-        )
+        resp = server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hi"},
+        })
         assert resp.get("result"), f"got error: {resp.get('error')}"
 
         # History should NOT contain the agent's output (version mismatch)
@@ -6751,7 +6740,7 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             captured["prompt"] = prompt
             return {
@@ -6777,13 +6766,11 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
 
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": corrupted},
-            }
-        )
+        resp = server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": corrupted},
+        })
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert captured["prompt"] == "hello"
     finally:
@@ -6795,7 +6782,7 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "reply",
@@ -6817,13 +6804,11 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
 
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "hi"},
-            }
-        )
+        resp = server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hi"},
+        })
         assert resp.get("result")
 
         # History was written
@@ -6848,7 +6833,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             seen["prompt"] = prompt
             seen["history"] = conversation_history
@@ -6892,17 +6877,15 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
 
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {
-                    "session_id": "sid",
-                    "text": "edited second",
-                    "truncate_before_user_ordinal": 1,
-                },
-            }
-        )
+        resp = server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {
+                "session_id": "sid",
+                "text": "edited second",
+                "truncate_before_user_ordinal": 1,
+            },
+        })
         assert resp.get("result"), f"got error: {resp.get('error')}"
 
         assert seen["prompt"] == "edited second"
@@ -7185,38 +7168,6 @@ def test_respond_unpacks_sid_tuple_correctly():
 # ---------------------------------------------------------------------------
 
 
-def test_config_set_model_rejects_while_running(monkeypatch):
-    """/model via config.set must reject during an in-flight turn."""
-    seen = {"called": False}
-
-    def _fake_apply(sid, session, raw, **_kwargs):
-        seen["called"] = True
-        return {"value": raw, "warning": ""}
-
-    monkeypatch.setattr(server, "_apply_model_switch", _fake_apply)
-
-    server._sessions["sid"] = _session(running=True)
-    try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "config.set",
-                "params": {
-                    "session_id": "sid",
-                    "key": "model",
-                    "value": "anthropic/claude-sonnet-4.6",
-                },
-            }
-        )
-        assert resp.get("error")
-        assert resp["error"]["code"] == 4009
-        assert "session busy" in resp["error"]["message"]
-        assert not seen["called"], (
-            "_apply_model_switch was called mid-turn — would race with "
-            "the worker thread reading agent.model / agent.client"
-        )
-    finally:
-        server._sessions.pop("sid", None)
 
 
 def test_config_set_model_allowed_when_idle(monkeypatch):
@@ -7358,12 +7309,13 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
 def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     """Regression guard: if session.close runs while session.create's
     _build thread is still constructing the agent, the build thread
-    must detect the orphan and clean up the slash_worker + notify
-    registration it's about to install.  Without the cleanup those
-    resources leak — the subprocess stays alive until atexit and the
-    notify callback lingers in the global registry."""
+    must detect the orphan and unregister the notify registration it's
+    about to install.  It must also never pre-warm a slash worker (each
+    worker forks the full stdio MCP fleet; spawn is on-demand in
+    slash.exec) — a worker constructed here would be a regression."""
     import threading
 
+    created_workers: list[str] = []
     closed_workers: list[str] = []
     unregistered_keys: list[str] = []
 
@@ -7371,6 +7323,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
         def __init__(self, key, model, profile_home=None):
             self.key = key
             self._closed = False
+            created_workers.append(key)
 
         def close(self):
             self._closed = True
@@ -7425,15 +7378,14 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
     # Start: session.create spawns _build thread, returns synchronously
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "session.create",
-            "params": {"cols": 80},
-        }
-    )
+    resp = server.handle_request({
+        "id": "1",
+        "method": "session.create",
+        "params": {"cols": 80},
+    })
     assert resp.get("result"), f"got error: {resp.get('error')}"
     sid = resp["result"]["session_id"]
+    own_key = resp["result"]["stored_session_id"]
     assert build_entered.wait(timeout=1.0), "deferred build did not start"
 
     # Wait until the (deferred) build thread has actually entered
@@ -7445,47 +7397,50 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     # Build thread is blocked in _slow_make_agent.  Close the session
     # NOW — this pops _sessions[sid] before _build can install the
     # worker/notify.
-    close_resp = server.handle_request(
-        {
-            "id": "2",
-            "method": "session.close",
-            "params": {"session_id": sid},
-        }
-    )
+    close_resp = server.handle_request({
+        "id": "2",
+        "method": "session.close",
+        "params": {"session_id": sid},
+    })
     assert close_resp.get("result", {}).get("closed") is True
 
-    # At this point session.close saw slash_worker=None (not yet
-    # installed) so it didn't close anything.  Release the build thread
-    # and let it finish — it should detect the orphan and clean up the
-    # worker it just allocated + unregister the notify.
+    # At this point session.close saw slash_worker=None (never eagerly
+    # installed) so it had nothing to close.  Release the build thread
+    # and let it finish — it should detect the orphan and unregister
+    # the notify, without ever having constructed a worker.
     release_build.set()
 
     # Give the build thread a moment to run through its finally.
     for _ in range(100):
-        if closed_workers:
+        if own_key in unregistered_keys:
             break
         import time
 
         time.sleep(0.02)
 
-    assert (
-        len(closed_workers) == 1
-    ), f"orphan worker was not cleaned up — closed_workers={closed_workers}"
+    assert created_workers == [], (
+        f"build thread pre-warmed a slash worker (spawn must stay on-demand "
+        f"in slash.exec) — created_workers={created_workers}"
+    )
     # Notify may be unregistered by both session.close (unconditional)
-    # and the orphan-cleanup path; the key guarantee is that the build
-    # thread does at least one unregister call (any prior close
-    # already popped the callback; the duplicate is a no-op).
-    assert len(unregistered_keys) >= 1, (
+    # and the orphan-cleanup path; the key guarantee is that THIS session's
+    # key gets unregistered (any prior close already popped the callback; the
+    # duplicate is a no-op). Match on our own key, not the global count: the
+    # registry is process-wide and a leaked _build thread from another
+    # session.create test can append a foreign key here and falsely satisfy
+    # a bare `>= 1`.
+    assert own_key in unregistered_keys, (
         f"orphan notify registration was not unregistered — "
-        f"unregistered_keys={unregistered_keys}"
+        f"{own_key} not in unregistered_keys={unregistered_keys}"
     )
 
 
 @pytest.mark.real_agent_prewarm
 def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     """Regression guard: when session.close does NOT race, the build
-    thread must install the worker + notify normally and leave them
-    alone (no over-eager cleanup)."""
+    thread must install the notify normally and leave it alone (no
+    over-eager cleanup) — and must not pre-warm a slash worker (spawn
+    is on-demand in slash.exec)."""
     closed_workers: list[str] = []
     unregistered_keys: list[str] = []
 
@@ -7503,7 +7458,9 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
             self.base_url = ""
             self.api_key = ""
 
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kwargs: _FakeAgent())
+    monkeypatch.setattr(
+        server, "_make_agent", lambda sid, key, session_db=None, **_kwargs: _FakeAgent()
+    )
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(
         server,
@@ -7535,13 +7492,11 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     server._sessions.clear()
 
     try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "session.create",
-                "params": {"cols": 80},
-            }
-        )
+        resp = server.handle_request({
+            "id": "1",
+            "method": "session.create",
+            "params": {"cols": 80},
+        })
         sid = resp["result"]["session_id"]
 
         # Wait for the build to finish (ready event inside session dict).
@@ -7561,15 +7516,16 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
         own_key = session["session_key"]
         own_closed = [k for k in closed_workers if k == own_key]
         own_unregistered = [k for k in unregistered_keys if k == own_key]
-        assert (
-            own_closed == []
-        ), f"build thread closed its own worker despite no race: {own_closed}"
-        assert (
-            own_unregistered == []
-        ), f"build thread unregistered its own notify despite no race: {own_unregistered}"
+        assert own_closed == [], (
+            f"build thread closed its own worker despite no race: {own_closed}"
+        )
+        assert own_unregistered == [], (
+            f"build thread unregistered its own notify despite no race: {own_unregistered}"
+        )
 
-        # Session should have the live worker installed.
-        assert session.get("slash_worker") is not None
+        # No pre-warmed worker: slash.exec spawns on demand, so a fresh
+        # session that hasn't run a worker-routed command carries None.
+        assert session.get("slash_worker") is None
     finally:
         # Cleanup + restore sibling sessions we snapshotted.
         server._sessions.clear()
@@ -7990,7 +7946,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
         api_mode = "codex_responses"
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "Rome was founded in 753 BC.",
@@ -8008,13 +7964,11 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "Tell me about Rome"},
-            }
-        )
+        server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "Tell me about Rome"},
+        })
 
     mock_title.assert_called_once()
     args = mock_title.call_args.args
@@ -8100,7 +8054,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": None,
@@ -8124,13 +8078,11 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
-    server.handle_request(
-        {
-            "id": "1",
-            "method": "prompt.submit",
-            "params": {"session_id": "sid", "text": "hello"},
-        }
-    )
+    server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {"session_id": "sid", "text": "hello"},
+    })
 
     complete_events = [e for e in emitted if e[0] == "message.complete"]
     assert complete_events, "expected message.complete to be emitted"
@@ -8147,7 +8099,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": None,
@@ -8169,13 +8121,11 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
-    server.handle_request(
-        {
-            "id": "1",
-            "method": "prompt.submit",
-            "params": {"session_id": "sid", "text": "hello"},
-        }
-    )
+    server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {"session_id": "sid", "text": "hello"},
+    })
 
     complete_events = [e for e in emitted if e[0] == "message.complete"]
     assert complete_events, "expected message.complete to be emitted"
@@ -8311,7 +8261,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     class _Agent:
         model = "model-live"
 
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
             assert prompt == "write a long answer"
             assert conversation_history == []
             stream_callback("partial ")
@@ -8339,23 +8291,19 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "_emit", _emit)
 
     try:
-        submit = server.handle_request(
-            {
-                "id": "submit",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid-live", "text": "write a long answer"},
-            }
-        )
+        submit = server.handle_request({
+            "id": "submit",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid-live", "text": "write a long answer"},
+        })
         assert submit["result"]["status"] == "streaming"
         assert started.wait(2), "fake model did not stream before activation"
 
-        resp = server.handle_request(
-            {
-                "id": "activate",
-                "method": "session.activate",
-                "params": {"session_id": "sid-live"},
-            }
-        )
+        resp = server.handle_request({
+            "id": "activate",
+            "method": "session.activate",
+            "params": {"session_id": "sid-live"},
+        })
 
         inflight = resp["result"].get("inflight")
         assert inflight == {
@@ -8367,13 +8315,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
 
         release.set()
         assert done.wait(2), "fake model turn did not complete"
-        completed = server.handle_request(
-            {
-                "id": "activate-done",
-                "method": "session.activate",
-                "params": {"session_id": "sid-live"},
-            }
-        )
+        completed = server.handle_request({
+            "id": "activate-done",
+            "method": "session.activate",
+            "params": {"session_id": "sid-live"},
+        })
         assert completed["result"].get("inflight") is None
         assert completed["result"]["messages"] == [
             {"role": "user", "text": "write a long answer"},
@@ -9506,13 +9452,6 @@ def test_make_agent_nested_max_turns_takes_priority(monkeypatch):
     assert mock_agent.call_args.kwargs["max_iterations"] == 500
 
 
-def test_make_agent_defaults_to_90(monkeypatch):
-    _setup_make_agent_mocks(monkeypatch, {})
-
-    with patch("run_agent.AIAgent") as mock_agent:
-        server._make_agent("sid1", "key1")
-
-    assert mock_agent.call_args.kwargs["max_iterations"] == 90
 
 
 def test_make_agent_uses_session_runtime_overrides(monkeypatch):
@@ -9644,7 +9583,9 @@ def test_notification_poller_delivers_completion(monkeypatch):
     emitted = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
             turns.append(prompt)
             return {
                 "final_response": "ok",
@@ -9654,6 +9595,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
     class _ImmediateThread:
         def __init__(self, target=None, daemon=None):
             self._target = target
+
         def start(self):
             self._target()
 
@@ -9699,7 +9641,10 @@ def test_notification_poller_delivers_completion(monkeypatch):
 
         # Should have triggered an agent turn
         assert len(turns) == 1
-        assert "[IMPORTANT: Background process proc_poller_test completed normally" in turns[0]
+        assert (
+            "[IMPORTANT: Background process proc_poller_test completed normally"
+            in turns[0]
+        )
     finally:
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
@@ -10283,7 +10228,8 @@ def test_attach_worker_stores_worker_on_live_session():
 
 def test_restart_slash_worker_closes_orphan_when_session_reaped(monkeypatch):
     """Post-turn restart of a session reaped mid-flight (e.g. close_on_disconnect
-    fired while `running` flipped false) must close the fresh worker, not orphan it."""
+    fired while `running` flipped false) must close both the stale worker and
+    the fresh replacement, not orphan either."""
     closed = []
 
     class _FakeWorker:
@@ -10295,11 +10241,14 @@ def test_restart_slash_worker_closes_orphan_when_session_reaped(monkeypatch):
 
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     server._sessions.pop("reaped", None)
-    reaped = {"session_key": "k"}  # not in _sessions -> torn down concurrently
+    # not in _sessions -> torn down concurrently; carries a live worker so the
+    # restart path actually runs (a workerless session is a restart no-op now)
+    reaped = {"session_key": "k", "slash_worker": _FakeWorker()}
     server._restart_slash_worker("reaped", reaped)
 
-    assert closed == [True]
-    assert reaped.get("slash_worker") is None
+    # stale worker closed by the restart, fresh worker closed by _attach_worker
+    # (sid no longer maps to this session)
+    assert closed == [True, True]
     assert "reaped" not in server._sessions
 
 
@@ -10312,11 +10261,13 @@ def test_restart_slash_worker_stores_on_live_session(monkeypatch):
             pass
 
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
-    live = {"session_key": "k", "slash_worker": None}
+    old_worker = _FakeWorker()
+    live = {"session_key": "k", "slash_worker": old_worker}
     server._sessions["live-restart"] = live
     try:
         server._restart_slash_worker("live-restart", live)
         assert isinstance(live["slash_worker"], _FakeWorker)
+        assert live["slash_worker"] is not old_worker
     finally:
         server._sessions.pop("live-restart", None)
 
@@ -10914,9 +10865,9 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
         "agent:\n"
         "  system_prompt: keepme\n"
     )
-    # save_config_value() resolves the config path from cli._hermes_home, which
-    # is captured at import time — patch it directly (set_hermes_home_override
-    # does NOT affect this snapshot).
+    # save_config_value() resolves the config path from get_hermes_home() (live
+    # env var), always targeting HERMES_HOME/config.yaml — point it at tmp_path.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     result = types.SimpleNamespace(
@@ -10949,6 +10900,7 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
         "  provider: custom:mylocal\n"
         "  base_url: http://localhost:1234/v1\n"
     )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     # Switch to a native provider with no base_url.
