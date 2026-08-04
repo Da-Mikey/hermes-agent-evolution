@@ -141,8 +141,15 @@ class TestHandleVisionAnalyze:
                 ))
                 st.enter_context(patch.dict(os.environ, {}, clear=False))
                 if config is not None:
-                    st.enter_context(patch("hermes_cli.config.load_config", return_value=config),
-patch("hermes_cli.config.load_config_readonly", return_value=config))
+                    st.enter_context(
+                        patch("hermes_cli.config.load_config", return_value=config)
+                    )
+                    st.enter_context(
+                        patch(
+                            "hermes_cli.config.load_config_readonly",
+                            return_value=config,
+                        )
+                    )
                 if env_model is None:
                     os.environ.pop("AUXILIARY_VISION_MODEL", None)
                 else:
