@@ -141,6 +141,15 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+    # Fork-only always-on blocks (#45 attention reset, deliberate work, #1356
+    # recovery-before-refusal), absent from upstream's copy of this test. Pin
+    # them like the neighbouring constants so the assertion stays about ORDER,
+    # not about the wording of paragraphs this test does not own.
+    monkeypatch.setattr(system_prompt, "ATTENTION_RESET_GUIDANCE", "ATTENTION_RESET")
+    monkeypatch.setattr(system_prompt, "DELIBERATE_WORK_GUIDANCE", "DELIBERATE_WORK")
+    monkeypatch.setattr(
+        system_prompt, "RECOVERY_BEFORE_REFUSAL_GUIDANCE", "RECOVERY_BEFORE_REFUSAL"
+    )
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
     expected_profile = (
@@ -153,6 +162,9 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        "ATTENTION_RESET",
+        "DELIBERATE_WORK",
+        "RECOVERY_BEFORE_REFUSAL",
         "STEER",
         "CODING_STABLE",
         "WORKSPACE",
@@ -182,7 +194,14 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    # The static cache runs up to the workspace block — the first part that
+    # varies per turn; CODING_STABLE is stable and belongs inside it. Sliced by
+    # that boundary rather than by a section count: upstream's copy of this test
+    # hard-codes 4, but this fork inserts three always-on blocks before STEER,
+    # and a magic number silently means the wrong thing after any such change.
+    sections = expected.split("\n\n")
+    static_len = sections.index("WORKSPACE")
+    assert agent._cached_system_prompt_static == "\n\n".join(sections[:static_len])
 
 
 class TestTelegramRichMessagesHint:

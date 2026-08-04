@@ -9002,8 +9002,17 @@ def _reconcile_existing_evolution_cron_jobs() -> list[str]:
     print("→ Reconciling enabled Evolution schedules / Узгодження розкладів Evolution...")
     reconciled: list[str] = []
     for profile in opted_in:
-        env = os.environ.copy()
-        env["HERMES_HOME"] = str(profile.path)
+        # Per-profile reconcile: HERMES_HOME must point at the profile being
+        # reconciled, not the caller's. inherit_profile_home=False keeps the
+        # explicit `extra` authoritative instead of letting the factory
+        # re-derive the ambient home over it.
+        from tools.environments.local import build_subprocess_env
+
+        env = build_subprocess_env(
+            inherit_profile_home=False,
+            scrub_secrets=False,
+            extra={"HERMES_HOME": str(profile.path)},
+        )
         try:
             result = subprocess.run(
                 [sys.executable, str(registrar)],

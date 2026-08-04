@@ -1817,6 +1817,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # lock so a reader that finishes opening after the drain finds the
         # shutdown in progress and closes its own connection immediately.
         self._read_conns_closed = False
+        # Symmetric flag for the WRITE connection.  ``_ensure_conn`` rebuilds a
+        # ``None`` connection so a stale handle (after ``hermes update``) does
+        # not cascade into mass message loss — but ``close()`` also leaves it
+        # ``None``, and the two must not look alike: reconnecting after a
+        # deliberate close silently resurrects a shut-down DB and lets a write
+        # that the caller expects to fail succeed instead.
+        self._write_conn_closed = False
         self._wal_active = False
         self._write_count = 0
         # One-shot guard for the runtime FTS rebuild recovery on the write
@@ -2353,6 +2360,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if self._conn is not None:
             return self._conn
+        if self._write_conn_closed:
+            # close() ran. Reconnecting here would resurrect a DB the caller
+            # deliberately shut down and turn a write that must fail into a
+            # silent success — the failure has to reach the call site, which
+            # is what the pre-queue accounting contract guards for.
+            raise sqlite3.ProgrammingError(
+                "Cannot operate on a closed SessionDB — open a new instance"
+            )
         if self.read_only:
             # Read-only connections are constructed in __init__ and never
             # lazily reconnected — callers should create a new SessionDB.
@@ -2602,6 +2617,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 pass
         self._read_local.conn = None
         with self._lock:
+            self._write_conn_closed = True
             if self._conn:
                 try:
                     self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
