@@ -94,7 +94,19 @@ class TestHandleFunctionCallIntegration:
 
         all_tools = _registry.get_all_tool_names()
         assert all_tools, "no tools registered — test environment broken"
-        target = all_tools[0]
+        # Pick a tool that takes no REQUIRED parameters. Dispatch validates
+        # arguments before reaching the handler (#1647), so calling a tool that
+        # requires one with {} now fails validation and the handler — the thing
+        # under test — never runs. all_tools[0] used to satisfy this by luck;
+        # it is bfl_flux3_get_result today, which requires 'id'.
+        def _takes_no_required_args(name: str) -> bool:
+            entry = _registry._tools[name]
+            schema = getattr(entry, "schema", None) or {}
+            params = (schema.get("function") or schema).get("parameters") or {}
+            return not params.get("required")
+
+        target = next((t for t in all_tools if _takes_no_required_args(t)), None)
+        assert target, "no zero-required-arg tool registered — test needs one"
         original = _registry._tools[target].handler
         _registry._tools[target].handler = boom
         try:
