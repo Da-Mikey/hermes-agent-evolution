@@ -1053,6 +1053,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch("hermes_cli.config.load_config", return_value={}),
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             a = AIAgent(
                 api_key="test-k...7890",
@@ -1072,10 +1073,8 @@ class TestInit:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"model": {"max_tokens": 4096}},
-            ),
+            patch("hermes_cli.config.load_config", return_value={"model": {"max_tokens": 4096}}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"model": {"max_tokens": 4096}}),
         ):
             a = AIAgent(
                 api_key="test-k...7890",
@@ -1096,10 +1095,8 @@ class TestInit:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"prompt_caching": {"cache_ttl": "30m"}},
-            ),
+            patch("hermes_cli.config.load_config", return_value={"prompt_caching": {"cache_ttl": "30m"}}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"prompt_caching": {"cache_ttl": "30m"}}),
         ):
             a = AIAgent(
                 api_key="test-k...7890",
@@ -1449,10 +1446,8 @@ class TestToolUseEnforcementConfig:
             ),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"agent": {"tool_use_enforcement": tool_use_enforcement}},
-            ),
+            patch("hermes_cli.config.load_config", return_value={"agent": {"tool_use_enforcement": tool_use_enforcement}}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"agent": {"tool_use_enforcement": tool_use_enforcement}}),
         ):
             a = AIAgent(
                 model=model,
@@ -1575,10 +1570,8 @@ class TestToolUseEnforcementConfig:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"agent": {"tool_use_enforcement": True}},
-            ),
+            patch("hermes_cli.config.load_config", return_value={"agent": {"tool_use_enforcement": True}}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"agent": {"tool_use_enforcement": True}}),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -1612,10 +1605,8 @@ class TestTaskCompletionGuidance:
             ),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"agent": agent_cfg},
-            ),
+            patch("hermes_cli.config.load_config", return_value={"agent": agent_cfg}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"agent": agent_cfg}),
         ):
             a = AIAgent(
                 model=model,
@@ -1662,10 +1653,8 @@ class TestTaskCompletionGuidance:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"agent": {"task_completion_guidance": True}},
-            ),
+            patch("hermes_cli.config.load_config", return_value={"agent": {"task_completion_guidance": True}}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"agent": {"task_completion_guidance": True}}),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
@@ -1694,10 +1683,8 @@ class TestEnvironmentProbeIntegration:
             ),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"agent": {"environment_probe": environment_probe}},
-            ),
+            patch("hermes_cli.config.load_config", return_value={"agent": {"environment_probe": environment_probe}}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"agent": {"environment_probe": environment_probe}}),
         ):
             a = AIAgent(
                 model=model,
@@ -3821,6 +3808,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
         ("delegate_task", {"goal": "Check the child path"}),
+        # Fork-only: agent-driven compaction (#1568 SelfCompact) routes through
+        # the same agent-level path, so it owns its post hook exactly like the
+        # tools above. Upstream has no such tool, hence no case for it.
+        ("compact_context", {"focus_topic": ""}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -3857,6 +3848,13 @@ class TestAgentRuntimePostHookOwnershipSync:
         )
         monkeypatch.setattr(
             "tools.read_terminal_tool.read_terminal_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        # Fork-only tool: stub it like the rest, or the case runs a real
+        # compaction pass (~3s and a live summariser call) to assert nothing
+        # about compaction — the hook-emission contract is all that is on test.
+        monkeypatch.setattr(
+            "tools.compact_context_tool.compact_context_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)

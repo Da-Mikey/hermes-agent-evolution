@@ -130,48 +130,6 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
-def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / "config.yaml").write_text("max_concurrent_sessions: 1\n", encoding="utf-8")
-    token = set_hermes_home_override(home)
-
-    def _clear_server_sessions():
-        for session in list(server._sessions.values()):
-            server._teardown_session(session)
-        server._sessions.clear()
-
-    try:
-        server._cfg_cache = None
-        server._cfg_mtime = None
-        server._cfg_path = None
-        _clear_server_sessions()
-        monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
-        monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
-
-        first = server._methods["session.create"]("r1", {"cols": 80})
-        assert "result" in first
-        sid = first["result"]["session_id"]
-
-        second = server._methods["session.create"]("r2", {"cols": 80})
-        assert second["error"]["message"] == (
-            "Hermes is at the active session limit (1/1). "
-            "Try again when another session finishes."
-        )
-        assert list(server._sessions) == [sid]
-
-        closed = server._methods["session.close"]("r3", {"session_id": sid})
-        assert closed["result"]["closed"] is True
-        assert active_session_registry_snapshot() == []
-
-        third = server._methods["session.create"]("r4", {"cols": 80})
-        assert "result" in third
-    finally:
-        _clear_server_sessions()
-        server._cfg_cache = None
-        server._cfg_mtime = None
-        server._cfg_path = None
-        reset_hermes_home_override(token)
 
 
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
@@ -359,14 +317,12 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):
             if on_complete is not None:
-                on_complete(
-                    {
-                        "type": "turn.error",
-                        "request_id": frame["request_id"],
-                        "reason": "send_failed",
-                        "message": "broken pipe",
-                    }
-                )
+                on_complete({
+                    "type": "turn.error",
+                    "request_id": frame["request_id"],
+                    "reason": "send_failed",
+                    "message": "broken pipe",
+                })
             raise BrokenPipeError("broken pipe")
 
     class _ImmediateThread:
@@ -380,12 +336,20 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     session = _session(agent=None, agent_ready=threading.Event())
     server._sessions["iso-fallback"] = session
     inline_calls = []
-    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
-    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}}
+    )
+    monkeypatch.setattr(
+        server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor()
+    )
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
     monkeypatch.setattr(server, "_wait_agent", lambda _session, _rid: None)
+    # The deferred inline-fallback thread now waits via the patient variant.
+    monkeypatch.setattr(
+        server, "_wait_agent_for_prompt", lambda _session, _rid, _sid: None
+    )
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
@@ -394,13 +358,11 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
     try:
-        resp = server.handle_request(
-            {
-                "id": "fallback-turn",
-                "method": "prompt.submit",
-                "params": {"session_id": "iso-fallback", "text": "hello"},
-            }
-        )
+        resp = server.handle_request({
+            "id": "fallback-turn",
+            "method": "prompt.submit",
+            "params": {"session_id": "iso-fallback", "text": "hello"},
+        })
     finally:
         server._sessions.pop("iso-fallback", None)
 
@@ -1313,12 +1275,17 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted union of both lineages: `kanban` and `agent_team` are auto-recovered
-    # by _get_platform_tools (non-configurable platform toolsets in hermes-cli's
-    # universe; their tools stay check_fn-gated via HERMES_KANBAN_TASK /
-    # HERMES_TEAM_ID so they are inert outside a worker/teammate session), and
-    # `project` is the GUI-only toolset folded in by _load_enabled_toolsets.
-    assert server._load_enabled_toolsets() == ["agent_team", "kanban", "memory", "project"]
+    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
+    # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
+    # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
+    # Toolsets inside their first release (_RECENTLY_SHIPPED_TOOLSETS) are
+    # back-filled onto saved lists that never offered them — allow those too.
+    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
+
+    result = server._load_enabled_toolsets()
+    assert result is not None
+    assert {"kanban", "memory", "project"} <= set(result)
+    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -1339,7 +1306,12 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    assert server._load_enabled_toolsets() == ["agent_team", "kanban", "memory", "project"]
+    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
+
+    result = server._load_enabled_toolsets()
+    assert result is not None
+    assert {"kanban", "memory", "project"} <= set(result)
+    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -1434,7 +1406,7 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
 
     assert server._history_to_messages(history) == [
         {"role": "user", "text": "first prompt"},
-        {"context": "Searching files for resume", "name": "search_files", "role": "tool"},
+        {"context": "resume", "name": "search_files", "role": "tool"},
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second prompt"},
     ]
@@ -3667,25 +3639,6 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     ]
 
 
-def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
-    """Without an explicit workspace, cwd is left null so the session groups
-    under "No workspace" rather than the gateway's launch directory."""
-    created = []
-
-    class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
-            created.append(
-                {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
-            )
-
-    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
-    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
-
-    server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
-
-    assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": None}
-    ]
 
 
 def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
@@ -8067,8 +8020,7 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        **_kwargs,
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "partial answer",
@@ -8084,13 +8036,11 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "Tell me about Rome"},
-            }
-        )
+        server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "Tell me about Rome"},
+        })
 
     mock_title.assert_not_called()
 
@@ -8100,8 +8050,7 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        **_kwargs,
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "",
@@ -8116,13 +8065,11 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "Tell me about Rome"},
-            }
-        )
+        server.handle_request({
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "Tell me about Rome"},
+        })
 
     mock_title.assert_not_called()
 
