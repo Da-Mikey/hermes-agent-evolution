@@ -480,7 +480,8 @@ class DeliveryRouter:
             f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**Target:** {target.to_string()}\n"
             f"**Error:** Delivery failed — content preserved below\n\n"
-            f"---\n\n{content}\n"
+            f"---\n\n{content}\n",
+            encoding="utf-8",
         )
         return path
 

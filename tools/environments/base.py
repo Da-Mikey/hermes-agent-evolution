@@ -401,7 +401,12 @@ def _cwd_marker(session_id: str) -> str:
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_"
+    # Fork variable: the per-job approval override (#611) is bridged per session
+    # exactly like the vars above, so it leaks the first job's mode into every
+    # later one through the shared snapshot unless it is excluded too. Named
+    # rather than prefixed — it is a single var, not a family.
+    "|HERMES_CRON_APPROVAL_MODE)"
 )
 
 
@@ -431,7 +436,7 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
+        "HERMES_UI_SESSION_ID HERMES_CRON_APPROVAL_MODE 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"

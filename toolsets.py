@@ -40,6 +40,13 @@ _HERMES_CORE_TOOLS = [
     "read_terminal", "close_terminal", "open_preview", "focus_pane", "react_to_message",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
+    # repo_map is a fork tool and registers through the registry rather than
+    # being listed on the `file` toolset (see that toolset's comment). Upstream's
+    # tiered disclosure defers every non-core registry tool behind the
+    # tool_search bridge, which would put a built-in codebase-overview tool
+    # behind a discovery step it never needed. Naming it here is the documented
+    # way to say always-load — the same status its `file` siblings above have.
+    "repo_map",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # BFL FLUX 3 video generation
