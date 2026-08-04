@@ -668,8 +668,51 @@ def _recover_renamed_skill(
         logger.info("Relocated renamed bundled skill: %s -> %s", candidate, dest)
         if not quiet:
             print(f"  → {skill_name} (moved {rel} → {dest.relative_to(SKILLS_DIR).as_posix()})")
+        _drop_remaining_stale_copies(skill_name, origin_hash, dest, active_index, hub_paths, quiet)
         return rel
     return None
+
+
+def _drop_remaining_stale_copies(
+    skill_name: str,
+    origin_hash: str,
+    dest: Path,
+    active_index: Dict[str, List[Path]],
+    hub_paths: Set[str],
+    quiet: bool,
+) -> None:
+    """Delete any further stale copies left by earlier moves of this skill.
+
+    ``_recover_renamed_skill`` relocates the first unmodified copy it finds and
+    stops, so a skill that upstream moved twice leaves the older location
+    stranded — it is still byte-identical to ``origin_hash``, still shadows the
+    canonical path in skill lookup, and never receives another update.
+
+    Only copies that hash to ``origin_hash`` are removed: that hash is what sync
+    itself wrote there, so the directory is provably ours and not the user's
+    work. Hub-installed paths and user-modified copies are left alone by the
+    same rules ``_recover_renamed_skill`` applies.
+    """
+    for candidate in active_index.get(skill_name, []):
+        if candidate == dest or not candidate.is_dir():
+            continue
+        try:
+            rel = candidate.relative_to(SKILLS_DIR).as_posix()
+        except ValueError:
+            continue
+        if rel in hub_paths or _dir_hash(candidate) != origin_hash:
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except (OSError, IOError):
+            logger.warning(
+                "Could not remove stale copy of renamed skill %s", candidate,
+                exc_info=True,
+            )
+            continue
+        logger.info("Removed stale copy of renamed bundled skill: %s", candidate)
+        if not quiet:
+            print(f"  → {skill_name} (removed stale copy at {rel})")
 
 
 def sync_skills(quiet: bool = False) -> dict:
@@ -721,7 +764,6 @@ def sync_skills(quiet: bool = False) -> dict:
     user_modified = []
     relocated: List[str] = []
     suppressed_skipped: List[str] = []
-    relocated: List[str] = []
     skipped = 0
 
     for skill_name, skill_src in bundled_skills:
@@ -1001,7 +1043,6 @@ def sync_skills(quiet: bool = False) -> dict:
         "relocated": relocated,
         "cleaned": cleaned,
         "suppressed": suppressed_skipped,
-        "relocated": relocated,
         "total_bundled": len(bundled_skills),
         "optional_provenance_backfilled": optional_provenance_backfilled,
         "shadowed_by_external": shadowed_by_external,

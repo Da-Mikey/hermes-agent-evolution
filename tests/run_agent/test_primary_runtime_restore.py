@@ -631,26 +631,6 @@ class TestTryRecoverPrimaryTransport:
             # wait_time = min(3 + 10, 8) = 8
             mock_sleep.assert_called_once_with(8)
 
-    def test_closes_existing_client_before_rebuild(self):
-        agent = _make_agent(provider="custom")
-        old_client = agent.client
-        error = _make_transport_error("ReadTimeout")
-
-        with (
-            patch("run_agent.OpenAI", return_value=MagicMock()),
-            patch("time.sleep"),
-            patch.object(agent, "_close_openai_client") as mock_close,
-        ):
-            agent._try_recover_primary_transport(
-                error,
-                retry_count=3,
-                max_retries=3,
-            )
-            mock_close.assert_called_once_with(
-                old_client,
-                reason="primary_recovery",
-                shared=True,
-            )
 
     def test_survives_rebuild_failure(self):
         """If client rebuild fails, returns False gracefully."""

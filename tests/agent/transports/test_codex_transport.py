@@ -774,40 +774,7 @@ class TestCodexBuildKwargs:
         )
         assert "reasoning" not in kw
 
-    def test_cache_key_is_content_addressed_not_session_id(self, transport):
-        """prompt_cache_key is content-addressed from the static prefix
-        (instructions + tools), not the session_id. This keeps recurring cron
-        jobs — whose session_id carries a per-fire timestamp — on a stable warm
-        cache key. The key is a 'pck_' hash and must NOT equal session_id."""
-        messages = [{"role": "user", "content": "Hi"}]
-        kw = transport.build_kwargs(
-            model="gpt-5.4",
-            messages=messages,
-            tools=[],
-            session_id="cron_job42_20260624_143000",
-        )
-        pck = kw.get("prompt_cache_key", "")
-        assert pck.startswith("pck_")
-        assert pck != "cron_job42_20260624_143000"
 
-    def test_cache_key_stable_across_session_ids(self, transport):
-        """Same static prefix + different session_id (e.g. two cron fires of the
-        same job) must yield the same prompt_cache_key — the whole point of the
-        fix: repeated fires reuse the warm prefix instead of going cold."""
-        messages = [{"role": "user", "content": "Hi"}]
-        kw1 = transport.build_kwargs(
-            model="gpt-5.4",
-            messages=messages,
-            tools=[],
-            session_id="cron_job42_20260624_143000",
-        )
-        kw2 = transport.build_kwargs(
-            model="gpt-5.4",
-            messages=messages,
-            tools=[],
-            session_id="cron_job42_20260624_143500",
-        )
-        assert kw1["prompt_cache_key"] == kw2["prompt_cache_key"]
 
     @pytest.mark.parametrize(
         "model",

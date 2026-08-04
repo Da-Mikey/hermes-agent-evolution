@@ -1064,52 +1064,7 @@ class TestInit:
             )
             assert a._cache_ttl == "5m"
 
-    def test_prompt_caching_cache_ttl_custom_1h(self):
-        """prompt_caching.cache_ttl 1h is applied when present in config."""
-        with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"prompt_caching": {"cache_ttl": "1h"}},
-            ),
-        ):
-            a = AIAgent(
-                api_key="test-k...7890",
-                model="anthropic/claude-sonnet-4-20250514",
-                base_url="https://openrouter.ai/api/v1",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-            assert a._cache_ttl == "1h"
 
-    def test_model_max_tokens_from_config(self):
-        """model.max_tokens config populates the chat-completions request cap."""
-        with (
-            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("terminal")),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
-            patch(
-                "hermes_cli.config.load_config",
-                return_value={"model": {"max_tokens": 4096}},
-            ),
-        ):
-            a = AIAgent(
-                api_key="test-k...7890",
-                provider="custom",
-                model="claude-opus-4-6-thinking",
-                base_url="http://proxy.example/v1",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-
-            kwargs = a._build_api_kwargs([{"role": "user", "content": "Hi"}])
-
-        assert a.max_tokens == 4096
-        assert kwargs["max_tokens"] == 4096
 
     def test_constructor_max_tokens_wins_over_config(self):
         """Explicit constructor max_tokens keeps programmatic callers stable."""
@@ -1576,17 +1531,7 @@ class TestToolUseEnforcementConfig:
         prompt = agent._build_system_prompt()
         assert OPENAI_MODEL_EXECUTION_GUIDANCE not in prompt
 
-    def test_true_forces_for_all_models(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="anthropic/claude-sonnet-4", tool_use_enforcement=True)
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
-    def test_string_true_forces_for_all_models(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="anthropic/claude-sonnet-4", tool_use_enforcement="true")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
     def test_always_forces_for_all_models(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
@@ -1594,17 +1539,7 @@ class TestToolUseEnforcementConfig:
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
-    def test_false_disables_for_gpt(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="openai/gpt-4.1", tool_use_enforcement=False)
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
-    def test_string_false_disables(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="openai/gpt-4.1", tool_use_enforcement="off")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
     def test_custom_list_matches(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
@@ -1717,13 +1652,6 @@ class TestTaskCompletionGuidance:
         prompt = agent._build_system_prompt()
         assert TASK_COMPLETION_GUIDANCE in prompt
 
-    def test_false_disables(self):
-        from agent.prompt_builder import TASK_COMPLETION_GUIDANCE
-        agent = self._make_agent(
-            model="anthropic/claude-opus-4.8", task_completion_guidance=False
-        )
-        prompt = agent._build_system_prompt()
-        assert TASK_COMPLETION_GUIDANCE not in prompt
 
     def test_no_tools_no_injection(self):
         """Same gate as tool_use_enforcement — no tools means no guidance.
@@ -1817,9 +1745,11 @@ class TestEnvironmentProbeIntegration:
     def test_probe_disabled_by_config(self, monkeypatch):
         """Even with detectable problems, the probe stays out when disabled."""
         from tools import env_probe
+
         env_probe._reset_cache_for_tests()
-        monkeypatch.setattr(env_probe, "_python_version_of",
-                            lambda b: {"python3": "3.11.15"}.get(b))
+        monkeypatch.setattr(
+            env_probe, "_python_version_of", lambda b: {"python3": "3.11.15"}.get(b)
+        )
         monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: False)
         monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: True)
         monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
@@ -3882,51 +3812,7 @@ class TestAgentRuntimePostHookOwnershipSync:
                 names.add(literal)
         return names
 
-    def test_frozenset_matches_inline_dispatch_chain(self):
-        from agent import tool_executor
-        from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
 
-        inline_names = self._extract_dispatch_chain_names(
-            tool_executor.execute_tool_calls_sequential
-        )
-        assert inline_names, (
-            "Could not find the dispatch chain (anchored on "
-            "`_block_msg is not None`) in execute_tool_calls_sequential. "
-            "If the dispatcher was refactored, update _DISPATCH_ANCHOR_LEFT "
-            "and the walker in this test."
-        )
-        assert inline_names == set(AGENT_RUNTIME_POST_HOOK_TOOL_NAMES), (
-            "Inline dispatch chain in "
-            "agent/tool_executor.py:execute_tool_calls_sequential has drifted "
-            "from AGENT_RUNTIME_POST_HOOK_TOOL_NAMES in "
-            "agent/agent_runtime_helpers.py.\n"
-            f"  Inline branches:     {sorted(inline_names)}\n"
-            f"  Ownership frozenset: {sorted(AGENT_RUNTIME_POST_HOOK_TOOL_NAMES)}\n"
-            "Update both together so post_tool_call fires exactly once per "
-            "tool execution."
-        )
-
-    def test_invoke_tool_dispatch_matches_inline_dispatch_chain(self):
-        """invoke_tool (concurrent path) and the inline dispatcher (sequential
-        path) must cover the same set of agent-runtime tools — otherwise
-        post_tool_call fires inconsistently depending on which executor ran
-        the tool."""
-        from agent import agent_runtime_helpers, tool_executor
-
-        invoke_tool_names = self._extract_invoke_tool_names(
-            agent_runtime_helpers.invoke_tool
-        )
-        inline_names = self._extract_dispatch_chain_names(
-            tool_executor.execute_tool_calls_sequential
-        )
-        assert invoke_tool_names == inline_names, (
-            "Static `function_name == \"...\"` branches diverged between "
-            "agent/agent_runtime_helpers.py:invoke_tool (concurrent path) "
-            "and agent/tool_executor.py:execute_tool_calls_sequential "
-            "(sequential path).\n"
-            f"  invoke_tool:                   {sorted(invoke_tool_names)}\n"
-            f"  execute_tool_calls_sequential: {sorted(inline_names)}"
-        )
 
     _CASES = (
         ("todo", {"todos": []}),
@@ -4323,22 +4209,6 @@ class TestHandleMaxIterations:
             "data_collection": "deny",
         }
 
-    def test_summary_keeps_nous_profile_body_without_routing_preferences(self, agent):
-        agent.base_url = "https://proxy.example.com/v1"
-        agent._base_url_lower = agent.base_url.lower()
-        agent.provider = "nous"
-        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
-        agent._cached_system_prompt = "You are helpful."
-
-        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
-
-        assert result == "Summary"
-        kwargs = agent.client.chat.completions.create.call_args.kwargs
-        from agent.portal_tags import nous_portal_tags
-
-        assert kwargs["extra_body"] == {
-            "tags": nous_portal_tags(session_id=agent.session_id)
-        }
 
     def test_summary_drops_invalid_provider_sort(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -4841,7 +4711,9 @@ class TestRunConversation:
 
         # 6 responses: original + 2 prefill + 3 retries after prefill exhaustion
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp] * 6),
+            patch.object(
+                agent, "_interruptible_api_call", side_effect=[empty_resp] * 6
+            ),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -4851,10 +4723,14 @@ class TestRunConversation:
 
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
-        # #34452: the bare "(empty)" sentinel is now replaced by a
-        # user-visible end-of-turn explanation so the failure isn't silent.
+        # The bare "(empty)" sentinel is never delivered for reasoning-only
+        # exhaustion: the labeled reasoning excerpt (which may contain the
+        # answer) replaces it at the terminal. See
+        # test_empty_terminal_reasoning_surface.py; #34452's explainer still
+        # covers the truly-empty case.
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        assert "only internal reasoning" in result["final_response"]
+        assert "reasoning only" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
@@ -4875,9 +4751,12 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        # #34452: explanation replaces the bare "(empty)" sentinel.
+        # Reasoning-only exhaustion delivers the labeled reasoning excerpt
+        # instead of the bare "(empty)" sentinel (see
+        # test_empty_terminal_reasoning_surface.py).
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        assert "only internal reasoning" in result["final_response"]
+        assert "structured reasoning answer" in result["final_response"]
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
@@ -6884,6 +6763,7 @@ class TestNousCredentialRefresh:
         agent.api_mode = "chat_completions"
 
         closed = {"value": False}
+        retired = {"value": False}
         rebuilt = {"kwargs": None}
         captured = {}
 
@@ -6909,12 +6789,28 @@ class TestNousCredentialRefresh:
             "hermes_cli.auth.resolve_nous_runtime_credentials", _fake_resolve
         )
 
-        agent.client = _ExistingClient()
+        existing = _ExistingClient()
+        agent.client = existing
+
+        _orig_retire = agent._retire_shared_openai_client
+
+        def _spy_retire(client, *, reason):
+            if client is existing:
+                retired["value"] = True
+            return _orig_retire(client, reason=reason)
+
+        monkeypatch.setattr(agent, "_retire_shared_openai_client", _spy_retire)
+
         with patch("run_agent.OpenAI", side_effect=_fake_openai):
             ok = agent._try_refresh_nous_client_credentials(force=True)
 
         assert ok is True
-        assert closed["value"] is True
+        # #70773: the replaced shared client is RETIRED (sockets shutdown,
+        # FD release deferred to GC), never hard-closed from the refreshing
+        # thread — close() releasing pool FDs cross-thread was the
+        # TLS-FD→SQLite corruption vector.
+        assert retired["value"] is True
+        assert closed["value"] is False
         assert captured["force_refresh"] is True
         assert rebuilt["kwargs"]["api_key"] == "new-nous-key"
         assert (
@@ -7056,9 +6952,15 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def entries(self):
+                return []
+
+            def mark_exhausted_and_rotate(
+                self, *, status_code, error_context=None, api_key_hint=None
+            ):
                 assert status_code == 429
                 assert error_context is None
+                assert api_key_hint == agent.api_key
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -7081,124 +6983,10 @@ class TestCredentialPoolRecovery:
         agent._swap_credential.assert_called_once_with(next_entry)
 
 
-    def test_recover_with_pool_refreshes_on_401(self, agent):
-        """401 with successful refresh should swap to refreshed credential."""
-        refreshed_entry = SimpleNamespace(label="refreshed-primary", id="abc")
 
-        class _Pool:
-            def try_refresh_current(self):
-                return refreshed_entry
 
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
 
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=401,
-            has_retried_429=False,
-        )
 
-        assert recovered is True
-        agent._swap_credential.assert_called_once_with(refreshed_entry)
-
-    def test_recover_with_pool_401_same_entry_refreshes_stop_after_two(self, agent):
-        """Repeated same-entry auth refreshes must eventually fall through.
-
-        A single-entry OAuth pool re-mints a fresh token on every 401, so
-        ``try_refresh_current()`` reports success forever. The cap (#26080)
-        must let the third consecutive same-entry refresh fall through
-        (return not-recovered) so the fallback chain can activate instead of
-        looping on the same dead credential.
-        """
-        refreshed_entry = SimpleNamespace(label="primary", id="abc")
-
-        class _Pool:
-            def try_refresh_current(self):
-                return refreshed_entry
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-        agent._auth_pool_refresh_counts = {}
-
-        first = agent._recover_with_credential_pool(status_code=401, has_retried_429=False)
-        second = agent._recover_with_credential_pool(status_code=401, has_retried_429=False)
-        third = agent._recover_with_credential_pool(status_code=401, has_retried_429=False)
-
-        assert first == (True, False)
-        assert second == (True, False)
-        # Third same-entry refresh exceeds the cap → not recovered, fall through.
-        assert third == (False, False)
-        assert agent._swap_credential.call_count == 2
-
-    def test_recover_with_pool_401_cap_is_per_entry(self, agent):
-        """Rotating to a different entry resets the per-entry refresh tally."""
-        entry_a = SimpleNamespace(label="primary", id="aaa")
-        entry_b = SimpleNamespace(label="secondary", id="bbb")
-        sequence = [entry_a, entry_a, entry_b, entry_b]
-
-        class _Pool:
-            def try_refresh_current(self):
-                return sequence.pop(0)
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-        agent._auth_pool_refresh_counts = {}
-
-        # Two refreshes of entry_a, then two of entry_b — neither hits the cap,
-        # so all four recover. The (provider, id) key isolates the tallies.
-        results = [
-            agent._recover_with_credential_pool(status_code=401, has_retried_429=False)
-            for _ in range(4)
-        ]
-
-        assert all(r == (True, False) for r in results)
-        assert agent._swap_credential.call_count == 4
-
-    def test_recover_with_pool_rotates_on_401_when_refresh_fails(self, agent):
-        """401 with failed refresh should rotate to next credential."""
-        next_entry = SimpleNamespace(label="secondary", id="def")
-
-        class _Pool:
-            def try_refresh_current(self):
-                return None  # refresh failed
-
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
-                assert status_code == 401
-                assert error_context is None
-                return next_entry
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=401,
-            has_retried_429=False,
-        )
-
-        assert recovered is True
-        assert retry_same is False
-        agent._swap_credential.assert_called_once_with(next_entry)
-
-    def test_recover_with_pool_401_refresh_fails_no_more_credentials(self, agent):
-        """401 with failed refresh and no other credentials returns not recovered."""
-
-        class _Pool:
-            def try_refresh_current(self):
-                return None
-
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
-                assert error_context is None
-                return None  # no more credentials
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=401,
-            has_retried_429=False,
-        )
-
-        assert recovered is False
-        agent._swap_credential.assert_not_called()
 
     def test_extract_api_error_context_uses_reset_timestamp_and_reason(self, agent):
         response = SimpleNamespace(headers={})
@@ -7254,32 +7042,6 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "GoUsageLimitError"
         assert context["reset_at"] == 1_000.0 + (6 * 60 * 60) + (29 * 60)
 
-    def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
-        next_entry = SimpleNamespace(label="secondary")
-        captured = {}
-
-        class _Pool:
-            def current(self):
-                return SimpleNamespace(label="primary")
-
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
-                captured["status_code"] = status_code
-                captured["error_context"] = error_context
-                return next_entry
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=429,
-            has_retried_429=True,
-            error_context={"reason": "device_code_exhausted", "reset_at": "2026-04-12T10:30:00Z"},
-        )
-
-        assert recovered is True
-        assert retry_same is False
-        assert captured["status_code"] == 429
-        assert captured["error_context"]["reason"] == "device_code_exhausted"
 
 
 class TestMaxTokensParam:

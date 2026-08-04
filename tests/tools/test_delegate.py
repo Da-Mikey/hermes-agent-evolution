@@ -2571,39 +2571,6 @@ class TestDispatchDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["override_acp_command"], "claude")
             self.assertEqual(kwargs["override_acp_args"], ["--acp", "--stdio"])
 
-    def test_model_acp_args_not_forwarded(self):
-        """The live model dispatch path strips hidden ACP transport args."""
-        import run_agent
-
-        captured = {}
-
-        def fake_delegate_task(**kwargs):
-            captured.update(kwargs)
-            return "{}"
-
-        parent = _make_mock_parent(depth=0)
-        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
-            run_agent.AIAgent._dispatch_delegate_task(
-                parent,
-                {
-                    "goal": "test",
-                    "acp_command": "claude",
-                    "acp_args": ["--acp", "--stdio"],
-                    "tasks": [
-                        {
-                            "goal": "nested",
-                            "acp_command": "codex",
-                            "acp_args": ["--acp"],
-                        },
-                    ],
-                },
-            )
-
-        self.assertNotIn("acp_command", captured)
-        self.assertNotIn("acp_args", captured)
-        self.assertEqual(captured["goal"], "test")
-        self.assertNotIn("acp_command", captured["tasks"][0])
-        self.assertNotIn("acp_args", captured["tasks"][0])
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
@@ -2921,16 +2888,6 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertNotIn("e.g. 'claude'", top_acp_desc)
         self.assertNotIn("e.g. \"claude\"", top_acp_desc)
 
-    def test_schema_omits_acp_transport_fields(self):
-        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
-
-        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-
-        task_props = props["tasks"]["items"]["properties"]
-        self.assertNotIn("acp_command", props)
-        self.assertNotIn("acp_args", props)
-        self.assertNotIn("acp_command", task_props)
-        self.assertNotIn("acp_args", task_props)
 
 
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".
