@@ -35,6 +35,14 @@
             install -Dm755 ${../scripts/dev-sandbox.sh} $out/bin/sandbox
           '')
           uv
+        ]
+        # The Wayland E2E capture stack is Linux-only — `cage` and `grim` carry
+        # `meta.platforms = [ ... -linux ]`, so merely EVALUATING them on Darwin
+        # aborts with "Refusing to evaluate package". Upstream never notices:
+        # `nix flake check` on macOS is this fork's own workflow (.github/
+        # workflows/nix.yml, ubuntu + macos), and upstream has no such job.
+        # nix/hermes-agent.nix already guards its own `cage` the same way.
+        ++ lib.optionals stdenv.isLinux [
           # Headless Wayland compositor for E2E tests (test:e2e:visual).
           # cage renders a single client with no window management, so
           # the Electron window opens at a fixed size without tiling.
