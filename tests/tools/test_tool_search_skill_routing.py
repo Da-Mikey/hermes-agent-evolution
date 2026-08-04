@@ -34,6 +34,7 @@ def test_tool_search_default_off_preserves_bm25_order():
     with (
         patch("tools.tool_search.search_catalog", return_value=_hits_bm25_suboptimal()),
         patch("hermes_cli.config.load_config", return_value={}),
+        patch("hermes_cli.config.load_config_readonly", return_value={}),
     ):
         out = dispatch_tool_search({"query": "read a file"}, current_tool_defs=[], config=cfg)
     import json
@@ -47,6 +48,7 @@ def test_tool_search_listwise_rerank_promotes_best_match():
     with (
         patch("tools.tool_search.search_catalog", return_value=_hits_bm25_suboptimal()),
         patch("hermes_cli.config.load_config", return_value={"skill_routing": {"listwise_rerank": True}}),
+        patch("hermes_cli.config.load_config_readonly", return_value={"skill_routing": {"listwise_rerank": True}}),
     ):
         out = dispatch_tool_search({"query": "read a file"}, current_tool_defs=[], config=cfg)
     import json
@@ -64,6 +66,7 @@ def test_tool_search_rerank_failure_degrades_gracefully():
         patch("tools.tool_search.search_catalog", return_value=_hits_bm25_suboptimal()),
         patch("agent.skill_routing.maybe_rerank_hits", side_effect=RuntimeError("boom")),
         patch("hermes_cli.config.load_config", return_value={"skill_routing": {"listwise_rerank": True}}),
+        patch("hermes_cli.config.load_config_readonly", return_value={"skill_routing": {"listwise_rerank": True}}),
     ):
         out = dispatch_tool_search({"query": "read a file"}, current_tool_defs=[], config=cfg)
     import json

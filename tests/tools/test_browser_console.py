@@ -266,6 +266,7 @@ class TestBrowserVisionConfig:
             patch("tools.browser_tool._run_browser_command", return_value={"success": True, "data": {"path": str(screenshot)}}),
             patch("tools.browser_tool._get_vision_model", return_value="test-model"),
             patch("hermes_cli.config.load_config", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
+            patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
             patch("tools.browser_tool.call_llm", return_value=mock_response) as mock_llm,
         ):
             result = json.loads(browser_vision("what is on the page?", task_id="test"))
@@ -295,10 +296,8 @@ class TestBrowserVisionConfig:
                         "data": {"path": str(screenshot), "annotations": annotations},
                     },
                 ),
-                patch(
-                    "hermes_cli.config.load_config",
-                    return_value={"model": {"supports_vision": True}},
-                ),
+                patch("hermes_cli.config.load_config", return_value={"model": {"supports_vision": True}}),
+                patch("hermes_cli.config.load_config_readonly", return_value={"model": {"supports_vision": True}}),
                 patch("tools.browser_tool._get_vision_model") as mock_get_vision_model,
                 patch("tools.browser_tool.call_llm") as mock_llm,
             ):

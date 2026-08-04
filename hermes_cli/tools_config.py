@@ -2160,15 +2160,7 @@ def _exempt_explicit_platform_native(
 #: toolset still ships zero schemas to a user without paid portal access — the
 #: same split Home Assistant uses. Probing the portal from this path would put
 #: a network call on every CLI start, gateway session and cron tick.
-#:
-#: ``agent_team`` is this fork's, and rides the same split: ``team_task`` /
-#: ``team_message`` are ``check_fn``-gated on ``HERMES_TEAM_ID`` (see
-#: tools/agent_team_tools.py), so enabling the toolset ships zero schemas to
-#: anyone who is not inside a teammate session. It shipped after this fork's
-#: users had already frozen their picker lists, which is exactly the parity gap
-#: this set exists to close — upstream has no such toolset, so it never
-#: appeared here.
-_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl", "agent_team"})
+_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl"})
 
 
 def _enable_recently_shipped_toolsets(

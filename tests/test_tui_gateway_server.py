@@ -1278,14 +1278,20 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
     # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
     # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
+    # `agent_team` is this fork's and lands in the same auto-recovered class —
+    # check_fn-gated on HERMES_TEAM_ID, so it is resolved at read time and never
+    # shown on the checklist, exactly like kanban. Upstream has no such toolset,
+    # which is why its copy of this test lists only three.
     # Toolsets inside their first release (_RECENTLY_SHIPPED_TOOLSETS) are
     # back-filled onto saved lists that never offered them — allow those too.
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
+    _AUTO_RECOVERED = {"kanban", "memory", "project", "agent_team"}
+
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - _AUTO_RECOVERED <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -1308,10 +1314,14 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
 
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
+    # See the sibling test: agent_team is this fork's check_fn-gated toolset and
+    # is auto-recovered at read time like kanban, never shown on the checklist.
+    _AUTO_RECOVERED = {"kanban", "memory", "project", "agent_team"}
+
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - _AUTO_RECOVERED <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 

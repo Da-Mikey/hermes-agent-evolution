@@ -141,9 +141,8 @@ class TestHandleVisionAnalyze:
                 ))
                 st.enter_context(patch.dict(os.environ, {}, clear=False))
                 if config is not None:
-                    st.enter_context(patch(
-                        "hermes_cli.config.load_config", return_value=config,
-                    ))
+                    st.enter_context(patch("hermes_cli.config.load_config", return_value=config),
+patch("hermes_cli.config.load_config_readonly", return_value=config))
                 if env_model is None:
                     os.environ.pop("AUXILIARY_VISION_MODEL", None)
                 else:
@@ -255,6 +254,7 @@ class TestVisionConfig:
 
             with (
                 patch("hermes_cli.config.load_config", return_value=config),
+                patch("hermes_cli.config.load_config_readonly", return_value=config),
                 patch(
                     "tools.vision_tools._image_to_base64_data_url",
                     return_value="data:image/png;base64,abc",
@@ -770,6 +770,7 @@ class TestVisionCpuBurstCap:
                 patch.dict(os.environ, {}, clear=False),
                 patch("tools.vision_tools._detect_host_cpus", return_value=host_cpus),
                 patch("hermes_cli.config.load_config", side_effect=Exception),
+                patch("hermes_cli.config.load_config_readonly", side_effect=Exception),
             ):
                 if env_value is None:
                     os.environ.pop("HERMES_VISION_MAX_CONCURRENCY", None)
