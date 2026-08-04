@@ -207,3 +207,25 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_total_bytes"] == shared_line_bytes
         assert entry["index_line_shared_bytes"] > 0
         assert entry["index_line_skill_count"] == 2
+
+def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
+    """Blank Slate prompt-size should report file + terminal schemas only."""
+    from hermes_cli.config import save_config
+    from hermes_cli.setup import (
+        _blank_slate_minimal_toolsets,
+        _blank_slate_minimize_config,
+    )
+
+    cfg = {"model": {"default": "MiniMax-M2.7"}}
+    _blank_slate_minimal_toolsets(cfg)
+    _blank_slate_minimize_config(cfg)
+    save_config(cfg)
+
+    data = compute_prompt_breakdown("cli")
+
+    # Fork delta: repo_map self-registers into the ``file`` toolset
+    # (tools/repo_map.py), so our minimal surface carries one tool more than
+    # upstream's. Upstream dropped this test in the v2026.7.30 range because
+    # the baseline count churns; the fork keeps it because the guard is on the
+    # blank-slate surface staying minimal, not on the exact number.
+    assert data["tools"]["count"] == 9
