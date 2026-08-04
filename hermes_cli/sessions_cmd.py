@@ -1153,6 +1153,45 @@ def cmd_sessions(args, sessions_parser=None):
             size_mb = os.path.getsize(db_path) / (1024 * 1024)
             print(f"Database size: {size_mb:.1f} MB")
 
+    elif action == "entropy":
+        sid = args.session_id
+        if not sid:
+            sessions = db.list_sessions_rich(limit=1)
+            if not sessions:
+                print("No sessions found.")
+                db.close()
+                return
+            sid = sessions[0]["id"]
+        resolved = db.resolve_session_id(sid)
+        if not resolved:
+            print(f"Session '{sid}' not found.")
+            db.close()
+            return
+        data = db.export_session(resolved)
+        if not data:
+            print(f"Session '{resolved}' not found.")
+            db.close()
+            return
+        from agent.entropy_eval import EntropyEngine, format_report_terminal
+
+        engine = EntropyEngine()
+        report = engine.analyze(resolved, data.get("messages", []))
+        print(format_report_terminal(report))
+
+    elif action == "cost":
+        from agent.insights import InsightsEngine
+
+        engine = InsightsEngine(db)
+        report = engine.cost_breakdown(
+            days=args.days,
+            source=getattr(args, "source", None),
+            limit=getattr(args, "limit", 20),
+        )
+        if getattr(args, "json", False):
+            print(_json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(engine.format_cost_terminal(report))
+
     else:
         sessions_parser.print_help()
 
