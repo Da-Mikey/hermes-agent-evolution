@@ -2779,7 +2779,7 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context():
+            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -2958,11 +2958,20 @@ def _run_single_child(
                     retry_budget,
                 )
                 try:
-                    retry_result = child.run_conversation(
-                        user_message=escalated_goal,
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
+                    # Same isolation as the first run: this is still the CHILD
+                    # executing. Without it the retry escapes the delegated-child
+                    # context and the child's tools act with the parent's
+                    # authority — a child that "completes" would close the
+                    # parent's Kanban task. Upstream has no shallow-retry loop,
+                    # so its own wrapping of the first call never covered this.
+                    with delegated_child_context(
+                        str(getattr(child, "session_id", "") or "")
+                    ):
+                        retry_result = child.run_conversation(
+                            user_message=escalated_goal,
+                            task_id=child_task_id,
+                            stream_callback=_relay_child_text,
+                        )
                 except Exception as _retry_exc:
                     # A retry failure must never break the delegation — fall
                     # back to the original shallow result and stop retrying.

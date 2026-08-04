@@ -1275,16 +1275,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _vp_err:
                     logging.debug("verify-policy consult failed: %s", _vp_err)
 
-            if not blocked and agent.tool_progress_callback:
-                try:
-                    agent.tool_progress_callback(
-                        "tool.completed", function_name, None, None,
-                        duration=tool_duration, is_error=is_error,
-                        result=function_result,
-                    )
-                except Exception as cb_err:
-                    logging.debug(f"Tool progress callback error: {cb_err}")
-
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -2000,15 +1990,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _vp_err:
                 logging.debug("verify-policy consult failed: %s", _vp_err)
 
-        if not _execution_blocked and agent.tool_progress_callback:
-            try:
-                agent.tool_progress_callback(
-                    "tool.completed", function_name, None, None,
-                    duration=tool_duration, is_error=_is_error_result,
-                    result=function_result,
-                )
-            except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
 
         agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""

@@ -18,6 +18,7 @@ def _make_agent(config: dict | None = None) -> AIAgent:
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("hermes_cli.config.load_config", return_value=config or {}),
+        patch("hermes_cli.config.load_config_readonly", return_value=config or {}),
         patch("run_agent.OpenAI"),
     ):
         agent = AIAgent(
@@ -65,6 +66,7 @@ def test_plan_mode_on_feasibility_off_leaves_plan_unvalidated():
     assert agent._plan_feasibility_enabled is False
     with (
         patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("agent.plan_mode.build_stub_plan", return_value=_infeasible_plan()),
     ):
         agent._maybe_activate_plan_mode("do the thing")
@@ -79,6 +81,7 @@ def test_plan_mode_on_feasibility_on_validates_through_real_seam():
     assert agent._plan_feasibility_enabled is True
     with (
         patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("agent.plan_mode.build_stub_plan", return_value=_infeasible_plan()),
     ):
         agent._maybe_activate_plan_mode("do the thing")

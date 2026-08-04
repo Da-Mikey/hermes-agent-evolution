@@ -37,7 +37,8 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -454,3 +455,20 @@ def async_delivery_supported() -> bool:
     if value is _UNSET:
         return True
     return bool(value)
+
+
+@contextmanager
+def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
+    """Bind a task-local session id and restore the prior value on exit.
+
+    With ``session_id=None`` this acts as a save/restore boundary around code
+    that may call :func:`set_current_session_id` itself (notably delegated
+    ``AIAgent`` construction).  It intentionally never mutates ``os.environ``.
+    """
+    previous = _SESSION_ID.get()
+    if session_id is not None:
+        _SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _SESSION_ID.set(previous)
