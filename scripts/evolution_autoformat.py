@@ -27,7 +27,14 @@ from typing import List, Optional, Sequence, Tuple
 
 
 def _run(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    p = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+    )
     return p.returncode, p.stdout, p.stderr
 
 

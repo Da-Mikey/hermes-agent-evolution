@@ -36,6 +36,10 @@ EXPECTED_FIELDS = {
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
     "restart_with_rebuilt_messages",
+    # Upstream addition arriving with the v2026.7.30 sync. Added by name rather
+    # than by taking upstream's copy of this file, which has no counter fields
+    # and no test_all_guards_default_false — both fork work (#704, #943, #1142).
+    "restart_with_redirected_messages",
 }
 
 

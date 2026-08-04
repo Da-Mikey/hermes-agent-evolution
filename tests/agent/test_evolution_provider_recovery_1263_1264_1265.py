@@ -29,6 +29,7 @@ def _agent(mx=10):
     with (patch("run_agent.get_tool_definitions", return_value=_td("terminal")),
           patch("run_agent.check_toolset_requirements", return_value={}),
           patch("hermes_cli.config.load_config", return_value={}),
+          patch("hermes_cli.config.load_config_readonly", return_value={}),
           patch("run_agent.OpenAI")):
         a = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
                    max_iterations=mx, quiet_mode=True, skip_context_files=True, skip_memory=True)

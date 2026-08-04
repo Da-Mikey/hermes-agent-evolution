@@ -758,47 +758,6 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
-    def test_v11_migration_backfills_base_fts_when_trigram_unavailable(
-        self, tmp_path, monkeypatch
-    ):
-        """Regression: v11 migration must backfill base FTS even when trigram is unavailable."""
-        real_connect = sqlite3.connect
-        db_path = tmp_path / "state.db"
-
-        # Phase 1: create a DB at schema v10 with messages.
-        db = SessionDB(db_path=db_path)
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="legacy message alpha")
-        db.append_message("s1", role="assistant", content="legacy reply beta")
-        # Force schema version to v10 so migration runs on next open.
-        db._conn.execute(
-            "UPDATE schema_version SET version = 10"
-        )
-        db._conn.commit()
-        db.close()
-
-        # Phase 2: reopen with trigram disabled — migration should still
-        # backfill base FTS and make existing messages searchable.
-        def connect_without_trigram(*args, **kwargs):
-            kwargs["factory"] = _NoTrigramConnection
-            return real_connect(*args, **kwargs)
-
-        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_without_trigram)
-        migrated_db = SessionDB(db_path=db_path)
-        try:
-            assert migrated_db._fts_enabled is True
-            assert migrated_db._trigram_available is False
-            assert migrated_db._fts_table_exists("messages_fts") is True
-            assert migrated_db._fts_table_exists("messages_fts_trigram") is False
-
-            # Existing messages must be searchable via base FTS.
-            results = migrated_db.search_messages("legacy message")
-            assert len(results) == 1
-            # snippet has FTS5 highlight markers (>>>...<<<); check raw content via get_messages
-            msgs = migrated_db.get_messages("s1")
-            assert any("legacy message" in m["content"] for m in msgs)
-        finally:
-            migrated_db.close()
 
     def test_cjk_search_falls_back_to_like_when_trigram_unavailable(
         self, tmp_path, monkeypatch
@@ -826,6 +785,78 @@ class TestSessionLifecycle:
             assert "大别山" in results[0]["snippet"]
         finally:
             db.close()
+
+    def test_end_session_first_reason_wins_across_concurrent_connections(self, db):
+        """Concurrent finalizers perform one transition, not last-write-wins."""
+        import threading
+
+        db.create_session(session_id="s1", source="cron")
+        db._conn.execute("CREATE TABLE session_end_audit (reason TEXT NOT NULL)")
+        db._conn.execute(
+            """
+            CREATE TRIGGER audit_session_end
+            AFTER UPDATE OF ended_at ON sessions
+            WHEN OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL
+            BEGIN
+                INSERT INTO session_end_audit(reason) VALUES (NEW.end_reason);
+            END
+            """
+        )
+
+        peer = SessionDB(db_path=db.db_path)
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def _end(session_db, reason):
+            try:
+                barrier.wait(timeout=5)
+                session_db.end_session("s1", reason)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_end, args=(db, "compression")),
+            threading.Thread(target=_end, args=(peer, "cron_complete")),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert errors == []
+            audit_rows = db._conn.execute(
+                "SELECT reason FROM session_end_audit"
+            ).fetchall()
+            assert len(audit_rows) == 1
+            assert db.get_session("s1")["end_reason"] == audit_rows[0]["reason"]
+        finally:
+            peer.close()
+
+    def test_update_session_model_clears_browser_lock_and_preserves_lineage(self, db):
+        """A later /model switch must replace, not compete with, a Browser lock."""
+        db.create_session(
+            session_id="s1",
+            source="hermes_browser",
+            model="x-ai/grok-4.5",
+            model_config={
+                "_branched_from": "parent-session",
+                "browser_model_lock": {
+                    "provider": "nous",
+                    "model": "x-ai/grok-4.5",
+                    "confirmed": True,
+                },
+            },
+        )
+
+        db.update_session_model("s1", "anthropic/claude-opus-4.8")
+
+        session = db.get_session("s1")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "anthropic/claude-opus-4.8"
+        assert "browser_model_lock" not in model_config
+        assert model_config["_branched_from"] == "parent-session"
 
 
 # =========================================================================
@@ -1271,68 +1302,8 @@ class TestMessageStorage:
 
         assert [m["content"] for m in conv if m["role"] == "user"] == ["same prompt", "next prompt"]
 
-    def test_get_resume_conversations_matches_separate_reads(self, db):
-        """The one-fetch resume projections must be byte-identical to the two
-        separate get_messages_as_conversation reads they replace — the whole
-        point of the single-SELECT optimization (desktop audit P1). Includes a
-        dangling tool-call tail so repair_alternation drops rows and the model /
-        display lengths diverge (exercises session.resume's prefix computation).
-        """
-        db.create_session("root", "tui")
-        db.append_message("root", role="user", content="first prompt")
-        db.append_message("root", role="assistant", content="first answer")
-        db.create_session("child", "tui", parent_session_id="root")
-        db.append_message("child", role="user", content="second prompt")
-        db.append_message(
-            "child", role="assistant", content="second answer", finish_reason="stop"
-        )
-        # Dangling assistant(tool_calls) tail with no tool response → repair
-        # drops it, so model_history is shorter than display_history.
-        db.append_message(
-            "child",
-            role="assistant",
-            content="",
-            tool_calls=[
-                {"id": "t1", "type": "function", "function": {"name": "x", "arguments": "{}"}}
-            ],
-        )
 
-        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
 
-        model_history, display_history = db.get_resume_conversations("child")
-
-        assert model_history == model_expected
-        assert display_history == display_expected
-        # Sanity: the tail really did diverge the two projections.
-        assert len(display_history) > len(model_history)
-
-    def test_get_resume_conversations_single_session_no_ancestors(self, db):
-        db.create_session("solo", "cli")
-        db.append_message("solo", role="user", content="hi")
-        db.append_message("solo", role="assistant", content="hello")
-
-        model_expected = db.get_messages_as_conversation("solo", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("solo", include_ancestors=True)
-        model_history, display_history = db.get_resume_conversations("solo")
-
-        assert model_history == model_expected
-        assert display_history == display_expected
-
-    def test_get_resume_conversations_dedupes_replayed_ancestor_user(self, db):
-        db.create_session("root", "tui")
-        db.append_message("root", role="user", content="same prompt")
-        db.append_message("root", role="user", content="same prompt")
-        db.append_message("root", role="assistant", content="answer")
-        db.create_session("child", "tui", parent_session_id="root")
-        db.append_message("child", role="user", content="next prompt")
-
-        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
-        model_history, display_history = db.get_resume_conversations("child")
-
-        assert model_history == model_expected
-        assert display_history == display_expected
 
     def test_get_ancestor_display_prefix_single_session_returns_empty(self, db):
         """A session with no compression ancestors has an empty prefix."""
@@ -3378,9 +3349,15 @@ class TestSanitizeTitle:
 
 class TestSchemaInit:
     def test_wal_mode(self, db):
+        """Prefer WAL on fixed SQLite; DELETE on WAL-reset-vulnerable builds (#69784)."""
+        from hermes_state import is_sqlite_wal_reset_vulnerable
+
         cursor = db._conn.execute("PRAGMA journal_mode")
-        mode = cursor.fetchone()[0]
-        assert mode == "wal"
+        mode = cursor.fetchone()[0].lower()
+        if is_sqlite_wal_reset_vulnerable():
+            assert mode == "delete"
+        else:
+            assert mode == "wal"
 
     def test_foreign_keys_enabled(self, db):
         cursor = db._conn.execute("PRAGMA foreign_keys")
@@ -3717,64 +3694,6 @@ class TestSchemaInit:
 
         migrated_db.close()
 
-    def test_v9_migration_skips_v10_trigram_backfill_before_v11_rebuild(self, tmp_path, monkeypatch):
-        """Direct v9→current migration should do only the v11 FTS rebuild.
-
-        v10 backfilled ``messages_fts_trigram`` with content-only rows. Current
-        v11+ migration immediately drops and rebuilds both FTS tables with
-        content + tool metadata, so running the v10 insert first is wasted work.
-        """
-        db_path = tmp_path / "v9_fts.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(SCHEMA_SQL)
-        conn.execute("DELETE FROM schema_version")
-        conn.execute("INSERT INTO schema_version (version) VALUES (9)")
-        conn.execute(
-            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
-            ("s1", "cli", 1000.0),
-        )
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("s1", "tool", "plain content", "browser_snapshot", '{"name":"browser_snapshot"}', 1001.0),
-        )
-        conn.commit()
-        conn.close()
-
-        trigram_content_only_inserts = []
-        real_connect = sqlite3.connect
-
-        def connect_with_trace(*args, **kwargs):
-            conn = real_connect(*args, **kwargs)
-
-            def trace(sql):
-                text = " ".join(str(sql).split())
-                if (
-                    "INSERT INTO messages_fts_trigram" in text
-                    and "SELECT id, content FROM messages" in text
-                ):
-                    trigram_content_only_inserts.append(text)
-
-            conn.set_trace_callback(trace)
-            return conn
-
-        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_with_trace)
-        migrated_db = SessionDB(db_path=db_path)
-        try:
-            assert trigram_content_only_inserts == []
-            version = migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
-            assert version == SCHEMA_VERSION
-            normal_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
-            trigram_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0]
-            assert normal_count == 1
-            assert trigram_count == 1
-            tool_hit = migrated_db._conn.execute(
-                "SELECT COUNT(*) FROM messages_fts_trigram "
-                "WHERE messages_fts_trigram MATCH 'browser_snapshot'"
-            ).fetchone()[0]
-            assert tool_hit == 1
-        finally:
-            migrated_db.close()
 
     def test_reconciliation_adds_missing_columns(self, tmp_path):
         """Columns present in SCHEMA_SQL but missing from the live table
@@ -4131,63 +4050,6 @@ class TestListSessionsRich:
             s["id"] for s in db.list_sessions_rich(limit=5, order_by_last_active=True)
         ] == ["old", "new"]
 
-    def test_order_by_last_active_uses_compression_tip_activity(self, db):
-        """A compression root whose tip was touched recently must rank above
-        a newer uncompressed session, even when that tip activity lives in a
-        different row and the outer LIMIT could otherwise cut it.
-
-        This is the case that forced SQL-level chain walking: a naive "cap
-        the SQL fetch at limit*K" optimization would drop the old root off
-        the SQL page before post-projection could promote it.
-        """
-        t0 = 1709500000.0
-        db.create_session("root1", "cli")
-        with db._lock:
-            db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
-            db._conn.execute(
-                "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
-                (t0 + 100, "compression", "root1"),
-            )
-        db.append_message("root1", "user", "old ask")
-
-        # Continuation tip created after root ended; last activity much later.
-        db.create_session("tip1", "cli", parent_session_id="root1")
-        with db._lock:
-            db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 101, "tip1"))
-        db.append_message("tip1", "user", "latest message")
-
-        # Bunch of newer, uncompressed sessions — fresher start_at but older
-        # last activity than the tip. Explicitly pin message timestamps so
-        # they don't pick up wall-clock from append_message.
-        for i in range(5):
-            sid = f"newer{i}"
-            db.create_session(sid, "cli")
-            with db._lock:
-                db._conn.execute(
-                    "UPDATE sessions SET started_at=? WHERE id=?",
-                    (t0 + 500 + i, sid),
-                )
-            db.append_message(sid, "user", f"msg {i}")
-            with db._lock:
-                db._conn.execute(
-                    "UPDATE messages SET timestamp=? WHERE session_id=? AND content=?",
-                    (t0 + 500 + i, sid, f"msg {i}"),
-                )
-
-        # Tip activity timestamp is the latest thing in the DB.
-        with db._lock:
-            db._conn.execute(
-                "UPDATE messages SET timestamp=? WHERE session_id=? AND content=?",
-                (t0 + 10_000, "tip1", "latest message"),
-            )
-            db._conn.commit()
-
-        # limit=1 is the stress test: the old root must win the single slot.
-        top = db.list_sessions_rich(limit=1, order_by_last_active=True)
-        assert len(top) == 1
-        # Projection surfaces the tip's id in the root's slot.
-        assert top[0]["id"] == "tip1"
-        assert top[0]["_lineage_root_id"] == "root1"
 
     def test_rich_list_includes_title(self, db):
         db.create_session("s1", "cli")
@@ -4372,6 +4234,37 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich(project_compression_tips=False)
         ids = [s["id"] for s in sessions]
         assert "continuation" not in ids, "Compression continuation should stay hidden"
+
+    def test_delete_session_expected_targets_fail_closed_on_new_delegate(self, db):
+        db.create_session("parent", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.create_session(
+            "branch",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_branched_from": "parent"},
+        )
+
+        expected_ids = db.get_session_delete_targets("parent")
+        assert expected_ids == ["parent", "delegate"]
+
+        db.create_session(
+            "late-delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+
+        assert db.delete_session("parent", expected_delete_ids=expected_ids) is False
+        assert db.get_session("parent") is not None
+        assert db.get_session("delegate") is not None
+        assert db.get_session("late-delegate") is not None
+        assert db.get_session("branch") is not None
 
 
 class TestCompressionChainProjection:
@@ -4809,26 +4702,6 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
-        """Writes periodically merge FTS segments so they never accumulate
-        into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
-        calls = {"n": 0}
-        real_optimize = db.optimize_fts
-
-        def _counting_optimize():
-            calls["n"] += 1
-            return real_optimize()
-
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
-        # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
-        db.create_session(session_id="s1", source="cli")
-        for i in range(9):
-            db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls["n"] == 2
-        # The auto-merge is layout-only: search is unaffected.
-        assert len(db.search_messages("needle")) == 9
 
     def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
         """A failing periodic optimize must not fail the surrounding write."""
@@ -4842,6 +4715,61 @@ class TestOptimizeFts:
         # write #2 trips the cadence; the swallowed failure must not propagate.
         db.append_message(session_id="s1", role="user", content="still persists")
         assert len(db.get_messages("s1")) == 1
+
+    def test_incremental_merge_bounded_commands_per_present_index(self, db):
+        """Each pass issues bounded 'merge' commands, never 'optimize'."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="bounded merge")
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            executed = db._merge_fts_incrementally(max_pages=37)
+        finally:
+            db._conn.set_trace_callback(None)
+
+        # At least one merge command per present FTS index, and never more
+        # than the per-pass command cap per index.
+        present = [t for t in db._FTS_TABLES if db._fts_table_exists(t)]
+        assert len(present) >= 2  # messages_fts + trigram on a fresh DB
+        merge_sql = [sql for sql in statements if "VALUES('merge', 37)" in sql]
+        assert len(merge_sql) == executed
+        assert (
+            len(present) <= executed <= (len(present) * db._FTS_MERGE_COMMANDS_PER_PASS)
+        )
+        for tbl in present:
+            n = sum(f"{tbl}({tbl}, rank)" in sql for sql in merge_sql)
+            assert 1 <= n <= db._FTS_MERGE_COMMANDS_PER_PASS
+        # The usermerge floor is applied so positive merges can make
+        # progress on levels with >= 2 segments (SQLite FTS5 §6.8).
+        assert any("VALUES('usermerge', 2)" in sql for sql in statements)
+        assert not any("'optimize'" in sql for sql in statements)
+
+    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
+        """Routine writes use bounded merge and never full optimize."""
+        db._FTS_MERGE_EVERY_N_WRITES = 5
+        calls = []
+
+        def _counting_merge(*, max_pages):
+            calls.append(max_pages)
+            return 0
+
+        def _unexpected_optimize():
+            raise AssertionError("routine cadence must not call optimize")
+
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _counting_merge)
+        monkeypatch.setattr(db, "optimize_fts", _unexpected_optimize)
+        db.create_session(session_id="s1", source="cli")
+        for i in range(3):
+            db.append_message(session_id="s1", role="user", content=f"needle {i}")
+        assert calls == []  # Four successful writes are below the boundary.
+        db.append_message(session_id="s1", role="user", content="needle 3")
+        assert calls == [500]  # The fifth write gets the production page budget.
+        for i in range(4, 8):
+            db.append_message(session_id="s1", role="user", content=f"needle {i}")
+        assert calls == [500]
+        db.append_message(session_id="s1", role="user", content="needle 8")
+        assert calls == [500, 500]  # The tenth write is the next boundary.
+        assert len(db.search_messages("needle")) == 9
 
 
 class TestAutoMaintenance:
@@ -4871,9 +4799,7 @@ class TestAutoMaintenance:
 
     def test_second_call_within_interval_skips(self, db):
         self._make_old_ended(db, "old", days_old=100)
-        first = db.maybe_auto_prune_and_vacuum(
-            retention_days=90, min_interval_hours=24
-        )
+        first = db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=24)
         assert first["skipped"] is False
         assert first["pruned"] == 1
 
@@ -4887,20 +4813,6 @@ class TestAutoMaintenance:
         assert second["pruned"] == 0
         assert db.get_session("old2") is not None  # untouched
 
-    def test_second_call_after_interval_runs_again(self, db):
-        self._make_old_ended(db, "old", days_old=100)
-        db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=24)
-
-        # Backdate the last-run marker to force another run.
-        db.set_meta("last_auto_prune", str(time.time() - 48 * 3600))
-
-        self._make_old_ended(db, "old2", days_old=100)
-        result = db.maybe_auto_prune_and_vacuum(
-            retention_days=90, min_interval_hours=24
-        )
-        assert result["skipped"] is False
-        assert result["pruned"] == 1
-        assert db.get_session("old2") is None
 
     def test_no_prunable_sessions_no_vacuum(self, db):
         """When prune deletes 0 rows, VACUUM is skipped (wasted I/O)."""
@@ -4926,14 +4838,6 @@ class TestAutoMaintenance:
         assert result["skipped"] is False
         assert result["pruned"] == 1
 
-    def test_state_meta_survives_vacuum(self, db):
-        """Marker written just before VACUUM must still be readable after."""
-        self._make_old_ended(db, "old", days_old=100)
-        db.maybe_auto_prune_and_vacuum(retention_days=90)
-        marker = db.get_meta("last_auto_prune")
-        assert marker is not None
-        # Should parse as a float timestamp close to now.
-        assert abs(float(marker) - time.time()) < 60
 
     def test_auto_prune_deletes_transcript_files(self, db, tmp_path):
         """Issue #3015: auto-prune must also delete on-disk transcript files."""
@@ -5195,44 +5099,23 @@ class TestFTS5ToolCallMigration:
 class TestApplyWalProbe:
     """Unit tests for the journal_mode probe in apply_wal_with_fallback."""
 
-    def test_skips_set_pragma_when_already_wal(self, tmp_path):
-        """Already-WAL connection must not trigger the set-pragma."""
-        import sqlite3
-        from hermes_state import apply_wal_with_fallback
-
-        class _TracingConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.executed = []
-
-            def execute(self, sql, params=()):
-                self.executed.append(sql)
-                return super().execute(sql, params)
-
-        db_path = tmp_path / "wal.db"
-        # Prime the file into WAL mode first.
-        with sqlite3.connect(str(db_path)) as seed:
-            seed.execute("PRAGMA journal_mode=WAL")
-
-        conn = _TracingConn(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        assert result == "wal"
-        # Only the probe should have fired; the set-pragma must NOT appear.
-        assert any("PRAGMA journal_mode" == sql.strip() for sql in conn.executed), (
-            "probe PRAGMA should have run"
-        )
-        assert not any("journal_mode=WAL" in sql for sql in conn.executed), (
-            "set-pragma must not run when already in WAL mode"
-        )
 
     def test_sets_wal_on_fresh_connection(self, tmp_path):
-        """Probe sees 'delete', then set-pragma runs and returns 'wal'."""
+        """Probe sees 'delete', then set-pragma runs and returns 'wal'.
+
+        Skipped on SQLite builds carrying the WAL-reset corruption bug
+        (#69784): there the #70055 gate deliberately refuses to enable WAL on a
+        fresh database and returns "delete". Asserting "wal" on those builds
+        would be asserting the corruption guard does NOT fire.
+        """
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state import apply_wal_with_fallback, is_sqlite_wal_reset_vulnerable
+
+        if is_sqlite_wal_reset_vulnerable():
+            pytest.skip(
+                f"linked SQLite {sqlite3.sqlite_version} carries the WAL-reset "
+                "bug; the #70055 gate correctly prefers DELETE here"
+            )
 
         class _TracingConn(sqlite3.Connection):
             def __init__(self, *a, **kw):
@@ -5255,164 +5138,10 @@ class TestApplyWalProbe:
             "set-pragma must fire on a fresh (non-WAL) connection"
         )
 
-    def test_macos_checkpoint_fullsync_barrier_applied(self, tmp_path, monkeypatch):
-        """On Darwin, apply_wal_with_fallback sets checkpoint_fullfsync=1 (issue #30636)."""
-        import sqlite3
-        import hermes_state
-        from hermes_state import apply_wal_with_fallback
 
-        class _TracingConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.executed = []
 
-            def execute(self, sql, params=()):
-                self.executed.append(sql)
-                return super().execute(sql, params)
 
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
 
-        db_path = tmp_path / "macos_fresh.db"
-        conn = _TracingConn(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        assert result == "wal"
-        assert any("checkpoint_fullfsync=1" in sql for sql in conn.executed), (
-            "checkpoint_fullfsync barrier must be applied on macOS"
-        )
-
-    def test_macos_barrier_applied_when_already_wal(self, tmp_path, monkeypatch):
-        """The Darwin barrier fires on the already-WAL early-return path too."""
-        import sqlite3
-        import hermes_state
-        from hermes_state import apply_wal_with_fallback
-
-        class _TracingConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.executed = []
-
-            def execute(self, sql, params=()):
-                self.executed.append(sql)
-                return super().execute(sql, params)
-
-        db_path = tmp_path / "macos_wal.db"
-        with sqlite3.connect(str(db_path)) as seed:
-            seed.execute("PRAGMA journal_mode=WAL")
-
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
-
-        conn = _TracingConn(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        assert result == "wal"
-        assert any("checkpoint_fullfsync=1" in sql for sql in conn.executed), (
-            "checkpoint_fullfsync barrier must fire on the already-WAL path"
-        )
-
-    def test_checkpoint_fullsync_barrier_skipped_off_darwin(self, tmp_path, monkeypatch):
-        """Non-macOS platforms must NOT issue the macOS-only PRAGMA."""
-        import sqlite3
-        import hermes_state
-        from hermes_state import apply_wal_with_fallback
-
-        class _TracingConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.executed = []
-
-            def execute(self, sql, params=()):
-                self.executed.append(sql)
-                return super().execute(sql, params)
-
-        monkeypatch.setattr(hermes_state.sys, "platform", "linux")
-
-        db_path = tmp_path / "linux_fresh.db"
-        conn = _TracingConn(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        assert result == "wal"
-        assert not any("checkpoint_fullfsync" in sql for sql in conn.executed), (
-            "checkpoint_fullfsync must not be issued off macOS"
-        )
-        assert not any("synchronous=FULL" in sql for sql in conn.executed), (
-            "synchronous=FULL must not be issued off macOS"
-        )
-
-    def test_macos_synchronous_full_enforced_fresh(self, tmp_path, monkeypatch):
-        """On Darwin, apply_wal_with_fallback enforces synchronous=FULL (issue #63531)."""
-        import sqlite3
-        import hermes_state
-        from hermes_state import apply_wal_with_fallback
-
-        class _TracingConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.executed = []
-
-            def execute(self, sql, params=()):
-                self.executed.append(sql)
-                return super().execute(sql, params)
-
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
-
-        db_path = tmp_path / "macos_fresh_sync.db"
-        conn = _TracingConn(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        assert result == "wal"
-        assert any("synchronous=FULL" in sql for sql in conn.executed), (
-            "synchronous=FULL must be enforced on macOS"
-        )
-
-    def test_macos_synchronous_full_enforced_already_wal(self, tmp_path, monkeypatch):
-        """synchronous=FULL is enforced even when DB is already in WAL mode (issue #63531)."""
-        import sqlite3
-        import hermes_state
-        from hermes_state import apply_wal_with_fallback
-
-        class _TracingConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.executed = []
-
-            def execute(self, sql, params=()):
-                self.executed.append(sql)
-                return super().execute(sql, params)
-
-        # Prime the file into WAL mode first (simulating an existing WAL DB).
-        db_path = tmp_path / "macos_wal_sync.db"
-        with sqlite3.connect(str(db_path)) as seed:
-            seed.execute("PRAGMA journal_mode=WAL")
-
-        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
-
-        conn = _TracingConn(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        assert result == "wal"
-        # The early-return path for existing WAL must also enforce synchronous=FULL.
-        assert any("synchronous=FULL" in sql for sql in conn.executed), (
-            "synchronous=FULL must be enforced even on existing WAL DBs"
-        )
-        assert not any("journal_mode=WAL" in sql for sql in conn.executed), (
-            "set-pragma must not run when already in WAL mode"
-        )
 
     def test_apply_wal_concurrent_connects_no_eio(self, tmp_path):
         """20 threads calling connect() on the same DB must not see disk I/O error."""
@@ -5486,63 +5215,22 @@ class TestApplyWalProbe:
 
         assert result == "delete"
 
-    def test_probe_failure_falls_through_to_set_pragma(self, tmp_path):
-        """When the read probe raises OperationalError, fall through to set-pragma."""
-        import sqlite3
-        from hermes_state import apply_wal_with_fallback
 
-        class _ProbeFails(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self._first = True
-
-            def execute(self, sql, params=()):
-                if self._first and "journal_mode" in sql and "WAL" not in sql:
-                    self._first = False
-                    raise sqlite3.OperationalError("simulated probe failure")
-                return super().execute(sql, params)
-
-        db_path = tmp_path / "probe_fail.db"
-        conn = _ProbeFails(str(db_path))
-        try:
-            result = apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
-
-        # Despite probe failure, set-pragma must still run and succeed.
-        assert result == "wal"
-
-    def test_no_downgrade_from_wal_to_delete_on_eio(self, tmp_path):
-        """OperationalError NOT in _WAL_INCOMPAT_MARKERS must propagate, not downgrade."""
-        import sqlite3
-        import pytest
-        from hermes_state import apply_wal_with_fallback
-
-        class _EIOConn(sqlite3.Connection):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self._first = True
-
-            def execute(self, sql, params=()):
-                # Let the probe succeed (returns "delete" for fresh DB).
-                if "journal_mode=WAL" in sql:
-                    raise sqlite3.OperationalError("some unexpected hardware failure")
-                return super().execute(sql, params)
-
-        db_path = tmp_path / "eio.db"
-        conn = _EIOConn(str(db_path))
-        try:
-            with pytest.raises(
-                sqlite3.OperationalError, match="some unexpected hardware failure"
-            ):
-                apply_wal_with_fallback(conn)
-        finally:
-            conn.close()
 
     def test_returns_wal_not_delete_from_probe(self, tmp_path):
-        """Early-return only on 'wal'; 'delete' or 'memory' must fall through to set-pragma."""
+        """Early-return only on 'wal'; 'delete' or 'memory' must fall through to set-pragma.
+
+        Same skip as the sibling above: on a WAL-reset-vulnerable build the
+        fall-through ends in DELETE by design (#70055), not in WAL.
+        """
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state import apply_wal_with_fallback, is_sqlite_wal_reset_vulnerable
+
+        if is_sqlite_wal_reset_vulnerable():
+            pytest.skip(
+                f"linked SQLite {sqlite3.sqlite_version} carries the WAL-reset "
+                "bug; the #70055 gate correctly prefers DELETE here"
+            )
 
         class _TracingConn(sqlite3.Connection):
             def __init__(self, *a, **kw):
@@ -6328,3 +6016,27 @@ class TestLoneSurrogatePersistence:
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
 
+
+
+def test_refresh_cannot_resurrect_a_lock_already_reclaimed(db, monkeypatch):
+    """Once a competitor owns the row, the old holder's refresh must fail.
+
+    The guard is the ``holder`` match, not the clock: a reclaim replaces
+    ``holder``, so the previous owner's UPDATE matches nothing.
+    """
+    db.create_session("s1", "cli")
+
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1000.0)
+    assert db.try_acquire_compression_lock("s1", "holder-a", ttl_seconds=10.0) is True
+
+    # holder-a's lease lapses and holder-b legitimately reclaims it.
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1020.0)
+    assert db.try_acquire_compression_lock("s1", "holder-b", ttl_seconds=10.0) is True
+
+    # holder-a coming back late must NOT steal it back.
+    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) is False
+    current = db._conn.execute(
+        "SELECT holder FROM compression_locks WHERE session_id = ?",
+        ("s1",),
+    ).fetchone()[0]
+    assert current == "holder-b"

@@ -285,3 +285,4 @@ class TestPatchFailureEscalation:
         assert "failure #" not in hint, (
             f"task_B's hint cross-contaminated from task_A: {hint!r}"
         )
+

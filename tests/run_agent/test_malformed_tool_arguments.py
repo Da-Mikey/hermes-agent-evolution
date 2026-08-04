@@ -24,6 +24,7 @@ def _make_agent() -> AIAgent:
         patch("run_agent.get_tool_definitions", return_value=tool_defs),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("hermes_cli.config.load_config", return_value={}),
+        patch("hermes_cli.config.load_config_readonly", return_value={}),
         patch("run_agent.OpenAI"),
     ):
         agent = AIAgent(
@@ -34,7 +35,6 @@ def _make_agent() -> AIAgent:
             skip_memory=True,
         )
     agent.client = MagicMock()
-    agent.tool_delay = 0
     agent._flush_messages_to_session_db = MagicMock()
     return agent
 

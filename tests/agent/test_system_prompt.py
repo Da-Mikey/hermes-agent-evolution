@@ -1,9 +1,11 @@
 """Tests for agent/system_prompt.py — context-file cwd wiring."""
 
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
 def _make_agent(**overrides):
@@ -70,6 +72,16 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def _prompt_parts(agent):
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        return build_system_prompt_parts(agent)
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
@@ -84,9 +96,9 @@ class TestCodingContextBlock:
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
-        stable = _stable_prompt(agent)
-        assert "coding agent" in stable
-        assert "Workspace" in stable
+        parts = _prompt_parts(agent)
+        assert "coding agent" in parts["stable"]
+        assert "Workspace" in parts["context"]
 
     def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
@@ -102,6 +114,94 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+def test_build_system_prompt_records_stable_prefix():
+    agent = _make_agent()
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value="context"),
+    ):
+        prompt = build_system_prompt(agent)
+
+    assert prompt.startswith(agent._cached_system_prompt_static)
+    assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
+
+
+def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
+    """The cache split must not reorder the stored coding prompt."""
+    import agent.system_prompt as system_prompt
+
+    agent = _make_agent(
+        valid_tool_names=["read_file"],
+        _parallel_tool_call_guidance=False,
+    )
+    monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
+    monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
+    monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+    # Fork-only always-on blocks (#45 attention reset, deliberate work, #1356
+    # recovery-before-refusal), absent from upstream's copy of this test. Pin
+    # them like the neighbouring constants so the assertion stays about ORDER,
+    # not about the wording of paragraphs this test does not own.
+    monkeypatch.setattr(system_prompt, "ATTENTION_RESET_GUIDANCE", "ATTENTION_RESET")
+    monkeypatch.setattr(system_prompt, "DELIBERATE_WORK_GUIDANCE", "DELIBERATE_WORK")
+    monkeypatch.setattr(
+        system_prompt, "RECOVERY_BEFORE_REFUSAL_GUIDANCE", "RECOVERY_BEFORE_REFUSAL"
+    )
+    monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
+
+    expected_profile = (
+        "Active Hermes profile: default. Other profiles (if any) live "
+        "under /hermes/profiles/<name>/. Each profile has its own skills/, "
+        "plugins/, cron/, and memories/ that affect a different session than "
+        "this one. Do not modify another profile's skills/plugins/cron/memories "
+        "unless the user explicitly directs you to."
+    )
+    expected = "\n\n".join((
+        "IDENTITY",
+        "HELP",
+        "ATTENTION_RESET",
+        "DELIBERATE_WORK",
+        "RECOVERY_BEFORE_REFUSAL",
+        "STEER",
+        "CODING_STABLE",
+        "WORKSPACE",
+        "Operator instructions (from config):\nOPERATOR",
+        expected_profile,
+        "SYSTEM_MESSAGE",
+        "CONTEXT_FILES",
+        "Conversation started: Friday, January 02, 2026",
+    ))
+
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
+        patch(
+            "agent.coding_context.coding_system_prompt_parts",
+            return_value=(
+                ["CODING_STABLE"],
+                ["WORKSPACE"],
+                ["Operator instructions (from config):\nOPERATOR"],
+            ),
+        ),
+        patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
+        patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
+    ):
+        prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
+
+    assert prompt == expected
+    # The static cache runs up to the workspace block — the first part that
+    # varies per turn; CODING_STABLE is stable and belongs inside it. Sliced by
+    # that boundary rather than by a section count: upstream's copy of this test
+    # hard-codes 4, but this fork inserts three always-on blocks before STEER,
+    # and a magic number silently means the wrong thing after any such change.
+    sections = expected.split("\n\n")
+    static_len = sections.index("WORKSPACE")
+    assert agent._cached_system_prompt_static == "\n\n".join(sections[:static_len])
 
 
 class TestTelegramRichMessagesHint:

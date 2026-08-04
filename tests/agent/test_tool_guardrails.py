@@ -11,6 +11,7 @@ from agent.tool_guardrails import (
     classify_tool_failure,
     toolguard_synthetic_result,
 )
+from agent.tool_guardrails import LoopCapConfig
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
@@ -1228,3 +1229,29 @@ def test_spiral_cap_interleaving_eventually_halts():
         "Terminal fail/success interleaving should have halted within 20 "
         "turns — the #1585 spiral cap must fire for this pattern"
     )
+
+
+def test_loop_cap_zero_disables_and_junk_falls_back():
+    # 0 is a legitimate "unlimited" value; negatives / junk fall back to default.
+    assert LoopCapConfig.from_mapping({"max_web_searches": 0}).max_web_searches == 0
+    assert LoopCapConfig.from_mapping({"max_web_searches": -5}).max_web_searches == 50
+    assert LoopCapConfig.from_mapping({"max_subagents": "nope"}).max_subagents == 50
+
+def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
+    # Loop caps fire even with hard_stop_enabled=False (the per-turn loop
+    # detector's flag). Each distinct query avoids the loop detector so we know
+    # the block came from the loop cap, not exact-failure repetition.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(max_web_searches=3),
+        )
+    )
+    for i in range(3):
+        assert (
+            controller.before_call("web_search", {"query": f"q{i}"}).action == "allow"
+        )
+    decision = controller.before_call("web_search", {"query": "q4"})
+    assert decision.action == "block"
+    assert decision.code == "loop_web_search_cap"
+    assert decision.should_halt is True

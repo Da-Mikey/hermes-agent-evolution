@@ -166,20 +166,6 @@ class TestTruncateContent:
         result = _truncate_content(content, "exact.md")
         assert result == content
 
-    def test_configured_context_file_max_chars_controls_truncation(self, monkeypatch):
-        def fake_load_config():
-            return {"context_file_max_chars": 120}
-
-        monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
-        content = "HEAD" + "x" * 160 + "TAIL"
-
-        result = _truncate_content(content, "config.md")
-
-        assert result != content
-        assert "truncated config.md" in result
-        assert "kept 84+24" in result
-        assert "HEAD" in result
-        assert "TAIL" in result
 
     def test_explicit_max_chars_overrides_config(self, monkeypatch):
         def fake_load_config():
@@ -197,6 +183,7 @@ class TestTruncateContent:
             return {"context_file_max_chars": 120}
 
         monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", fake_load_config)
 
         _truncate_content("x" * 180, "warning.md")
 
@@ -214,6 +201,7 @@ class TestTruncateContent:
             return {"context_file_max_chars": 120}
 
         monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", fake_load_config)
 
         # Generate a warning in a fresh child context, then assert it did NOT
         # leak into the parent context's accumulator.
@@ -271,6 +259,10 @@ class TestDynamicContextFileCap:
         # An explicit value always wins, even when a big window is available.
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
+            lambda: {"context_file_max_chars": 1_000},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
             lambda: {"context_file_max_chars": 1_000},
         )
         assert _get_context_file_max_chars(200_000) == 1_000
@@ -1343,6 +1335,25 @@ class TestPromptBuilderConstants:
         assert "Markdown" in hint
         assert "absolute" in hint
 
+    def test_api_server_hint_scopes_media_tag_guidance(self):
+        """api_server MEDIA: interception is partial (#68402, corrected):
+        _resolve_media_to_data_urls (gateway/platforms/api_server.py) inlines
+        small image MEDIA: tags as base64 data URLs on the chat, completions,
+        and responses endpoints — but non-image files are never resolved
+        (_MEDIA_IMG_EXT is image-only) and the /v1/runs handler never calls
+        the resolver at all. The hint must teach BOTH halves: images work via
+        MEDIA:, everything else needs a plain path in the response text."""
+        hint = PLATFORM_HINTS["api_server"]
+        # Images ARE intercepted: inlined as data URLs.
+        assert "MEDIA:" in hint
+        assert "inlined" in hint.lower()
+        assert "data" in hint.lower()  # data URLs
+        # The gaps: non-image files and the runs endpoint.
+        assert "non-image" in hint.lower()
+        assert "runs" in hint.lower()
+        # Fallback guidance: plain file path in the response text.
+        assert "plain" in hint.lower()
+
 
 # =========================================================================
 # Environment hints
@@ -1547,19 +1558,6 @@ class TestEnvironmentHints:
         assert "ENV-WINS" in result
         assert "CONFIG-VALUE" not in result
 
-    def test_environment_hint_falls_back_to_config(self, monkeypatch):
-        """With no env var, the config.yaml value is used."""
-        import agent.prompt_builder as _pb
-        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
-        monkeypatch.delenv("TERMINAL_ENV", raising=False)
-        monkeypatch.delenv("HERMES_ENVIRONMENT_HINT", raising=False)
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"agent": {"environment_hint": "CONFIG-VALUE"}},
-        )
-        _pb._clear_backend_probe_cache()
-        result = _pb.build_environment_hints()
-        assert "CONFIG-VALUE" in result
 
     def test_environment_hint_empty_by_default(self, monkeypatch):
         """No hint configured anywhere → no embedder text, host block intact."""

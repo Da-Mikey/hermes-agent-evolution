@@ -234,7 +234,14 @@ def fetch_open_issues(
 
 
 def _default_runner(cmd: List[str]) -> str:
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    )
     return proc.stdout
 
 

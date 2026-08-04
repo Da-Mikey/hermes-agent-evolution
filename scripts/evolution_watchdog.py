@@ -258,7 +258,14 @@ def check_jobs(jobs_file: Path, now: datetime) -> List[str]:
 
 
 def _default_runner(cmd: List[str]) -> Tuple[int, str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 

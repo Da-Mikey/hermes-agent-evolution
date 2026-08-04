@@ -451,8 +451,12 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
-    assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
+    expected_metadata = {
+        "thread_id": "1234567890.000001",
+        "message_id": "1234567890.000001",
+    }
+    assert adapter.sent[0]["metadata"] == expected_metadata
+    assert all(call["metadata"] == expected_metadata for call in adapter.typing)
 
 
 @pytest.mark.asyncio
@@ -1796,3 +1800,22 @@ async def test_run_agent_suppresses_thinking_when_thinking_off(monkeypatch, tmp_
         [c["content"] for c in adapter.sent] + [c["content"] for c in adapter.edits]
     )
     assert "weighing the options here" not in blob
+
+
+class TestSlackReplyInThreadProgressRouting:
+    """#18859: reply_in_thread=false must stop progress from creating threads."""
+
+    def test_slack_reply_in_thread_false_drops_synthetic_thread(self):
+        from gateway.run import _resolve_progress_thread_id
+
+        # source.thread_id == event ts is the adapter's synthetic
+        # session-keying thread for top-level messages — not a real thread.
+        assert (
+            _resolve_progress_thread_id(
+                Platform.SLACK,
+                source_thread_id="1700000000.000100",
+                event_message_id="1700000000.000100",
+                reply_in_thread=False,
+            )
+            is None
+        )

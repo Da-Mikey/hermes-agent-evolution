@@ -294,7 +294,9 @@ def check_merge_policy_with_quality(
 
 
 def _run(cmd: List[str]) -> Tuple[int, str, str]:
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     return p.returncode, p.stdout, p.stderr
 
 

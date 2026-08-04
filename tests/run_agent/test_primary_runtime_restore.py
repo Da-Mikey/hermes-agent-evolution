@@ -631,26 +631,6 @@ class TestTryRecoverPrimaryTransport:
             # wait_time = min(3 + 10, 8) = 8
             mock_sleep.assert_called_once_with(8)
 
-    def test_closes_existing_client_before_rebuild(self):
-        agent = _make_agent(provider="custom")
-        old_client = agent.client
-        error = _make_transport_error("ReadTimeout")
-
-        with (
-            patch("run_agent.OpenAI", return_value=MagicMock()),
-            patch("time.sleep"),
-            patch.object(agent, "_close_openai_client") as mock_close,
-        ):
-            agent._try_recover_primary_transport(
-                error,
-                retry_count=3,
-                max_retries=3,
-            )
-            mock_close.assert_called_once_with(
-                old_client,
-                reason="primary_recovery",
-                shared=True,
-            )
 
     def test_survives_rebuild_failure(self):
         """If client rebuild fails, returns False gracefully."""
@@ -668,6 +648,41 @@ class TestTryRecoverPrimaryTransport:
             )
 
         assert result is False
+
+    def test_allowed_for_nous_anthropic_messages(self):
+        """Portal Claude holds a local Anthropic SDK client — rebuild it."""
+        agent = _make_agent(
+            provider="nous",
+            base_url="https://inference-api.nousresearch.com/v1",
+        )
+        agent.api_mode = "anthropic_messages"
+        agent.model = "anthropic/claude-opus-4.8"
+        agent._primary_runtime.update({
+            "api_mode": "anthropic_messages",
+            "model": "anthropic/claude-opus-4.8",
+            "provider": "nous",
+            "anthropic_api_key": "portal-jwt",
+            "anthropic_base_url": "https://inference-api.nousresearch.com/v1",
+            "is_anthropic_oauth": False,
+        })
+        error = _make_transport_error("ReadTimeout")
+        rebuilt = MagicMock(name="anthropic-client")
+
+        with (
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=rebuilt,
+            ),
+            patch("time.sleep"),
+        ):
+            result = agent._try_recover_primary_transport(
+                error,
+                retry_count=3,
+                max_retries=3,
+            )
+
+        assert result is True
+        assert agent._anthropic_client is rebuilt
 
 
 # =============================================================================

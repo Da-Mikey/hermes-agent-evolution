@@ -2,6 +2,10 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    outputs:
+      review_status:
+        description: "JSON array of review status objects"
+        value: ${{ jobs.check-attribution.outputs.review_status }}
 
 permissions:
   contents: read
@@ -10,21 +14,36 @@ jobs:
   check-attribution:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.check-emails.outputs.review_status }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0  # Full history needed for git log
 
       - name: Check for unmapped contributor emails
+        id: check-emails
         run: |
           # Get the merge base between this PR and main
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Find any new author emails in this PR's commits.
+          #
+          # --first-parent is load-bearing on upstream-sync PRs. A sync records
+          # the upstream release as a second parent (see the `-s ours` merge in
+          # sync/upstream-catchup), which makes UPSTREAM's entire history
+          # reachable from HEAD without moving the merge base. Without
+          # --first-parent this range then yields every upstream contributor
+          # who ever touched the project — 485 addresses on the v2026.7.30 sync
+          # versus 1 with it — and demands the fork "map" people who never
+          # contributed to it. Following only the first parent keeps the range
+          # to commits actually authored on this branch, which is what the
+          # attribution gate is asking about.
+          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges --first-parent | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
+            echo "review_status=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -67,6 +86,16 @@ jobs:
             echo ""
             echo "To find the GitHub username for an email:"
             echo "  gh api 'search/users?q=EMAIL+in:email' --jq '.items[0].login'"
+
+            # Emit review_status for unmapped emails
+            DETAIL=$(echo -e "$MISSING" | sed '/^$/d; s/^  //')
+            HOW_TO_FIX=$'Add mappings to scripts/release.py AUTHOR_MAP:\n```\n"<email>": "<github-username>",\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
+            REVIEW_STATUS=$(jq -nc \
+              --arg detail "$DETAIL" \
+              --arg how_to_fix "$HOW_TO_FIX" \
+              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not in AUTHOR_MAP.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
+            echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
+
             exit 1
           else
             echo "✅ All contributor emails are mapped."
