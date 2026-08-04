@@ -1254,8 +1254,10 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     This implements the fork upstream sync logic:
     - If upstream remote doesn't exist, ask user if they want to add it
     - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
+    - If origin/main is strictly behind upstream/main, fast-forward pull
+    - If fork has diverged (ahead AND behind), SKIP the upstream/main merge
+      (this fork tracks upstream release tags via its release-sync process,
+      not bleeding-edge upstream/main)
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
@@ -1320,13 +1322,30 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has commits not on upstream, we need to be careful
     if origin_ahead > 0:
+        if upstream_ahead == 0:
+            # Fork is ahead but upstream has nothing new — nothing to do
+            print("  ✓ Fork is up to date with upstream (fork has extra commits)")
+            return
+
+        # Fork has diverged: both ahead AND behind upstream/main. Do NOT
+        # auto-merge upstream/main here. This fork tracks upstream RELEASE TAGS
+        # (the stabilized ``v2026.M.D`` releases) via its dedicated
+        # evolution-upstream-sync process, NOT bleeding-edge ``upstream/main``
+        # (~300 commits/day — an unwinnable chase that conflicts on essentially
+        # every update and would abort, or silently drop fork features on a
+        # blind resolve). Leave upstream integration to the release-sync process
+        # and preserve the fork's commits untouched here.
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        print(
+            f"ℹ Fork has {origin_ahead} commit(s) not on upstream and is "
+            f"{upstream_ahead} commit(s) behind upstream/main."
+        )
+        print(
+            "  ↷ Skipping upstream/main auto-merge — this fork tracks upstream "
+            "release tags via its release-sync process, not bleeding-edge main."
+        )
         return
 
     # If upstream is not ahead, fork is up to date
