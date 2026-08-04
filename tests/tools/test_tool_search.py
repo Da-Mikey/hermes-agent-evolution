@@ -733,6 +733,17 @@ class TestBridgeDispatch:
         assert err is not None
         assert "bridge tool" in err.lower()
 
+    def test_resolve_underlying_call_rejects_recursion(self):
+        """tool_call cannot invoke tool_call itself."""
+        from tools.tool_search import resolve_underlying_call, TOOL_CALL_NAME
+
+        name, args, err = resolve_underlying_call({
+            "name": TOOL_CALL_NAME,
+            "arguments": {},
+        })
+        assert err is not None
+        assert "bridge tool" in err.lower()
+
 
 class TestSearchStreakGuard:
     """#1144 — fallback directive after N consecutive searches with no tool_call."""

@@ -2,7 +2,7 @@
   "fork_ref": "origin/main",
   "upstream_ref": "upstream/main",
   "base_ref": "v2026.7.20",
-  "fork_head": "ef258181dbb89f7dd479218a822686c854095f08",
+  "fork_head": "452a05ea9f7163ab6401688e19deaaaebeb2edcc",
   "upstream_head": "d1c6c6b58e87d132f7370333e92899205d6232bf",
   "owned_markers": [
     "#1012",
@@ -117,6 +117,8 @@
     "#1611",
     "#1612",
     "#164",
+    "#1647",
+    "#1648",
     "#165",
     "#167",
     "#173",

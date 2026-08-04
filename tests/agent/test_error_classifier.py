@@ -1386,6 +1386,49 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.message == "Internal server error occurred"
 
+    def test_400_litellm_invalid_request_body_shape(self, caplog):
+        """litellm/Bedrock proxy shape (errorMessage/errorCode) → format_error.
+
+        The proxy in front of Anthropic surfaces the empty-content rejection
+        as {"errorMessage": "...non-empty content...", "errorCode":
+        "INVALID_REQUEST_BODY", "errorArgs": {"reason": "..."}}.  Those keys
+        are not the standard error.message / message, so err_body_msg used to
+        come back empty → is_generic=True → mis-routed into compression on a
+        large session.  Both the message pattern and the errorCode must be
+        recognized, and a distinct warning must be logged so the condition is
+        observable in the field.
+        """
+        import logging
+
+        proxy_msg = (
+            "The provided request body is invalid: claude "
+            "messages.208: all messages must have non-empty content "
+            "except for the optional final assistant message"
+        )
+        e = MockAPIError(
+            proxy_msg,
+            status_code=400,
+            body={
+                "errorMessage": proxy_msg,
+                "errorCode": "INVALID_REQUEST_BODY",
+                "statusCode": 400,
+                "errorArgs": {"reason": "claude messages.208: ..."},
+            },
+        )
+        with caplog.at_level(logging.WARNING, logger="agent.error_classifier"):
+            result = classify_api_error(
+                e,
+                approx_tokens=66000,
+                context_length=200000,
+                num_messages=219,
+            )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is not True
+        assert any(
+            "Malformed message array 400" in r.getMessage() for r in caplog.records
+        ), "Expected a distinct warning identifying the malformed-body 400"
+
 
 # ── Test: Adversarial / edge cases (from live testing) ─────────────────
 

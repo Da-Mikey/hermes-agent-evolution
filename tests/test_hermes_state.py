@@ -827,6 +827,78 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_end_session_first_reason_wins_across_concurrent_connections(self, db):
+        """Concurrent finalizers perform one transition, not last-write-wins."""
+        import threading
+
+        db.create_session(session_id="s1", source="cron")
+        db._conn.execute("CREATE TABLE session_end_audit (reason TEXT NOT NULL)")
+        db._conn.execute(
+            """
+            CREATE TRIGGER audit_session_end
+            AFTER UPDATE OF ended_at ON sessions
+            WHEN OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL
+            BEGIN
+                INSERT INTO session_end_audit(reason) VALUES (NEW.end_reason);
+            END
+            """
+        )
+
+        peer = SessionDB(db_path=db.db_path)
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def _end(session_db, reason):
+            try:
+                barrier.wait(timeout=5)
+                session_db.end_session("s1", reason)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_end, args=(db, "compression")),
+            threading.Thread(target=_end, args=(peer, "cron_complete")),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert errors == []
+            audit_rows = db._conn.execute(
+                "SELECT reason FROM session_end_audit"
+            ).fetchall()
+            assert len(audit_rows) == 1
+            assert db.get_session("s1")["end_reason"] == audit_rows[0]["reason"]
+        finally:
+            peer.close()
+
+    def test_update_session_model_clears_browser_lock_and_preserves_lineage(self, db):
+        """A later /model switch must replace, not compete with, a Browser lock."""
+        db.create_session(
+            session_id="s1",
+            source="hermes_browser",
+            model="x-ai/grok-4.5",
+            model_config={
+                "_branched_from": "parent-session",
+                "browser_model_lock": {
+                    "provider": "nous",
+                    "model": "x-ai/grok-4.5",
+                    "confirmed": True,
+                },
+            },
+        )
+
+        db.update_session_model("s1", "anthropic/claude-opus-4.8")
+
+        session = db.get_session("s1")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "anthropic/claude-opus-4.8"
+        assert "browser_model_lock" not in model_config
+        assert model_config["_branched_from"] == "parent-session"
+
 
 # =========================================================================
 # Message storage
@@ -4373,6 +4445,37 @@ class TestListSessionsRich:
         ids = [s["id"] for s in sessions]
         assert "continuation" not in ids, "Compression continuation should stay hidden"
 
+    def test_delete_session_expected_targets_fail_closed_on_new_delegate(self, db):
+        db.create_session("parent", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.create_session(
+            "branch",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_branched_from": "parent"},
+        )
+
+        expected_ids = db.get_session_delete_targets("parent")
+        assert expected_ids == ["parent", "delegate"]
+
+        db.create_session(
+            "late-delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+
+        assert db.delete_session("parent", expected_delete_ids=expected_ids) is False
+        assert db.get_session("parent") is not None
+        assert db.get_session("delegate") is not None
+        assert db.get_session("late-delegate") is not None
+        assert db.get_session("branch") is not None
+
 
 class TestCompressionChainProjection:
     """Tests for lineage-aware list_sessions_rich — compressed conversations
@@ -4842,6 +4945,61 @@ class TestOptimizeFts:
         # write #2 trips the cadence; the swallowed failure must not propagate.
         db.append_message(session_id="s1", role="user", content="still persists")
         assert len(db.get_messages("s1")) == 1
+
+    def test_incremental_merge_bounded_commands_per_present_index(self, db):
+        """Each pass issues bounded 'merge' commands, never 'optimize'."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="bounded merge")
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            executed = db._merge_fts_incrementally(max_pages=37)
+        finally:
+            db._conn.set_trace_callback(None)
+
+        # At least one merge command per present FTS index, and never more
+        # than the per-pass command cap per index.
+        present = [t for t in db._FTS_TABLES if db._fts_table_exists(t)]
+        assert len(present) >= 2  # messages_fts + trigram on a fresh DB
+        merge_sql = [sql for sql in statements if "VALUES('merge', 37)" in sql]
+        assert len(merge_sql) == executed
+        assert (
+            len(present) <= executed <= (len(present) * db._FTS_MERGE_COMMANDS_PER_PASS)
+        )
+        for tbl in present:
+            n = sum(f"{tbl}({tbl}, rank)" in sql for sql in merge_sql)
+            assert 1 <= n <= db._FTS_MERGE_COMMANDS_PER_PASS
+        # The usermerge floor is applied so positive merges can make
+        # progress on levels with >= 2 segments (SQLite FTS5 §6.8).
+        assert any("VALUES('usermerge', 2)" in sql for sql in statements)
+        assert not any("'optimize'" in sql for sql in statements)
+
+    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
+        """Routine writes use bounded merge and never full optimize."""
+        db._FTS_MERGE_EVERY_N_WRITES = 5
+        calls = []
+
+        def _counting_merge(*, max_pages):
+            calls.append(max_pages)
+            return 0
+
+        def _unexpected_optimize():
+            raise AssertionError("routine cadence must not call optimize")
+
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _counting_merge)
+        monkeypatch.setattr(db, "optimize_fts", _unexpected_optimize)
+        db.create_session(session_id="s1", source="cli")
+        for i in range(3):
+            db.append_message(session_id="s1", role="user", content=f"needle {i}")
+        assert calls == []  # Four successful writes are below the boundary.
+        db.append_message(session_id="s1", role="user", content="needle 3")
+        assert calls == [500]  # The fifth write gets the production page budget.
+        for i in range(4, 8):
+            db.append_message(session_id="s1", role="user", content=f"needle {i}")
+        assert calls == [500]
+        db.append_message(session_id="s1", role="user", content="needle 8")
+        assert calls == [500, 500]  # The tenth write is the next boundary.
+        assert len(db.search_messages("needle")) == 9
 
 
 class TestAutoMaintenance:
@@ -6328,3 +6486,27 @@ class TestLoneSurrogatePersistence:
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
 
+
+
+def test_refresh_cannot_resurrect_a_lock_already_reclaimed(db, monkeypatch):
+    """Once a competitor owns the row, the old holder's refresh must fail.
+
+    The guard is the ``holder`` match, not the clock: a reclaim replaces
+    ``holder``, so the previous owner's UPDATE matches nothing.
+    """
+    db.create_session("s1", "cli")
+
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1000.0)
+    assert db.try_acquire_compression_lock("s1", "holder-a", ttl_seconds=10.0) is True
+
+    # holder-a's lease lapses and holder-b legitimately reclaims it.
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1020.0)
+    assert db.try_acquire_compression_lock("s1", "holder-b", ttl_seconds=10.0) is True
+
+    # holder-a coming back late must NOT steal it back.
+    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) is False
+    current = db._conn.execute(
+        "SELECT holder FROM compression_locks WHERE session_id = ?",
+        ("s1",),
+    ).fetchone()[0]
+    assert current == "holder-b"

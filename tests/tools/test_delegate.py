@@ -34,6 +34,8 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
 )
+import types
+from tools.delegate_tool import _load_config
 
 
 def _make_mock_parent(depth=0):
@@ -578,6 +580,56 @@ class TestDelegateTask(unittest.TestCase):
         self.assertTrue(callable(mock_child.thinking_callback))
         mock_child.thinking_callback("deliberating...")
         parent.tool_progress_callback.assert_not_called()
+
+    def test_nous_child_rederives_api_mode_from_model(self):
+        """Portal is dual-wire — same provider + different model prefix must
+        not inherit the parent's Messages/chat_completions mode verbatim."""
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://inference-api.nousresearch.com/v1"
+        parent.api_key = "portal-jwt"
+        parent.provider = "nous"
+        parent.api_mode = "anthropic_messages"
+        parent.model = "anthropic/claude-opus-4.8"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Stay on chat completions",
+                context=None,
+                toolsets=None,
+                model="hermes-4-405b",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "nous")
+            self.assertEqual(kwargs["model"], "hermes-4-405b")
+            self.assertEqual(kwargs["api_mode"], "chat_completions")
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+            parent.api_mode = "chat_completions"
+            parent.model = "hermes-4-405b"
+
+            _build_child_agent(
+                task_index=0,
+                goal="Move onto Messages",
+                context=None,
+                toolsets=None,
+                model="anthropic/claude-opus-4.8",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["api_mode"], "anthropic_messages")
 
 
 class TestToolNamePreservation(unittest.TestCase):
@@ -1262,6 +1314,12 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
         self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
+
+    def test_execute_code_not_blocked(self):
+        """Children retain execute_code (programmatic tool calling) so they
+        can batch mechanical work instead of burning reasoning iterations
+        (Teknium, Jul 2026)."""
+        self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):
@@ -2513,6 +2571,40 @@ class TestDispatchDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["override_acp_command"], "claude")
             self.assertEqual(kwargs["override_acp_args"], ["--acp", "--stdio"])
 
+    def test_model_acp_args_not_forwarded(self):
+        """The live model dispatch path strips hidden ACP transport args."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "test",
+                    "acp_command": "claude",
+                    "acp_args": ["--acp", "--stdio"],
+                    "tasks": [
+                        {
+                            "goal": "nested",
+                            "acp_command": "codex",
+                            "acp_args": ["--acp"],
+                        },
+                    ],
+                },
+            )
+
+        self.assertNotIn("acp_command", captured)
+        self.assertNotIn("acp_args", captured)
+        self.assertEqual(captured["goal"], "test")
+        self.assertNotIn("acp_command", captured["tasks"][0])
+        self.assertNotIn("acp_args", captured["tasks"][0])
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
@@ -2672,6 +2764,32 @@ class TestConcurrencyDefaults(unittest.TestCase):
     def test_configured_value_returned(self, mock_cfg):
         self.assertEqual(_get_max_concurrent_children(), 6)
 
+    def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
+        stale_cli = types.ModuleType("cli")
+        stale_cli.CLI_CONFIG = {
+            "delegation": {
+                "max_iterations": 45,
+                "model": "",
+                "provider": "",
+                "base_url": "",
+                "api_key": "",
+            }
+        }
+        active_config = {
+            "delegation": {
+                "max_iterations": 50,
+                "max_concurrent_children": 50,
+                "max_spawn_depth": 10,
+            }
+        }
+
+        with patch.dict("sys.modules", {"cli": stale_cli}):
+            with patch(
+                "hermes_cli.config.load_config_readonly", return_value=active_config
+            ):
+                self.assertEqual(_load_config()["max_concurrent_children"], 50)
+                self.assertEqual(_get_max_concurrent_children(), 50)
+
 
 # =========================================================================
 # max_spawn_depth clamping
@@ -2802,6 +2920,17 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         top_acp_desc = props["acp_command"]["description"].lower()
         self.assertNotIn("e.g. 'claude'", top_acp_desc)
         self.assertNotIn("e.g. \"claude\"", top_acp_desc)
+
+    def test_schema_omits_acp_transport_fields(self):
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertNotIn("acp_command", props)
+        self.assertNotIn("acp_args", props)
+        self.assertNotIn("acp_command", task_props)
+        self.assertNotIn("acp_args", task_props)
 
 
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".

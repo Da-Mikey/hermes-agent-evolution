@@ -285,3 +285,27 @@ class TestPatchFailureEscalation:
         assert "failure #" not in hint, (
             f"task_B's hint cross-contaminated from task_A: {hint!r}"
         )
+
+    def test_first_two_failures_use_normal_hint(
+        self, hermes_home, tmp_path, fresh_tracker
+    ):
+        from tools.file_tools import _handle_patch
+
+        target = tmp_path / "f.py"
+        target.write_text("def foo():\n    return 1\n")
+
+        for _i in range(2):
+            result = _handle_patch(
+                {
+                    "mode": "replace",
+                    "path": str(target),
+                    "old_string": f"NONEXISTENT_{_i}_XYZQQQ",
+                    "new_string": "x",
+                },
+                task_id="esc_t1",
+            )
+            d = json.loads(result)
+            hint = d.get("_hint", "") or ""
+            assert "failure #" not in hint, (
+                f"Escalating hint fired too early on attempt {_i + 1}: {hint!r}"
+            )

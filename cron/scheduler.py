@@ -5150,9 +5150,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if success
             else _summarize_cron_failure_for_delivery(job, error, failure_category)
         )
-        # Treat whitespace-only final responses the same as empty
-        # responses: do not deliver a blank message, and let the
-        # empty-response guard below mark the run as a soft failure.
+        # Whitespace-only output is a valid quiet no-work result.  It is already
+        # saved locally above and must not become a Telegram message.  Upstream's
+        # #8585 guard (empty response ⇒ soft failure) is deliberately NOT carried:
+        # this fork's evolution/monitor jobs legitimately produce no output on a
+        # quiet tick, and marking those "failed" made last_status useless.
         should_deliver = bool(deliver_content.strip())
         unresolved_origin = False
         # Cron silence suppression — see _is_cron_silence_response.  Replaces the

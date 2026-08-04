@@ -18,6 +18,20 @@ import pytest
 
 from tests.tools.conftest import register_all_web_providers
 
+def _force_inprocess_search(monkeypatch, prov):
+    """Route bounded search through the in-process helper.
+
+    Happy-path unit tests install a fake ``ddgs`` in the parent interpreter;
+    spawn workers would not see that fake. Isolation behavior is covered by
+    dedicated process tests below.
+    """
+    monkeypatch.setattr(
+        prov,
+        "_run_ddgs_search_bounded",
+        lambda query, safe_limit: prov._run_ddgs_search(query, safe_limit),
+        raising=True,
+    )
+
 
 def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text_sleep=None):
     """Install a stub ``ddgs`` module in sys.modules for the duration of a test.
@@ -364,6 +378,16 @@ class TestDDGSProviderSearch:
         assert result["success"] is True
         assert result["data"]["web"][0]["url"] == "https://e.com"
         assert result["data"]["web"][0]["title"] == "T"
+
+    def test_empty_results(self, monkeypatch):
+        _install_fake_ddgs(monkeypatch, text_results=[])
+        import plugins.web.ddgs.provider as prov
+
+        _force_inprocess_search(monkeypatch, prov)
+
+        result = prov.DDGSWebSearchProvider().search("nothing", limit=5)
+        assert result["success"] is True
+        assert result["data"]["web"] == []
 
 
 # ---------------------------------------------------------------------------
