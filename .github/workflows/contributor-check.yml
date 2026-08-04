@@ -27,8 +27,19 @@ jobs:
           # Get the merge base between this PR and main
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Find any new author emails in this PR's commits.
+          #
+          # --first-parent is load-bearing on upstream-sync PRs. A sync records
+          # the upstream release as a second parent (see the `-s ours` merge in
+          # sync/upstream-catchup), which makes UPSTREAM's entire history
+          # reachable from HEAD without moving the merge base. Without
+          # --first-parent this range then yields every upstream contributor
+          # who ever touched the project — 485 addresses on the v2026.7.30 sync
+          # versus 1 with it — and demands the fork "map" people who never
+          # contributed to it. Following only the first parent keeps the range
+          # to commits actually authored on this branch, which is what the
+          # attribution gate is asking about.
+          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges --first-parent | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
