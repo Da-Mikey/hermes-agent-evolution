@@ -27,6 +27,7 @@ import os
 import threading
 import time
 from concurrent.futures import (
+    ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
@@ -3632,6 +3633,17 @@ def delegate_task(
     from tools.async_delegation import _current_origin_session_id
 
     _origin_wake_sid = _current_origin_session_id()
+
+    # Save parent tool names BEFORE any child construction mutates the global.
+    # Constructing a child calls AIAgent(), which calls get_tool_definitions()
+    # and overwrites model_tools._last_resolved_tool_names with the child's
+    # toolset. _build_child_preserving_parent_tools restores it around each
+    # individual construction, but the snapshot is still needed: each child
+    # gets it stamped as _delegate_saved_tool_names, and the finally below
+    # restores it authoritatively once ALL children are built.
+    import model_tools as _model_tools
+
+    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's

@@ -1280,20 +1280,27 @@ def handle_function_call(
                     f"'{underlying_name}' is not available in this session. "
                     "Use tool_search to find tools you can call."
                 )
-            # NOTE: upstream validates via
-            # _ts_mod.validate_deferred_call_args (ironclaw#5149). Switch to it
-            # when tools/tool_search.py is integrated — it does not exist in
-            # this tree yet. Ours checks the same thing and additionally resets
-            # the #1144 search streak, which theirs does not.
-            # Pre-execution schema validation (#1039): catch wrong argument
-            # types and missing required params before dispatching the tool,
-            # returning a clear error instead of letting it fail at runtime.
+            # Two-stage pre-execution validation. The stages catch different
+            # things and the order matters.
+            #
+            # 1. Missing REQUIRED arguments (ironclaw#5149). A deferred tool's
+            #    schema is invisible until tool_describe, so models call it
+            #    blind by name and omit required fields. This returns the
+            #    parameter schema itself, letting the model repair the call in
+            #    one round-trip instead of reading an opaque KeyError.
+            _probe_err = _ts_mod.validate_deferred_call_args(
+                underlying_name, underlying_args
+            )
+            if _probe_err is not None:
+                return _probe_err
+            # 2. Wrong argument TYPES (#1039). The probe above deliberately
+            #    does no type checking, so this still earns its place.
             _schema = registry.get_schema(underlying_name)
             _ok, _err = _ts_mod.validate_tool_args(
                 underlying_name, underlying_args, _schema
             )
             if not _ok:
-                return json.dumps({"error": _err}, ensure_ascii=False)
+                return tool_error(_err)
             # #1144 — the model invoked a discovered tool, so reset the
             # consecutive-search streak (the search loop converged).
             _ts_mod.reset_search_streak(session_id)

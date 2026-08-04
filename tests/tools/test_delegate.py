@@ -185,8 +185,10 @@ class TestChildSystemPrompt(unittest.TestCase):
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
+        # code_execution stays: upstream unblocked execute_code for subagents
+        # in v2026.7.30, so its toolset is no longer stripped either.
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
-        self.assertEqual(sorted(result), ["file", "terminal"])
+        self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
 
     def test_preserves_allowed_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "web", "browser"])
@@ -262,10 +264,12 @@ class TestStripBlockedTools(unittest.TestCase):
             "clarify",
             "cronjob",
             "delegation",
-            "code_execution",
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
+        # code_execution is deliberately absent: upstream unblocked
+        # execute_code for subagents in v2026.7.30.
+        self.assertNotIn("code_execution", disabled)
 
         definitions = model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
@@ -1236,8 +1240,17 @@ class TestSubagentCostRollup(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "execute_code"]:
+        for tool in ["delegate_task", "clarify", "memory", "send_message", "cronjob"]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
+
+    def test_execute_code_is_no_longer_blocked(self):
+        """Upstream unblocked execute_code for subagents in v2026.7.30.
+
+        It was blocked here through v2026.7.20; this fork never changed that
+        either way, so the removal is upstream's call. Pinned so a future sync
+        that re-adds it shows up as a deliberate decision rather than drift.
+        """
+        self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):
         from tools.delegate_tool import (

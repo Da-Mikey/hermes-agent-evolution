@@ -47,7 +47,7 @@ class TestConfigParsing:
 
         cfg = ToolSearchConfig.from_raw(None)
         assert cfg.enabled == "auto"
-        assert cfg.threshold_pct == 10.0
+        assert cfg.threshold_pct == 5.0
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -426,14 +426,26 @@ class TestThresholdGate:
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
         assert should_activate(cfg, deferrable_tokens=100, context_length=200_000)
 
-    def test_auto_below_threshold_does_not_activate(self):
-        from tools.tool_search import ToolSearchConfig, should_activate
+    def test_threshold_no_longer_gates_activation(self):
+        """threshold_pct governs the LISTING BUDGET, not activation.
+
+        Upstream's July 2026 tiered-disclosure change: any deferrable tool
+        activates the bridge, because schemas always defer — there is nothing
+        to gain by leaving a deferrable tool inline. What threshold_pct now
+        sizes is how much of the catalog listing gets embedded
+        (listing_token_budget). This used to assert the opposite.
+        """
+        from tools.tool_search import (
+            ToolSearchConfig,
+            listing_token_budget,
+            should_activate,
+        )
 
         cfg = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
-        # 5% of 200K = below 10% threshold
-        assert not should_activate(
-            cfg, deferrable_tokens=10_000, context_length=200_000
-        )
+        # Well under 10% of the context, yet it still activates.
+        assert should_activate(cfg, deferrable_tokens=10_000, context_length=200_000)
+        # The percentage now shows up in the listing budget instead.
+        assert listing_token_budget(cfg, 200_000) == 20_000
 
     def test_auto_at_or_above_threshold_activates(self):
         from tools.tool_search import ToolSearchConfig, should_activate
@@ -442,13 +454,25 @@ class TestThresholdGate:
         assert should_activate(cfg, deferrable_tokens=20_000, context_length=200_000)
         assert should_activate(cfg, deferrable_tokens=50_000, context_length=200_000)
 
-    def test_auto_without_context_length_uses_20k_cutoff(self):
-        """Fallback cutoff used when the active model is unknown."""
-        from tools.tool_search import ToolSearchConfig, should_activate
+    def test_activation_needs_only_a_deferrable_tool(self):
+        """With no known context length, activation still only needs a tool.
+
+        The old fallback cutoff gated activation; under tiered disclosure the
+        unknown-context fallback applies to the listing budget instead.
+        """
+        from tools.tool_search import (
+            ToolSearchConfig,
+            listing_token_budget,
+            should_activate,
+        )
 
         cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
-        assert not should_activate(cfg, deferrable_tokens=10_000, context_length=0)
+        assert should_activate(cfg, deferrable_tokens=10_000, context_length=0)
         assert should_activate(cfg, deferrable_tokens=25_000, context_length=0)
+        # Nothing deferrable is still a no-op.
+        assert not should_activate(cfg, deferrable_tokens=0, context_length=0)
+        # Unknown context falls back to a fixed cutoff for the listing budget.
+        assert listing_token_budget(cfg, 0) > 0
 
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas
