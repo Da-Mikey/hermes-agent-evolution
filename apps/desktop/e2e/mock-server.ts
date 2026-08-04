@@ -76,6 +76,18 @@ export interface ScriptedTurn {
   }>
 }
 
+// NOTE: the tool ALTERNATES between `todo` and `session_search` on purpose.
+// This fork's loop guard (agent/loop_guard.py, absent upstream) interrupts a
+// run when one MUTATING tool is called `_MUTATING_REPEAT_THRESHOLD` = 4 times
+// in a row, and `todo` is mutating. Four consecutive `todo` calls — what this
+// script originally sent — tripped it exactly: the guard injected a synthetic
+// `[loop-guard] …` USER message, which then became the last user message, so
+// the mock no longer saw E2E_INTERIM_TRIGGER, fell through to its default
+// reply, and the scripted final turn never ran. `session_search` is idempotent
+// (threshold 8), so alternating keeps every streak at 1.
+//
+// What the script is actually testing — a turn with visible text ALONGSIDE a
+// tool call produces an interim — does not depend on WHICH tool it is.
 const INTERIM_SCRIPT: ScriptedTurn[] = [
   {
     text: 'Let me start by planning the approach.',
@@ -83,7 +95,7 @@ const INTERIM_SCRIPT: ScriptedTurn[] = [
   },
   {
     text: 'Now checking the details before answering.',
-    toolCalls: [{ name: 'todo', args: { todos: [{ id: '2', content: 'Check details', status: 'in_progress' }] } }],
+    toolCalls: [{ name: 'session_search', args: { query: 'details' } }],
   },
   {
     // No visible text alongside this tool call — should NOT produce an
@@ -94,7 +106,7 @@ const INTERIM_SCRIPT: ScriptedTurn[] = [
   },
   {
     text: 'Found something interesting worth noting.',
-    toolCalls: [{ name: 'todo', args: { todos: [{ id: '4', content: 'Note finding', status: 'completed' }] } }],
+    toolCalls: [{ name: 'session_search', args: { query: 'finding' } }],
   },
   {
     // Final answer — different from all interim texts.
