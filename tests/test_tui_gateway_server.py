@@ -3269,7 +3269,7 @@ class _RecordingAgent:
         return None
 
     def run_conversation(
-        self, prompt, conversation_history=None, stream_callback=None
+        self, prompt, conversation_history=None, stream_callback=None, **_kwargs
     ):
         self._turns.append(prompt)
         return {"final_response": "", "messages": []}
@@ -3364,9 +3364,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
 
     from tools.process_registry import process_registry
 
-    _configure_immediate_prompt_run(
-        monkeypatch, tmp_path, immediate_threads=False
-    )
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
     real_thread_class = threading.Thread
     threads = []
     nested_started = threading.Event()
@@ -3380,7 +3378,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
 
     class _BlockingNotificationAgent(_RecordingAgent):
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             turns.append(prompt)
             if "proc_batch_1" in prompt:
@@ -3553,8 +3551,6 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch, tmp_path):
         server._sessions.pop("sid_b", None)
         process_registry._completion_consumed.discard(event["session_id"])
 
-
-
     """session.create must NOT eagerly write a DB row.
 
     Every TUI/desktop launch opens a session here just to paint the composer;
@@ -3575,9 +3571,11 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch, tmp_path):
         lambda *a, **k: types.SimpleNamespace(daemon=False, start=lambda: None),
     )
 
-    resp = server.handle_request(
-        {"id": "1", "method": "session.create", "params": {"cols": 80}}
-    )
+    resp = server.handle_request({
+        "id": "1",
+        "method": "session.create",
+        "params": {"cols": 80},
+    })
     sid = resp["result"]["session_id"]
     try:
         assert resp["result"]["stored_session_id"]
@@ -3591,18 +3589,43 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
-            created.append(
-                {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
-            )
+        def create_session(
+            self,
+            key,
+            source=None,
+            model=None,
+            model_config=None,
+            parent_session_id=None,
+            cwd=None,
+            profile_name=None,
+        ):
+            created.append({
+                "key": key,
+                "source": source,
+                "model": model,
+                "model_config": model_config,
+                "cwd": cwd,
+            })
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
 
-    server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path), "explicit_cwd": True})
+    server._ensure_session_db_row({
+        "session_key": "k1",
+        "cwd": str(tmp_path),
+        "explicit_cwd": True,
+    })
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": None,
+            "cwd": str(tmp_path),
+        }
     ]
 
 
@@ -3610,10 +3633,23 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
-            created.append(
-                {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
-            )
+        def create_session(
+            self,
+            key,
+            source=None,
+            model=None,
+            model_config=None,
+            parent_session_id=None,
+            cwd=None,
+            profile_name=None,
+        ):
+            created.append({
+                "key": key,
+                "source": source,
+                "model": model,
+                "model_config": model_config,
+                "cwd": cwd,
+            })
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
@@ -3621,7 +3657,13 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     server._ensure_session_db_row({"session_key": "k1", "source": "tool"})
 
     assert created == [
-        {"key": "k1", "source": "tool", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "tool",
+            "model": "test-model",
+            "model_config": None,
+            "cwd": None,
+        }
     ]
 
 
@@ -3658,22 +3700,32 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
-            created.append(
-                {"key": key, "model": model, "model_config": model_config, "cwd": cwd}
-            )
+        def create_session(
+            self,
+            key,
+            source=None,
+            model=None,
+            model_config=None,
+            parent_session_id=None,
+            cwd=None,
+            profile_name=None,
+        ):
+            created.append({
+                "key": key,
+                "model": model,
+                "model_config": model_config,
+                "cwd": cwd,
+            })
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "global/default")
 
-    server._ensure_session_db_row(
-        {
-            "session_key": "k1",
-            "model_override": {"model": "openai/gpt-5.5", "provider": "openrouter"},
-            "create_reasoning_override": {"effort": "high"},
-            "create_service_tier_override": "priority",
-        }
-    )
+    server._ensure_session_db_row({
+        "session_key": "k1",
+        "model_override": {"model": "openai/gpt-5.5", "provider": "openrouter"},
+        "create_reasoning_override": {"effort": "high"},
+        "create_service_tier_override": "priority",
+    })
 
     assert len(created) == 1
     row = created[0]
@@ -3690,7 +3742,16 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None):
+        def create_session(
+            self,
+            key,
+            source=None,
+            model=None,
+            model_config=None,
+            parent_session_id=None,
+            cwd=None,
+            profile_name=None,
+        ):
             created.append({"model": model, "model_config": model_config})
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
@@ -4069,13 +4130,20 @@ def test_config_get_approval_mode_fails_safe_to_manual_for_invalid_explicit_valu
     import yaml
 
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    # _load_approval_mode delegates to the canonical resolver in
+    # tools.approval, which reads via hermes_cli.config.load_config —
+    # that path resolves HERMES_HOME from the environment, not
+    # server._hermes_home.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump({"approvals": {"mode": "sometimes"}})
     )
 
-    response = server.handle_request(
-        {"id": "1", "method": "config.get", "params": {"key": "approvals.mode"}}
-    )
+    response = server.handle_request({
+        "id": "1",
+        "method": "config.get",
+        "params": {"key": "approvals.mode"},
+    })
     assert response["result"]["value"] == "manual"
 
 
@@ -4083,13 +4151,18 @@ def test_config_get_approval_mode_normalizes_yaml_off(tmp_path, monkeypatch):
     import yaml
 
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    # See fail-safe test above: the canonical resolver reads via
+    # load_config, which resolves HERMES_HOME from the environment.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump({"approvals": {"mode": False}})
     )
 
-    response = server.handle_request(
-        {"id": "1", "method": "config.get", "params": {"key": "approvals.mode"}}
-    )
+    response = server.handle_request({
+        "id": "1",
+        "method": "config.get",
+        "params": {"key": "approvals.mode"},
+    })
     assert response["result"]["value"] == "off"
 
 
@@ -4099,23 +4172,28 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
     import yaml
 
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    # config.set writes via server._hermes_home, but the post-write
+    # session.info emit resolves the effective mode through the canonical
+    # tools.approval resolver (load_config → env HERMES_HOME).
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
     server._sessions["sid"] = {"agent": object(), "session_key": "profile-session"}
 
     try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "config.set",
-                "params": {"key": "approvals.mode", "value": "manual"},
-            }
-        )
+        resp = server.handle_request({
+            "id": "1",
+            "method": "config.set",
+            "params": {"key": "approvals.mode", "value": "manual"},
+        })
     finally:
         server._sessions.clear()
 
     assert resp["result"] == {"key": "approvals.mode", "value": "manual"}
-    assert yaml.safe_load((tmp_path / "config.yaml").read_text())["approvals"]["mode"] == "manual"
+    assert (
+        yaml.safe_load((tmp_path / "config.yaml").read_text())["approvals"]["mode"]
+        == "manual"
+    )
     assert emitted and emitted[0][0:2] == ("session.info", "sid")
     assert emitted[0][2]["approval_mode"] == "manual"
 
@@ -5759,7 +5837,9 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
 def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):
-            raise AssertionError("slash worker should not run for isolated read commands")
+            raise AssertionError(
+                "slash worker should not run for isolated read commands"
+            )
 
     history_from_db = [
         {"role": "user", "content": "live question from state db"},
@@ -5785,7 +5865,9 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
         def get_ancestor_display_prefix(self, _sid):
             return []
 
-        def get_messages_as_conversation(self, key, include_ancestors=True, repair_alternation=False):
+        def get_messages_as_conversation(
+            self, key, include_ancestors=True, repair_alternation=False, **_kwargs
+        ):
             assert key == "session-key"
             assert include_ancestors is True
             return list(history_from_db)
@@ -5818,7 +5900,9 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
     )
     monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}}
+    )
 
     cases = {
         "usage": "Total tokens:                 140",
@@ -5832,13 +5916,11 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
 
     try:
         for command, expected in cases.items():
-            resp = server.handle_request(
-                {
-                    "id": command,
-                    "method": "slash.exec",
-                    "params": {"command": command, "session_id": "sid"},
-                }
-            )
+            resp = server.handle_request({
+                "id": command,
+                "method": "slash.exec",
+                "params": {"command": command, "session_id": "sid"},
+            })
             assert "result" in resp, (command, resp)
             assert expected in resp["result"]["output"]
             assert "stale parent mirror" not in resp["result"]["output"]
@@ -5854,7 +5936,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             captured["session_key"] = get_current_session_key(default="")
             return {
@@ -5875,13 +5957,11 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
 
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "prompt.submit",
-            "params": {"session_id": "sid", "text": "ping"},
-        }
-    )
+    resp = server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {"session_id": "sid", "text": "ping"},
+    })
 
     assert resp["result"]["status"] == "streaming"
     assert captured["session_key"] == "session-key"
@@ -5896,7 +5976,7 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
         api_key = ""
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             captured["prompt"] = prompt
             return {
@@ -5912,8 +5992,8 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
             self._target()
 
     fake_ctx = types.ModuleType("agent.context_references")
-    fake_ctx.preprocess_context_references = (
-        lambda message, **kwargs: types.SimpleNamespace(
+    fake_ctx.preprocess_context_references = lambda message, **kwargs: (
+        types.SimpleNamespace(
             blocked=False,
             message="expanded prompt",
             warnings=[],
@@ -5932,13 +6012,11 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     monkeypatch.setitem(sys.modules, "agent.context_references", fake_ctx)
     monkeypatch.setitem(sys.modules, "agent.model_metadata", fake_meta)
 
-    server.handle_request(
-        {
-            "id": "1",
-            "method": "prompt.submit",
-            "params": {"session_id": "sid", "text": "@diff"},
-        }
-    )
+    server.handle_request({
+        "id": "1",
+        "method": "prompt.submit",
+        "params": {"session_id": "sid", "text": "@diff"},
+    })
 
     assert captured["prompt"] == "expanded prompt"
 
@@ -7990,6 +8068,7 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
     class _Agent:
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None
+        **_kwargs,
         ):
             return {
                 "final_response": "partial answer",
@@ -8022,6 +8101,7 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
     class _Agent:
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None
+        **_kwargs,
         ):
             return {
                 "final_response": "",
@@ -9660,7 +9740,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
     turns = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
             return {"final_response": "ok", "messages": []}
 
