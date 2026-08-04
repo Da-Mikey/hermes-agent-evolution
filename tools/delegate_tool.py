@@ -2964,9 +2964,11 @@ def _run_single_child(
                     # authority — a child that "completes" would close the
                     # parent's Kanban task. Upstream has no shallow-retry loop,
                     # so its own wrapping of the first call never covered this.
-                    with delegated_child_context(
-                        str(getattr(child, "session_id", "") or "")
-                    ):
+                    from agent.delegation_context import (
+                        delegated_child_context as _dcc,
+                    )
+
+                    with _dcc(str(getattr(child, "session_id", "") or "")):
                         retry_result = child.run_conversation(
                             user_message=escalated_goal,
                             task_id=child_task_id,

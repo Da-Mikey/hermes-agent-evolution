@@ -5101,9 +5101,21 @@ class TestApplyWalProbe:
 
 
     def test_sets_wal_on_fresh_connection(self, tmp_path):
-        """Probe sees 'delete', then set-pragma runs and returns 'wal'."""
+        """Probe sees 'delete', then set-pragma runs and returns 'wal'.
+
+        Skipped on SQLite builds carrying the WAL-reset corruption bug
+        (#69784): there the #70055 gate deliberately refuses to enable WAL on a
+        fresh database and returns "delete". Asserting "wal" on those builds
+        would be asserting the corruption guard does NOT fire.
+        """
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state import apply_wal_with_fallback, is_sqlite_wal_reset_vulnerable
+
+        if is_sqlite_wal_reset_vulnerable():
+            pytest.skip(
+                f"linked SQLite {sqlite3.sqlite_version} carries the WAL-reset "
+                "bug; the #70055 gate correctly prefers DELETE here"
+            )
 
         class _TracingConn(sqlite3.Connection):
             def __init__(self, *a, **kw):
@@ -5206,9 +5218,19 @@ class TestApplyWalProbe:
 
 
     def test_returns_wal_not_delete_from_probe(self, tmp_path):
-        """Early-return only on 'wal'; 'delete' or 'memory' must fall through to set-pragma."""
+        """Early-return only on 'wal'; 'delete' or 'memory' must fall through to set-pragma.
+
+        Same skip as the sibling above: on a WAL-reset-vulnerable build the
+        fall-through ends in DELETE by design (#70055), not in WAL.
+        """
         import sqlite3
-        from hermes_state import apply_wal_with_fallback
+        from hermes_state import apply_wal_with_fallback, is_sqlite_wal_reset_vulnerable
+
+        if is_sqlite_wal_reset_vulnerable():
+            pytest.skip(
+                f"linked SQLite {sqlite3.sqlite_version} carries the WAL-reset "
+                "bug; the #70055 gate correctly prefers DELETE here"
+            )
 
         class _TracingConn(sqlite3.Connection):
             def __init__(self, *a, **kw):
