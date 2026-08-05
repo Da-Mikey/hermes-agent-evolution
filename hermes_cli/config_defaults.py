@@ -385,6 +385,8 @@ DEFAULT_CONFIG = {
         "extract_backend": "",  # per-capability override for web_extract (e.g. "native")
         "search_backend_fallback_chain": "",
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
+        # #1704 — consecutive web_search calls before appending a fallback_directive steering the model to synthesize or change approach. 0 disables.
+        "search_streak_threshold": 5,
     },
     "browser": {
         "inactivity_timeout": 120,
