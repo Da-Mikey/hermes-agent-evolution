@@ -1741,6 +1741,16 @@ def handle_function_call(
         except Exception:
             pass
 
+        # Independent execution-evidence capture: record what actually ran,
+        # separate from the model's narrative, so explanations can be
+        # cross-checked against recorded evidence (#1716). Fail-open.
+        try:
+            from agent.exec_evidence import record_evidence
+
+            record_evidence(function_name, function_args)
+        except Exception:
+            pass
+
         # Sanitize untrusted tool output before it re-enters model context:
         # fence off prompt-injection patterns (ignore-prior-instructions,
         # role tags, persona hijacks) so they are read as data. Fail-open.
