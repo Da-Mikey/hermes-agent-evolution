@@ -2146,15 +2146,21 @@ class ShellFileOperations(FileOperations):
             # tool_result_classification.py:34, and classify_tool_failure
             # checks '"error"' in the result) to flag this as a failure,
             # inflating the patch failure count and triggering unnecessary
-            # retry spirals. With success=True and no error key, the result
+            # retry spirals. With success=True and no_change=True, the result
             # is correctly classified as a landed no-op.
-            return PatchResult(
-                success=True,
-                structured_error=(
-                    "old_string and new_string are identical — no changes "
-                    "needed. The file content is already in the desired state."
-                ),
-            )
+            #
+            # BUT: if the identical string is NOT present in the file, this
+            # is genuinely an error (the edit targets text that doesn't exist).
+            if old_string in content or new_string in content:
+                return PatchResult(
+                    success=True,
+                    no_change=True,
+                    note=(
+                        "old_string and new_string are identical — no changes "
+                        "needed. The file content is already in the desired state."
+                    ),
+                )
+            # Identical old/new but neither present → fall through to error
 
         if error or match_count == 0:
             # Already-applied detection: the most common patch failure in
