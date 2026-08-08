@@ -444,8 +444,9 @@ class TestThresholdGate:
         cfg = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
         # Well under 10% of the context, yet it still activates.
         assert should_activate(cfg, deferrable_tokens=10_000, context_length=200_000)
-        # The percentage now shows up in the listing budget instead.
-        assert listing_token_budget(cfg, 200_000) == 20_000
+        # The percentage shows up in the listing budget, but capped by
+        # listing_max_tokens (default 4000): min(4000, 10% * 200000) = 4000.
+        assert listing_token_budget(cfg, 200_000) == 4_000
 
     def test_auto_at_or_above_threshold_activates(self):
         from tools.tool_search import ToolSearchConfig, should_activate

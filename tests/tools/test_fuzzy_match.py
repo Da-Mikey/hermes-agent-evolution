@@ -583,8 +583,9 @@ class TestAmbiguousMatchEnrichment:
             content, "x = 1\n", "x = 2\n", replace_all=False
         )
         assert count == 0
-        assert "Line 1" in err
-        assert "Line 2" in err
+        # Upstream changed format from "Line N" to "L{N}:" prefix
+        assert "L1:" in err
+        assert "L2:" in err
 
     def test_ambiguous_error_format_is_multiline(self):
         """The enriched error uses a multi-line format for readability."""
