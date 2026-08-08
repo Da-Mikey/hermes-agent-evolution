@@ -5188,36 +5188,36 @@ def validate_requested_model(
         if suggestions:
             suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
 
-            # Model not in live /v1/models — check the curated catalog
-            # before rejecting.  Providers may omit models from their live
-            # listing that are still valid (stale cache, partial rollout,
-            # gated previews).  Use the pure-catalog helper (no extra live
-            # fetch) so we only accept models Hermes actually ships.  (#46850)
-            #
-            # EXCEPTION: official OpenAI hosts (canonical api.openai.com and
-            # the data-residency regional hosts).  Their /v1/models listing is
-            # access-scoped and authoritative — a model absent from it is one
-            # this key CANNOT serve, so the curated soft-accept would
-            # manufacture a selection that 400s at first use.  Custom
-            # OpenAI-compatible proxies keep the fallback (incomplete
-            # listings are common there).
-            _openai_listing_is_authoritative = False
-            if normalized in ("openai", "openai-api"):
-                from hermes_cli.providers import is_official_openai_host
+        # Model not in live /v1/models — check the curated catalog
+        # before rejecting.  Providers may omit models from their live
+        # listing that are still valid (stale cache, partial rollout,
+        # gated previews).  Use the pure-catalog helper (no extra live
+        # fetch) so we only accept models Hermes actually ships.  (#46850)
+        #
+        # EXCEPTION: official OpenAI hosts (canonical api.openai.com and
+        # the data-residency regional hosts).  Their /v1/models listing is
+        # access-scoped and authoritative — a model absent from it is one
+        # this key CANNOT serve, so the curated soft-accept would
+        # manufacture a selection that 400s at first use.  Custom
+        # OpenAI-compatible proxies keep the fallback (incomplete
+        # listings are common there).
+        _openai_listing_is_authoritative = False
+        if normalized in ("openai", "openai-api"):
+            from hermes_cli.providers import is_official_openai_host
 
-                _openai_listing_is_authoritative = is_official_openai_host(base_url)
-            if not _openai_listing_is_authoritative and _model_in_provider_catalog(
-                requested_for_lookup.lower(), _provider_keys(normalized)
-            ):
-                return {
-                    "accepted": True,
-                    "persist": True,
-                    "recognized": True,
-                    "message": (
-                        f"Note: `{requested}` was not found in the live /v1/models listing "
-                        f"but exists in the curated catalog — accepted."
-                    ),
-                }
+            _openai_listing_is_authoritative = is_official_openai_host(base_url)
+        if not _openai_listing_is_authoritative and _model_in_provider_catalog(
+            requested_for_lookup.lower(), _provider_keys(normalized)
+        ):
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": (
+                    f"Note: `{requested}` was not found in the live /v1/models listing "
+                    f"but exists in the curated catalog — accepted."
+                ),
+            }
 
         return {
             "accepted": False,
