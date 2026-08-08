@@ -167,6 +167,47 @@ class TestCoerceToolArgs:
             result = coerce_tool_args("test_tool", args)
             assert result["path"] == "[not-json-at-all"
 
+    def test_bracket_comma_path_list_extracts_first(self):
+        """#1681 — bracket-wrapped comma-separated path list (not valid
+        JSON, so json.loads fails) should still extract the first path."""
+        schema = self._mock_schema({"path": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"path": "[path/a, path/b]"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["path"] == "path/a"
+
+    def test_bare_comma_path_list_extracts_first(self):
+        """#1681 — bare comma-separated path list (no brackets) also
+        extracts the first path."""
+        schema = self._mock_schema({"path": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"path": "src/main.py, src/utils.py"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["path"] == "src/main.py"
+
+    def test_comma_in_sentence_not_mangled(self):
+        """#1681 — a normal sentence containing a comma is NOT a path list."""
+        schema = self._mock_schema({"path": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"path": "just a comma, in a sentence"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["path"] == "just a comma, in a sentence"
+
+    def test_bare_word_comma_not_path_list(self):
+        """#1681 — 'value1, value2' (no path separators in rest) untouched."""
+        schema = self._mock_schema({"path": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"path": "value1, value2"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["path"] == "value1, value2"
+
+    def test_content_param_with_commas_not_truncated(self):
+        schema = self._mock_schema({"content": {"type": "string"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"content": "line one, line two, line three"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["content"] == "line one, line two, line three"
+
     def test_stringified_array_on_union_string_array_parsed_as_list(self):
         """Union type ['string', 'array'] — array branch fires first.
 
@@ -181,6 +222,105 @@ class TestCoerceToolArgs:
             args = {"path": '["a.py", "b.py"]'}
             result = coerce_tool_args("test_tool", args)
             assert result["path"] == ["a.py", "b.py"]
+
+    # ── #1681 regression: union-type guard for read_file's path param ──
+
+    def test_real_read_file_stringified_json_array_parses_to_list(self):
+        """#1681 regression — read_file's path is ``["string", "array"]``.
+
+        The old guard checked ``expected == "string"`` only and never fired
+        for read_file. A stringified JSON array reached read_file as a
+        literal string → file-not-found spiral. The fix fires the guard
+        when the schema type is a list containing ``"string"``, and parses
+        into a native list when the union also includes ``"array"``.
+        """
+        args = {"path": '["src/a.py", "src/b.py"]'}
+        result = coerce_tool_args("read_file", args)
+        assert result["path"] == ["src/a.py", "src/b.py"]
+
+    def test_real_read_file_comma_separated_paths_parses_to_list(self):
+        """Regression for #1681 — comma-separated path list on read_file's
+        union-typed ``path`` param should parse into a native list, not
+        pass through as a literal string.
+        """
+        args = {"path": "src/a.py, src/b.py"}
+        result = coerce_tool_args("read_file", args)
+        assert result["path"] == ["src/a.py", "src/b.py"]
+
+    def test_real_read_file_bracket_non_json_paths_parses_to_list(self):
+        """Regression for #1681 — bracket-wrapped non-JSON path list."""
+        args = {"path": "[src/a.py, src/b.py]"}
+        result = coerce_tool_args("read_file", args)
+        assert result["path"] == ["src/a.py", "src/b.py"]
+
+    def test_real_read_file_single_path_unchanged(self):
+        """A single path string must pass through unchanged on the union
+        type — not wrapped in a list."""
+        args = {"path": "src/main.py"}
+        result = coerce_tool_args("read_file", args)
+        assert result["path"] == "src/main.py"
+
+    def test_real_read_file_single_element_json_array_parses_to_list(self):
+        """A single-element JSON array string should parse to a
+        single-element list (the model intended a batch read)."""
+        args = {"path": '["only.py"]'}
+        result = coerce_tool_args("read_file", args)
+        assert result["path"] == ["only.py"]
+
+
+# ── _parse_stringified_array_to_list unit tests (#1681) ──────────────
+
+
+class TestParseStringifiedArrayToList:
+    """Unit tests for the _parse_stringified_array_to_list helper."""
+
+    def test_json_array_of_strings(self):
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list('["a.py", "b.py"]') == ["a.py", "b.py"]
+
+    def test_single_element_json_array(self):
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list('["only.py"]') == ["only.py"]
+
+    def test_comma_separated_paths(self):
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list("src/a.py, src/b.py") == [
+            "src/a.py",
+            "src/b.py",
+        ]
+
+    def test_bracket_non_json_paths(self):
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list("[src/a.py, src/b.py]") == [
+            "src/a.py",
+            "src/b.py",
+        ]
+
+    def test_non_path_comma_string_returns_none(self):
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list("hello, world") is None
+
+    def test_json_array_of_numbers_returns_none(self):
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list("[1, 2, 3]") is None
+
+    def test_plain_path_returns_none(self):
+        """A single path with no comma is not a list."""
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list("src/main.py") is None
+
+    def test_non_string_returns_none(self):
+        from model_tools import _parse_stringified_array_to_list
+
+        assert _parse_stringified_array_to_list(None) is None
+        assert _parse_stringified_array_to_list(123) is None
 
 
 # ── Schema-guided nested JSON-string normalization (cline/cline#11803) ─────

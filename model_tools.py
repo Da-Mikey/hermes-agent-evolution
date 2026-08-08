@@ -879,11 +879,54 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         # likely intended path). Only fires for string-typed params where
         # ``_coerce_value`` is a no-op — the array-typed branch above
         # already handles JSON arrays on array-typed fields.
+        #
+        # #1681 regression fix: read_file's ``path`` param uses a UNION
+        # type ``["string", "array"]`` for batch-read support. The guard
+        # above checked ``expected == "string"`` only, so it NEVER fired
+        # for read_file — the stringified array sailed through as a
+        # literal string, producing the file-not-found spiral the guard
+        # was meant to prevent. We now also fire when the schema type is
+        # a list containing ``"string"`` (union type). When the union also
+        # includes ``"array"``, we parse the stringified array into a
+        # native list (the schema accepts it, and read_file's batch path
+        # handles native lists) instead of extracting only the first
+        # element — preserving the model's intent to read multiple files.
+        _expected_types = (
+            {expected} if isinstance(expected, str) else set(expected or [])
+        )
+        _accepts_string = "string" in _expected_types
+        _accepts_array = "array" in _expected_types
         if (
-            expected == "string"
+            _accepts_string
             and isinstance(value, str)
-            and value.lstrip().startswith("[")
+            and (
+                value.lstrip().startswith("[")
+                # #1681 — also fire on bare comma-separated path lists
+                # (``"src/a.py, src/b.py"``, no brackets). The helper's
+                # path-like guards reject non-path strings (sentences,
+                # bare words), so widening the trigger is safe.
+                or ("," in value and _is_path_like_param(key))
+            )
         ):
+            # When the schema also accepts ``"array"``, parse the
+            # stringified array into a native list so read_file's batch
+            # path handles it — the model intended a multi-file read.
+            if _accepts_array:
+                parsed_list = _parse_stringified_array_to_list(value)
+                if parsed_list is not None:
+                    logger.info(
+                        "coerce_tool_args: %s.%s received a stringified "
+                        "array string (%.80s...) for a string|array union "
+                        "param — parsing into native list of %d items.",
+                        tool_name,
+                        key,
+                        value,
+                        len(parsed_list),
+                    )
+                    args[key] = parsed_list
+                    continue
+            # Schema is string-only (or parse failed) — extract the
+            # first element as the most likely intended single path.
             extracted = _extract_first_from_stringified_array(value)
             if extracted is not None:
                 logger.info(
@@ -1014,25 +1057,151 @@ def _extract_first_from_stringified_array(value: str) -> Optional[str]:
     first string element so the tool receives a usable scalar path
     instead of the literal array string.
 
+    Falls back to splitting a non-JSON bracket-wrapped or bare
+    comma-separated list of paths (e.g. ``"[path/a, path/b]"`` or
+    ``"path/a, path/b"``) — a common open-weight-model emission when it
+    intends a list but forgets the JSON quoting. Without this, the whole
+    string would reach read_file and produce a file-not-found spiral.
+
     Returns the first string element, or ``None`` when the value is not a
     parseable JSON array of strings (in which case the caller leaves the
     original value untouched).
     """
     if not isinstance(value, str):
         return None
+    stripped = value.strip()
     try:
-        parsed = json.loads(value.strip())
+        parsed = json.loads(stripped)
     except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, list) and parsed:
+        # Only unwrap arrays of strings — a list of dicts/numbers on a
+        # string-typed param is a different error and should not be silently
+        # mangled into ``str(parsed[0])``.
+        first = parsed[0]
+        if isinstance(first, str):
+            return first
         return None
-    if not isinstance(parsed, list) or not parsed:
+    # ── Non-JSON comma-separated list fallback (#1681) ──────────────────
+    # The JSON parse failed. Detect a bracket-wrapped or bare
+    # comma-separated list of path-like items and take the first. Only
+    # fire when the value LOOKS like a path list: it contains a comma with
+    # whitespace, and the first token is a plausible path (not a bare
+    # number/word that a genuine path string could never be). This avoids
+    # mangling legitimate single-path strings that merely contain a comma
+    # (e.g. a filename with a comma, or shell args with flags).
+    _comma_list = re.match(
+        r"^[\[\s]*(?P<first>[^,\[\]\s][^,]*?)"
+        r"\s*,\s*(?P<rest>[^\]].*?)[\]\s]*$",
+        stripped,
+        re.DOTALL,
+    )
+    if not _comma_list:
         return None
-    # Only unwrap arrays of strings — a list of dicts/numbers on a
-    # string-typed param is a different error and should not be silently
-    # mangled into ``str(parsed[0])``.
-    first = parsed[0]
-    if isinstance(first, str):
-        return first
+    first_token = _comma_list.group("first").strip()
+    rest = _comma_list.group("rest").strip()
+    # Heuristic guard: the first token must look like a path — contain a
+    # path separator or a dot-extension or be a relative path — and the
+    # rest must look like another path, not arbitrary text.
+    if _looks_like_path(first_token) and _looks_like_path_list_rest(rest):
+        logger.info(
+            "coerce_tool_args: extracted first item from comma-separated "
+            "path list (%.60s...) for a string-typed param.",
+            value,
+        )
+        return first_token
     return None
+
+
+def _parse_stringified_array_to_list(value: str) -> Optional[List[str]]:
+    """Parse a stringified JSON array or comma-separated path list into a
+    native ``list[str]`` (#1681 regression fix).
+
+    Used when the schema type is a union like ``["string", "array"]``
+    (e.g. ``read_file``'s ``path`` param) and the model emitted a
+    stringified array. Unlike :func:`_extract_first_from_stringified_array`
+    (which takes only the first element for pure-string params), this
+    preserves ALL elements so the tool's batch-read path can handle them.
+
+    Returns a list of string paths, or ``None`` when the value is not a
+    parseable array of path-like strings.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    # ── JSON array path ──────────────────────────────────────────────
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, list) and parsed:
+        # Only unwrap arrays of strings — mixed types on a path param are
+        # a different error class.
+        if all(isinstance(item, str) for item in parsed):
+            return parsed
+        return None
+    # ── Non-JSON comma-separated list fallback ────────────────────────
+    # Same heuristic as _extract_first_from_stringified_array but returns
+    # ALL path-like tokens, not just the first.
+    _comma_list = re.match(
+        r"^[\[\s]*(?P<first>[^,\[\]\s][^,]*?)"
+        r"\s*,\s*(?P<rest>[^\]].*?)[\]\s]*$",
+        stripped,
+        re.DOTALL,
+    )
+    if not _comma_list:
+        return None
+    first_token = _comma_list.group("first").strip()
+    rest = _comma_list.group("rest").strip()
+    # Stricter than _looks_like_path: require an actual path separator
+    # (slash, dot-extension, or ..) — not just len >= 3 — so non-path
+    # strings like "hello, world" are NOT split into a path list.
+    if not (_PATH_SEPARATOR_RE.search(first_token) and _PATH_SEPARATOR_RE.search(rest)):
+        return None
+    # Split the full string into individual path tokens.
+    inner = stripped.strip("[] \n\t")
+    tokens = [t.strip() for t in inner.split(",")]
+    # Keep only non-empty tokens with a path separator.
+    path_tokens = [t for t in tokens if t and _PATH_SEPARATOR_RE.search(t)]
+    if len(path_tokens) >= 2:
+        return path_tokens
+    return None
+
+
+# Path separators / extensions that mark a token as path-like (#1681).
+_PATH_SEPARATOR_RE = re.compile(r"[/\\]|[.]\w{1,10}\Z|\.\.", re.IGNORECASE)
+
+
+def _looks_like_path(token: str) -> bool:
+    """Return True when *token* looks like a filesystem path."""
+    if not token:
+        return False
+    if _PATH_SEPARATOR_RE.search(token):
+        return True
+    # A bare word that is a known shell/tool keyword is not a path.
+    if token.lower() in {"true", "false", "null", "none", "and", "or", "not"}:
+        return False
+    return len(token) >= 3
+
+
+_PATH_LIKE_PARAM_RE = re.compile(
+    r"path|file|url|dir|dest|src|dst|target|glob|pattern|prefix|output|input",
+    re.IGNORECASE,
+)
+
+
+def _is_path_like_param(key: str) -> bool:
+    """Return True when *key* names a param that typically holds a path/URL."""
+    if not key:
+        return False
+    return _PATH_LIKE_PARAM_RE.search(key) is not None
+
+
+def _looks_like_path_list_rest(rest: str) -> bool:
+    """Return True when *rest* looks like the remainder of a path list."""
+    if not rest:
+        return False
+    return _PATH_SEPARATOR_RE.search(rest) is not None
 
 
 def _coerce_value(value: str, expected_type, schema: dict | None = None):
@@ -1528,6 +1697,16 @@ def handle_function_call(
             except Exception:
                 pass  # file_tools may not be loaded yet
 
+        # #1704 — reset the web_search consecutive-search streak whenever a
+        # non-web_search tool runs (the model acted on/abandoned results).
+        if function_name != "web_search":
+            try:
+                from tools.web_tools import reset_web_search_streak
+
+                reset_web_search_streak(session_id)
+            except Exception:
+                pass  # web_tools may not be loaded yet
+
         # Deterministic tool-argument contract check (issue #904). Re-checks
         # the final, post-coercion/post-middleware arguments against the
         # tool's own registered schema (``required`` fields, ``enum``
@@ -1739,6 +1918,65 @@ def handle_function_call(
         except Exception:
             pass
 
+        # Independent execution-evidence capture: record what actually ran,
+        # separate from the model's narrative, so explanations can be
+        # cross-checked against recorded evidence (#1716). Fail-open.
+        try:
+            from agent.exec_evidence import record_evidence
+
+            record_evidence(function_name, function_args)
+        except Exception:
+            pass
+
+        # Sanitize untrusted tool output before it re-enters model context:
+        # fence off prompt-injection patterns (ignore-prior-instructions,
+        # role tags, persona hijacks) so they are read as data. Fail-open.
+        try:
+            from agent.tool_sanitize import sanitize_tool_result
+
+            _sanitized = sanitize_tool_result(result)
+            if isinstance(_sanitized, str):
+                result = _sanitized
+        except Exception:
+            pass
+
+        # EchoLeak + agentjacking defense (#1717): neutralize remote-fetch
+        # image links and fence crash/debug output before it re-enters model
+        # context. Fail-open.
+        try:
+            from agent.echoleak_defense import sanitize_output
+
+            _sanitized = sanitize_output(result)
+            if isinstance(_sanitized, str):
+                result = _sanitized
+        except Exception:
+            pass
+            if isinstance(_sanitized, str):
+                result = _sanitized
+        except Exception:
+            pass
+
+        # Structured audit event (#1718) — tool calls as immutable JSONL
+        # events (EU AI Act Art. 12).  Gated + fail-open.
+        try:
+            from agent.audit_log import EVENT_TOOL_CALL_COMPLETE, log_audit_event
+
+            _status, _err_type, _ = _tool_result_observer_fields(result)
+            log_audit_event(
+                EVENT_TOOL_CALL_COMPLETE,
+                session_id=session_id or "",
+                turn_id=turn_id or "",
+                tool_call_id=tool_call_id or "",
+                tool_name=function_name,
+                task_id=task_id or "",
+                args=function_args,
+                duration_ms=duration_ms,
+                result=result[:4000] if isinstance(result, str) else result,
+                status=_status,
+                error_type=_err_type or "",
+            )
+        except Exception:
+            pass
         return result
 
     except Exception as e:
@@ -1774,6 +2012,13 @@ def handle_function_call(
                 )
         except Exception:
             pass  # never let the recovery module itself cause a failure
+        # Redact secrets from the error string before it re-enters context (#1717).
+        try:
+            from agent.echoleak_defense import sanitize_error_for_context
+
+            enriched = sanitize_error_for_context(enriched)
+        except Exception:
+            pass
         return tool_error(enriched)
 
 
