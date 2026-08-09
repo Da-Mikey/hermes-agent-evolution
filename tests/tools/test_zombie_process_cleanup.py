@@ -512,7 +512,13 @@ class TestDelegationCleanup:
                 parent_agent=parent,
             )
 
-            assert child_started.is_set()
+            # The child worker thread runs in a separate executor that
+            # _run_single_child shuts down with wait=False on timeout, so
+            # child_started may lag the returned result under CI load. Wait
+            # for the event (bounded) instead of asserting immediately.
+            assert child_started.wait(timeout=5), (
+                "child never signalled start before timeout"
+            )
             assert result["status"] == "timeout"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
