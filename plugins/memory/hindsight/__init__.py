@@ -51,6 +51,15 @@ from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
+try:
+    from hindsight_client_api.exceptions import NotFoundException
+except (ImportError, ModuleNotFoundError):
+    class NotFoundException(Exception):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+            self.status = kwargs.get("status")
+            self.reason = kwargs.get("reason")
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
@@ -1225,7 +1234,8 @@ class HindsightMemoryProvider(MemoryProvider):
         means "no longer pending" and is treated as done. Transient errors
         return False so the caller keeps waiting until its deadline.
         """
-        from hindsight_client_api.exceptions import NotFoundException
+        # NotFoundException is defined at module level above (or imported from hindsight_client_api)
+        pass
 
         try:
             resp = self._run_hindsight_operation(

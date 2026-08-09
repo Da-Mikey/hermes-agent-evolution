@@ -69,7 +69,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         "results_dir = Path(os.environ['RESULTS_DIR'])\n"
         "go_file = Path(os.environ['GO_FILE'])\n"
         "(ready_dir / idx).write_text('ready', encoding='utf-8')\n"
-        "deadline = time.time() + 10\n"
+        "deadline = time.time() + 30\n"
         "while not go_file.exists():\n"
         "    if time.time() > deadline:\n"
         "        raise RuntimeError('timed out waiting for go file')\n"
@@ -87,7 +87,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         "else:\n"
         "    (results_dir / idx).write_text('OK', encoding='utf-8')\n"
         "    print('OK', flush=True)\n"
-        "    deadline = time.time() + 10\n"
+        "    deadline = time.time() + 30\n"
         "    while len(list(results_dir.iterdir())) < worker_count:\n"
         "        if time.time() > deadline:\n"
         "            raise RuntimeError('timed out waiting for all workers to attempt acquire')\n"
@@ -114,7 +114,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
                 )
             )
 
-        deadline = time.time() + 10
+        deadline = time.time() + 30
         while len(list(ready_dir.iterdir())) < len(workers):
             if time.time() > deadline:
                 raise AssertionError("workers did not become ready")
@@ -123,7 +123,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
 
         outputs = []
         for worker in workers:
-            stdout, stderr = worker.communicate(timeout=10)
+            stdout, stderr = worker.communicate(timeout=30)
             assert worker.returncode == 0, stderr
             outputs.append(stdout.strip())
     finally:

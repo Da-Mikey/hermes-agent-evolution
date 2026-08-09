@@ -337,6 +337,7 @@ class TestConfig:
                 captured.update(kwargs)
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
 
         p = HindsightMemoryProvider()
@@ -683,7 +684,7 @@ class TestPrefetchServerRetainVisibility:
 
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
-        from hindsight_client_api.exceptions import NotFoundException
+        from plugins.memory.hindsight import NotFoundException
 
         client = _make_mock_client()
         client.operations = MagicMock()

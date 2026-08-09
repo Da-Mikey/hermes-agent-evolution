@@ -6,10 +6,12 @@ import asyncio
 import socket
 
 import pytest
+import sys
 
 
 @pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"), reason="Unix datagram sockets are unavailable"
+    sys.platform != "linux" or not hasattr(socket, "AF_UNIX"),
+    reason="Abstract Unix domain sockets are a Linux-only feature",
 )
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"

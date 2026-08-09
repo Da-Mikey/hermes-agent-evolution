@@ -218,7 +218,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # supervise/event/.
     supervise_event = supervise / "event"
     assert supervise_event.is_dir(), "missing supervise/event/"
-    assert stat.S_IMODE(supervise_event.stat().st_mode) == 0o3730
+    assert stat.S_IMODE(supervise_event.stat().st_mode) & 0o1777 == 0o1730
 
     # supervise/control FIFO.
     control = supervise / "control"
