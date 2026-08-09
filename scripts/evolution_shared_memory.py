@@ -95,9 +95,10 @@ def _query_global_scope(
 
     # Path 2: filesystem fallback — read global notes directly from canonical locations
     possible_paths = [
-        Path.home() / ".turbo-quant-memory" / "global" / "notes",
         _hermes_home() / "tqmemory" / "global" / "notes",
         _hermes_home() / "turbo_quant_memory" / "global" / "notes",
+        _hermes_home() / ".turbo-quant-memory" / "global" / "notes",
+        Path.home() / ".turbo-quant-memory" / "global" / "notes",
     ]
     global_notes_dir = None
     for p in possible_paths:
