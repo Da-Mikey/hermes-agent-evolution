@@ -371,6 +371,9 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_TOKEN", raising=False)
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
@@ -378,7 +381,9 @@ class TestFailureAttribution:
         )
         from agent.credential_pool import load_pool
 
-        return load_pool("anthropic")
+        with patch("agent.anthropic_adapter.read_claude_code_credentials", return_value=None), \
+             patch("agent.anthropic_adapter.read_hermes_oauth_credentials", return_value=None):
+            return load_pool("anthropic")
 
     def _entry(self, idx, key, **overrides):
         entry = {
