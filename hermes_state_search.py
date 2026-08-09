@@ -929,6 +929,21 @@ class SessionSearchMixin:
         if bookend < 0:
             bookend = 0
 
+        # A falsy/invalid anchor (None, 0) has no real id to centre on.
+        # When bookends are requested, fall back to the latest message in
+        # the session so callers still get a usable view instead of empty
+        # lists — matches the behaviour contract tested by readers that
+        # pass ``msg.get("anchor_id")`` (None when the column is absent).
+        if not around_message_id and bookend > 0:
+            with self._read_ctx() as conn:
+                fallback = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            if fallback is not None:
+                around_message_id = fallback[0]
+
         # Reuse the primitive — handles anchor-existence, content decoding,
         # tool_calls deserialisation, and boundary counts.
         primitive = self.get_messages_around(
@@ -974,7 +989,7 @@ class SessionSearchMixin:
 
                 bookend_start_rows = conn.execute(
                     f"SELECT * FROM messages "
-                    f"WHERE session_id = ? AND id < ?{role_clause} "
+                    f"WHERE session_id = ? AND id <= ?{role_clause} "
                     f"AND length(content) > 0 "
                     f"ORDER BY id ASC LIMIT ?",
                     (session_id, window_min_id, *role_params, bookend),
