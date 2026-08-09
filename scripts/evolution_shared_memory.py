@@ -62,8 +62,11 @@ def _query_global_scope(
     """
     # Path 1: direct Python import of tqmemory server
     try:
-        sys.path.insert(0, os.path.expanduser("~/.hermes/tqmemory/src"))
-        from turbo_memory_mcp.server import semantic_search_impl  # type: ignore
+        try:
+            from turbo_memory_mcp.server import semantic_search_impl  # type: ignore
+        except ImportError:
+            sys.path.insert(0, os.path.expanduser("~/.hermes/tqmemory/src"))
+            from turbo_memory_mcp.server import semantic_search_impl  # type: ignore
 
         results = semantic_search_impl(
             query=query,
@@ -74,19 +77,34 @@ def _query_global_scope(
         )
         if isinstance(results, str):
             results = json.loads(results)
+        raw_list = []
         if isinstance(results, list):
-            return results
-        if isinstance(results, dict) and "results" in results:
-            return results["results"]
-        return []
+            raw_list = results
+        elif isinstance(results, dict) and "results" in results:
+            raw_list = results.get("results", [])
+
+        # Consistently filter evolution-tagged notes
+        filtered = []
+        for n in raw_list:
+            tags = n.get("tags", []) if isinstance(n, dict) else []
+            if not tags or any("evolution" in str(t).lower() for t in tags):
+                filtered.append(n)
+        return filtered[:limit]
     except Exception:
         pass  # MCP server not available — fall through to filesystem
 
-    # Path 2: filesystem fallback — read global notes directly
-    global_notes_dir = _hermes_home() / "tqmemory" / "global" / "notes"
-    if not global_notes_dir.exists():
-        global_notes_dir = _hermes_home() / "turbo_quant_memory" / "global" / "notes"
-    if not global_notes_dir.exists():
+    # Path 2: filesystem fallback — read global notes directly from canonical locations
+    possible_paths = [
+        Path.home() / ".turbo-quant-memory" / "global" / "notes",
+        _hermes_home() / "tqmemory" / "global" / "notes",
+        _hermes_home() / "turbo_quant_memory" / "global" / "notes",
+    ]
+    global_notes_dir = None
+    for p in possible_paths:
+        if p.exists():
+            global_notes_dir = p
+            break
+    if not global_notes_dir:
         return []
 
     notes = []
