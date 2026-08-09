@@ -2238,13 +2238,20 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = tempfile.gettempdir()
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+
+    valid_dirs = {temp_dir}
+    if raw_temp_dir in ("/tmp", "/var/tmp") or temp_dir in ("/private/tmp", "/private/var/tmp"):
+        valid_dirs.add(raw_temp_dir)
+        valid_dirs.add(temp_dir)
+
+    if os.path.dirname(operand) not in valid_dirs:
         return False
 
-    target = os.path.realpath(operand)
-    if os.path.dirname(target) != temp_dir:
+    target_dir = os.path.realpath(os.path.dirname(operand))
+    if target_dir != temp_dir:
         return False
     return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
