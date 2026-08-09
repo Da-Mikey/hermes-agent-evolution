@@ -1995,6 +1995,7 @@ def resolve_runtime_provider(
                 raise
             logger.info("Qwen OAuth credentials failed; "
                         "falling through to next provider.")
+            provider = "openrouter"
 
     if provider == "minimax-oauth":
         pconfig = PROVIDER_REGISTRY.get(provider)
@@ -2171,7 +2172,7 @@ def resolve_runtime_provider(
 
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
-    if pconfig and pconfig.auth_type == "api_key":
+    if provider != "openrouter" and pconfig and pconfig.auth_type == "api_key":
         creds = resolve_api_key_provider_credentials(provider)
         # An explicitly selected API-key provider is authoritative. Returning
         # a runtime with an empty key defers failure until the first request and

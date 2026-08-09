@@ -90,7 +90,9 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     """When requested_provider is 'auto' and Qwen creds fail, fall through."""
     from hermes_cli.auth import AuthError
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    orig_resolve = rp.resolve_provider
+    monkeypatch.setattr(rp, "resolve_provider", lambda req="auto", *a, **k: "qwen-oauth" if req == "auto" else orig_resolve(req, *a, **k))
+    monkeypatch.setattr(rp, "load_pool", lambda p: type("Pool", (), {"has_credentials": lambda self: False})())
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",

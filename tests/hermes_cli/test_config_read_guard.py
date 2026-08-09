@@ -47,7 +47,7 @@ ALLOWLIST = {
 
 # Directories that never count (tests may build fixture configs freely).
 EXCLUDED_DIR_PARTS = {
-    "tests", ".venv", ".git", ".worktrees", "node_modules", "website",
+    "tests", ".venv", ".git", ".worktrees", ".claude", "node_modules", "website",
     "docs", "scripts", "examples", "apps",
 }
 

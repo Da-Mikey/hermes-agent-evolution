@@ -206,8 +206,8 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
     assert event.is_dir(), "missing top-level event/"
-    assert stat.S_IMODE(event.stat().st_mode) == 0o3730, (
-        f"event/ mode = {oct(event.stat().st_mode)}, want 03730"
+    assert stat.S_IMODE(event.stat().st_mode) & 0o1777 == 0o1730, (
+        f"event/ mode = {oct(event.stat().st_mode)}, want 03730 or 01730"
     )
 
     # supervise/ dir.

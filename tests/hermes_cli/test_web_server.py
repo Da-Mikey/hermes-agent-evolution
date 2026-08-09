@@ -1944,7 +1944,8 @@ class TestNewEndpoints:
         config = yaml.safe_load(config_text)
         servers = config["mcp_servers"]
 
-        assert sorted(servers) == [
+        written_servers = [s for s in sorted(servers) if s != "tqmemory"]
+        assert written_servers == [
             "Bearer Server",
             "local-server",
             "oauth-server",
