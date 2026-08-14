@@ -3882,16 +3882,41 @@ class MCPServerTask:
                 # (Ported from Kilo Code's MCP resilience fix.)
                 if not self._ready.is_set():
                     if _is_auth_error(root):
+                        # Park instead of returning: ending the run task
+                        # drops the only listener on ``_reconnect_event``,
+                        # so the server stays dead even after re-login.
                         logger.warning(
-                            "MCP server '%s' failed initial OAuth authentication, "
-                            "not retrying automatically: %s: %s",
+                            "MCP server '%s' failed initial authentication, "
+                            "parking until credentials change; re-authenticate "
+                            "with `hermes mcp login %s` "
+                            "(state: connecting → parked): %s: %s",
+                            self.name,
                             self.name,
                             type(root).__name__,
                             root,
                         )
                         self._error = exc
                         self._ready.set()
-                        return
+                        self._was_parked = True
+                        self._deregister_tools()
+                        self._reconnect_event.clear()
+                        parked = await self._wait_for_reconnect_or_shutdown(
+                            timeout=_PARKED_RETRY_INTERVAL
+                        )
+                        if parked == "shutdown":
+                            return
+                        logger.debug(
+                            "MCP server '%s': attempting revival after "
+                            "initial auth failure (self-probe or explicit "
+                            "reconnect request); rebuilding transport.",
+                            self.name,
+                        )
+                        initial_retries = 0
+                        self._reconnect_retries = 0
+                        backoff = 1.0
+                        self._error = None
+                        self._ready.clear()
+                        continue
 
                     if failure_class == "permanent":
                         # Deterministic failure (bad command, non-MCP URL,
