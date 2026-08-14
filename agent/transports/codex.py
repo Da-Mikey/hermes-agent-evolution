@@ -10,6 +10,24 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+# Cron fires build session_id as ``cron_<job_id>_<YYYYMMDD_HHMMSS>`` (see
+# cron/scheduler.py). The trailing timestamp is per-fire noise; stripped so
+# repeat fires of the same job share a cache scope (see #51395/#52295).
+_CRON_SESSION_ID_RE = re.compile(r"^(cron_.+)_\d{8}_\d{6}$")
+
+
+def _cache_scope_from_session_id(session_id: Optional[str]) -> str:
+    """Normalize a physical session_id into a stable logical cache scope.
+
+    Every non-cron session_id already identifies one conversation/agent
+    instance (main run, a specific child/subagent, a sibling child, ...),
+    so it is used unchanged. Only cron's per-fire timestamp needs stripping.
+    """
+    sid = str(session_id or "")
+    match = _CRON_SESSION_ID_RE.match(sid)
+    return match.group(1) if match else sid
+
+
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 

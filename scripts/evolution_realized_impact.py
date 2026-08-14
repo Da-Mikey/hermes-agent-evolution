@@ -338,21 +338,33 @@ def compute_realized(
 
     ``today`` is passed in (never read the clock here — keeps it deterministic
     and testable, same discipline as the rest of the evolution scripts).
+
+    Window is over MATURE merges only (age >= ``maturity_days``). A too-new
+    merge is neither help nor hurt — it's simply unknown. Including unknowns
+    in the ``last``-N slice would push older verdicted merges out, so during
+    dense merging the verdicted sample shrinks and rotates rapidly toward
+    whatever verdict batch happened to stamp most recently — a lag artifact
+    that made the rate crater from ~55% to 20% in five merges' time on real
+    data. Filtering first gives a stable, apples-to-apples sample.
     """
-    window = records[-last:] if last and last > 0 else list(records)
+    def _is_mature(r: Dict[str, Any]) -> bool:
+        days = _days_between(r.get("merged_at"), today)
+        return days is not None and days >= maturity_days
+
+    mature = [r for r in records if _is_mature(r)]
+    window = mature[-last:] if last and last > 0 else list(mature)
 
     verdicted = [
         r for r in window if r.get("verdict") in (VERDICTS_GOOD | VERDICTS_BAD)
     ]
     confirmed = [r for r in verdicted if r.get("verdict") in VERDICTS_GOOD]
 
-    # Matured-but-unverified: merged long enough ago to have been exercised, yet
-    # the verification step never recorded a verdict — the loop isn't closing.
+    # Every window entry is mature by construction, so any without a verdict
+    # is matured-but-unverified — the verification step never recorded one.
     matured_unverified = [
         r
         for r in window
         if r.get("verdict") not in (VERDICTS_GOOD | VERDICTS_BAD)
-        and (_days_between(r.get("merged_at"), today) or 0) >= maturity_days
     ]
 
     realized_rate = (len(confirmed) / len(verdicted)) if verdicted else None
