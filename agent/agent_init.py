@@ -161,6 +161,17 @@ def _provider_default_routes(provider: str) -> set[str]:
     except Exception:
         pass
 
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+
+        for cp in get_compatible_custom_providers() or []:
+            if _normalize_custom_provider_name(cp.get("name")) == provider:
+                route = _normalize_route_base_url(cp.get("base_url", ""))
+                if route:
+                    routes.add(route)
+    except Exception:
+        pass
+
     if provider == "gemini":
         routes.update(
             f"{route.rstrip('/')}/openai"

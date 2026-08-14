@@ -116,9 +116,17 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
-    server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    server.bind(sock_path)
+    import tempfile
+
+    try:
+        sock_path = str(tmp_path / "fly-api.sock")
+        server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        server.bind(sock_path)
+    except OSError:
+        temp_dir = tempfile.mkdtemp(dir="/tmp")
+        sock_path = os.path.join(temp_dir, "fly.sock")
+        server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        server.bind(sock_path)
     server.listen(1)
 
     def serve():

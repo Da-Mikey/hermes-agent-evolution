@@ -20,6 +20,11 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    # Soft file-descriptor limit for long-running Hermes server processes.
+    # Clamped to the OS hard limit; 0/false/null disables the adjustment.
+    "runtime": {
+        "nofile_soft_limit": 4096,
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
@@ -35,6 +40,11 @@ DEFAULT_CONFIG = {
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
         "gateway_timeout": 1800,
+        # Maximum time an alias routing key waits for the active turn holding
+        # the same resolved session lease. On expiry the inbound message is
+        # rejected with a resend notice rather than run without serialization.
+        # Non-positive values fall back to 1800 seconds.
+        "gateway_turn_lease_timeout": 1800,
         # Force-interrupt budget once gateway stop()/drain has begun
         # (seconds). Applies to SIGTERM/external stop and to the final
         # phase of in-band restart after any after-turn wait. 0 = interrupt

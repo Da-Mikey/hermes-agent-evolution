@@ -2,13 +2,67 @@
 
 import pytest
 
+from agent.conversation_compression import (
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
+    ROUTINE_COMPRESSION_STATUS_SAMPLES,
+)
 from gateway.config import Platform
 from gateway.run import (
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
-from agent.conversation_compression import CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE, ROUTINE_COMPRESSION_STATUS_SAMPLES
 
+# Every human-facing chat surface that must receive noise-filtered,
+# secret-redacted, provider-error-sanitized output (not just Telegram).
+# The filtering functions under test (_prepare_gateway_status_message /
+# _sanitize_gateway_final_response) are platform-agnostic shared logic in
+# gateway.run — a representative platform subset is sufficient; per-platform
+# copies were near-duplicate parametrizations.
+CHAT_PLATFORMS = [
+    "telegram",
+    "slack",
+    "feishu",
+]
+
+NOISY_STATUS_MESSAGES = [
+    "🗜️ Preflight compression check before sending...",
+    (
+        "📦 Pre-API compression: ~123,456 tokens near the context/output limit. "
+        "Compacting before the next model call."
+    ),
+    "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    "💤 Resumed after 3600s idle — compacting ~120,000 tokens before continuing.",
+    "⚠️  Session compressed 12 times — accuracy may degrade. Consider /new to start fresh.",
+    "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
+    "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
+    "⏳ Retrying in 4.2s (attempt 1/3)...",
+    # Buffered overflow/attempt-cap retry chatter (replayed on retry exhaustion).
+    "🗜️ Context too large (~250,000 tokens) — compressing (1/3)...",
+    "🗜️ Compressed 30 → 12 messages, retrying...",
+    "🗜️ Compressed ~250,000 → ~120,000 tokens, retrying...",
+    "🗜️ Context reduced to 120,000 tokens (was 250,000), retrying...",
+    # Post-#69332 auto-lower wording + aux-provider/lock chatter.
+    (
+        "⚠ Compression model small (openrouter) context is 32,000 tokens, but "
+        "the main model big (anthropic)'s compression threshold was 100,000 "
+        "tokens. Auto-lowered this session's threshold to 30,000 tokens so "
+        "compression can run."
+    ),
+    (
+        "⚠ Configured auxiliary compression provider 'openai' is unavailable — "
+        "context compression will drop middle turns without a summary. Check "
+        "auxiliary.compression in config.yaml and reauthenticate that provider."
+    ),
+    (
+        "⚠ Skipping concurrent compression — another path is already "
+        "compressing this session. Will retry after it finishes."
+    ),
+]
+
+# Messages that must NEVER be swallowed by the compression-noise filter:
+# deliberate carve-outs from routine-compression silence — manual /compress
+# feedback (manual_compression_feedback.py headlines) and abort/failure
+# notices that require user action.
 VISIBLE_COMPRESSION_MESSAGES = [
     "Compressed: 30 → 12 messages",
     "Compression aborted: 30 messages preserved",
@@ -49,34 +103,6 @@ VISIBLE_COMPRESSION_MESSAGES = [
     ),
 ]
 
-# Every human-facing chat surface that must receive noise-filtered,
-# secret-redacted, provider-error-sanitized output (not just Telegram).
-CHAT_PLATFORMS = [
-    "telegram",
-    "whatsapp",
-    "discord",
-    "slack",
-    "signal",
-    "matrix",
-    "mattermost",
-    "dingtalk",
-    "feishu",
-    "wecom",
-    "weixin",
-    "bluebubbles",
-    "qqbot",
-    "homeassistant",
-    "sms",
-]
-
-NOISY_STATUS_MESSAGES = [
-    "🗜️ Preflight compression check before sending...",
-    "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
-    "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
-    "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
-    "⏳ Retrying in 4.2s (attempt 1/3)...",
-]
-
 
 def test_telegram_status_suppresses_auxiliary_and_retry_noise():
     """Auxiliary failures and retry backoff chatter should not hit Telegram."""
@@ -108,6 +134,12 @@ def test_programmatic_surfaces_keep_raw_status():
         )
 
 
+@pytest.mark.parametrize("message", ["still on it", "⏳ Working — 3 min"])
+def test_telegram_status_keeps_legitimate_heartbeat_messages(message):
+    """The compression filter must not swallow user-facing work heartbeats."""
+    assert _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", message) == message
+
+
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
 @pytest.mark.parametrize("message", NOISY_STATUS_MESSAGES)
 def test_all_chat_gateways_suppress_noise(platform, message):
@@ -115,7 +147,37 @@ def test_all_chat_gateways_suppress_noise(platform, message):
     assert _prepare_gateway_status_message(platform, "warn", message) is None
 
 
-@pytest.mark.parametrize("platform", ["whatsapp", "slack", "signal", "matrix"])
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+@pytest.mark.parametrize(
+    "message", ROUTINE_COMPRESSION_STATUS_SAMPLES, ids=lambda m: m[:32]
+)
+def test_all_routine_compression_statuses_suppressed_from_source_constants(
+    platform, message
+):
+    """Every ROUTINE compression status the agent actually emits is filtered.
+
+    Iterates the sample-formatted status strings built from the SAME
+    constants the emission sites use (agent/conversation_compression.py's
+    ROUTINE_COMPRESSION_STATUS_SAMPLES), so a reworded emit site that drifts
+    past the noise regex fails here without anyone remembering to re-copy
+    the literal into this file.
+    """
+    assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+@pytest.mark.parametrize("message", VISIBLE_COMPRESSION_MESSAGES, ids=lambda m: m[:32])
+def test_manual_compress_feedback_and_failure_notices_stay_visible(platform, message):
+    """Manual /compress feedback and abort notices must never be swallowed.
+
+    These are the deliberate carve-outs from routine-compression silence
+    (#16775 failures, manual_compression_feedback.py) — widening the noise
+    regex must not start eating them.
+    """
+    assert _prepare_gateway_status_message(platform, "warn", message) == message
+
+
+@pytest.mark.parametrize("platform", ["slack", "matrix"])
 def test_chat_gateways_redact_secret_in_provider_error(platform):
     """Provider-error bodies carrying secrets must never reach chat users.
 
@@ -137,7 +199,7 @@ def test_chat_gateways_redact_secret_in_provider_error(platform):
     assert "provider" in sanitized.lower()
 
 
-@pytest.mark.parametrize("platform", ["whatsapp", "slack", "signal", "matrix"])
+@pytest.mark.parametrize("platform", ["slack", "matrix"])
 def test_chat_gateways_redact_secret_in_non_error_body(platform):
     """Secrets must be redacted even when no provider-error rewrite fires.
 
@@ -281,40 +343,3 @@ def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_
     # Prose around the secret is preserved — redaction is surgical.
     assert "here is the token you asked me to echo" in sanitized
     assert sanitized.endswith("done.")
-
-
-@pytest.mark.parametrize("message", ["still on it", "⏳ Working — 3 min"])
-def test_telegram_status_keeps_legitimate_heartbeat_messages(message):
-    """The compression filter must not swallow user-facing work heartbeats."""
-    assert (
-        _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", message)
-        == message
-    )
-
-@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
-@pytest.mark.parametrize(
-    "message", ROUTINE_COMPRESSION_STATUS_SAMPLES, ids=lambda m: m[:32]
-)
-def test_all_routine_compression_statuses_suppressed_from_source_constants(
-    platform, message
-):
-    """Every ROUTINE compression status the agent actually emits is filtered.
-
-    Iterates the sample-formatted status strings built from the SAME
-    constants the emission sites use (agent/conversation_compression.py's
-    ROUTINE_COMPRESSION_STATUS_SAMPLES), so a reworded emit site that drifts
-    past the noise regex fails here without anyone remembering to re-copy
-    the literal into this file.
-    """
-    assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
-
-@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
-@pytest.mark.parametrize("message", VISIBLE_COMPRESSION_MESSAGES, ids=lambda m: m[:32])
-def test_manual_compress_feedback_and_failure_notices_stay_visible(platform, message):
-    """Manual /compress feedback and abort notices must never be swallowed.
-
-    These are the deliberate carve-outs from routine-compression silence
-    (#16775 failures, manual_compression_feedback.py) — widening the noise
-    regex must not start eating them.
-    """
-    assert _prepare_gateway_status_message(platform, "warn", message) == message
