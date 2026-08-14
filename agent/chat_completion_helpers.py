@@ -1226,6 +1226,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
                     exc,
                 )
 
+        # Native server-side compaction (gpt-5.6 on direct OpenAI API /
+        # ChatGPT Codex routes only) — None on every other route/model, in
+        # which case the request is unchanged from pre-feature behavior.
+        from agent.native_compaction import native_compaction_context_management
+        _context_management = native_compaction_context_management(
+            agent,
+            is_codex_backend=is_codex_backend,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+        )
+
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
@@ -1237,6 +1248,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
+            provider=getattr(agent, "provider", None),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
@@ -1246,6 +1258,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+            context_management=_context_management,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -1764,7 +1777,9 @@ def try_activate_fallback(
                 _retry_after_raw = _ra_headers.get("retry-after") or _ra_headers.get(
                     "Retry-After"
                 )
-            _cooldown = 60.0
+            backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
+            agent._rate_limit_backoff_count = backoff_count + 1
+            _cooldown = min(60.0 * (2 ** backoff_count), 14400.0)
             # Billing exhaustion (403/402 credits depleted) is a permanent
             # failure for that provider until the account is topped up — a
             # 60-second cooldown causes the agent to retry the same dead
@@ -1906,6 +1921,32 @@ def try_activate_fallback(
 
         fb_base_url_hint = (fb.get("base_url") or "").strip() or None
         fb_api_key_hint = resolve_entry_api_key(fb)
+        # Determine api_mode from the ORIGINAL base_url (before URL transformation).
+        # resolve_provider_client() calls _to_openai_base_url() which can rewrite
+        # a dual-surface /anthropic base to /v1, losing the Anthropic wire signal
+        # from the client's post-rewrite base_url. Pre-compute here so detection
+        # sees the URL the user actually configured. (#79787)
+        #
+        # An explicit ``api_mode`` on the fallback entry always wins — including
+        # an explicit "chat_completions" — and suppresses all re-detection below.
+        fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
+        fb_api_mode = "chat_completions"
+        if fb_api_mode_explicit:
+            fb_api_mode = str(fb.get("api_mode")).strip()
+        elif fb_provider == "anthropic":
+            # Provider-name check must not be gated on fb_base_url_hint:
+            # an entry that names provider: anthropic without an explicit
+            # base_url uses the provider's default endpoint and must still
+            # resolve to anthropic_messages, not chat_completions.
+            fb_api_mode = "anthropic_messages"
+        elif fb_base_url_hint:
+            _orig_url = fb_base_url_hint.rstrip("/").lower()
+            if (
+                _orig_url.endswith("/anthropic")
+                or base_url_hostname(fb_base_url_hint) == "api.anthropic.com"
+            ):
+                fb_api_mode = "anthropic_messages"
+
         # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
         # when no explicit key is in the fallback config. Host match
         # (not substring) — see GHSA-76xc-57q6-vm5m.
@@ -1919,6 +1960,7 @@ def try_activate_fallback(
             raw_codex=True,
             explicit_base_url=fb_base_url_hint,
             explicit_api_key=fb_api_key_hint,
+            api_mode=fb_api_mode,
         )
         if fb_client is None:
             logger.warning(
@@ -1940,51 +1982,55 @@ def try_activate_fallback(
                 _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        # Re-determine api_mode from provider / resolved base URL / model when
+        # the pre-computed pass above landed on the default and the user did
+        # not pin api_mode explicitly. An explicit fb.api_mode (even
+        # "chat_completions") must never be overridden here.
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
-            fb_api_mode = "codex_responses"
-        elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
-            # Portal is dual-wire: anthropic/* must land on /v1/messages.
-            # resolve_provider_client still returns an OpenAI client for
-            # Nous; the anthropic_messages branch below rebuilds the native
-            # client from that credential + base_url.
-            from hermes_cli.providers import nous_api_mode
 
-            fb_api_mode = nous_api_mode(fb_model)
-        elif (
-            fb_provider == "anthropic"
-            or fb_base_url.rstrip("/").lower().endswith("/anthropic")
-            or base_url_hostname(fb_base_url) == "api.anthropic.com"
-        ):
-            # Custom providers (e.g. cron-anthropic) point at the native
-            # api.anthropic.com host with no "/anthropic" path suffix, so the
-            # name/suffix checks above miss them and they default to
-            # chat_completions → POST /v1/chat/completions → 404. Match the
-            # host the same way determine_api_mode() and _detect_api_mode_for_url()
-            # do on the primary path. (#32243, #49247)
-            fb_api_mode = "anthropic_messages"
-        elif _fb_is_azure:
-            # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
-            # support the Responses API. Stay on chat_completions.
-            fb_api_mode = "chat_completions"
-        elif agent._is_direct_openai_url(fb_base_url):
-            fb_api_mode = "codex_responses"
-        elif agent._provider_model_requires_responses_api(
-            fb_model,
-            provider=fb_provider,
-        ):
-            # GPT-5.x models usually need Responses API, but keep
-            # provider-specific exceptions like Copilot gpt-5-mini on
-            # chat completions.
-            fb_api_mode = "codex_responses"
-        elif fb_provider == "bedrock" or (
-            base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
-            and base_url_host_matches(fb_base_url, "amazonaws.com")
-        ):
-            fb_api_mode = "bedrock_converse"
+        if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
+            if fb_provider == "openai-codex":
+                fb_api_mode = "codex_responses"
+            elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
+                # Portal is dual-wire: anthropic/* must land on /v1/messages.
+                # resolve_provider_client still returns an OpenAI client for
+                # Nous; the anthropic_messages branch below rebuilds the native
+                # client from that credential + base_url.
+                from hermes_cli.providers import nous_api_mode
+
+                fb_api_mode = nous_api_mode(fb_model)
+            elif (
+                fb_provider == "anthropic"
+                or fb_base_url.rstrip("/").lower().endswith("/anthropic")
+                or base_url_hostname(fb_base_url) == "api.anthropic.com"
+            ):
+                # Custom providers (e.g. cron-anthropic) point at the native
+                # api.anthropic.com host with no "/anthropic" path suffix, so the
+                # name/suffix checks above miss them and they default to
+                # chat_completions → POST /v1/chat/completions → 404. Match the
+                # host the same way determine_api_mode() and _detect_api_mode_for_url()
+                # do on the primary path. (#32243, #49247)
+                fb_api_mode = "anthropic_messages"
+            elif _fb_is_azure:
+                # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
+                # support the Responses API. Stay on chat_completions.
+                fb_api_mode = "chat_completions"
+            elif agent._is_direct_openai_url(fb_base_url):
+                fb_api_mode = "codex_responses"
+            elif agent._provider_model_requires_responses_api(
+                fb_model,
+                provider=fb_provider,
+            ):
+                # GPT-5.x models usually need Responses API, but keep
+                # provider-specific exceptions like Copilot gpt-5-mini on
+                # chat completions.
+                fb_api_mode = "codex_responses"
+            elif fb_provider == "bedrock" or (
+                base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
+                and base_url_host_matches(fb_base_url, "amazonaws.com")
+            ):
+                fb_api_mode = "bedrock_converse"
 
         old_model = agent.model
         old_provider = agent.provider
@@ -2702,6 +2748,41 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
+    def _stream_final_text(response) -> str:
+        if response is None:
+            return ""
+        choices = getattr(response, "choices", None) or []
+        first = choices[0] if choices else None
+        message = getattr(first, "message", None)
+        if message is None:
+            return ""
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+        try:
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    text = getattr(part, "text", None)
+                    if isinstance(text, str):
+                        parts.append(text)
+                return "".join(parts)
+        except Exception:
+            pass
+        return ""
+
+    def _emit_stream_start() -> None:
+        emit = getattr(agent, "_emit_stream_start", None)
+        if emit is not None:
+            emit()
+
+    def _emit_stream_end(
+        *, final_text: str, finished: bool, error: str | None
+    ) -> None:
+        emit = getattr(agent, "_emit_stream_end", None)
+        if emit is not None:
+            emit(final_text=final_text, finished=finished, error=error)
+
     # Cron and other non-interactive, nested-pool contexts deadlock on the
     # spawned worker thread (#62151). They also have no stream consumer, so the
     # deltas this path produces go nowhere. Delegate to the non-streaming entry
@@ -2717,8 +2798,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ensure on_first_delta reaches it. Store it on the instance
         # temporarily so _run_codex_stream can pick it up.
         agent._codex_on_first_delta = on_first_delta
+        _emit_stream_start()
         try:
-            return agent._interruptible_api_call(api_kwargs)
+            response = agent._interruptible_api_call(api_kwargs)
+            _emit_stream_end(
+                final_text=_stream_final_text(response), finished=True, error=None
+            )
+            return response
+        except Exception as exc:
+            _emit_stream_end(final_text="", finished=False, error=str(exc))
+            raise
         finally:
             agent._codex_on_first_delta = None
 
@@ -2812,6 +2901,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _fire_first()
                     agent._fire_tool_gen_started(name)
 
+                try:
+                    from agent.plugin_stream_hooks import (
+                        has_reasoning_stream_observer_hooks,
+                    )
+
+                    plugin_reasoning_observer = (
+                        has_reasoning_stream_observer_hooks()
+                    )
+                except Exception:
+                    logger.debug(
+                        "plugin reasoning stream observer check failed",
+                        exc_info=True,
+                    )
+                    plugin_reasoning_observer = False
+
                 def _on_reasoning(text):
                     _fire_first()
                     agent._fire_reasoning_delta(text)
@@ -2862,7 +2966,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_text_delta=_on_text if agent._has_stream_consumers() else None,
                     on_tool_start=_on_tool,
                     on_reasoning_delta=_on_reasoning
-                    if agent.reasoning_callback or agent.stream_delta_callback
+                    if agent.reasoning_callback
+                    or agent.stream_delta_callback
+                    or plugin_reasoning_observer
                     else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
                     on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
@@ -2874,85 +2980,97 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 if stream is not None:
                     stream.close()
 
-        t = threading.Thread(target=_context_thread_target(_bedrock_call), daemon=True)
-        t.start()
-        while t.is_alive():
-            t.join(timeout=0.3)
-            if agent._interrupt_requested:
-                raise InterruptedError("Agent interrupted during Bedrock API call")
-            # Liveness watchdog: no Bedrock event for longer than the stale
-            # timeout means the stream has wedged (open socket, keep-alives but
-            # no data, or a silently hung provider).  Without this the worker
-            # blocks in ``for event in event_stream`` indefinitely.
-            _stale_elapsed = time.time() - _bedrock_last_event["t"]
-            if _stale_elapsed > _bedrock_stale_timeout:
-                logger.warning(
-                    "Bedrock stream stale for %.0fs (threshold %.0fs) — no events "
-                    "received. region=%s model=%s. Aborting call.",
-                    _stale_elapsed,
-                    _bedrock_stale_timeout,
-                    _bedrock_region,
-                    api_kwargs.get("modelId", "unknown"),
-                )
-                agent._buffer_status(
-                    f"⚠️ No events from Bedrock for {int(_stale_elapsed)}s "
-                    f"(model: {api_kwargs.get('modelId', 'unknown')}). Aborting..."
-                )
-                # Count the stale kill in the SAME cross-turn breaker as the
-                # OpenAI/Anthropic path (#58962).
-                _bump_stale_streak(agent)
-                # Best-effort: evict the region's cached bedrock-runtime client
-                # so the NEXT call reconnects with a fresh pool.  NOTE: this does
-                # NOT abort the in-flight botocore EventStream the worker thread
-                # is blocked on — botocore exposes no external cancellation for
-                # it — so the daemon worker keeps reading until its socket read
-                # ultimately errors.  We therefore end THIS call by raising
-                # below and let the streak+give-up breaker escalate across turns.
-                try:
-                    from agent.bedrock_adapter import invalidate_runtime_client
-
-                    invalidate_runtime_client(_bedrock_region)
-                except Exception as _inval_exc:
-                    logger.debug(
-                        "bedrock: stale client eviction failed: %s", _inval_exc
-                    )
-                # Reset the timer so a repeated trip (should the worker somehow
-                # survive) waits a fresh interval rather than re-firing instantly.
-                _bedrock_last_event["t"] = time.time()
-                # Escalate across turns: raises RuntimeError once the streak
-                # crosses HERMES_STREAM_STALE_GIVEUP, so a persistently wedged
-                # Bedrock provider aborts fast instead of re-waiting the timeout.
-                _check_stale_giveup(agent)
-                # Streak still under the give-up threshold: end THIS call with a
-                # TimeoutError so the outer retry loop / next turn re-evaluates
-                # and the streak carries forward.  Break rather than keep polling
-                # a worker we cannot abort.
-                result["error"] = TimeoutError(
-                    f"Bedrock stream produced no events for {int(_stale_elapsed)}s "
-                    f"(threshold {int(_bedrock_stale_timeout)}s) — aborting stalled "
-                    f"stream so the retry/fallback path can recover."
-                )
-                break
-        # Worker exited before the poll loop observed the interrupt flag. The
-        # Bedrock stream callback breaks out and returns a PARTIAL response
-        # without raising on interrupt (see bedrock_adapter.py
-        # stream_converse_with_callbacks / on_interrupt_check), so result[
-        # "response"] is populated with error=None and the in-loop raise above
-        # never fires. Re-check here so /stop is not silently swallowed on the
-        # Bedrock path — mirrors the post-worker guard on the main streaming
-        # loop. (#59999 area)
-        if agent._interrupt_requested:
-            raise InterruptedError(
-                "Agent interrupted during Bedrock API call (post-worker)"
+        _emit_stream_start()
+        try:
+            t = threading.Thread(
+                target=_context_thread_target(_bedrock_call), daemon=True
             )
-        if result["error"] is not None:
-            raise result["error"]
-        # Success — clear the cross-turn breaker (#58962): Bedrock proved
-        # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
-        # recovered provider doesn't carry a stale streak into later turns.
-        if result["response"] is not None:
-            _reset_stale_streak(agent)
-        return result["response"]
+            t.start()
+            while t.is_alive():
+                t.join(timeout=0.3)
+                if agent._interrupt_requested:
+                    raise InterruptedError("Agent interrupted during Bedrock API call")
+                # Liveness watchdog: no Bedrock event for longer than the stale
+                # timeout means the stream has wedged (open socket, keep-alives but
+                # no data, or a silently hung provider).  Without this the worker
+                # blocks in ``for event in event_stream`` indefinitely.
+                _stale_elapsed = time.time() - _bedrock_last_event["t"]
+                if _stale_elapsed > _bedrock_stale_timeout:
+                    logger.warning(
+                        "Bedrock stream stale for %.0fs (threshold %.0fs) — no events "
+                        "received. region=%s model=%s. Aborting call.",
+                        _stale_elapsed,
+                        _bedrock_stale_timeout,
+                        _bedrock_region,
+                        api_kwargs.get("modelId", "unknown"),
+                    )
+                    agent._buffer_status(
+                        f"⚠️ No events from Bedrock for {int(_stale_elapsed)}s "
+                        f"(model: {api_kwargs.get('modelId', 'unknown')}). Aborting..."
+                    )
+                    # Count the stale kill in the SAME cross-turn breaker as the
+                    # OpenAI/Anthropic path (#58962).
+                    _bump_stale_streak(agent)
+                    # Best-effort: evict the region's cached bedrock-runtime client
+                    # so the NEXT call reconnects with a fresh pool.  NOTE: this does
+                    # NOT abort the in-flight botocore EventStream the worker thread
+                    # is blocked on — botocore exposes no external cancellation for
+                    # it — so the daemon worker keeps reading until its socket read
+                    # ultimately errors.  We therefore end THIS call by raising
+                    # below and let the streak+give-up breaker escalate across turns.
+                    try:
+                        from agent.bedrock_adapter import invalidate_runtime_client
+
+                        invalidate_runtime_client(_bedrock_region)
+                    except Exception as _inval_exc:
+                        logger.debug(
+                            "bedrock: stale client eviction failed: %s", _inval_exc
+                        )
+                    # Reset the timer so a repeated trip (should the worker somehow
+                    # survive) waits a fresh interval rather than re-firing instantly.
+                    _bedrock_last_event["t"] = time.time()
+                    # Escalate across turns: raises RuntimeError once the streak
+                    # crosses HERMES_STREAM_STALE_GIVEUP, so a persistently wedged
+                    # Bedrock provider aborts fast instead of re-waiting the timeout.
+                    _check_stale_giveup(agent)
+                    # Streak still under the give-up threshold: end THIS call with a
+                    # TimeoutError so the outer retry loop / next turn re-evaluates
+                    # and the streak carries forward.  Break rather than keep polling
+                    # a worker we cannot abort.
+                    result["error"] = TimeoutError(
+                        f"Bedrock stream produced no events for {int(_stale_elapsed)}s "
+                        f"(threshold {int(_bedrock_stale_timeout)}s) — aborting stalled "
+                        f"stream so the retry/fallback path can recover."
+                    )
+                    break
+            # Worker exited before the poll loop observed the interrupt flag. The
+            # Bedrock stream callback breaks out and returns a PARTIAL response
+            # without raising on interrupt (see bedrock_adapter.py
+            # stream_converse_with_callbacks / on_interrupt_check), so result[
+            # "response"] is populated with error=None and the in-loop raise above
+            # never fires. Re-check here so /stop is not silently swallowed on the
+            # Bedrock path — mirrors the post-worker guard on the main streaming
+            # loop. (#59999 area)
+            if agent._interrupt_requested:
+                raise InterruptedError(
+                    "Agent interrupted during Bedrock API call (post-worker)"
+                )
+            if result["error"] is not None:
+                raise result["error"]
+            # Success — clear the cross-turn breaker (#58962): Bedrock proved
+            # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
+            # recovered provider doesn't carry a stale streak into later turns.
+            if result["response"] is not None:
+                _reset_stale_streak(agent)
+            _emit_stream_end(
+                final_text=_stream_final_text(result["response"]),
+                finished=True,
+                error=None,
+            )
+            return result["response"]
+        except Exception as exc:
+            _emit_stream_end(final_text="", finished=False, error=str(exc))
+            raise
 
     result = {"response": None, "error": None, "partial_tool_names": []}
 
@@ -3614,6 +3732,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         else:
                             # Unrepairable — flag for truncation handling
                             has_truncated_tool_args = True
+                elif finish_reason is None:
+                    # Stream ended with no finish_reason AND this tool call's
+                    # arguments never received a single byte (name arrived,
+                    # argument generation never started before the connection
+                    # died). Left unflagged, this fell through to
+                    # `effective_finish_reason = finish_reason or "stop"`
+                    # below — a normal "stop" turn carrying a tool call whose
+                    # empty arguments string later gets silently coerced to
+                    # "{}" at the dispatch boundary and executed with no
+                    # arguments and no retry (#80498). Route it through the
+                    # same dropped-mid-tool-call stub path already used for a
+                    # truncated-but-nonempty JSON string.
+                    has_truncated_tool_args = True
                 mock_tool_calls.append(
                     SimpleNamespace(
                         id=tc["id"],
@@ -3887,6 +4018,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         if agent._interrupt_requested:
             return None
+        def _tool_use_dropped_mid_stream(message) -> bool:
+            if getattr(message, "stop_reason", None) is not None:
+                return False
+            for block in getattr(message, "content", None) or []:
+                if getattr(block, "type", None) == "tool_use":
+                    return True
+            return False
+
         if (
             base_final_message is not None
             and not getattr(base_final_message, "content", None)
@@ -3897,6 +4036,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "(possible upstream error or malformed event stream)."
             )
         if base_final_message is not None and not stream.output_modified:
+            if _tool_use_dropped_mid_stream(base_final_message):
+                raise EmptyStreamError(
+                    "Stream ended with no stop_reason while a tool_use "
+                    "block was still incomplete; treating as a "
+                    "mid-tool-call stream drop (#80498)."
+                )
             return base_final_message
         final_message = accumulator.response(base_final_message)
         if (
@@ -3906,6 +4051,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             raise EmptyStreamError(
                 "Provider returned an empty stream with no stop_reason "
                 "(possible upstream error or malformed event stream)."
+            )
+        if _tool_use_dropped_mid_stream(final_message):
+            raise EmptyStreamError(
+                "Stream ended with no stop_reason while a tool_use "
+                "block was still incomplete; treating as a "
+                "mid-tool-call stream drop (#80498)."
             )
         return final_message
 
@@ -3926,6 +4077,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 if agent._interrupt_requested:
                     _cancel_current_stream_attempt("interrupt_before_stream_retry")
                     raise InterruptedError("Agent interrupted before stream retry")
+                _emit_stream_start()
                 try:
                     if agent.api_mode == "anthropic_messages":
                         # #67142: per-request client (credential refresh happens
@@ -3940,8 +4092,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic(request_client)
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
+                    _emit_stream_end(
+                        final_text=_stream_final_text(result["response"]),
+                        finished=True,
+                        error=None,
+                    )
                     return  # success
                 except Exception as e:
+                    _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the

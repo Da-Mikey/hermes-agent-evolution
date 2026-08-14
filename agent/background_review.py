@@ -708,11 +708,6 @@ def _run_review_in_thread(
     Spawns a forked ``AIAgent`` inheriting the parent's runtime, runs the
     review prompt, and surfaces a compact action summary back to the user
     via ``agent._safe_print`` and ``agent.background_review_callback``.
-
-    ``block_durable_writes`` (X1 enforcement): when True (a correction-triggered
-    review for a NOT-yet-promotable transient correction), the fork's runtime
-    tool whitelist excludes the durable memory/skill writers, so the LLM fork
-    cannot persist the one-off correction. See ``_review_tool_whitelist``.
     """
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
@@ -736,6 +731,32 @@ def _run_review_in_thread(
 
     review_agent = None
     review_messages: List[Dict] = []
+
+    def _unregister_review_agent(agent_ref) -> None:
+        """Idempotent: clears the review fork from both tracking slots.
+        Called from the run_conversation finally and the outer safety-net finally.
+        """
+        if agent_ref is None:
+            return
+        if hasattr(agent, "_background_review_agent"):
+            _br_lock = getattr(agent, "_background_review_lock", None)
+            if _br_lock is not None:
+                with _br_lock:
+                    if agent._background_review_agent is agent_ref:
+                        agent._background_review_agent = None
+            elif agent._background_review_agent is agent_ref:
+                agent._background_review_agent = None
+        if hasattr(agent, "_active_children"):
+            try:
+                _ac_lock = getattr(agent, "_active_children_lock", None)
+                if _ac_lock is not None:
+                    with _ac_lock:
+                        agent._active_children.remove(agent_ref)
+                else:
+                    agent._active_children.remove(agent_ref)
+            except (ValueError, AttributeError):
+                pass
+
     try:
         # Silence stdout/stderr for THIS worker thread only.  A process-global
         # ``contextlib.redirect_stdout(devnull)`` here would also blank
@@ -932,6 +953,30 @@ def _run_review_in_thread(
             # agent.compression_enabled, so this short-circuits both paths.
             review_agent.compression_enabled = False
 
+            # Register this fork on the PARENT's _active_children (the same
+            # list interrupt() fans out to for subagent delegation) and
+            # _background_review_agent (a direct pointer the next live turn
+            # uses to proactively cancel a still-running review). Without
+            # this, a review still streaming when the next turn starts races
+            # the live turn against the same session_id/credentials — producing
+            # doubled prompt-token accounting and a Ctrl+C-proof lockup.
+            # Best-effort: agents built without agent_init.py (test stubs)
+            # degrade to "no cross-cancellation" rather than aborting the review.
+            if hasattr(agent, "_background_review_agent"):
+                _br_lock = getattr(agent, "_background_review_lock", None)
+                if _br_lock is not None:
+                    with _br_lock:
+                        agent._background_review_agent = review_agent
+                else:
+                    agent._background_review_agent = review_agent
+            if hasattr(agent, "_active_children"):
+                _ac_lock = getattr(agent, "_active_children_lock", None)
+                if _ac_lock is not None:
+                    with _ac_lock:
+                        agent._active_children.append(review_agent)
+                else:
+                    agent._active_children.append(review_agent)
+
             from hermes_cli.plugins import (
                 set_thread_tool_whitelist,
                 clear_thread_tool_whitelist,
@@ -975,7 +1020,7 @@ def _run_review_in_thread(
                 pass
 
             # Initialize the source-chain accumulator (#2192) so tool calls
-            # during this background-review fork record their provenance.  The
+            # during this background-review fork record their provenance. The
             # chain is read by skill_manage(create) at admission time and
             # persisted into the skill's usage record.
             from tools.skill_provenance import init_source_chain, reset_source_chain
@@ -1001,6 +1046,12 @@ def _run_review_in_thread(
             finally:
                 reset_source_chain(_source_chain_token)
                 clear_thread_tool_whitelist()
+                # Unregister as soon as run_conversation() itself has
+                # returned — that's the only phase making outbound API
+                # calls, i.e. the only phase that can race the parent's
+                # next live turn. Runs on both the success and exception
+                # path (this whole block is inside the try/finally above).
+                _unregister_review_agent(review_agent)
 
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
@@ -1074,6 +1125,13 @@ def _run_review_in_thread(
         # thread-scoped silence here so teardown output (Honcho flush, Hindsight
         # sync, background thread joins) stays quiet even on the exception path,
         # without blanking other threads' streams.
+        # Also a safety-net unregister: covers exceptions raised during setup
+        # (between registration and the run_conversation try/finally above)
+        # that the primary _unregister_review_agent call site never reaches.
+        # _unregister_review_agent is idempotent (checks `is`/`in` membership),
+        # so calling it again here after the primary call site already ran is
+        # a harmless no-op.
+        _unregister_review_agent(review_agent)
         if review_agent is not None:
             try:
                 with thread_scoped_silence():
@@ -1136,7 +1194,8 @@ def _format_correction_focus(correction_hint: Dict[str, Any]) -> str:
     if durable or tier == "durable":
         lines.append(
             "This correction has recurred across sessions (or the user asked "
-            "to remember it): it is a DURABLE preference. Embed it where it "
+            "for it explicitly) and has been PROMOTED to the durable tier. "
+            "Persist the generalized rule into the persistent artifact that "
             "will re-enter future sessions — memory and/or the governing "
             "skill — so the next session starts already knowing.\n"
         )
@@ -1157,6 +1216,7 @@ def spawn_background_review_thread(
     messages_snapshot: List[Dict],
     review_memory: bool = False,
     review_skills: bool = False,
+    focus: Optional[str] = None,
     correction_hint: Optional[Dict[str, Any]] = None,
     block_durable_writes: bool = False,
 ):
@@ -1165,6 +1225,12 @@ def spawn_background_review_thread(
     Returns a ``(target, prompt)`` tuple.  The caller (``AIAgent._spawn_background_review``)
     owns the actual ``threading.Thread`` construction so test-level patches
     of ``run_agent.threading.Thread`` keep working.
+
+    ``focus`` is optional user steering (the ``/refine [instructions]``
+    path): appended to the chosen review prompt so the fork prioritizes what
+    the user asked for while keeping the same guardrails. Automatic
+    post-turn reviews pass ``None`` — their prompts are byte-identical to
+    before this parameter existed.
 
     ``correction_hint`` (Phase 1): when present, a focused preamble describing
     the detected INTERRUPT / DENY / STEER correction is prepended to the
@@ -1183,6 +1249,15 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
+
+    focus = (focus or "").strip()
+    if focus:
+        prompt = (
+            f"{prompt}\n\n"
+            f"The user explicitly requested this review with the following "
+            f"focus — prioritize it over the general instructions above:\n"
+            f"{focus}"
+        )
 
     if correction_hint:
         prompt = _format_correction_focus(correction_hint) + prompt

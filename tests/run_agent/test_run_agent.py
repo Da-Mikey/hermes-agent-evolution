@@ -3929,6 +3929,9 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
+        ("read_preview", {}),
+        ("read_window_below", {}),
+        ("setup_mcp", {"server": "linear", "action": "install"}),
         ("delegate_task", {"goal": "Check the child path"}),
         # Fork-only: agent-driven compaction (#1568 SelfCompact) routes through
         # the same agent-level path, so it owns its post hook exactly like the
@@ -6494,14 +6497,18 @@ class TestRunConversation:
             "assistant",
             "user",
         ]
-        checkpoint = replay[-2]["content"]
-        assert "interrupted by a user correction" in checkpoint
+        # Scaffold rides on the user correction (api_content → content), never
+        # as the assistant placeholder's own reply (#81841).
+        placeholder = replay[-2]["content"]
+        correction = replay[-1]["content"]
+        assert "interrupted by a user correction" not in (placeholder or "")
+        assert "interrupted by a user correction" in correction
+        assert correction.endswith("No, use Postgres instead.")
         # Displayed chain-of-thought must NOT be replayed: an assistant turn
         # inlining its own reasoning trips Anthropic's output classifier and
         # bricks the session with deterministic empty responses (July 2026).
-        assert "I should implement this with SQLite." not in checkpoint
-        assert "Reasoning shown before the interruption" not in checkpoint
-        assert replay[-1]["content"] == "No, use Postgres instead."
+        assert "I should implement this with SQLite." not in correction
+        assert "Reasoning shown before the interruption" not in correction
         assert agent._pending_redirect is None
         assert any(
             snapshot[-1].get("content") == "No, use Postgres instead."
@@ -6580,11 +6587,20 @@ class TestRunConversation:
         assert calls == 2
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
-        checkpoint = results["result"]["messages"][-3]
-        assert "interrupted by a user correction" in checkpoint["content"]
+        placeholder = results["result"]["messages"][-3]
+        correction = results["result"]["messages"][-2]
+        assert placeholder["role"] == "assistant"
+        assert "interrupted by a user correction" not in (
+            placeholder.get("content") or ""
+        )
+        assert "interrupted by a user correction" in (
+            correction.get("api_content") or ""
+        )
         # Displayed reasoning is display-only — replaying it as assistant
         # content trips Anthropic's output classifier (July 2026 brickings).
-        assert "Following the original approach." not in checkpoint["content"]
+        assert "Following the original approach." not in (
+            placeholder.get("content") or ""
+        )
         assert results["result"]["messages"][-2]["content"] == (
             "Use the corrected approach."
         )
@@ -7104,6 +7120,8 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                failure_reason=None,
+                **kwargs,
             ):
                 assert status_code == 402
                 assert error_context is None
@@ -7132,6 +7150,8 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                failure_reason=None,
+                **kwargs,
             ):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
@@ -7163,7 +7183,13 @@ class TestCredentialPoolRecovery:
                 return []
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self,
+                *,
+                status_code,
+                error_context=None,
+                api_key_hint=None,
+                failure_reason=None,
+                **kwargs,
             ):
                 assert status_code == 429
                 assert error_context is None

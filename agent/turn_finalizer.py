@@ -26,6 +26,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_sanitization import _sanitize_surrogates
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -252,45 +253,6 @@ def finalize_turn(
         _cleanup_errors.append(f"save_trajectory: {_save_err}")
         logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
-    # Capture the turn's TOOL CALLS for the evolution pipeline (#1363).
-    #
-    # Distinct from _save_trajectory above: that writes the full ShareGPT
-    # conversation including user prose, this writes call metadata only — tool
-    # name, redacted args, status, truncated result summary.
-    #
-    # Also opt-in, behind HERMES_EVOLUTION_CAPTURE and OFF by default. Redaction
-    # catches credential-shaped keys, not sensitive values in ordinary fields
-    # (a path with a username, an SQL string, an internal hostname all survive
-    # it), so writing on every turn of every interactive session unasked would
-    # be wrong even for metadata. capture_turn() checks the flag itself.
-    #
-    # It exists because the pipeline had no record of what the agent actually
-    # did: evolution_funnel's trajectory contains one entry naming itself.
-    # Seven issues wait on this input, and six PRs were closed for
-    # implementing against a synthetic substitute for it.
-    #
-    # Guarded like every other step here (#8049): a metrics write must never
-    # discard a completed turn's response.
-    try:
-        from agent.tool_call_capture import capture_turn
-
-        capture_turn(
-            messages,
-            session_id=getattr(agent, "session_id", "") or "",
-            task_descriptor=_summarize_user_message_for_log(user_message),
-            completed=completed,
-            timings=getattr(agent, "_turn_call_timings", None),
-        )
-        # Drained per turn so a long session cannot accumulate one entry per
-        # call for its whole lifetime.
-        if getattr(agent, "_turn_call_timings", None):
-            agent._turn_call_timings = {}
-    except Exception as _capture_err:
-        _cleanup_errors.append(f"tool_call_capture: {_capture_err}")
-        logger.error(
-            "finalize_turn: tool-call capture failed: %s", _capture_err, exc_info=True
-        )
-
     # Clean up VM and browser for this task after conversation completes
     try:
         agent._cleanup_task_resources(effective_task_id)
@@ -451,19 +413,13 @@ def finalize_turn(
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
-    # ── Post-turn assertion hook (#1301) ──────────────────────────────
-    # τ-bench-style outcome-fidelity grading: after the turn ends and state is
-    # persisted, evaluate the transcript against an opt-in assertion contract
-    # (``HERMES_ASSERT_CONTRACT``). Emits a structured score (DB state hash ×
-    # COMMUNICATE required substrings) so a CI/eval harness can grade runs
-    # without parsing logs. Inert unless the env var is set — production paths
-    # are untouched. See ``agent/post_turn_assertion.py``.
+    # The gateway owns a separate in-memory history snapshot. Keep it current
+    # even when finalization reports a cleanup error: a later prompt must not be
+    # sent with the pre-turn snapshot while the durable DB already has this turn.
     try:
-        from agent.post_turn_assertion import run_if_enabled as _run_assertion
-
-        _run_assertion(messages)
-    except Exception as _assert_err:
-        logger.debug("post-turn assertion hook failed: %s", _assert_err)
+        agent._session_messages = messages
+    except Exception:
+        pass
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -574,7 +530,8 @@ def finalize_turn(
                     or _is_partial_stream_recovery
                 ):
                     _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason
+                        _turn_exit_reason,
+                        getattr(agent, "_last_persistence_error_cause", None),
                     )
                     if _explanation:
                         if _is_empty_terminal:
@@ -592,6 +549,7 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _pre_transform_response = None
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -609,6 +567,7 @@ def finalize_turn(
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
+                    _pre_transform_response = final_response
                     final_response = _hook_result
                     _response_transformed = True
                     break  # First non-empty string wins
@@ -681,6 +640,18 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
+    # Class-level surrogate chokepoint (#80366, #55143, #55309, #19819):
+    # ``final_response`` is often the RAW SDK content
+    # (``assistant_message.content``), not the sanitized copy stored in
+    # history by ``build_assistant_message``. Any lone UTF-16 surrogate
+    # (U+D800–U+DFFF) in it crashes downstream consumers — oneshot stdout
+    # writes, Telegram's ``utf16_len`` length check, Signal formatting,
+    # JSON envelope encodes — on every provider (Ollama, NVIDIA NIM, …).
+    # Scrub once here, where model text leaves the conversation loop, so
+    # every delivery surface receives valid Unicode.
+    if isinstance(final_response, str):
+        final_response = _sanitize_surrogates(final_response)
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -693,6 +664,7 @@ def finalize_turn(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
+        "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,
@@ -720,11 +692,20 @@ def finalize_turn(
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
     # final_response; also stamp `error` so gateway surfaces status="error"
-    # (and desktop can toast disk-full) instead of a quiet complete frame.
+    # (and desktop can toast the cause) instead of a quiet complete frame.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
         result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
+            "session storage could not be written — check the state database "
+            "health (`hermes doctor`), then send your message again"
         )
+        # Machine-readable cause for the gateway/desktop: exactly
+        # 'session_persistence_failed:<locked|disk|unknown>'. Never clobber a
+        # failure_reason another path already stamped on this result.
+        if "failure_reason" not in result:
+            _cause = getattr(agent, "_last_persistence_error_cause", None)
+            result["failure_reason"] = (
+                "session_persistence_failed:" + (_cause or "unknown")
+            )
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

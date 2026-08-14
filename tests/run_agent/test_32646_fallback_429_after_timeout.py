@@ -264,6 +264,7 @@ class TestFallbackChainResetOnTransportRecovery:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.title_generator.maybe_auto_title"),
             patch("run_agent.OpenAI", return_value=MagicMock()),
             patch("agent.agent_runtime_helpers.time.sleep"),
             patch(

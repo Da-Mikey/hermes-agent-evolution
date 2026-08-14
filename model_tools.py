@@ -54,11 +54,22 @@ def _is_delegated_child_context() -> bool:
         return False
 
 
+def _is_dispatcher_owned_worker() -> bool:
+    """False when HERMES_KANBAN_* is present but this execution does not own it
+    (delegate_task child, or a cron job fired in-process from a worker)."""
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
 
-_tool_loop = None  # persistent loop for the main (CLI) thread
+_tool_loop = None          # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
 
@@ -92,7 +103,7 @@ def _get_worker_loop():
     By keeping the loop alive for the thread's lifetime, cached clients
     stay valid and their cleanup runs on a live loop.
     """
-    loop = getattr(_worker_thread_local, "loop", None)
+    loop = getattr(_worker_thread_local, 'loop', None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -218,7 +229,6 @@ discover_builtin_tools()
 # Plugin tool discovery (user/project/pip plugins)
 try:
     from hermes_cli.plugins import discover_plugins
-
     discover_plugins()
 except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
@@ -248,16 +258,10 @@ _LEGACY_TOOLSET_MAP = {
     "image_tools": ["image_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
     "browser_tools": [
-        "browser_navigate",
-        "browser_snapshot",
-        "browser_click",
-        "browser_type",
-        "browser_scroll",
-        "browser_back",
-        "browser_press",
-        "browser_get_images",
-        "browser_vision",
-        "browser_console",
+        "browser_navigate", "browser_snapshot", "browser_click",
+        "browser_type", "browser_scroll", "browser_back",
+        "browser_press", "browser_get_images",
+        "browser_vision", "browser_console"
     ],
     "cronjob_tools": ["cronjob"],
     "file_tools": ["read_file", "write_file", "patch", "search_files"],
@@ -270,7 +274,7 @@ _LEGACY_TOOLSET_MAP = {
 # =============================================================================
 
 # Module-level memoization for get_tool_definitions(). Keyed on
-# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation).
+# (profile scope, enabled/disabled toolsets, registry generation).
 # Hot callers (gateway runner, AIAgent.__init__) invoke this on every turn
 # with quiet_mode=True; caching avoids ~7 ms of registry walking + schema
 # filtering + check_fn probing per call. Only active when quiet_mode=True
@@ -281,6 +285,7 @@ _LEGACY_TOOLSET_MAP = {
 # inner check_fn TTL cache in registry.py handles environment drift (Docker
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_tool_defs_cache_lock = threading.Lock()
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
@@ -295,7 +300,8 @@ def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
     execute_code sandbox reconfigured)."""
-    _tool_defs_cache.clear()
+    with _tool_defs_cache_lock:
+        _tool_defs_cache.clear()
 
 
 def get_tool_definitions(
@@ -334,7 +340,6 @@ def get_tool_definitions(
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
-
             cfg_path = get_config_path()
             cfg_stat = cfg_path.stat()
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
@@ -343,6 +348,7 @@ def get_tool_definitions(
         profile_scope = check_fn_cache_scope()
         if profile_scope != CHECK_FN_CACHE_BYPASS:
             cache_key = (
+                registry.current_scope_key(),
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
                 registry._generation,
@@ -350,9 +356,11 @@ def get_tool_definitions(
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
+                _is_dispatcher_owned_worker(),
                 profile_scope,
             )
-        cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
+        with _tool_defs_cache_lock:
+            cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
@@ -362,12 +370,8 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(
-        enabled_toolsets,
-        disabled_toolsets,
-        quiet_mode,
-        skip_tool_search_assembly=skip_tool_search_assembly,
-    )
+    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
+                                       skip_tool_search_assembly=skip_tool_search_assembly)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -379,10 +383,16 @@ def get_tool_definitions(
         # Bound the cache with LRU eviction so a long-lived Gateway process
         # doesn't accumulate entries unboundedly across the many distinct
         # toolset/config fingerprints it sees over its lifetime (#19251).
-        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
-        return list(result)
+        with _tool_defs_cache_lock:
+            # Another thread may have populated this exact key while this
+            # thread computed. Reuse it and serialize capacity eviction.
+            cached = _tool_defs_cache.get(cache_key)
+            if cached is None:
+                if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+                    _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
+                _tool_defs_cache[cache_key] = result
+                cached = result
+        return list(cached)
     if quiet_mode:
         return list(result)
     return result
@@ -403,6 +413,7 @@ def _compute_tool_definitions(
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
+            and _is_dispatcher_owned_worker()
             and "kanban" not in effective_enabled_toolsets
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
@@ -416,22 +427,17 @@ def _compute_tool_definitions(
                 resolved = resolve_toolset(toolset_name)
                 tools_to_include.update(resolved)
                 if not quiet_mode:
-                    print(
-                        f"✅ Enabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}"
-                    )
+                    print(f"✅ Enabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
             elif toolset_name in _LEGACY_TOOLSET_MAP:
                 legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
                 tools_to_include.update(legacy_tools)
                 if not quiet_mode:
-                    print(
-                        f"✅ Enabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}"
-                    )
+                    print(f"✅ Enabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
     else:
         # Default: start with everything
         from toolsets import get_all_toolsets
-
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
 
@@ -443,10 +449,7 @@ def _compute_tool_definitions(
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
                 from toolsets import bundle_non_core_tools, get_toolset
-
-                if toolset_name.startswith("hermes-") or (
-                    get_toolset(toolset_name) or {}
-                ).get("posture"):
+                if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
                     # Platform bundles (hermes-*) include _HERMES_CORE_TOOLS, and
                     # posture toolsets (`posture: True`, e.g. `coding`) re-list
                     # those same core tools without owning them, so subtracting
@@ -456,11 +459,8 @@ def _compute_tool_definitions(
                     to_remove = bundle_non_core_tools(toolset_name)
                     tools_to_include.difference_update(to_remove)
                     resolved = sorted(to_remove)
-                    if (
-                        not quiet_mode
-                        and toolset_name.startswith("hermes-")
-                        and toolset_name not in _WARNED_DISABLED_BUNDLES
-                    ):
+                    if (not quiet_mode and toolset_name.startswith("hermes-")
+                            and toolset_name not in _WARNED_DISABLED_BUNDLES):
                         _WARNED_DISABLED_BUNDLES.add(toolset_name)
                         logger.info(
                             "agent.disabled_toolsets contains platform-bundle "
@@ -475,16 +475,12 @@ def _compute_tool_definitions(
                     resolved = resolve_toolset(toolset_name)
                     tools_to_include.difference_update(resolved)
                 if not quiet_mode:
-                    print(
-                        f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}"
-                    )
+                    print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
             elif toolset_name in _LEGACY_TOOLSET_MAP:
                 legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
                 tools_to_include.difference_update(legacy_tools)
                 if not quiet_mode:
-                    print(
-                        f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}"
-                    )
+                    print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
 
@@ -508,16 +504,9 @@ def _compute_tool_definitions(
     # execute_code" even when the API key isn't configured or the toolset is
     # disabled (#560-discord).
     if "execute_code" in available_tool_names:
-        from tools.code_execution_tool import (
-            SANDBOX_ALLOWED_TOOLS,
-            build_execute_code_schema,
-            _get_execution_mode,
-        )
-
+        from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema, _get_execution_mode
         sandbox_enabled = SANDBOX_ALLOWED_TOOLS & available_tool_names
-        dynamic_schema = build_execute_code_schema(
-            sandbox_enabled, mode=_get_execution_mode()
-        )
+        dynamic_schema = build_execute_code_schema(sandbox_enabled, mode=_get_execution_mode())
         for i, td in enumerate(filtered_tools):
             if td.get("function", {}).get("name") == "execute_code":
                 filtered_tools[i] = {"type": "function", "function": dynamic_schema}
@@ -536,15 +525,13 @@ def _compute_tool_definitions(
         if discord_tool_name in available_tool_names:
             try:
                 from tools import discord_tool as _dt
-
                 schema_fn = getattr(_dt, _discord_schema_fns[discord_tool_name])
                 dynamic = schema_fn()
             except Exception:
                 dynamic = None
             if dynamic is None:
                 filtered_tools = [
-                    t
-                    for t in filtered_tools
+                    t for t in filtered_tools
                     if t.get("function", {}).get("name") != discord_tool_name
                 ]
                 available_tool_names.discard(discord_tool_name)
@@ -574,12 +561,25 @@ def _compute_tool_definitions(
                     }
                     break
 
+    # browser_exec (Browser Use mode) runs arbitrary Python on the host via
+    # the browser-use CLI subprocess.  A session whose toolset selection
+    # excludes the terminal surface (e.g. a messaging platform configured
+    # without terminal access) must not regain host code execution through
+    # the browser toolset — that would silently widen the operator's chosen
+    # security posture.  Session-level gate, NOT a check_fn: check_fn results
+    # are TTL-cached process-wide while one gateway process serves many
+    # sessions with different toolset configs.
+    if "browser_exec" in available_tool_names and "terminal" not in available_tool_names:
+        filtered_tools = [
+            td for td in filtered_tools
+            if td.get("function", {}).get("name") != "browser_exec"
+        ]
+        available_tool_names.discard("browser_exec")
+
     if not quiet_mode:
         if filtered_tools:
             tool_names = [t["function"]["name"] for t in filtered_tools]
-            print(
-                f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(tool_names)}"
-            )
+            print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(tool_names)}")
         else:
             print("🛠️  No tools selected (all filtered out or unavailable)")
 
@@ -594,7 +594,6 @@ def _compute_tool_definitions(
     # is a no-op for schemas that are already well-formed.
     try:
         from tools.schema_sanitizer import sanitize_tool_schemas
-
         filtered_tools = sanitize_tool_schemas(filtered_tools)
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
@@ -611,7 +610,6 @@ def _compute_tool_definitions(
     # case some caller invokes get_tool_definitions twice.
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
-
         ts_cfg = _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             context_length = _resolve_active_context_length()
@@ -621,13 +619,11 @@ def _compute_tool_definitions(
                 config=ts_cfg,
             )
             if assembly.activated and not quiet_mode:
-                _forms = {
-                    "full": "catalog listing embedded",
-                    "names": "names-only listing embedded",
-                    "mixed": "listing embedded (oversized servers summarized)",
-                    "groups": "server summary embedded (search-only discovery)",
-                    "none": "no listing (search-only)",
-                }
+                _forms = {"full": "catalog listing embedded",
+                          "names": "names-only listing embedded",
+                          "mixed": "listing embedded (oversized servers summarized)",
+                          "groups": "server summary embedded (search-only discovery)",
+                          "none": "no listing (search-only)"}
                 print(
                     f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
                     f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
@@ -648,7 +644,6 @@ def _resolve_active_context_length() -> int:
     """
     try:
         from hermes_cli.config import load_config as _load
-
         cfg = _load() or {}
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         if not isinstance(model_cfg, dict):
@@ -657,7 +652,6 @@ def _resolve_active_context_length() -> int:
         if not model_id:
             return 0
         from agent.model_metadata import get_model_context_length
-
         # Honor explicit `model.context_length` in config.yaml — short-circuits
         # the OpenRouter /models probe at get_model_context_length step 0, so
         # non-OpenRouter providers don't pay the ~2-3s OpenRouter fetch at every
@@ -677,30 +671,42 @@ def _resolve_active_context_length() -> int:
         if provider:
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-
-                rt = (
-                    resolve_runtime_provider(requested=provider, target_model=model_id)
-                    or {}
-                )
+                rt = resolve_runtime_provider(
+                    requested=provider, target_model=model_id
+                ) or {}
                 base_url = str(rt.get("base_url") or base_url or "").strip()
                 api_key = str(rt.get("api_key") or "").strip()
             except Exception as rt_exc:
                 logger.debug(
                     "Runtime credential resolution failed for tool-search "
                     "context gate (provider=%s): %s — using config values only",
-                    provider,
-                    rt_exc,
+                    provider, rt_exc,
                 )
-        return int(
-            get_model_context_length(
-                model_id,
-                base_url=base_url,
-                api_key=api_key,
-                config_context_length=config_ctx,
-                provider=provider,
-            )
-            or 0
-        )
+        # Fast path: a previously discovered on-disk cache entry is plenty
+        # for SIZING the tool-search gate — unlike compression budgeting, a
+        # slightly stale window can't corrupt anything (should_activate only
+        # picks a disclosure tier). The full resolver below deliberately
+        # bypasses the persistent cache for some providers (Nous portal,
+        # Codex OAuth) so IT can reconcile against the authoritative live
+        # /models endpoint — correct for compression sizing, but it costs a
+        # ~200ms network probe on EVERY CLI startup. When any prior session
+        # already learned the window, use it for the gate and let the full
+        # resolver (called later on the compression path) do reconciliation.
+        if config_ctx is None and base_url:
+            try:
+                from agent.model_metadata import get_cached_context_length
+                cached_ctx = get_cached_context_length(model_id, base_url)
+                if isinstance(cached_ctx, int) and cached_ctx > 0:
+                    return cached_ctx
+            except Exception:
+                pass
+        return int(get_model_context_length(
+            model_id,
+            base_url=base_url,
+            api_key=api_key,
+            config_context_length=config_ctx,
+            provider=provider,
+        ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0
@@ -735,15 +741,17 @@ _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 #
 # Ported from ironclaw#1639.
 _TOOL_ERROR_ROLE_TAG_RE = re.compile(
-    r"</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>",
+    r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>',
     re.IGNORECASE,
 )
-_TOOL_ERROR_FENCE_OPEN_RE = re.compile(
-    r"^\s*```(?:json|xml|html|markdown)?\s*", re.MULTILINE
-)
-_TOOL_ERROR_FENCE_CLOSE_RE = re.compile(r"\s*```\s*$", re.MULTILINE)
-_TOOL_ERROR_CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
-_TOOL_ERROR_MAX_LEN = 2000
+_TOOL_ERROR_FENCE_OPEN_RE = re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE)
+_TOOL_ERROR_FENCE_CLOSE_RE = re.compile(r'\s*```\s*$', re.MULTILINE)
+_TOOL_ERROR_CDATA_RE = re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL)
+# Single home for the tool-error context cap: tools/registry.py. Both this
+# sanitizer (exception paths) and the dispatch-boundary bounding
+# (tool_error / _bound_json_error_result) trim to the same budget so text
+# never passes two different caps with two different markers.
+from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 
 
 def _sanitize_tool_error(error_msg: str) -> str:
@@ -758,14 +766,13 @@ def _sanitize_tool_error(error_msg: str) -> str:
     sanitized = _TOOL_ERROR_FENCE_CLOSE_RE.sub("", sanitized)
     sanitized = _TOOL_ERROR_CDATA_RE.sub("", sanitized)
     if len(sanitized) > _TOOL_ERROR_MAX_LEN:
-        sanitized = sanitized[: _TOOL_ERROR_MAX_LEN - 3] + "..."
+        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
     return f"[TOOL_ERROR] {sanitized}"
 
 
 # =========================================================================
 # Tool argument type coercion
 # =========================================================================
-
 
 def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Coerce tool call arguments to match their JSON Schema types.
@@ -802,7 +809,6 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     # wire names before schema lookup / dispatch.
     try:
         from tools.schema_sanitizer import unrename_tool_args
-
         args = unrename_tool_args(schema.get("parameters"), args)
     except Exception:  # pragma: no cover — never break dispatch
         pass
@@ -820,11 +826,7 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         # ``None`` itself is preserved — we don't know whether the model
         # meant "omit" or "empty list", and tools with sensible defaults
         # (e.g. read_file's normalize_read_pagination) already handle it.
-        if (
-            expected == "array"
-            and value is not None
-            and not isinstance(value, (list, tuple))
-        ):
+        if expected == "array" and value is not None and not isinstance(value, (list, tuple)):
             if isinstance(value, str):
                 coerced = _coerce_value(value, expected, schema=prop_schema)
                 if coerced is not value:
@@ -840,24 +842,61 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                         "but could not be parsed — model may have emitted a "
                         "JSON-encoded string instead of a native array. "
                         "Falling back to single-element list.",
-                        tool_name,
-                        key,
+                        tool_name, key,
                     )
                 args[key] = [value]
                 logger.info(
                     "coerce_tool_args: wrapped bare string in list for %s.%s",
-                    tool_name,
-                    key,
+                    tool_name, key,
                 )
                 continue
             args[key] = [value]
             logger.info(
                 "coerce_tool_args: wrapped bare %s in list for %s.%s",
-                type(value).__name__,
-                tool_name,
-                key,
+                type(value).__name__, tool_name, key,
             )
             continue
+
+        # ── Stringified-array guard for string-typed params (#1681) ──
+        _expected_types = (
+            {expected} if isinstance(expected, str) else set(expected or [])
+        )
+        _accepts_string = "string" in _expected_types
+        _accepts_array = "array" in _expected_types
+        if (
+            _accepts_string
+            and isinstance(value, str)
+            and (
+                value.lstrip().startswith("[")
+                or ("," in value and _is_path_like_param(key))
+            )
+        ):
+            if _accepts_array:
+                parsed_list = _parse_stringified_array_to_list(value)
+                if parsed_list is not None:
+                    logger.info(
+                        "coerce_tool_args: %s.%s received a stringified "
+                        "array string (%.80s...) for a string|array union "
+                        "param — parsing into native list of %d items.",
+                        tool_name,
+                        key,
+                        value,
+                        len(parsed_list),
+                    )
+                    args[key] = parsed_list
+                    continue
+            extracted = _extract_first_from_stringified_array(value)
+            if extracted is not None:
+                logger.info(
+                    "coerce_tool_args: %s.%s received a stringified JSON "
+                    "array string (%.80s...) for a string-typed param — "
+                    "extracting first element.",
+                    tool_name,
+                    key,
+                    value,
+                )
+                args[key] = extracted
+                continue
 
         if not isinstance(value, str):
             # Recurse into already-native containers so JSON-encoded
@@ -873,77 +912,6 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if not expected and not _schema_allows_null(prop_schema):
             continue
-
-        # ── Stringified-array guard for string-typed params (#1681) ──
-        # When the schema declares ``"type": "string"`` (e.g. read_file's
-        # ``path``), the model sometimes emits a stringified JSON array
-        # like ``'["path/a", "path/b"]'``. Without this guard the literal
-        # array string reaches the tool → file-not-found → retry spiral.
-        # Detect the pattern and extract the first element (the most
-        # likely intended path). Only fires for string-typed params where
-        # ``_coerce_value`` is a no-op — the array-typed branch above
-        # already handles JSON arrays on array-typed fields.
-        #
-        # #1681 regression fix: read_file's ``path`` param uses a UNION
-        # type ``["string", "array"]`` for batch-read support. The guard
-        # above checked ``expected == "string"`` only, so it NEVER fired
-        # for read_file — the stringified array sailed through as a
-        # literal string, producing the file-not-found spiral the guard
-        # was meant to prevent. We now also fire when the schema type is
-        # a list containing ``"string"`` (union type). When the union also
-        # includes ``"array"``, we parse the stringified array into a
-        # native list (the schema accepts it, and read_file's batch path
-        # handles native lists) instead of extracting only the first
-        # element — preserving the model's intent to read multiple files.
-        _expected_types = (
-            {expected} if isinstance(expected, str) else set(expected or [])
-        )
-        _accepts_string = "string" in _expected_types
-        _accepts_array = "array" in _expected_types
-        if (
-            _accepts_string
-            and isinstance(value, str)
-            and (
-                value.lstrip().startswith("[")
-                # #1681 — also fire on bare comma-separated path lists
-                # (``"src/a.py, src/b.py"``, no brackets). The helper's
-                # path-like guards reject non-path strings (sentences,
-                # bare words), so widening the trigger is safe.
-                or ("," in value and _is_path_like_param(key))
-            )
-        ):
-            # When the schema also accepts ``"array"``, parse the
-            # stringified array into a native list so read_file's batch
-            # path handles it — the model intended a multi-file read.
-            if _accepts_array:
-                parsed_list = _parse_stringified_array_to_list(value)
-                if parsed_list is not None:
-                    logger.info(
-                        "coerce_tool_args: %s.%s received a stringified "
-                        "array string (%.80s...) for a string|array union "
-                        "param — parsing into native list of %d items.",
-                        tool_name,
-                        key,
-                        value,
-                        len(parsed_list),
-                    )
-                    args[key] = parsed_list
-                    continue
-            # Schema is string-only (or parse failed) — extract the
-            # first element as the most likely intended single path.
-            extracted = _extract_first_from_stringified_array(value)
-            if extracted is not None:
-                logger.info(
-                    "coerce_tool_args: %s.%s received a stringified JSON "
-                    "array string (%.80s...) for a string-typed param — "
-                    "extracting first element.",
-                    tool_name,
-                    key,
-                    value,
-                )
-                args[key] = extracted
-                continue
-
         coerced = _coerce_value(value, expected, schema=prop_schema)
         if coerced is not value:
             args[key] = coerced
@@ -1053,161 +1021,6 @@ def _normalize_json_strings_for_schema(value: Any, schema: Any) -> Any:
     return value
 
 
-def _extract_first_from_stringified_array(value: str) -> Optional[str]:
-    """Extract the first element from a stringified JSON array (#1681).
-
-    When the model emits a string-typed param value that is actually a
-    JSON-encoded array (e.g. ``'["path/a", "path/b"]'``), extract the
-    first string element so the tool receives a usable scalar path
-    instead of the literal array string.
-
-    Falls back to splitting a non-JSON bracket-wrapped or bare
-    comma-separated list of paths (e.g. ``"[path/a, path/b]"`` or
-    ``"path/a, path/b"``) — a common open-weight-model emission when it
-    intends a list but forgets the JSON quoting. Without this, the whole
-    string would reach read_file and produce a file-not-found spiral.
-
-    Returns the first string element, or ``None`` when the value is not a
-    parseable JSON array of strings (in which case the caller leaves the
-    original value untouched).
-    """
-    if not isinstance(value, str):
-        return None
-    stripped = value.strip()
-    try:
-        parsed = json.loads(stripped)
-    except (ValueError, TypeError):
-        parsed = None
-    if isinstance(parsed, list) and parsed:
-        # Only unwrap arrays of strings — a list of dicts/numbers on a
-        # string-typed param is a different error and should not be silently
-        # mangled into ``str(parsed[0])``.
-        first = parsed[0]
-        if isinstance(first, str):
-            return first
-        return None
-    # ── Non-JSON comma-separated list fallback (#1681) ──────────────────
-    # The JSON parse failed. Detect a bracket-wrapped or bare
-    # comma-separated list of path-like items and take the first. Only
-    # fire when the value LOOKS like a path list: it contains a comma with
-    # whitespace, and the first token is a plausible path (not a bare
-    # number/word that a genuine path string could never be). This avoids
-    # mangling legitimate single-path strings that merely contain a comma
-    # (e.g. a filename with a comma, or shell args with flags).
-    _comma_list = re.match(
-        r"^[\[\s]*(?P<first>[^,\[\]\s][^,]*?)"
-        r"\s*,\s*(?P<rest>[^\]].*?)[\]\s]*$",
-        stripped,
-        re.DOTALL,
-    )
-    if not _comma_list:
-        return None
-    first_token = _comma_list.group("first").strip()
-    rest = _comma_list.group("rest").strip()
-    # Heuristic guard: the first token must look like a path — contain a
-    # path separator or a dot-extension or be a relative path — and the
-    # rest must look like another path, not arbitrary text.
-    if _looks_like_path(first_token) and _looks_like_path_list_rest(rest):
-        logger.info(
-            "coerce_tool_args: extracted first item from comma-separated "
-            "path list (%.60s...) for a string-typed param.",
-            value,
-        )
-        return first_token
-    return None
-
-
-def _parse_stringified_array_to_list(value: str) -> Optional[List[str]]:
-    """Parse a stringified JSON array or comma-separated path list into a
-    native ``list[str]`` (#1681 regression fix).
-
-    Used when the schema type is a union like ``["string", "array"]``
-    (e.g. ``read_file``'s ``path`` param) and the model emitted a
-    stringified array. Unlike :func:`_extract_first_from_stringified_array`
-    (which takes only the first element for pure-string params), this
-    preserves ALL elements so the tool's batch-read path can handle them.
-
-    Returns a list of string paths, or ``None`` when the value is not a
-    parseable array of path-like strings.
-    """
-    if not isinstance(value, str):
-        return None
-    stripped = value.strip()
-    # ── JSON array path ──────────────────────────────────────────────
-    try:
-        parsed = json.loads(stripped)
-    except (ValueError, TypeError):
-        parsed = None
-    if isinstance(parsed, list) and parsed:
-        # Only unwrap arrays of strings — mixed types on a path param are
-        # a different error class.
-        if all(isinstance(item, str) for item in parsed):
-            return parsed
-        return None
-    # ── Non-JSON comma-separated list fallback ────────────────────────
-    # Same heuristic as _extract_first_from_stringified_array but returns
-    # ALL path-like tokens, not just the first.
-    _comma_list = re.match(
-        r"^[\[\s]*(?P<first>[^,\[\]\s][^,]*?)"
-        r"\s*,\s*(?P<rest>[^\]].*?)[\]\s]*$",
-        stripped,
-        re.DOTALL,
-    )
-    if not _comma_list:
-        return None
-    first_token = _comma_list.group("first").strip()
-    rest = _comma_list.group("rest").strip()
-    # Stricter than _looks_like_path: require an actual path separator
-    # (slash, dot-extension, or ..) — not just len >= 3 — so non-path
-    # strings like "hello, world" are NOT split into a path list.
-    if not (_PATH_SEPARATOR_RE.search(first_token) and _PATH_SEPARATOR_RE.search(rest)):
-        return None
-    # Split the full string into individual path tokens.
-    inner = stripped.strip("[] \n\t")
-    tokens = [t.strip() for t in inner.split(",")]
-    # Keep only non-empty tokens with a path separator.
-    path_tokens = [t for t in tokens if t and _PATH_SEPARATOR_RE.search(t)]
-    if len(path_tokens) >= 2:
-        return path_tokens
-    return None
-
-
-# Path separators / extensions that mark a token as path-like (#1681).
-_PATH_SEPARATOR_RE = re.compile(r"[/\\]|[.]\w{1,10}\Z|\.\.", re.IGNORECASE)
-
-
-def _looks_like_path(token: str) -> bool:
-    """Return True when *token* looks like a filesystem path."""
-    if not token:
-        return False
-    if _PATH_SEPARATOR_RE.search(token):
-        return True
-    # A bare word that is a known shell/tool keyword is not a path.
-    if token.lower() in {"true", "false", "null", "none", "and", "or", "not"}:
-        return False
-    return len(token) >= 3
-
-
-_PATH_LIKE_PARAM_RE = re.compile(
-    r"path|file|url|dir|dest|src|dst|target|glob|pattern|prefix|output|input",
-    re.IGNORECASE,
-)
-
-
-def _is_path_like_param(key: str) -> bool:
-    """Return True when *key* names a param that typically holds a path/URL."""
-    if not key:
-        return False
-    return _PATH_LIKE_PARAM_RE.search(key) is not None
-
-
-def _looks_like_path_list_rest(rest: str) -> bool:
-    """Return True when *rest* looks like the remainder of a path list."""
-    if not rest:
-        return False
-    return _PATH_SEPARATOR_RE.search(rest) is not None
-
-
 def _coerce_value(value: str, expected_type, schema: dict | None = None):
     """Attempt to coerce a string *value* to *expected_type*.
 
@@ -1261,57 +1074,124 @@ def _schema_allows_null(schema: dict | None) -> bool:
     return False
 
 
-def _split_path_list(value: str) -> Optional[List[str]]:
-    """Split a comma-separated / bracket-wrapped list of bare path-like items.
+def _extract_first_from_stringified_array(value: str) -> Optional[str]:
+    """Extract the first element from a stringified JSON array (#1681)."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, list) and parsed:
+        first = parsed[0]
+        if isinstance(first, str):
+            return first
+        return None
+    _comma_list = re.match(
+        r"^[\[\s]*(?P<first>[^,\[\]\s][^,]*?)"
+        r"\s*,\s*(?P<rest>[^\]].*?)[\]\s]*$",
+        stripped,
+        re.DOTALL,
+    )
+    if not _comma_list:
+        return None
+    first_token = _comma_list.group("first").strip()
+    rest = _comma_list.group("rest").strip()
+    if _looks_like_path(first_token) and _looks_like_path_list_rest(rest):
+        logger.info(
+            "coerce_tool_args: extracted first item from comma-separated "
+            "path list (%.60s...) for a string-typed param.",
+            value,
+        )
+        return first_token
+    return None
 
-    Models occasionally emit a path list as ``"a.py, b.py"`` or ``"[/a, /b]"``
-    where a native JSON array was expected (#1681). ``json.loads`` fails on
-    these because bare paths aren't quoted, so they previously fell through to
-    the caller's single-element-wrap fallback — read_file then got a literal
-    malformed string like ``"[/a, /b]"`` as a single path, producing a
-    file-not-found spiral.
 
-    Returns a list of trimmed items when the string looks like a path list
-    (≥2 comma-separated items, or a single item inside brackets), else ``None``
-    so the caller keeps its existing single-element fallback. Single-path
-    values (``"/a.py"``) return ``None`` — they must NOT be split, since a
-    path itself can contain commas rarely but the common case is a lone path.
+def _parse_stringified_array_to_list(value: str) -> Optional[List[str]]:
+    """Parse a stringified JSON array or comma-separated path list into a
+    native ``list[str]`` (#1681 regression fix).
     """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, list) and parsed:
+        if all(isinstance(item, str) for item in parsed):
+            return parsed
+        return None
+    _comma_list = re.match(
+        r"^[\[\s]*(?P<first>[^,\[\]\s][^,]*?)"
+        r"\s*,\s*(?P<rest>[^\]].*?)[\]\s]*$",
+        stripped,
+        re.DOTALL,
+    )
+    if not _comma_list:
+        return None
+    first_token = _comma_list.group("first").strip()
+    rest = _comma_list.group("rest").strip()
+    if not (_PATH_SEPARATOR_RE.search(first_token) and _PATH_SEPARATOR_RE.search(rest)):
+        return None
+    inner = stripped.strip("[] \n\t")
+    tokens = [t.strip() for t in inner.split(",")]
+    path_tokens = [t for t in tokens if t and _PATH_SEPARATOR_RE.search(t)]
+    if len(path_tokens) >= 2:
+        return path_tokens
+    return None
+
+
+_PATH_SEPARATOR_RE = re.compile(r"[/\\]|[.]\w{1,10}\Z|\.\.", re.IGNORECASE)
+
+
+def _looks_like_path(token: str) -> bool:
+    """Return True when *token* looks like a filesystem path."""
+    if not token:
+        return False
+    if _PATH_SEPARATOR_RE.search(token):
+        return True
+    if any(token.startswith(p) for p in ("~", ".", "/")):
+        return True
+    return len(token) >= 3
+
+
+_PATH_LIKE_PARAM_RE = re.compile(
+    r"path|file|url|dir|dest|src|dst|target|glob|pattern|prefix|output|input",
+    re.IGNORECASE,
+)
+
+
+def _is_path_like_param(key: str) -> bool:
+    """Return True when *key* names a param that typically holds a path/URL."""
+    if not key:
+        return False
+    return _PATH_LIKE_PARAM_RE.search(key) is not None
+
+
+def _looks_like_path_list_rest(rest: str) -> bool:
+    """Return True when *rest* looks like the remainder of a path list."""
+    if not rest:
+        return False
+    return _PATH_SEPARATOR_RE.search(rest) is not None
+
+
+def _split_path_list(value: str) -> Optional[List[str]]:
+    """Split a comma-separated / bracket-wrapped list of bare path-like items."""
     if not value or not value.strip():
         return None
     s = value.strip()
-    # Unwrap a single bracket pair: "[/a, /b]" -> "/a, /b".
     if s.startswith("[") and s.endswith("]"):
         s = s[1:-1].strip()
     items = [part.strip().strip("'\"") for part in s.split(",") if part.strip()]
-    # Only treat it as a path list when we actually split into multiple items.
-    # A lone item (single path, possibly comma-less) must stay a single string
-    # so a path that merely contains a bracket or comma is not mangled.
     if len(items) >= 2:
         return items
     return None
 
 
 def _coerce_json(value: str, expected_python_type: type):
-    """Parse *value* as JSON when the schema expects an array or object.
-
-    Handles model output drift where a complex oneOf/discriminated-union schema
-    causes the LLM to emit the array/object as a JSON string instead of a native
-    structure.  Returns the original string if parsing fails or yields the wrong
-    Python type.
-
-    For empty/whitespace-only strings — a common drift pattern where the model
-    emits ``""`` or ``" "`` where a list/object is expected — we return an
-    empty container of the expected type instead of logging a parse-failure
-    warning on every call.  This eliminates the high-volume
-    ``failed to parse string as JSON for expected type list`` log spam (2393+
-    occurrences) from providers whose tool-call serialization does not align
-    with JSON Schema expectations.  Non-empty non-JSON strings still fall
-    through to the caller's single-element wrapping logic.
-    """
-    # Empty/whitespace-only string → empty container of expected type.
-    # This is the most common drift pattern (model emits "" for a list
-    # parameter) and silencing it here prevents 2000+ log warnings/day.
+    """Parse *value* as JSON when the schema expects an array or object."""
     if not value or not value.strip():
         if expected_python_type is list:
             return []
@@ -1321,13 +1201,6 @@ def _coerce_json(value: str, expected_python_type: type):
     try:
         parsed = json.loads(value)
     except (ValueError, TypeError) as exc:
-        # The value isn't JSON. Before falling through to the caller's
-        # single-element-wrap fallback, try splitting a comma-separated /
-        # bracket-wrapped list of bare path-like items (#1681). Models
-        # sometimes emit ``path="a.py, b.py"`` (or ``"[/a, /b]"``) where a
-        # JSON array was expected; splitting turns it into a real batch list
-        # instead of a literal malformed path that read_file would treat as
-        # a single "File not found" spiral.
         if expected_python_type is list:
             items = _split_path_list(value)
             if items is not None:
@@ -1338,7 +1211,7 @@ def _coerce_json(value: str, expected_python_type: type):
                     items,
                 )
                 return items
-        logger.debug(
+        logger.warning(
             "coerce_tool_args: failed to parse string as JSON for expected type %s: %s",
             expected_python_type.__name__,
             exc,
@@ -1350,7 +1223,7 @@ def _coerce_json(value: str, expected_python_type: type):
             expected_python_type.__name__,
         )
         return parsed
-    logger.debug(
+    logger.warning(
         "coerce_tool_args: JSON-parsed value is %s, expected %s — skipping coercion",
         type(parsed).__name__,
         expected_python_type.__name__,
@@ -1387,12 +1260,21 @@ def _coerce_boolean(value: str):
 
 
 def _tool_result_observer_fields(
+    tool_name: str,
     result: Any,
 ) -> tuple[str, Optional[str], Optional[str]]:
     try:
         parsed_result = json.loads(result) if isinstance(result, str) else result
         if isinstance(parsed_result, dict) and parsed_result.get("error"):
             return "error", "tool_error", str(parsed_result.get("error"))
+    except Exception:
+        pass
+    try:
+        from agent.display import _detect_tool_failure
+
+        failed, suffix = _detect_tool_failure(tool_name, result)
+        if failed:
+            return "error", "tool_error", suffix.strip().strip("[]") or None
     except Exception:
         pass
     return "ok", None, None
@@ -1425,11 +1307,13 @@ def _emit_post_tool_call_hook(
     """
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
-
         if not has_hook("post_tool_call"):
             return
         if status is None:
-            status, error_type, error_message = _tool_result_observer_fields(result)
+            status, error_type, error_message = _tool_result_observer_fields(
+                function_name,
+                result,
+            )
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
@@ -1502,6 +1386,23 @@ def handle_function_call(
     # inline. tool_call is unwrapped to the underlying tool so that every
     # downstream hook (pre/post, edit approval, guardrails) sees the real
     # tool name, not the bridge.
+    _dispatch_start = time.monotonic()
+
+    def _return_bridge_result(result: Any) -> Any:
+        _emit_post_tool_call_hook(
+            function_name=function_name,
+            function_args=function_args,
+            result=result,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            duration_ms=int((time.monotonic() - _dispatch_start) * 1000),
+            middleware_trace=list(_tool_middleware_trace),
+        )
+        return result
+
     _ts_mod = None
     try:
         from tools import tool_search as _ts_mod  # noqa: F401
@@ -1523,33 +1424,33 @@ def handle_function_call(
             # the deferred catalog identical to the deferrable subset of the
             # session's own tool list, and avoids polluting the process-global
             # _last_resolved_tool_names with out-of-scope tools.
-            current_defs = (
-                get_tool_definitions(
-                    enabled_toolsets=enabled_toolsets,
-                    disabled_toolsets=disabled_toolsets,
-                    quiet_mode=True,
-                    skip_tool_search_assembly=True,
-                )
-                or []
-            )
+            current_defs = get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True, skip_tool_search_assembly=True,
+            ) or []
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
-            return _ts_mod.dispatch_tool_search(
-                function_args or {},
-                current_tool_defs=current_defs,
-                session_id=session_id,
+            return _return_bridge_result(
+                _ts_mod.dispatch_tool_search(
+                    function_args or {},
+                    current_tool_defs=current_defs,
+                )
             )
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
-            return _ts_mod.dispatch_tool_describe(
-                function_args or {}, current_tool_defs=current_defs
+            return _return_bridge_result(
+                _ts_mod.dispatch_tool_describe(
+                    function_args or {},
+                    current_tool_defs=current_defs,
+                )
             )
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
-                function_args or {}
-            )
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
-                return tool_error(err or "tool_call could not be resolved")
+                return _return_bridge_result(
+                    tool_error(err or "tool_call could not be resolved")
+                )
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
@@ -1558,34 +1459,18 @@ def handle_function_call(
             # the bridge even if the catalog scoping above regressed.
             _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
             if underlying_name not in _scoped_deferrable:
-                return tool_error(
-                    f"'{underlying_name}' is not available in this session. "
-                    "Use tool_search to find tools you can call."
+                return _return_bridge_result(
+                    tool_error(
+                        f"'{underlying_name}' is not available in this session. "
+                        "Use tool_search to find tools you can call."
+                    )
                 )
-            # Two-stage pre-execution validation. The stages catch different
-            # things and the order matters.
-            #
-            # 1. Missing REQUIRED arguments (ironclaw#5149). A deferred tool's
-            #    schema is invisible until tool_describe, so models call it
-            #    blind by name and omit required fields. This returns the
-            #    parameter schema itself, letting the model repair the call in
-            #    one round-trip instead of reading an opaque KeyError.
-            _probe_err = _ts_mod.validate_deferred_call_args(
-                underlying_name, underlying_args
-            )
+            # Probe-validate against the deferred tool's schema (ironclaw#5149):
+            # a blind call missing required arguments returns the parameter
+            # schema instead of dispatching into an opaque downstream failure.
+            _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
             if _probe_err is not None:
-                return _probe_err
-            # 2. Wrong argument TYPES (#1039). The probe above deliberately
-            #    does no type checking, so this still earns its place.
-            _schema = registry.get_schema(underlying_name)
-            _ok, _err = _ts_mod.validate_tool_args(
-                underlying_name, underlying_args, _schema
-            )
-            if not _ok:
-                return tool_error(_err)
-            # #1144 — the model invoked a discovered tool, so reset the
-            # consecutive-search streak (the search loop converged).
-            _ts_mod.reset_search_streak(session_id)
+                return _return_bridge_result(_probe_err)
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
             return handle_function_call(
@@ -1594,6 +1479,8 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1643,7 +1530,6 @@ def handle_function_call(
             block_message: Optional[str] = None
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
-
                 block_message = resolve_pre_tool_block(
                     function_name,
                     function_args,
@@ -1681,95 +1567,26 @@ def handle_function_call(
         try:
             from acp_adapter.edit_approval import maybe_require_edit_approval
 
-            edit_block_message = maybe_require_edit_approval(
-                function_name, function_args
-            )
+            edit_block_message = maybe_require_edit_approval(function_name, function_args)
             if edit_block_message is not None:
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=edit_block_message,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="blocked",
+                    error_type="edit_approval_denied",
+                    middleware_trace=list(_tool_middleware_trace),
+                )
                 return edit_block_message
         except Exception as _edit_approval_err:
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
-                return tool_error("Edit approval denied: approval guard failed")
-
-        # Notify the read-loop tracker when a non-read/search tool runs,
-        # so the *consecutive* counter resets (reads after other work are fine).
-        if function_name not in _READ_SEARCH_TOOLS:
-            try:
-                from tools.file_tools import notify_other_tool_call
-
-                notify_other_tool_call(task_id or "default")
-            except Exception:
-                pass  # file_tools may not be loaded yet
-
-        # #1704 — reset the web_search consecutive-search streak whenever a
-        # non-web_search tool runs (the model acted on/abandoned results).
-        if function_name != "web_search":
-            try:
-                from tools.web_tools import reset_web_search_streak
-
-                reset_web_search_streak(session_id)
-            except Exception:
-                pass  # web_tools may not be loaded yet
-
-        # Deterministic tool-argument contract check (issue #904). Re-checks
-        # the final, post-coercion/post-middleware arguments against the
-        # tool's own registered schema (``required`` fields, ``enum``
-        # values, basic ``type`` matching) right at the composition boundary,
-        # before dispatch() invokes the handler. Default ON since #1530 (the
-        # #1528 audit confirmed every native tool ships a safe schema, and
-        # the check is fail-open on any schema without a structured contract),
-        # with env/config escape hatches — see agent.tool_arg_contract.
-        try:
-            from agent.tool_arg_contract import (
-                check_tool_args_contract,
-                tool_arg_contract_enabled,
-            )
-
-            if tool_arg_contract_enabled():
-                _contract_outcome = check_tool_args_contract(
-                    function_name, function_args, registry.get_schema(function_name)
-                )
-                if not _contract_outcome.ok:
-                    _contract_error = _contract_outcome.error_message()
-                    result = json.dumps({"error": _contract_error}, ensure_ascii=False)
-                    _emit_post_tool_call_hook(
-                        function_name=function_name,
-                        function_args=function_args,
-                        result=result,
-                        task_id=task_id,
-                        session_id=session_id,
-                        tool_call_id=tool_call_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        status="blocked",
-                        error_type="arg_contract_violation",
-                        error_message=_contract_error,
-                        middleware_trace=list(_tool_middleware_trace),
-                    )
-                    return result
-        except Exception as _contract_check_err:
-            logger.debug("tool_arg_contract check error: %s", _contract_check_err)
-
-        # Circuit-breaker gate: if this tool has tripped its per-tool breaker
-        # (N consecutive failures), refuse the call and return a diagnostic
-        # that tells the model to stop retrying and use an alternative tool.
-        # This prevents the retry-spiral pattern where the agent re-calls a
-        # failing terminal command dozens of times across a session (#942).
-        try:
-            from agent.tool_error_recovery import get_breaker
-
-            _breaker = get_breaker(function_name)
-            if _breaker.should_trip():
-                _breaker_count = _breaker._consecutive_failures
-                _breaker_msg = (
-                    f"Circuit breaker open: {function_name} has failed "
-                    f"{_breaker_count} consecutive times. Stop retrying "
-                    f"{function_name} and use an alternative tool "
-                    f"(read_file, search_files, write_file) or report the "
-                    f"blocker. Repeatedly calling {function_name} will keep "
-                    f"failing."
-                )
-                result = json.dumps({"error": _breaker_msg}, ensure_ascii=False)
+                result = tool_error("Edit approval denied: approval guard failed")
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1780,13 +1597,19 @@ def handle_function_call(
                     turn_id=turn_id,
                     api_request_id=api_request_id,
                     status="blocked",
-                    error_type="circuit_breaker",
-                    error_message=_breaker_msg,
+                    error_type="edit_approval_error",
                     middleware_trace=list(_tool_middleware_trace),
                 )
                 return result
-        except Exception as _cb_err:
-            logger.debug("circuit breaker check error: %s", _cb_err)
+
+        # Notify the read-loop tracker when a non-read/search tool runs,
+        # so the *consecutive* counter resets (reads after other work are fine).
+        if function_name not in _READ_SEARCH_TOOLS:
+            try:
+                from tools.file_tools import notify_other_tool_call
+                notify_other_tool_call(task_id or "default")
+            except Exception:
+                pass  # file_tools may not be loaded yet
 
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
@@ -1802,10 +1625,10 @@ def handle_function_call(
                 reset_current_observability_context,
                 set_current_observability_context,
             )
-
             _approval_tokens = set_current_observability_context(
                 turn_id=turn_id or "",
                 tool_call_id=tool_call_id or "",
+                session_id=session_id or "",
             )
         except Exception:
             reset_current_observability_context = None
@@ -1813,32 +1636,22 @@ def handle_function_call(
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
-                sandbox_enabled = (
-                    enabled_tools
-                    if enabled_tools is not None
-                    else _last_resolved_tool_names
-                )
-
+                sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
-                        function_name,
-                        next_args,
+                        function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
-
             else:
-
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
-                        function_name,
-                        next_args,
+                        function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
-
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
@@ -1856,10 +1669,7 @@ def handle_function_call(
                     api_request_id=api_request_id or "",
                 )
         finally:
-            if (
-                _approval_tokens is not None
-                and reset_current_observability_context is not None
-            ):
+            if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
                     reset_current_observability_context(_approval_tokens)
                 except Exception:
@@ -1879,68 +1689,6 @@ def handle_function_call(
             middleware_trace=list(_tool_middleware_trace),
         )
 
-        # Tool-call dedup tracker (When2Tool, #2282): record this call's
-        # outcome and, if it is a repeat of a recently-successful call,
-        # append an advisory hint so the model can reuse the prior result
-        # instead of re-running the tool. Fail-open and cache-safe — it
-        # only appends to the result string, never mutates the system
-        # prompt or message roles.
-        try:
-            from agent.tool_dedup import check_tool_dedup, record_tool_call
-
-            # Derive success from the *raw* result BEFORE appending any
-            # hint, so an error result is never misclassified as "ok".
-            _dedup_status, _, _ = _tool_result_observer_fields(result)
-            # Check for a duplicate of a *prior* successful call BEFORE
-            # recording this one, so the current call never flags itself.
-            _dedup_hint = check_tool_dedup(
-                function_name, function_args, session_id=session_id
-            )
-            if _dedup_hint and isinstance(result, str):
-                # Embed the hint inside the JSON result dict (following the
-                # `_warning` key pattern in file_tools.py) so downstream
-                # consumers that call json.loads(result) still see valid
-                # JSON.  Fall back to raw append for non-JSON results.
-                try:
-                    _parsed = json.loads(result)
-                    if isinstance(_parsed, dict):
-                        _parsed["_dedup_hint"] = _dedup_hint
-                        result = json.dumps(_parsed, ensure_ascii=False)
-                    else:
-                        result = result + "\n" + _dedup_hint
-                except (json.JSONDecodeError, TypeError):
-                    result = result + "\n" + _dedup_hint
-            record_tool_call(
-                function_name,
-                function_args,
-                session_id=session_id,
-                success=(_dedup_status == "ok"),
-            )
-        except Exception as _dedup_err:
-            logger.debug("tool_dedup wiring error: %s", _dedup_err)
-
-        # Source-chain provenance (#2192): record tool-call sources during
-        # background-review forks so the skill's origin chain is traceable.
-        try:
-            from tools.skill_provenance import add_provenance_entry
-
-            add_provenance_entry(
-                function_name,
-                source_id=function_args.get("url") or function_args.get("path") or "",
-            )
-        except Exception:
-            pass
-
-        # Skill-Use boundary instrumentation (#2183): record each tool call
-        # made while a skill is active so check_boundary_violations can
-        # detect forbidden-tool usage when the skill is deactivated.
-        try:
-            from tools.skill_compliance import record_tool_call_for_active_skill
-
-            record_tool_call_for_active_skill(function_name)
-        except Exception:
-            pass
-
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
         # returning a string from transform_tool_result. Runs after
@@ -1951,9 +1699,11 @@ def handle_function_call(
         # field derivation and the payload dispatch.
         try:
             from hermes_cli.lifecycle import has_hook, invoke_hook
-
             if has_hook("transform_tool_result"):
-                status, error_type, error_message = _tool_result_observer_fields(result)
+                status, error_type, error_message = _tool_result_observer_fields(
+                    function_name,
+                    result,
+                )
                 hook_results = invoke_hook(
                     "transform_tool_result",
                     tool_name=function_name,
@@ -1976,142 +1726,38 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
-        # Record tool outcome for circuit-breaker tracking.
-        #
-        # A tool that returns a normal JSON result is NOT necessarily a
-        # success: `terminal` returns exit_code != 0 (and `status: "error"`)
-        # for failed commands without raising, so it lands on this path and
-        # would otherwise reset the breaker to 0 every call — the breaker
-        # never accumulates consecutive failures and the retry spiral runs
-        # unchecked (#2302, 8th recurrence). Inspect the result for error
-        # indicators and record a failure when present.
-        try:
-            from agent.tool_error_recovery import (
-                record_tool_outcome,
-                result_indicates_failure,
-            )
-
-            record_tool_outcome(
-                function_name, success=not result_indicates_failure(result)
-            )
-        except Exception:
-            pass
-
-        # Independent execution-evidence capture: record what actually ran,
-        # separate from the model's narrative, so explanations can be
-        # cross-checked against recorded evidence (#1716). Fail-open.
-        try:
-            from agent.exec_evidence import record_evidence
-
-            record_evidence(function_name, function_args)
-        except Exception:
-            pass
-
-        # Sanitize untrusted tool output before it re-enters model context:
-        # fence off prompt-injection patterns (ignore-prior-instructions,
-        # role tags, persona hijacks) so they are read as data. Fail-open.
-        try:
-            from agent.tool_sanitize import sanitize_tool_result
-
-            _sanitized = sanitize_tool_result(result)
-            if isinstance(_sanitized, str):
-                result = _sanitized
-        except Exception:
-            pass
-
-        # EchoLeak + agentjacking defense (#1717): neutralize remote-fetch
-        # image links and fence crash/debug output before it re-enters model
-        # context. Fail-open.
-        try:
-            from agent.echoleak_defense import sanitize_output
-
-            _sanitized = sanitize_output(result)
-            if isinstance(_sanitized, str):
-                result = _sanitized
-        except Exception:
-            pass
-            if isinstance(_sanitized, str):
-                result = _sanitized
-        except Exception:
-            pass
-
-        # Structured audit event (#1718) — tool calls as immutable JSONL
-        # events (EU AI Act Art. 12).  Gated + fail-open.
-        try:
-            from agent.audit_log import EVENT_TOOL_CALL_COMPLETE, log_audit_event
-
-            _status, _err_type, _ = _tool_result_observer_fields(result)
-            log_audit_event(
-                EVENT_TOOL_CALL_COMPLETE,
-                session_id=session_id or "",
-                turn_id=turn_id or "",
-                tool_call_id=tool_call_id or "",
-                tool_name=function_name,
-                task_id=task_id or "",
-                args=function_args,
-                duration_ms=duration_ms,
-                result=result[:4000] if isinstance(result, str) else result,
-                status=_status,
-                error_type=_err_type or "",
-            )
-        except Exception:
-            pass
         return result
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
-        # Classify the tool-level error and enrich the result with a
-        # recovery hint so the model sees not just *what* failed but
-        # *what to try next* (retry, check path, fix args, etc.).
-        enriched = _sanitize_tool_error(error_msg)
-        try:
-            from agent.tool_error_recovery import (
-                classify_tool_error,
-                classify_tool_exception,
-                recovery_hint,
-                record_tool_outcome,
-                get_breaker,
-            )
-
-            # #2245 — inspect the exception *type* first (catches TimeoutError,
-            # ConnectionError, KeyError, HTTP-status wrappers that stringify to
-            # unhelpful messages), then fall back to the string classifier.
-            try:
-                failure = classify_tool_exception(function_name, e)
-            except Exception:
-                failure = classify_tool_error(function_name, str(e))
-            hint = recovery_hint(failure)
-            if hint:
-                enriched = f"{enriched}{hint}"
-            record_tool_outcome(function_name, success=False)
-            # Failure-class-aware escalation (#942): when the breaker is
-            # close to tripping, append a stronger warning so the model
-            # knows it is in a retry spiral before the hard gate fires.
-            _breaker = get_breaker(function_name)
-            _fail_count = _breaker._consecutive_failures
-            if _fail_count >= 3 and not _breaker.should_trip():
-                enriched = (
-                    f"{enriched} [WARNING: {function_name} has now failed "
-                    f"{_fail_count} consecutive times. Consider switching "
-                    f"to an alternative tool or approach.]"
-                )
-        except Exception:
-            pass  # never let the recovery module itself cause a failure
-        # Redact secrets from the error string before it re-enters context (#1717).
-        try:
-            from agent.echoleak_defense import sanitize_error_for_context
-
-            enriched = sanitize_error_for_context(enriched)
-        except Exception:
-            pass
-        return tool_error(enriched)
+        result = tool_error(_sanitize_tool_error(error_msg))
+        duration_ms = (
+            int((time.monotonic() - _dispatch_start) * 1000)
+            if _dispatch_start is not None
+            else 0
+        )
+        _emit_post_tool_call_hook(
+            function_name=function_name,
+            function_args=function_args,
+            result=result,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            duration_ms=duration_ms,
+            status="error",
+            error_type=type(e).__name__,
+            error_message=str(e),
+            middleware_trace=list(_tool_middleware_trace),
+        )
+        return result
 
 
 # =============================================================================
 # Backward-compat wrapper functions
 # =============================================================================
-
 
 def get_all_tool_names() -> List[str]:
     """Return all registered tool names."""

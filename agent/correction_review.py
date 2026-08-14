@@ -149,6 +149,8 @@ def decide_correction_review(
     # deterministically; the fork would be write-blocked, so spawning it would
     # waste an aux-model call.
     spawn = bool(healthy_review or correction_durable)
+    if getattr(agent, "skip_background_review", False):
+        spawn = False
 
     return {
         "spawn": spawn,
