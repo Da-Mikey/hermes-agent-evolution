@@ -46,6 +46,9 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
+_PROBE_CACHE_MAX = 32
+_python_prefix_cache: dict = {}
+_usable_python_cache: dict = {}
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
@@ -1992,6 +1995,85 @@ def _kill_process_group(proc, escalate: bool = False):
                     proc.kill()
                 except Exception as e2:
                     logger.debug("Could not kill process: %s", e2, exc_info=True)
+
+
+def _cache_probe_result(cache: dict, key: str, value):
+    """Insert into a bounded probe cache, FIFO-evicting at the cap."""
+    if len(cache) >= _PROBE_CACHE_MAX:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
+def _probe_python(python_path: str, code: str, *, text: bool = False):
+    """Run ``python_path -c code`` with the standard interpreter-probe guards.
+
+    Returns the ``CompletedProcess``, or ``None`` when the interpreter is
+    missing, can't be spawned, or hangs past the 5s timeout.
+    """
+    try:
+        from agent.delegation_context import delegated_child_subprocess_env
+
+        return subprocess.run(
+            [python_path, "-c", code],
+            timeout=5,
+            capture_output=True,
+            text=text,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            stdin=subprocess.DEVNULL,
+            env=delegated_child_subprocess_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        return None
+
+
+def _is_usable_python(python_path: str) -> bool:
+    """Check whether a candidate Python interpreter is usable for execute_code.
+
+    Requires Python 3.8+ (f-strings and stdlib modules the RPC stubs need).
+    Successful probes are cached per interpreter path; failures are retried
+    (a sticky False would silently pin project mode to sys.executable).
+    """
+    cached = _usable_python_cache.get(python_path)
+    if cached is not None:
+        return cached
+    result = _probe_python(
+        python_path,
+        "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)",
+    )
+    if result is None:
+        return False
+    usable = result.returncode == 0
+    _cache_probe_result(_usable_python_cache, python_path, usable)
+    return usable
+
+
+def _uses_hermes_python_environment(python_path: str) -> bool:
+    """Whether *python_path* belongs to Hermes's active Python environment."""
+    if python_path == sys.executable or (
+        os.path.realpath(python_path) == os.path.realpath(sys.executable)
+    ):
+        return True
+    return _python_environment_prefix(python_path) == os.path.realpath(sys.prefix)
+
+
+def _python_environment_prefix(python_path: str) -> str:
+    """Return the resolved ``sys.prefix`` reported by *python_path*, if any.
+
+    Successful probes are cached per interpreter path (bounded, FIFO-evicted).
+    Failures are NOT cached: a transient probe failure (fork pressure, 5s
+    timeout on a loaded host) must not stick for the process lifetime — a
+    sticky empty result would silently drop the hermes root from every
+    subsequent execute_code call's PYTHONPATH.
+    """
+    cached = _python_prefix_cache.get(python_path)
+    if cached is not None:
+        return cached
+    result = _probe_python(python_path, "import sys; print(sys.prefix)", text=True)
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        prefix = os.path.realpath(result.stdout.strip())
+        _cache_probe_result(_python_prefix_cache, python_path, prefix)
+        return prefix
+    return ""
 
 
 def _load_config() -> dict:

@@ -565,6 +565,14 @@ def should_use_direct_api_call(agent) -> bool:
     return getattr(agent, "platform", None) == "subagent"
 
 
+# How often an in-flight direct_api_call refreshes last_activity_ts.
+# Must stay well under the async-delegation idle stall threshold (450s) and
+# the sync heartbeat idle window so a healthy slow model wait is never
+# mistaken for a frozen child. Kept below the 30s monitor sweep interval so
+# progress tokens change every sample while the request is open.
+_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS = 15.0
+
+
 def direct_api_call(agent, api_kwargs: dict):
     """Run a non-streaming LLM call inline on the conversation thread.
 

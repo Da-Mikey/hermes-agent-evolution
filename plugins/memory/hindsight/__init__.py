@@ -48,6 +48,31 @@ from agent.secret_scope import get_secret
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
+
+
+def _local_runtime_hint(reason: str | None) -> str:
+    """Actionable install guidance when the local_embedded runtime is missing.
+
+    ``local_embedded`` imports ``from hindsight import HindsightEmbedded``, which
+    is provided only by the ``hindsight-all`` package (its wheel ships the
+    top-level ``hindsight`` module). ``plugin.yaml`` declares only
+    ``hindsight-client`` (enough for cloud / local_external), so a user who
+    selected local_embedded without going through ``hermes memory setup`` — a
+    hand-written config, the legacy ``"mode": "local"`` alias, or a restored
+    backup — hits ``ModuleNotFoundError: No module named 'hindsight'``.
+    NousResearch/hermes-agent#7718.
+    """
+    text = (reason or "").lower()
+    if "no module named" in text and ("hindsight'" in text or 'hindsight"' in text
+                                      or "hindsight_embed" in text):
+        return (
+            f" Install the embedded runtime with: uv pip install --python "
+            f"{sys.executable} hindsight-all — or run 'hermes memory setup'. "
+            "(local_embedded needs the 'hindsight-all' package, which provides the "
+            "top-level 'hindsight' module; 'hindsight-client' alone only covers "
+            "cloud / local_external.)"
+        )
+    return ""
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
@@ -830,6 +855,26 @@ class HindsightMemoryProvider(MemoryProvider):
             return has_key or has_url
         except Exception:
             return False
+
+    def unavailable_reason(self) -> str:
+        """Explain an unavailable local_embedded provider (missing runtime).
+
+        ``is_available()`` returns False for local modes when the embedded
+        runtime can't be imported, so ``initialize()`` — and the hint it would
+        log — is never reached (#7718). Surface the install guidance here, where
+        agent_init warns about an unavailable provider.
+        """
+        try:
+            cfg = _load_config()
+            mode = cfg.get("mode", "cloud")
+        except Exception:
+            return ""
+        if mode not in {"local", "local_embedded"}:
+            return ""
+        available, reason = _check_local_runtime()
+        if available:
+            return ""
+        return _local_runtime_hint(reason).strip()
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/hindsight/config.json."""

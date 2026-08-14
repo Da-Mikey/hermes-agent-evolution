@@ -24,6 +24,13 @@ _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
 
 
+class HonchoAuthError(RuntimeError):
+    """Auth failure that survived a forced refresh and one retry.
+
+    Raised, not swallowed, so callers can tell a rejected credential from an empty result.
+    """
+
+
 @dataclass
 class HonchoSession:
     """

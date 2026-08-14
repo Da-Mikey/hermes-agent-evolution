@@ -7689,6 +7689,15 @@ class AIAgent:
         if "api.mistral.ai" in self._base_url_lower:
             return False
 
+        try:
+            from hermes_cli.models import openrouter_model_reasoning_capabilities
+
+            caps = openrouter_model_reasoning_capabilities(self.model)
+            if isinstance(caps, dict) and "supports_reasoning" in caps:
+                return bool(caps["supports_reasoning"])
+        except Exception:
+            pass
+
         model = (self.model or "").lower()
         reasoning_model_prefixes = (
             "deepseek/",

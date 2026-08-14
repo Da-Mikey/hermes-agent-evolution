@@ -299,6 +299,68 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
+def _get_worktree_isolation() -> bool:
+    """Read delegation.worktree_isolation from config (bool, default False).
+
+    Inspired by Muse Code's ``--subagent-worktree-isolation`` (Meta, Aug
+    2026): when enabled, each delegated child gets its own git worktree
+    checked out from the parent's current commit so parallel children never
+    contend for the same working copy. Opt-in and git-only — in a non-git
+    workspace or on a non-local terminal backend the flag is ignored without
+    an error and children share the parent's workspace as before.
+    """
+    cfg = _load_config()
+    return bool(cfg.get("worktree_isolation", False))
+
+
+def steer_subagent(
+    subagent_id: str,
+    text: str,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> bool:
+    """Queue steering text into a single running subagent without stopping it.
+
+    The redirection-side mirror of interrupt_subagent(): resolves the live
+    child in the registry and calls AIAgent.steer(), which appends the text
+    to the child's last tool result at its next iteration boundary — the
+    current tool call is never cut. Returns True if a matching subagent
+    QUEUED the text while the child was still accepting work; False for an
+    unknown/closed id, an ownership mismatch, a record with no live agent, or
+    empty text. ``owner_session_id=None`` deliberately preserves the internal
+    in-process helper contract; gateway callers must pass exact authority.
+
+    Acceptance and completion are linearized by the registry lock. If
+    acceptance wins but no delivery boundary remains, ``_run_single_child``
+    drains the exact text into the completion entry as ``missed_steer``.
+    """
+    if not text or not text.strip():
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or not record.get("accepting_steer", False):
+            return False
+        if owner_session_id is not None:
+            if (
+                record.get("owner_session_id") != owner_session_id
+                or owner_transport is None
+                or record.get("owner_transport") is not owner_transport
+                or owner_session_record is None
+                or record.get("owner_session_record") is not owner_session_record
+            ):
+                return False
+        agent = record.get("agent")
+        if agent is None:
+            return False
+        try:
+            return bool(agent.steer(text))
+        except Exception as exc:
+            logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
+            return False
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 

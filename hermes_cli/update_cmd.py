@@ -1656,7 +1656,10 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     if origin_ahead > 0:
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
+        if upstream_ahead > 0:
+            print("  Skipping upstream/main auto-merge to preserve your changes.")
+        else:
+            print("  Skipping upstream sync to preserve your changes.")
         print("  If you want to merge upstream changes, run:")
         print("    git pull upstream main")
         return

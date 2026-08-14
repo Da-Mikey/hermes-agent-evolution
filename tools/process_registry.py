@@ -43,6 +43,46 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+
+def _suggest_process_action(action: str) -> str | None:
+    """Return the closest valid action name by edit distance, or None.
+
+    Issue #890: models frequently invent action names like ``create``,
+    ``start``, ``run``, ``status``, ``stop``, ``check``, ``tail``, or
+    ``restart`` — none of which exist.  A bare "unknown action" error
+    leaves the model to guess.  This suggests the nearest valid action
+    so the model can self-correct in one round-trip.
+    """
+    import difflib
+
+    valid = ["list", "poll", "log", "wait", "kill", "write", "submit", "close"]
+    synonyms = {
+        "create": "list",
+        "start": "list",
+        "run": "list",
+        "status": "poll",
+        "check": "poll",
+        "stop": "kill",
+        "tail": "log",
+        "restart": "poll",
+        "read": "log",
+        "send": "submit",
+        "output": "log",
+        "info": "list",
+        "delete": "kill",
+        "remove": "kill",
+        "end": "kill",
+        "terminate": "kill",
+        "attach": "log",
+        "show": "log",
+    }
+    if action in synonyms:
+        return synonyms[action]
+    matches = difflib.get_close_matches(action, valid, n=1, cutoff=0.4)
+    return matches[0] if matches else None
+
+
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -2954,6 +2994,8 @@ def _handle_process(args, **kw):
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
+    valid_actions = {"list", "poll", "log", "wait", "kill", "write", "submit", "close"}
+
     if action == "list":
         # Surface session-scoped background processes (e.g. a forgotten
         # preview server) in addition to this task's own — they share the
@@ -2972,14 +3014,64 @@ def _handle_process(args, **kw):
             },
             ensure_ascii=False,
         )
-    elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
+    elif action in valid_actions - {"list"}:
         if not session_id:
-            return tool_error(f"session_id is required for {action}")
+            try:
+                from tools.approval import get_current_session_key
+                session_key = get_current_session_key(default="") or ""
+            except Exception:
+                session_key = ""
+            all_procs = process_registry.list_sessions(
+                task_id=task_id, session_key=session_key or None
+            )
+            active_procs = [
+                p for p in all_procs
+                if isinstance(p, dict) and p.get("status") != "exited"
+            ]
+            if len(active_procs) == 1:
+                session_id = active_procs[0].get("session_id", "")
+            elif len(all_procs) == 1:
+                session_id = all_procs[0].get("session_id", "")
+            else:
+                hint = ""
+                if len(active_procs) > 1:
+                    ids = ", ".join(p.get("session_id", "?") for p in active_procs[:5])
+                    hint = f" {len(active_procs)} processes are running. Specify one of: {ids}"
+                elif len(all_procs) > 1:
+                    hint = f" {len(all_procs)} processes exist. Use action='list' to see all."
+                return tool_error(f"session_id is required for {action}.{hint}")
+        if session_id:
+            _existing = process_registry.get(session_id)
+            if _existing is None:
+                try:
+                    from tools.approval import get_current_session_key
+                    _sk = get_current_session_key(default="") or ""
+                except Exception:
+                    _sk = ""
+                _avail = process_registry.list_sessions(
+                    task_id=task_id, session_key=_sk or None
+                )
+                _avail_ids = [
+                    p.get("session_id", "?")
+                    for p in _avail
+                    if isinstance(p, dict) and p.get("session_id")
+                ]
+                if _avail_ids:
+                    return tool_error(
+                        f"No process with ID '{session_id}'. "
+                        f"Available: {', '.join(_avail_ids[:5])}. "
+                        f"Use action='list' to see all processes."
+                    )
+                return tool_error(
+                    f"No process with ID '{session_id}'. "
+                    "No processes are currently registered. "
+                    "Use action='list' to verify."
+                )
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":
             return json.dumps(_redact_process_result(process_registry.read_log(
-                session_id, offset=args.get("offset"), limit=args.get("limit", 200))), ensure_ascii=False)
+                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
         elif action == "wait":
             return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
         elif action == "kill":
@@ -2993,7 +3085,17 @@ def _handle_process(args, **kw):
             return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
         elif action == "close":
             return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
+    else:
+        suggestion = _suggest_process_action(action)
+        valid_list = ", ".join(sorted(valid_actions))
+        if suggestion:
+            return tool_error(
+                f"Unknown process action: {action!r}. Did you mean '{suggestion}'? "
+                f"Valid actions: {valid_list}"
+            )
+        return tool_error(
+            f"Unknown process action: {action!r}. Valid actions: {valid_list}"
+        )
 
 
 registry.register(

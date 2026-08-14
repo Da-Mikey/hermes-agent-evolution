@@ -8,6 +8,8 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 import json
 import logging
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -52,6 +54,109 @@ from cron.jobs import (
     resume_job,
     update_job,
 )
+
+
+_MAX_CONSECUTIVE_CRON_FAILURES = 3
+_CRON_RETRY_WINDOW_SECONDS = 300.0  # failures older than this are forgotten
+_cron_failure_tracker: Dict[str, List[float]] = {}
+_cron_failure_tracker_lock = threading.Lock()
+
+
+def _record_cron_failure(task_id: Optional[str]) -> int:
+    """Record a cron failure for *task_id* and return the current streak."""
+    if not task_id:
+        return 1
+    now = time.monotonic()
+    with _cron_failure_tracker_lock:
+        window = [
+            ts
+            for ts in _cron_failure_tracker.get(task_id, [])
+            if now - ts < _CRON_RETRY_WINDOW_SECONDS
+        ]
+        window.append(now)
+        _cron_failure_tracker[task_id] = window
+        return len(window)
+
+
+def _get_cron_failure_streak(task_id: Optional[str]) -> int:
+    """Return the current failure streak for *task_id* without incrementing."""
+    if not task_id:
+        return 0
+    now = time.monotonic()
+    with _cron_failure_tracker_lock:
+        window = [
+            ts
+            for ts in _cron_failure_tracker.get(task_id, [])
+            if now - ts < _CRON_RETRY_WINDOW_SECONDS
+        ]
+        return len(window)
+
+
+def _reset_cron_failure(task_id: Optional[str]) -> None:
+    """Reset the failure streak for *task_id* after a successful operation."""
+    if not task_id:
+        return
+    with _cron_failure_tracker_lock:
+        _cron_failure_tracker.pop(task_id, None)
+
+
+def _cron_preflight_check() -> Optional[str]:
+    """Probe basic cron availability and return a user-facing error string.
+
+    Returns ``None`` when cron appears usable, otherwise a short diagnostic
+    message explaining what is missing.  The check is best-effort: on systems
+    where ``crontab`` is intentionally absent or where Hermes is using the
+    internal JSON scheduler only, we still verify that the cron directory is
+    writable so job persistence does not fail silently.
+    """
+    from cron.jobs import CRON_DIR, ensure_dirs
+
+    try:
+        ensure_dirs()
+        probe = CRON_DIR / ".preflight_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as exc:
+        return (
+            f"Cron directory is not writable ({CRON_DIR}): {exc}. "
+            "Check permissions for the user running Hermes."
+        )
+
+    crontab = shutil.which("crontab")
+    if crontab is None:
+        logger.warning(
+            "The 'crontab' command is not on PATH — only the internal JSON "
+            "scheduler will be available. Install cronie or vixie-cron if "
+            "system-level crontab integration is needed."
+        )
+        return None
+
+    try:
+        result = subprocess.run(
+            [crontab, "-l"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return f"Cron preflight probe failed: crontab -l could not run: {exc}"
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        if "no crontab" not in stderr.lower() and "no such file" not in stderr.lower():
+            return (
+                f"Cron preflight probe failed: crontab -l exited {result.returncode}."
+                + (f" stderr: {stderr}" if stderr else "")
+            )
+
+    daemon_paths = [Path("/usr/sbin/cron"), Path("/usr/sbin/crond")]
+    if sys.platform != "win32" and not any(p.exists() for p in daemon_paths):
+        logger.debug(
+            "No separate cron daemon binary found; relying on internal scheduler"
+        )
+
+    return None
 
 
 def _notify_provider_jobs_changed_safe() -> None:

@@ -252,98 +252,162 @@ def _write_stderr_log_header(server_name: str) -> None:
 # Graceful import -- MCP SDK is an optional dependency
 # ---------------------------------------------------------------------------
 
-_MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
 _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
 _MCP_ELICITATION_TYPES = False
 _MCP_MESSAGE_HANDLER_SUPPORTED = False
+_MCP_LOGGING_CALLBACK_SUPPORTED = False
+_MCP_NEW_HTTP = False
 # Conservative fallback for SDK builds that don't export LATEST_PROTOCOL_VERSION.
 # Streamable HTTP was introduced by 2025-03-26, so this remains valid for the
 # HTTP transport path even on older-but-supported SDK versions.
 LATEST_PROTOCOL_VERSION = "2025-03-26"
+
+# The heavy SDK import is LAZY (see _ensure_mcp_sdk): importing `mcp` costs
+# ~260ms. Availability is decided here with a metadata-only find_spec probe.
 try:
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-
-    _MCP_AVAILABLE = True
-    try:
-        from mcp.client.streamable_http import streamablehttp_client
-
-        _MCP_HTTP_AVAILABLE = True
-    except ImportError:
-        _MCP_HTTP_AVAILABLE = False
-    # Prefer the non-deprecated API (mcp >= 1.24.0); fall back to the
-    # deprecated wrapper for older SDK versions.
-    try:
-        from mcp.client.streamable_http import streamable_http_client
-
-        _MCP_NEW_HTTP = True
-    except ImportError:
-        _MCP_NEW_HTTP = False
-    try:
-        from mcp.types import LATEST_PROTOCOL_VERSION
-    except ImportError:
-        logger.debug(
-            "mcp.types.LATEST_PROTOCOL_VERSION not available -- using fallback protocol version"
-        )
-    # SSE transport client (for MCP servers using SSE transport instead of Streamable HTTP)
-    try:
-        from mcp.client.sse import sse_client
-    except ImportError:
-        sse_client = None
-        logger.debug(
-            "mcp.client.sse.sse_client not available -- SSE transport disabled"
-        )
-    # Sampling types -- separated so older SDK versions don't break MCP support
-    try:
-        from mcp.types import (
-            CreateMessageResult,
-            CreateMessageResultWithTools,
-            ErrorData,
-            SamplingCapability,
-            SamplingToolsCapability,
-            TextContent,
-            ToolUseContent,
-        )
-
-        _MCP_SAMPLING_TYPES = True
-    except ImportError:
-        logger.debug("MCP sampling types not available -- sampling disabled")
-        CreateMessageResult = None
-        CreateMessageResultWithTools = None
-        ErrorData = None
-        SamplingCapability = None
-        SamplingToolsCapability = None
-        TextContent = None
-        ToolUseContent = None
-    # Elicitation types -- gated separately for the same reason as sampling.
-    # Added in mcp Python SDK 1.11.0 (Jul 2025); servers use elicitation to
-    # ask the client for structured input mid-tool-call (e.g. payment
-    # authorization). Missing types just disable the feature; everything
-    # else keeps working.
-    try:
-        from mcp.types import ElicitRequestParams, ElicitResult
-
-        _MCP_ELICITATION_TYPES = True
-    except ImportError:
-        logger.debug("MCP elicitation types not available -- elicitation disabled")
-    # Notification types for dynamic tool discovery (tools/list_changed)
-    try:
-        from mcp.types import (
-            ServerNotification,
-            ToolListChangedNotification,
-            PromptListChangedNotification,
-            ResourceListChangedNotification,
-        )
-
-        _MCP_NOTIFICATION_TYPES = True
-    except ImportError:
-        logger.debug(
-            "MCP notification types not available -- dynamic tool discovery disabled"
-        )
-except ImportError:
+    import importlib.util as _importlib_util
+    _MCP_AVAILABLE = _importlib_util.find_spec("mcp") is not None
+except Exception:
+    _MCP_AVAILABLE = False
+if not _MCP_AVAILABLE:
     logger.debug("mcp package not installed -- MCP tool support disabled")
+
+ClientSession: Any = None
+StdioServerParameters = None
+stdio_client = None
+streamablehttp_client = None
+streamable_http_client = None
+CreateMessageResult = None
+CreateMessageResultWithTools = None
+ErrorData = None
+SamplingCapability = None
+SamplingToolsCapability = None
+TextContent = None
+ToolUseContent = None
+ElicitRequestParams = None
+ElicitResult = None
+ServerNotification = None
+ToolListChangedNotification = None
+PromptListChangedNotification = None
+ResourceListChangedNotification = None
+sse_client = None
+_MCP_SDK_IMPORT_ATTEMPTED = False
+_MCP_SDK_IMPORT_LOCK = threading.Lock()
+
+_MCP_SDK_LAZY_SYMBOLS = frozenset({
+    "StdioServerParameters", "stdio_client",
+    "streamablehttp_client", "streamable_http_client",
+    "CreateMessageResult", "CreateMessageResultWithTools", "ErrorData",
+    "SamplingCapability", "SamplingToolsCapability", "TextContent",
+    "ToolUseContent", "ElicitRequestParams", "ElicitResult",
+    "ServerNotification", "ToolListChangedNotification",
+    "PromptListChangedNotification", "ResourceListChangedNotification",
+    "sse_client",
+})
+
+
+def __getattr__(name: str):
+    if name in _MCP_SDK_LAZY_SYMBOLS:
+        _ensure_mcp_sdk()
+        try:
+            return globals()[name]
+        except KeyError:
+            pass
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _ensure_mcp_sdk() -> bool:
+    """Import the optional ``mcp`` SDK on first use. Returns availability."""
+    global _MCP_SDK_IMPORT_ATTEMPTED, _MCP_AVAILABLE, _MCP_HTTP_AVAILABLE
+    global _MCP_SAMPLING_TYPES, _MCP_NOTIFICATION_TYPES, _MCP_ELICITATION_TYPES
+    global _MCP_MESSAGE_HANDLER_SUPPORTED, _MCP_LOGGING_CALLBACK_SUPPORTED
+    global _MCP_NEW_HTTP, LATEST_PROTOCOL_VERSION, sse_client
+    global ClientSession, StdioServerParameters, stdio_client
+    global streamablehttp_client, streamable_http_client
+    global CreateMessageResult, CreateMessageResultWithTools, ErrorData
+    global SamplingCapability, SamplingToolsCapability, TextContent, ToolUseContent
+    global ElicitRequestParams, ElicitResult
+    global ServerNotification, ToolListChangedNotification
+    global PromptListChangedNotification, ResourceListChangedNotification
+
+    if not _MCP_AVAILABLE:
+        return False
+    if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+        return _MCP_AVAILABLE
+    with _MCP_SDK_IMPORT_LOCK:
+        if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+            return _MCP_AVAILABLE
+        try:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+            _MCP_AVAILABLE = True
+            try:
+                from mcp.client.streamable_http import streamablehttp_client
+                _MCP_HTTP_AVAILABLE = True
+            except ImportError:
+                _MCP_HTTP_AVAILABLE = False
+            try:
+                from mcp.client.streamable_http import streamable_http_client
+                _MCP_NEW_HTTP = True
+            except ImportError:
+                _MCP_NEW_HTTP = False
+            try:
+                from mcp.types import LATEST_PROTOCOL_VERSION
+            except ImportError:
+                logger.debug("mcp.types.LATEST_PROTOCOL_VERSION not available -- using fallback protocol version")
+            try:
+                from mcp.client.sse import sse_client
+            except ImportError:
+                sse_client = None
+                logger.debug("mcp.client.sse.sse_client not available -- SSE transport disabled")
+            try:
+                from mcp.types import (
+                    CreateMessageResult,
+                    CreateMessageResultWithTools,
+                    ErrorData,
+                    SamplingCapability,
+                    SamplingToolsCapability,
+                    TextContent,
+                    ToolUseContent,
+                )
+                _MCP_SAMPLING_TYPES = True
+            except ImportError:
+                logger.debug("MCP sampling types not available -- sampling disabled")
+            try:
+                from mcp.types import ElicitRequestParams, ElicitResult
+                _MCP_ELICITATION_TYPES = True
+            except ImportError:
+                logger.debug("MCP elicitation types not available -- elicitation disabled")
+            try:
+                from mcp.types import (
+                    ServerNotification,
+                    ToolListChangedNotification,
+                    PromptListChangedNotification,
+                    ResourceListChangedNotification,
+                )
+                _MCP_NOTIFICATION_TYPES = True
+            except ImportError:
+                logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
+        except ImportError:
+            logger.debug("mcp package not installed -- MCP tool support disabled")
+            _MCP_AVAILABLE = False
+
+        if _MCP_AVAILABLE:
+            try:
+                from mcp.types import METHOD_NOT_FOUND as _mnf
+                global _JSONRPC_METHOD_NOT_FOUND
+                _JSONRPC_METHOD_NOT_FOUND = _mnf
+            except Exception:
+                pass
+
+        _MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
+        if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
+            logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
+        _MCP_LOGGING_CALLBACK_SUPPORTED = _check_logging_callback_support()
+        _MCP_SDK_IMPORT_ATTEMPTED = True
+        return _MCP_AVAILABLE
 
 
 def _check_message_handler_support() -> bool:
@@ -358,13 +422,6 @@ def _check_message_handler_support() -> bool:
         return "message_handler" in inspect.signature(ClientSession).parameters
     except (TypeError, ValueError):
         return False
-
-
-_MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
-if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
-    logger.debug(
-        "MCP SDK does not support message_handler -- dynamic tool discovery disabled"
-    )
 
 
 def _check_logging_callback_support() -> bool:
@@ -382,8 +439,6 @@ def _check_logging_callback_support() -> bool:
     except (TypeError, ValueError):
         return False
 
-
-_MCP_LOGGING_CALLBACK_SUPPORTED = _check_logging_callback_support()
 
 # MCP logging levels (RFC 5424 syslog severities) -> Python logging levels.
 # Port of anomalyco/opencode#34529's serverLog mapping.
@@ -608,12 +663,9 @@ def _exc_str(exc: BaseException) -> str:
 
 # JSON-RPC "method not found" — the error a server returns when it does not
 # implement a requested method (e.g. a tool-capable server that never wired up
-# the optional ``ping`` utility). Defined locally with a fallback so detection
-# works even on SDK builds that don't export the constant.
-try:
-    from mcp.types import METHOD_NOT_FOUND as _JSONRPC_METHOD_NOT_FOUND
-except Exception:  # pragma: no cover — older/newer SDK without the constant
-    _JSONRPC_METHOD_NOT_FOUND = -32601
+# the optional ``ping`` utility). Default here so import stays lazy; _ensure_mcp_sdk
+# overwrites this with the SDK constant when the package is first imported.
+_JSONRPC_METHOD_NOT_FOUND = -32601
 
 
 def _is_method_not_found_error(exc: BaseException) -> bool:
@@ -2907,6 +2959,7 @@ class MCPServerTask:
                 "it is not installed. Run `hermes setup` to install MCP support, "
                 "then retry."
             )
+        _ensure_mcp_sdk()
 
         command = config.get("command")
         args = config.get("args", [])
@@ -7292,6 +7345,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
+    _ensure_mcp_sdk()
 
     servers = _filter_suspicious_mcp_servers(servers)
     if not servers:
@@ -7513,6 +7567,7 @@ def discover_mcp_tools() -> List[str]:
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
+    _ensure_mcp_sdk()
 
     servers = _load_mcp_config()
     if not servers:
@@ -7701,6 +7756,7 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
     """
     if not _MCP_AVAILABLE:
         return {}
+    _ensure_mcp_sdk()
 
     servers_config = _load_mcp_config()
     if not servers_config:
