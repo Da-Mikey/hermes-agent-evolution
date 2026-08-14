@@ -113,6 +113,46 @@ class TestComputeRealized:
         assert h["realized_impact_rate"] == 1.0
         assert h["flags"] == []
 
+    def test_fresh_merges_do_not_evict_older_verdicts_from_window(self):
+        # A dense burst of too-new-to-verify merges must NOT push older,
+        # verdicted merges out of the sample. Without maturity filtering,
+        # a `records[-last:]` slice fills with unknowns and the verdicted
+        # subset rotates toward whatever the freshest batch stamped — a
+        # lag artifact that observed on real data drove rate 55%→20% in
+        # five merges' time.
+        today = "2026-06-30"
+        old_verdicted = [
+            _merge(i, "2026-06-10") | _verdict(i, "confirmed") for i in range(1, 6)
+        ]
+        fresh_unknown = [_merge(i, "2026-06-29") for i in range(100, 130)]
+        recs = old_verdicted + fresh_unknown
+        h = compute_realized(recs, today=today, last=30, maturity_days=5)
+        assert h["verified"] == 5
+        assert h["confirmed"] == 5
+        assert h["realized_impact_rate"] == 1.0
+        assert h["matured_unverified"] == 0
+
+    def test_only_mature_merges_counted_as_matured_unverified(self):
+        # Fresh unverified merges must not inflate matured_unverified —
+        # only merges past maturity with no verdict should count.
+        recs = [_merge(i, "2026-06-29") for i in range(1, 5)]  # 1 day old
+        recs += [_merge(i, "2026-06-01") for i in range(10, 13)]  # 29 days old
+        h = compute_realized(recs, today="2026-06-30", maturity_days=5)
+        assert h["merged_tracked"] == 3  # only mature merges enter window
+        assert h["matured_unverified"] == 3
+
+    def test_missing_or_corrupt_merged_at_excluded_from_mature_window(self):
+        # Records with missing or corrupt merged_at must not be treated as mature,
+        # avoiding false UNVERIFIED_BACKLOG flags.
+        recs = [
+            {"issue": 1, "predicted_impact": 1.0},
+            {"issue": 2, "merged_at": "bad-date"},
+        ]
+        h = compute_realized(recs, today="2026-06-30", maturity_days=5)
+        assert h["merged_tracked"] == 0
+        assert h["matured_unverified"] == 0
+        assert h["flags"] == []
+
 
 class TestFormat:
     def test_format_includes_rate_and_tail(self):

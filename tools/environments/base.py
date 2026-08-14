@@ -52,6 +52,16 @@ _activity_callback_local = threading.local()
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 
+class EnvironmentConnectionError(RuntimeError):
+    """Infrastructure/connection-class failure of a terminal backend.
+
+    Raised when the backend itself is unreachable (SSH host down, Docker
+    daemon not running, remote file sync failing on a dead link) — never
+    for a command that merely exited nonzero.  Subclassing RuntimeError
+    lets generic callers catch it alongside subprocess/OS failures.
+    """
+
+
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text.
 
