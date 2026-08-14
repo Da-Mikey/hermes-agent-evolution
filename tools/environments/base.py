@@ -847,6 +847,13 @@ class BaseEnvironment(ABC):
             )
             parts.append(f"unset {present} {value}")
 
+        # Harness attribution for local and remote backends. Never clobber
+        # an outer harness value that arrived via the inherited process env.
+        parts.append(
+            'export AI_AGENT="${AI_AGENT:-hermes-agent}" '
+            'HERMES_AGENT="${HERMES_AGENT:-true}"'
+        )
+
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)

@@ -1684,10 +1684,12 @@ def _run_post_setup(post_setup_key: str):
     from hermes_constants import find_node_executable
 
     if post_setup_key in {"agent_browser", "browserbase"}:
-        # Every non-Camofox browser backend drives through the Browser Use
-        # CLI when it's runnable — install it here too, not only on the
-        # explicit "Browser Use" picker row.
-        _ensure_browser_use_cli()
+        # Cloud Browser Use / Browserbase rows install the CLI here.
+        # The local agent_browser Chromium path must not run this first:
+        # its tests (and the Chromium-only post-setup) assert a single
+        # npx/agent-browser subprocess.run, not a uv bootstrap.
+        if post_setup_key != "agent_browser":
+            _ensure_browser_use_cli()
         # agent-browser is no longer a root package.json dependency (#43564)
         # — it resolves lazily via npx (or a global/Hermes-managed install)
         # instead of a local `npm install`, so there's no node_modules/
@@ -1713,6 +1715,13 @@ def _run_post_setup(post_setup_key: str):
         # / npx only through the extended fallback path, which a bare
         # shutil.which("npx") lookup misses.
         try:
+            # Post-setup must re-resolve: a prior tool call in this process
+            # can leave _find_agent_browser's cache pointing at a path that
+            # is no longer on PATH (tests and `hermes tools` both hit this).
+            import tools.browser_tool as _bt
+
+            _bt._cached_agent_browser = None
+            _bt._agent_browser_resolved = False
             browser_cmd = _find_agent_browser(validate=False)
         except FileNotFoundError:
             _print_warning(

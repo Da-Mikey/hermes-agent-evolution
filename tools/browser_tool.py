@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import shutil
 import sys
@@ -69,6 +70,7 @@ from hermes_constants import (
     agent_browser_runnable,
     get_hermes_home,
     get_hermes_home_override,
+    node_tool_runnable,
 )
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -2319,6 +2321,113 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
 
 
+NPX_AGENT_BROWSER_SENTINEL = "npx agent-browser"
+
+# Pinned to match scripts/install.sh / scripts/install.ps1 so a git-clone
+# install resolving agent-browser via bare npx gets the same version as a
+# managed install. Update both together.
+AGENT_BROWSER_NPX_SPEC = "agent-browser@^0.26.0"
+
+
+def _is_npx_agent_browser_sentinel(browser_cmd: str) -> bool:
+    return browser_cmd.strip() == NPX_AGENT_BROWSER_SENTINEL
+
+
+def _resolve_npx_bin() -> Optional[str]:
+    """Resolve a runnable npx binary, preferring the Hermes-managed/Homebrew
+    extended search over a bare ambient PATH lookup.
+    """
+    extended_path = _merge_browser_path("")
+    if extended_path:
+        extended_npx = shutil.which("npx", path=extended_path)
+        if extended_npx and node_tool_runnable(extended_npx):
+            return extended_npx
+    npx_path = shutil.which("npx")
+    if npx_path and node_tool_runnable(npx_path):
+        return npx_path
+    return None
+
+
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Best-effort kill of *proc* and any descendants it spawned."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        return
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    for sig in (signal.SIGTERM, sigkill):
+        try:
+            killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+
+def warm_agent_browser_npx_cache(timeout: float = 60.0) -> bool:
+    """Best-effort pre-fetch of the agent-browser npm package via npx."""
+    npx_bin = _resolve_npx_bin()
+    if not npx_bin:
+        return False
+
+    env = _build_browser_env()
+    env["PATH"] = _merge_browser_path(env.get("PATH", ""))
+
+    popen_kwargs: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+        "creationflags": windows_hide_flags(),
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    cmd = [
+        npx_bin,
+        "--ignore-scripts",
+        "--prefer-offline",
+        "-y",
+        AGENT_BROWSER_NPX_SPEC,
+        "--version",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, **popen_kwargs)
+    except Exception:
+        return False
+    try:
+        proc.communicate(timeout=timeout)
+        return proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return False
+    except Exception:
+        _kill_process_tree(proc)
+        return False
+
+
 def _agent_browser_candidate_present(path: str | None) -> bool:
     if not path:
         return False
@@ -2398,10 +2507,8 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             _agent_browser_resolved = True
             return _cached_agent_browser
 
-    # Check common npx locations (also search the extended fallback PATH)
-    npx_path = shutil.which("npx")
-    if not npx_path and extended_path:
-        npx_path = shutil.which("npx", path=extended_path)
+    # Check common npx locations (prefer Hermes-managed npx).
+    npx_path = _resolve_npx_bin()
     if npx_path:
         if not validate:
             return "npx agent-browser"
