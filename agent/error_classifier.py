@@ -123,6 +123,8 @@ _BILLING_PATTERNS = [
     "balance_depleted",
     "model_not_supported_on_free_tier",
     "not available on the free tier",
+    "requires a paid subscription",
+    "paid subscription",
 ]
 
 # xAI's explicit Grok credit-exhaustion code. Keep the HTTP 403 special case

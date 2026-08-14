@@ -185,6 +185,12 @@ try:
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
 
+# Browser Use CLI (optional)
+try:
+    from tools.browser_use_cli import is_browser_use_cli_mode as _is_browser_use_cli_mode
+except ImportError:
+    _is_browser_use_cli_mode = lambda: False  # noqa: E731
+
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
@@ -5079,6 +5085,12 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
+    # Browser Use CLI backend — browser_exec replaces the whole browser_*
+    # surface (including browser_cdp/browser_dialog, whose check_fns funnel
+    # through here), so hide these tools from the model.
+    if _is_browser_use_cli_mode():
+        return False
+
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():
         return True

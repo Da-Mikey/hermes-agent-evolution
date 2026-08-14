@@ -62,16 +62,10 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     goals, so these checks must never run on it.
     """
     if len(task_list) < 2:
-        # A 1-item tasks=[] list is normally a misuse of the batch form,
-        # but a teammate spawn (task.team) has to travel as a task object
-        # so the child can inherit team identity.
-        if any(isinstance(t, dict) and t.get("team") for t in task_list):
-            return None
-        return (
-            "Batch mode requires at least 2 tasks. For a single task, use "
-            "the `goal` parameter instead of `tasks`: "
-            'delegate_task(goal="...", context="...").'
-        )
+        # Allow 1-item tasks=[] so callers that already built a task object
+        # (team spawn, or a single child with per-task fields) still run.
+        # Empty lists are neutralized before this helper is called.
+        return None
 
     for i, task in enumerate(task_list):
         goal = str(task.get("goal", "")).strip()
@@ -90,13 +84,6 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
                 f"({marker.group(0)!r}). Substitute the real value before "
                 "calling delegate_task — subagents cannot resolve "
                 "placeholders."
-            )
-        if len(goal) < _MIN_BATCH_GOAL_LEN:
-            return (
-                f"Task {i} goal is too short ({goal!r}). Write a specific, "
-                "self-contained goal of at least "
-                f"{_MIN_BATCH_GOAL_LEN} characters so the subagent knows "
-                "exactly what to do."
             )
     return None
 
@@ -322,13 +309,40 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     sid = record.get("subagent_id")
     if not sid:
         return
+    record.setdefault("accepting_steer", True)
     with _active_subagents_lock:
         _active_subagents[sid] = record
 
 
-def _unregister_subagent(subagent_id: str) -> None:
+def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
     with _active_subagents_lock:
-        _active_subagents.pop(subagent_id, None)
+        record = _active_subagents.get(subagent_id)
+        if record is not None and (agent is None or record.get("agent") is agent):
+            _active_subagents.pop(subagent_id, None)
+
+
+def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
+    """Atomically close steer acceptance and drain its final durable artifact.
+
+    ``steer_subagent`` holds the same registry lock through ``agent.steer``.
+    Therefore either acceptance wins and this drain sees its exact text, or
+    closure wins and the caller is rejected. Exact agent identity prevents a
+    finishing child with a recycled public id from closing its replacement.
+    """
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None or record.get("agent") is not agent:
+            return None
+        record["accepting_steer"] = False
+        drain = getattr(agent, "_drain_pending_steer", None)
+        if not callable(drain):
+            return None
+        try:
+            pending = drain()
+        except Exception as exc:
+            logger.debug("final steer drain for %s failed: %s", subagent_id, exc)
+            return None
+        return pending if isinstance(pending, str) and pending.strip() else None
 
 
 def interrupt_subagent(subagent_id: str) -> bool:
@@ -417,6 +431,24 @@ def steer_subagent(
             return False
 
 
+def _capture_gateway_steer_authority(
+    owner_session_id: Optional[str],
+) -> tuple[Any, Any]:
+    """Capture exact request transport + live session generation, if any.
+
+    This is intentionally an in-process bridge, not a serializable capability.
+    Non-gateway hosts (including the CLI helper path) receive ``(None, None)``.
+    """
+    if not owner_session_id:
+        return None, None
+    try:
+        from tui_gateway.server import _current_session_steer_authority
+
+        return _current_session_steer_authority(owner_session_id)
+    except Exception:
+        return None, None
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -425,7 +457,18 @@ def list_active_subagents() -> List[Dict[str, Any]]:
     """
     with _active_subagents_lock:
         return [
-            {k: v for k, v in r.items() if k != "agent"}
+            {
+                k: v
+                for k, v in r.items()
+                if k
+                not in {
+                    "agent",
+                    "owner_session_id",
+                    "owner_transport",
+                    "owner_session_record",
+                    "accepting_steer",
+                }
+            }
             for r in _active_subagents.values()
         ]
 
@@ -2689,6 +2732,10 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2827,6 +2874,19 @@ def _run_single_child(
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
     if _subagent_id:
+        if owner_session_id is None:
+            try:
+                from gateway.session_context import get_session_env
+
+                owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
+            except Exception:
+                owner_session_id = None
+        if owner_session_id and (
+            owner_transport is None or owner_session_record is None
+        ):
+            owner_transport, owner_session_record = (
+                _capture_gateway_steer_authority(owner_session_id)
+            )
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
@@ -2844,6 +2904,9 @@ def _run_single_child(
             "status": "running",
             "tool_count": 0,
             "agent": child,
+            "owner_session_id": owner_session_id,
+            "owner_transport": owner_transport,
+            "owner_session_record": owner_session_record,
         })
 
     try:
@@ -2925,6 +2988,17 @@ def _run_single_child(
         )
         try:
             result = _child_future.result(timeout=child_timeout)
+            _late_pending_steer = (
+                _close_subagent_steering(_subagent_id, child) if _subagent_id else None
+            )
+            if _late_pending_steer:
+                _existing_pending = result.get("pending_steer") if isinstance(result, dict) else None
+                if isinstance(result, dict):
+                    result["pending_steer"] = (
+                        f"{_existing_pending}\n{_late_pending_steer}"
+                        if isinstance(_existing_pending, str) and _existing_pending
+                        else _late_pending_steer
+                    )
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2974,6 +3048,10 @@ def _run_single_child(
                         task_index,
                         diagnostic_path,
                     )
+
+            _late_pending_steer = (
+                _close_subagent_steering(_subagent_id, child) if _subagent_id else None
+            )
 
             if child_progress_cb:
                 try:
@@ -3032,6 +3110,11 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                **(
+                    {"missed_steer": _late_pending_steer}
+                    if _late_pending_steer
+                    else {}
+                ),
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -3160,7 +3243,9 @@ def _run_single_child(
             status == "completed"
             and not tool_trace
             and not _child_is_orchestrator
-            and not getattr(child, "_delegate_output_schema", None)
+            and not isinstance(
+                getattr(child, "_delegate_output_schema", None), dict
+            )
             and not _summary_is_json
         ):
             retry_budget = _get_shallow_retry_budget()
@@ -3273,7 +3358,18 @@ def _run_single_child(
         if shallow_retries:
             entry["shallow_retries"] = shallow_retries
 
+        _missed_steer = result.get("pending_steer")
+        if isinstance(_missed_steer, str) and _missed_steer.strip():
+            entry["missed_steer"] = _missed_steer
+            _miss_note = (
+                "[steer did not land — the subagent finished before it could "
+                f"be delivered: {_missed_steer}]"
+            )
+            entry["summary"] = f"{summary}\n\n{_miss_note}" if summary else _miss_note
+
         _output_schema = getattr(child, "_delegate_output_schema", None)
+        if not isinstance(_output_schema, dict):
+            _output_schema = None
         if _output_schema:
             from tools.delegation_output_schema import (
                 MAX_SCHEMA_RETRIES,
@@ -3338,7 +3434,9 @@ def _run_single_child(
         if (
             status == "completed"
             and not tool_trace
-            and not getattr(child, "_delegate_output_schema", None)
+            and not isinstance(
+                getattr(child, "_delegate_output_schema", None), dict
+            )
         ):
             entry["shallow_result"] = True
             _retry_note = (
@@ -3355,6 +3453,12 @@ def _run_single_child(
                 "either re-delegate with explicit tool instructions or do "
                 "the work inline." + _retry_note + "\n\n" + summary
             )
+            if entry.get("missed_steer"):
+                _miss_note = (
+                    "[steer did not land — the subagent finished before it could "
+                    f"be delivered: {entry['missed_steer']}]"
+                )
+                entry["summary"] = f"{entry['summary']}\n\n{_miss_note}"
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -3487,7 +3591,7 @@ def _run_single_child(
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
-            _unregister_subagent(_subagent_id)
+            _unregister_subagent(_subagent_id, agent=child)
 
         if child_pool is not None and leased_cred_id is not None:
             try:
@@ -4096,6 +4200,15 @@ def delegate_task(
     from tools.async_delegation import _current_origin_session_id
 
     _origin_wake_sid = _current_origin_session_id()
+    try:
+        from gateway.session_context import get_session_env
+
+        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+    except Exception:
+        _origin_ui_session_id = ""
+    _origin_owner_transport, _origin_owner_session_record = (
+        _capture_gateway_steer_authority(_origin_ui_session_id)
+    )
 
     # Save parent tool names BEFORE any child construction mutates the global.
     # Constructing a child calls AIAgent(), which calls get_tool_definitions()
@@ -4264,7 +4377,12 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child(
+                _i, _t["goal"], child, parent_agent,
+                owner_session_id=_origin_ui_session_id or None,
+                owner_transport=_origin_owner_transport,
+                owner_session_record=_origin_owner_session_record,
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -4282,6 +4400,9 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        owner_session_id=_origin_ui_session_id or None,
+                        owner_transport=_origin_owner_transport,
+                        owner_session_record=_origin_owner_session_record,
                     )
                     futures[future] = i
 

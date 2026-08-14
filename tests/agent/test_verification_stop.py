@@ -156,15 +156,16 @@ def test_verify_on_stop_default_path_through_load_config(tmp_path, clear_verify_
     from hermes_cli.config import load_config
 
     merged = load_config()
-    assert merged["agent"]["verify_on_stop"] == "auto"
+    # Fork contract (v31): default is explicit False, not the upstream
+    # surface-aware "auto" sentinel. An env override still wins.
+    assert merged["agent"]["verify_on_stop"] is False
 
-    # Interactive surface resolves ON through the real loader.
     clear_verify_env.setenv("HERMES_SESSION_SOURCE", "cli")
-    assert verify_on_stop_enabled() is True
-
-    # A messaging platform resolves OFF.
-    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "telegram")
     assert verify_on_stop_enabled() is False
+
+    # Env still forces the behavior on even when config default is off.
+    clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "1")
+    assert verify_on_stop_enabled() is True
 
 
 def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):

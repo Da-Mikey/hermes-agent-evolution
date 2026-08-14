@@ -419,6 +419,8 @@ class TestSubagentSteerRPC:
             _unregister_subagent("sid-rpc-2")
 
     def test_run_single_child_binds_exact_runtime_owner_artifacts(self):
+        from unittest.mock import patch
+
         from gateway.session_context import clear_session_vars, set_session_vars
         from tools.delegate_tool import _run_single_child
 
@@ -465,14 +467,15 @@ class TestSubagentSteerRPC:
             ui_session_id="ui-owner",
         )
         try:
-            _run_single_child(
-                0,
-                "owner binding",
-                child=child,
-                parent_agent=MagicMock(),
-                owner_transport=owner_transport,
-                owner_session_record=owner_session_record,
-            )
+            with patch("tools.delegate_tool._get_shallow_retry_budget", return_value=0):
+                _run_single_child(
+                    0,
+                    "owner binding",
+                    child=child,
+                    parent_agent=MagicMock(),
+                    owner_transport=owner_transport,
+                    owner_session_record=owner_session_record,
+                )
         finally:
             clear_session_vars(tokens)
 
