@@ -118,15 +118,22 @@ class TestResolveChildPython(unittest.TestCase):
         sys.executable for the process lifetime.
         """
         import tools.code_execution_tool as cet
+
         cet._usable_python_cache.clear()
         try:
-            cet._usable_python_cache["/flaky/python"] = True
-            self.assertTrue(cet._is_usable_python("/flaky/python"))
-            cet._usable_python_cache.clear()
-            # Failures must not be written into the cache.
-            with patch.object(cet, "_probe_python", return_value=None):
-                self.assertFalse(cet._is_usable_python("/no-such-python"))
-            self.assertNotIn("/no-such-python", cet._usable_python_cache)
+            with patch.object(cet, "_probe_python", return_value=None) as mock_probe:
+                self.assertFalse(cet._is_usable_python("/flaky/python"))
+            self.assertEqual(mock_probe.call_count, 1)
+            self.assertNotIn("/flaky/python", cet._usable_python_cache)
+            with patch.object(
+                cet,
+                "_probe_python",
+                return_value=unittest.mock.MagicMock(returncode=0),
+            ) as mock_probe:
+                self.assertTrue(cet._is_usable_python("/flaky/python"))
+            self.assertEqual(
+                mock_probe.call_count, 1, "probe must be retried after a failure"
+            )
         finally:
             cet._usable_python_cache.clear()
 

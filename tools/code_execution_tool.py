@@ -2139,33 +2139,6 @@ def _get_execution_mode() -> str:
     return DEFAULT_EXECUTION_MODE
 
 
-@functools.lru_cache(maxsize=32)
-def _is_usable_python(python_path: str) -> bool:
-    """Check whether a candidate Python interpreter is usable for execute_code.
-
-    Requires Python 3.8+ (f-strings and stdlib modules the RPC stubs need).
-    Cached so we don't fork a subprocess on every execute_code call.
-    """
-    try:
-        from agent.delegation_context import delegated_child_subprocess_env
-
-        result = subprocess.run(
-            [
-                python_path,
-                "-c",
-                "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)",
-            ],
-            timeout=5,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-            stdin=subprocess.DEVNULL,
-            env=delegated_child_subprocess_env(),
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
-        return False
-
-
 def _resolve_child_python(mode: str) -> str:
     """Pick the Python interpreter for the execute_code subprocess.
 
