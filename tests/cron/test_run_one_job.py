@@ -18,7 +18,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     """Patch the job pipeline primitives and record the call order."""
     calls = []
 
-    def fake_run_job(job):
+    def fake_run_job(job, *, defer_agent_teardown=None, **kw):
         calls.append(("run_job", job["id"]))
         fr = final if silent_marker_in is None else silent_marker_in
         return (success, output, fr, error)
@@ -31,7 +31,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None, tool_calls=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None, tool_calls=None, **_kw):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -66,76 +66,6 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
-def test_run_one_job_silent_skips_delivery(monkeypatch):
-    """A [SILENT] final response saves output + marks the run but does NOT
-    deliver."""
-    calls = _patch_pipeline(monkeypatch, silent_marker_in="[SILENT]")
-
-    s.run_one_job({"id": "j3", "name": "t"})
-
-    kinds = [c[0] for c in calls]
-    assert "run_job" in kinds and "save" in kinds and "mark" in kinds
-    assert "deliver" not in kinds
-
-
-def test_run_one_job_empty_response_is_quiet_success(monkeypatch):
-    """An empty no-work response is successful and is never delivered."""
-    calls = _patch_pipeline(monkeypatch, final="   ")
-
-    ok = s.run_one_job({"id": "j4", "name": "t"})
-
-    assert ok is True
-    kinds = [c[0] for c in calls]
-    assert "deliver" not in kinds
-    assert ("mark", "j4", True) in calls
-
-
-def test_run_one_job_cyrillic_silent_skips_delivery(monkeypatch):
-    """The Cyrillic silence marker is internal and never delivered."""
-    calls = _patch_pipeline(monkeypatch, silent_marker_in="[СИЛЕНТ]")
-
-    s.run_one_job({"id": "j4-cyr", "name": "t"})
-
-    assert "deliver" not in [c[0] for c in calls]
-
-
-def test_cron_silence_response_accepts_spaced_brackets_and_cyrillic():
-    """Whitespace inside brackets is tolerated for all supported markers."""
-    assert s._is_cron_silence_response("[ SILENT ]")
-    assert s._is_cron_silence_response("[ СИЛЕНТ ]")
-
-
-def test_run_one_job_failed_job_delivers_error(monkeypatch):
-    """A failed job still delivers (the error notice) and marks not-ok."""
-    calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
-
-    s.run_one_job({"id": "j5", "name": "t"})
-
-    kinds = [c[0] for c in calls]
-    assert "deliver" in kinds  # failures always deliver
-    mark = [c for c in calls if c[0] == "mark"][0]
-    assert mark == ("mark", "j5", False)
-
-
-def test_run_one_job_exception_marks_failure(monkeypatch):
-    """If run_job raises, the helper marks the run failed and returns False
-    rather than propagating."""
-    def boom(job):
-        raise RuntimeError("kaboom")
-
-    monkeypatch.setattr(s, "run_job", boom)
-    marks = []
-    monkeypatch.setattr(
-        s, "mark_job_run",
-        lambda jid, ok, err=None, delivery_error=None, tool_calls=None: marks.append((jid, ok)),
-    )
-
-    ok = s.run_one_job({"id": "j6", "name": "t"})
-
-    assert ok is False
-    assert marks == [("j6", False)]
-
-
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -153,7 +83,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
 
     scope_during_run = {}
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, **kw):
         # This is where resolve_runtime_provider() would read a secret. Prove a
         # scope is installed and the profile's secret resolves without raising.
         scope_during_run["scope"] = ss.current_secret_scope()

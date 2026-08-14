@@ -488,6 +488,68 @@ def cron_command(args):
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")
 
+    if subcmd == "notepad":
+        return cron_notepad(args)
+
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick|notepad]")
     sys.exit(1)
+
+
+def cron_notepad(args) -> int:
+    """Manage persistent key-value notepad entries for a cron job."""
+    from cron import notepad
+
+    job_id = getattr(args, "job_id", None)
+    if not job_id:
+        print("Error: job_id is required")
+        return 1
+
+    action = getattr(args, "notepad_action", "list") or "list"
+
+    if action == "list":
+        notes = notepad.list_notes(job_id)
+        if not notes:
+            print(f"No notepad entries for job {job_id}")
+            return 0
+        for item in notes:
+            print(f"{item['key']}: {item['value']}")
+        return 0
+
+    if action == "get":
+        key = getattr(args, "key", None)
+        if not key:
+            print("Error: key is required for get")
+            return 1
+        val = notepad.get_note(job_id, key)
+        if val is None:
+            print(f"Key not found: {key}")
+            return 1
+        print(val)
+        return 0
+
+    if action == "set":
+        key = getattr(args, "key", None)
+        val = getattr(args, "value", None)
+        if key is None or val is None:
+            print("Error: key and value are required for set")
+            return 1
+        try:
+            notepad.set_note(job_id, key, val)
+            print(f"Set {key} for job {job_id}")
+            return 0
+        except Exception as e:
+            print(f"Error: {e}")
+            return 1
+
+    if action in {"delete", "del", "rm"}:
+        key = getattr(args, "key", None)
+        if not key:
+            print("Error: key is required for delete")
+            return 1
+        notepad.delete_note(job_id, key)
+        print(f"Deleted {key} for job {job_id}")
+        return 0
+
+    print(f"Unknown notepad action: {action}")
+    return 1

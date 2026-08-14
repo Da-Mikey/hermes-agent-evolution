@@ -66,7 +66,8 @@ class TestCronPoolShutdownGuard:
             },
         )
         aiaagent_patch = patch("run_agent.AIAgent", return_value=MagicMock())
-        return [tpe_patch, cfg_patch, runtime_patch, aiaagent_patch]
+        mcp_patch = patch("tools.mcp_tool.discover_mcp_tools", return_value=[])
+        return [tpe_patch, cfg_patch, runtime_patch, aiaagent_patch, mcp_patch]
 
     def test_shutdown_runtimeerror_returns_clean_failure(self):
         """When _cron_pool.submit() raises the interpreter-shutdown
