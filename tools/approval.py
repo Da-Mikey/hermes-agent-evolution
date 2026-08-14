@@ -3158,7 +3158,21 @@ def _get_approval_timeout() -> int:
 
 
 def _get_cron_approval_mode() -> str:
-    """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
+    """Read the cron approval mode. Returns 'deny' or 'approve'.
+
+    Resolution order (fork delta #611):
+      1. Per-job ``HERMES_CRON_APPROVAL_MODE`` contextvar/env override.
+      2. Global ``approvals.cron_mode`` config.
+    """
+    from gateway.session_context import get_session_env
+
+    override = get_session_env("HERMES_CRON_APPROVAL_MODE", "").strip().lower()
+    if override in {"approve", "off", "allow", "yes"}:
+        return "approve"
+    # Anything else explicit (including "deny") is a hard deny; empty/"auto"/
+    # "default" falls through to the global config.
+    if override and override not in {"auto", "default"}:
+        return "deny"
     try:
         from hermes_cli.config import load_config_readonly
         config = load_config_readonly()
