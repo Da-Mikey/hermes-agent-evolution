@@ -1115,6 +1115,7 @@ def image_generate_tool(
     seed: Optional[int] = None,
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
+    upscale: Optional[bool] = None,
 ) -> str:
     """Generate an image from a text prompt, or edit a source image, via FAL.
 
@@ -1248,7 +1249,10 @@ def image_generate_tool(
 
         # Edit endpoints already return the final composition; the Clarity
         # upscaler is a text-to-image quality pass, so skip it for edits.
-        should_upscale = bool(meta.get("upscale", False)) and not use_edit
+        if upscale is None:
+            should_upscale = bool(meta.get("upscale", False)) and not use_edit
+        else:
+            should_upscale = bool(upscale) and not use_edit
 
         formatted_images = []
         for img in images:
@@ -1284,6 +1288,7 @@ def image_generate_tool(
             "success": True,
             "image": formatted_images[0]["url"] if formatted_images else None,
             "modality": modality,
+            "upscaled": bool(formatted_images and formatted_images[0].get("upscaled")),
         }
 
         debug_call_data["success"] = True
@@ -1495,6 +1500,13 @@ IMAGE_GENERATE_SCHEMA = {
                     "capped per-model; the description above indicates the max."
                 ),
             },
+            "upscale": {
+                "type": "boolean",
+                "description": (
+                    "Optional override for the per-model Clarity upscale pass. "
+                    "When omitted, the catalog default is used."
+                ),
+            },
         },
         "required": ["prompt"],
     },
@@ -1608,6 +1620,8 @@ def _dispatch_to_plugin_provider(
     try:
         if configured_model:
             kwargs["model"] = configured_model
+        if upscale is not None:
+            kwargs["upscale"] = upscale
         if isinstance(image_url, str) and image_url.strip():
             kwargs["image_url"] = image_url.strip()
         norm_refs = None
