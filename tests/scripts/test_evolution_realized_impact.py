@@ -153,6 +153,10 @@ class TestComputeRealized:
         assert h["matured_unverified"] == 0
         assert h["flags"] == []
 
+        # When maturity_days is 0, None/corrupt dates still do not count as mature
+        h0 = compute_realized(recs, today="2026-06-30", maturity_days=0)
+        assert h0["merged_tracked"] == 0
+
 
 class TestFormat:
     def test_format_includes_rate_and_tail(self):
