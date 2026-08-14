@@ -1471,6 +1471,14 @@ def handle_function_call(
             _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
             if _probe_err is not None:
                 return _return_bridge_result(_probe_err)
+            from tools.registry import registry as _schema_registry
+            _ok, _type_err = _ts_mod.validate_tool_args(
+                underlying_name,
+                underlying_args,
+                _schema_registry.get_schema(underlying_name),
+            )
+            if not _ok:
+                return _return_bridge_result(tool_error(_type_err))
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
             return handle_function_call(

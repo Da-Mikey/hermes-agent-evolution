@@ -27,6 +27,8 @@ Usage:
 
 import os
 import re
+import base64
+import binascii
 import difflib
 import hashlib
 from abc import ABC, abstractmethod
@@ -1249,6 +1251,78 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == "yes"
         return self._command_cache[cmd]
 
+    def _sample_file_bytes(self, path: str, length: int = 1000):
+        """Fetch the first ``length`` raw bytes of a file through the terminal.
+
+        File operations run through a terminal backend (possibly remote), so
+        raw bytes cannot cross the transport directly — the terminal decodes
+        stdout with ``errors="replace"`` and manufactures U+FFFD at every
+        byte it cannot decode, including a multibyte character cut in half by
+        ``head -c``. Wrapping the sample in base64 lets the original bytes
+        survive the transport, so binary detection can happen at the byte
+        layer where it is well-defined (#80308 and friends).
+
+        Returns the sample bytes, or ``None`` when the transport could not
+        produce clean base64 (exotic shells without ``base64``); callers fall
+        back to the legacy text-sample heuristic in that case.
+        """
+        result = self._exec(
+            f"head -c {length} {self._escape_shell_arg(path)} 2>/dev/null | base64"
+        )
+        if result.exit_code != 0:
+            return None
+        encoded = _strip_terminal_fence_leaks(result.stdout)
+        encoded = "".join(encoded.split())
+        if not encoded:
+            return b""
+        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+            return None
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+
+    @staticmethod
+    def _is_likely_binary_bytes(sample: bytes) -> bool:
+        """Byte-layer binary detection (the boundary for the #80308 class).
+
+        Contract: a file is text when its sample is valid UTF-8, allowing one
+        incomplete multibyte sequence at the very end (an artifact of cutting
+        the sample at a byte boundary, not a property of the file). Anything
+        else — NUL bytes, mid-stream invalid UTF-8 such as latin-1 or true
+        binaries — stays read-only, preserving the anti-mojibake guarantee
+        the old U+FFFD check existed for: a read→edit→write round-trip must
+        never rewrite undecodable bytes with replacement characters.
+        """
+        if not sample:
+            return False
+        if b"\x00" in sample:
+            return True
+        try:
+            sample.decode("utf-8")
+            return False
+        except UnicodeDecodeError as exc:
+            # UTF-8 sequences are at most 4 bytes: an error starting in the
+            # last 3 bytes with a clean prefix is a boundary cut, not binary.
+            if exc.start >= len(sample) - 3:
+                try:
+                    sample[: exc.start].decode("utf-8")
+                    return False
+                except UnicodeDecodeError:
+                    pass
+            return True
+
+    def _file_is_binary(self, path: str) -> bool:
+        """Prefer byte-layer detection; fall back to the text heuristic."""
+        sample_bytes = self._sample_file_bytes(path)
+        if sample_bytes is not None:
+            ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
+            return ext_binary or self._is_likely_binary_bytes(sample_bytes)
+        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        sample_result = self._exec(sample_cmd)
+        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        return self._is_likely_binary(path, sample_output)
+
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
@@ -1549,21 +1623,23 @@ class ShellFileOperations(FileOperations):
                 ),
             )
 
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-
-        if self._is_likely_binary(path, sample_output):
+        # Read a sample to check for binary content — at the byte layer when
+        # the transport allows, falling back to the legacy text heuristic.
+        if self._file_is_binary(path):
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
                 error="Binary file - cannot display as text. Use appropriate tools to handle this file type.",
             )
 
-        # Read with pagination using sed
+        # Read with pagination using sed, clamping each line in the shell.
+        from tools.tool_output_limits import get_max_line_length
+        line_clamp_bytes = 4 * get_max_line_length() + 1
         end_line = offset + limit - 1
-        read_cmd = f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)} | cut -b1-8001"
+        read_cmd = (
+            f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)}"
+            f" | cut -b1-{line_clamp_bytes}"
+        )
         read_result = self._exec(read_cmd)
 
         if read_result.exit_code != 0:
@@ -1597,6 +1673,17 @@ class ShellFileOperations(FileOperations):
         hint = None
         if truncated:
             hint = f"Use offset={end_line + 1} to continue reading (showing {offset}-{end_line} of {total_lines} lines)"
+
+        # ``cut`` (unlike sed -n p) always newline-terminates its output,
+        # so a file whose final line has no trailing newline would grow a
+        # phantom empty last line. Only possible when this page reaches the
+        # file's final line; probe the last byte and strip the artifact.
+        if not truncated and read_output.endswith("\n"):
+            tail_cmd = f"tail -c 1 {self._escape_shell_arg(path)} | wc -l"
+            tail_result = self._exec(tail_cmd)
+            tail_output = _strip_terminal_fence_leaks(tail_result.stdout)
+            if tail_result.exit_code == 0 and tail_output.strip() == "0":
+                read_output = read_output[:-1]
 
         return ReadResult(
             content=self._add_line_numbers(read_output, offset),
@@ -1752,11 +1839,7 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(
-            f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        )
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        if self._file_is_binary(path):
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -3338,9 +3421,23 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")
 
-        # Add pattern and path
+        # Add pattern and path. grep applies --exclude-dir to the command-line
+        # search root too, so passing the default relative root ``.`` causes
+        # ``.*`` to exclude the entire search. Anchor relative paths at the
+        # shell's live cwd; quoting $PWD separately keeps user paths escaped
+        # while working across local, container, and remote backends.
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        is_absolute = path.startswith(("/", "\\\\")) or bool(
+            re.match(r"^[A-Za-z]:[\\/]", path)
+        )
+        if is_absolute:
+            search_root = self._escape_shell_arg(path)
+        else:
+            relative_path = path[2:] if path.startswith("./") else path
+            search_root = '"$PWD"'
+            if relative_path not in {"", "."}:
+                search_root += f"/{self._escape_shell_arg(relative_path)}"
+        cmd_parts.append(search_root)
 
         # Fetch generously so we can compute total before slicing
         fetch_limit = limit + offset + (200 if context > 0 else 0)
