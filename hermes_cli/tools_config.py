@@ -1740,6 +1740,20 @@ def _run_post_setup(post_setup_key: str):
         # use until the command timeout fires. Skip inside Docker — the
         # image bakes Chromium in at build time, and runtime users usually
         # can't write to PLAYWRIGHT_BROWSERS_PATH anyway.
+        if (
+            _is_npx_agent_browser_sentinel(browser_cmd)
+            and not _resolve_npx_bin()
+        ):
+            _print_warning(
+                "    npx not found - browser tools require Node.js: https://nodejs.org"
+            )
+            return
+        if not browser_cmd:
+            _print_warning(
+                "    npx not found - browser tools require Node.js: https://nodejs.org"
+            )
+            return
+
         if _chromium_installed():
             _print_success("    Chromium browser already installed, nothing to do")
             return

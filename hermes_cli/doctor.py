@@ -2120,6 +2120,20 @@ def run_doctor(args):
         except Exception:
             _resolved_ab = None
 
+        if _is_termux():
+            # Termux doctor must not treat a host leftover (npx sentinel or
+            # a desktop PATH install) as an available Termux browser.
+            _termux_prefix = os.getenv("PREFIX", "")
+            if (
+                _resolved_ab
+                and _is_npx_agent_browser_sentinel(_resolved_ab)
+            ) or (
+                _resolved_ab
+                and _termux_prefix
+                and not str(_resolved_ab).startswith(_termux_prefix)
+            ):
+                _resolved_ab = None
+
         if _resolved_ab and _is_npx_agent_browser_sentinel(_resolved_ab):
             check_ok("agent-browser", "(resolves via npx on first use)")
             agent_browser_ok = True

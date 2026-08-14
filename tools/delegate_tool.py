@@ -3149,7 +3149,20 @@ def _run_single_child(
         _child_is_orchestrator = (
             getattr(child, "_delegate_role", None) == "orchestrator"
         )
-        if status == "completed" and not tool_trace and not _child_is_orchestrator:
+        _summary_is_json = False
+        if summary:
+            try:
+                _parsed_summary = json.loads(str(summary).strip())
+                _summary_is_json = isinstance(_parsed_summary, (dict, list))
+            except (TypeError, ValueError):
+                _summary_is_json = False
+        if (
+            status == "completed"
+            and not tool_trace
+            and not _child_is_orchestrator
+            and not getattr(child, "_delegate_output_schema", None)
+            and not _summary_is_json
+        ):
             retry_budget = _get_shallow_retry_budget()
             while shallow_retries < retry_budget and not tool_trace:
                 shallow_retries += 1
@@ -3260,6 +3273,46 @@ def _run_single_child(
         if shallow_retries:
             entry["shallow_retries"] = shallow_retries
 
+        _output_schema = getattr(child, "_delegate_output_schema", None)
+        if _output_schema:
+            from tools.delegation_output_schema import (
+                MAX_SCHEMA_RETRIES,
+                build_retry_message,
+                validate_output,
+            )
+
+            if status != "completed" or not (summary or "").strip():
+                entry["schema_valid"] = False
+            else:
+                _schema_ok, _schema_errors = validate_output(summary, _output_schema)
+                _schema_retries = 0
+                if not _schema_ok:
+                    _schema_retries = min(1, MAX_SCHEMA_RETRIES)
+                    try:
+                        _schema_retry = child.run_conversation(
+                            user_message=build_retry_message(_schema_errors),
+                            task_id=child_task_id,
+                        )
+                        _schema_retry_outcome = _derive_child_outcome(_schema_retry)
+                        _retry_summary = _schema_retry_outcome.get("summary") or ""
+                        _schema_ok, _schema_errors = validate_output(
+                            _retry_summary, _output_schema
+                        )
+                        if _schema_ok:
+                            summary = _retry_summary
+                            entry["summary"] = summary
+                    except Exception as _schema_retry_exc:
+                        logger.debug(
+                            "Subagent %d schema retry failed: %s",
+                            task_index,
+                            _schema_retry_exc,
+                        )
+                entry["schema_valid"] = bool(_schema_ok)
+                if _schema_retries:
+                    entry["schema_retries"] = _schema_retries
+                if not _schema_ok:
+                    entry["schema_errors"] = _schema_errors
+
         # #1369: surface the toolset auto-adjustment so the parent agent sees
         # a structured signal (not a free-text refusal) that `terminal` was
         # auto-added because the goal needed shell access.  Lets the parent
@@ -3282,7 +3335,11 @@ def _run_single_child(
         # Issue #323: by this point the bounded auto-retry above has already
         # tried (and failed) to recover, so this only fires when retries were
         # exhausted or disabled — the warning still tells the parent to act.
-        if status == "completed" and not tool_trace:
+        if (
+            status == "completed"
+            and not tool_trace
+            and not getattr(child, "_delegate_output_schema", None)
+        ):
             entry["shallow_result"] = True
             _retry_note = (
                 f" Auto-retry exhausted ({shallow_retries} attempt(s)) and the "
@@ -3965,6 +4022,8 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [{"goal": goal, "context": context, "role": top_role}]
+        if output_schema is not None:
+            task_list[0]["output_schema"] = output_schema
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -3982,6 +4041,20 @@ def delegate_task(
         batch_error = _validate_batch_tasks(task_list)
         if batch_error:
             return tool_error(batch_error)
+
+    from tools.delegation_output_schema import (
+        append_output_contract,
+        coerce_output_schema,
+    )
+
+    for i, task in enumerate(task_list):
+        raw_schema = task.get("output_schema")
+        schema, schema_err = coerce_output_schema(raw_schema)
+        if schema_err:
+            return tool_error(schema_err)
+        task["_coerced_schema"] = schema
+        if schema:
+            task["context"] = append_output_contract(task.get("context"), schema)
 
     # Handoff collapse-mode (#319): when requested, condense the parent's
     # recent conversation into each task's `context` via the existing
@@ -4088,6 +4161,8 @@ def delegate_task(
                     ),
                     role=effective_role,
                 )
+            if t.get("_coerced_schema"):
+                child._delegate_output_schema = t["_coerced_schema"]
             # ── Empty-toolset validation (#1387) ───────────────────────────
             # After construction, check whether the child actually resolved
             # to ≥1 tool.  If not, append a structured error entry to results
@@ -5133,6 +5208,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "output_schema": {
+                            "type": "object",
+                            "description": (
+                                "Optional JSON Schema the child's FINAL answer "
+                                "must satisfy. Validated by the parent; one "
+                                "bounded retry on failure."
+                            ),
+                        },
                         "team": {
                             "type": "object",
                             "description": (
@@ -5174,6 +5257,14 @@ DELEGATE_TASK_SCHEMA = {
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "output_schema": {
+                "type": "object",
+                "description": (
+                    "Optional JSON Schema the child's FINAL answer must "
+                    "satisfy (single-goal form). Validated by the parent; "
+                    "one bounded retry on failure."
+                ),
             },
             "role": {
                 "type": "string",
