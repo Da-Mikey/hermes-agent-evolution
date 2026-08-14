@@ -165,6 +165,11 @@ _local_model_name: Optional[str] = None
 # Without it, two concurrent voice messages can both see `_local_model is
 # None` and download/load the whisper model twice (#24767).
 _local_model_lock = threading.Lock()
+_IDLE_UNLOAD_CHECK_INTERVAL = 30  # seconds between idle checks
+_last_transcription_time = 0.0
+_idle_unload_thread: Optional[threading.Thread] = None
+_idle_unload_stop = threading.Event()
+_idle_unload_mgmt_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -1622,6 +1627,71 @@ def _should_force_faster_whisper_cpu() -> bool:
     if _sysctl_value("sysctl.proc_translated") == "1":
         return True
     return _sysctl_value("hw.optional.arm64") == "1"
+
+
+def _get_idle_unload_seconds(local_cfg: Dict[str, Any]) -> int:
+    """Resolve the idle unload timeout from config.
+
+    0 = never unload (default). Negative values are treated as 0.
+    """
+    try:
+        val = int(local_cfg.get("unload_after_idle_seconds", 0))
+    except (TypeError, ValueError):
+        return 0
+    return max(val, 0)
+
+
+def _unload_local_model() -> None:
+    """Release the cached local whisper model and free its memory."""
+    global _local_model, _local_model_name
+    with _local_model_lock:
+        if _local_model is not None:
+            logger.info(
+                "Unloading local whisper model '%s' after idle timeout",
+                _local_model_name or "unknown",
+            )
+            _local_model = None
+            _local_model_name = None
+
+
+def _start_idle_unload_watcher(timeout_seconds: int) -> None:
+    """Ensure the idle-unload watcher thread is running."""
+    global _idle_unload_thread
+    with _idle_unload_mgmt_lock:
+        if _idle_unload_thread is not None and _idle_unload_thread.is_alive():
+            return
+
+        def _watch(initial_timeout=timeout_seconds):
+            timeout = initial_timeout
+            while not _idle_unload_stop.is_set():
+                if _idle_unload_stop.wait(_IDLE_UNLOAD_CHECK_INTERVAL):
+                    break
+                if _local_model is None:
+                    break
+                try:
+                    timeout = _get_idle_unload_seconds(
+                        _load_stt_config().get("local") or {}
+                    )
+                except Exception:  # noqa: BLE001 - keep the seed value
+                    timeout = initial_timeout
+                if timeout <= 0:
+                    break
+                idle_for = time.monotonic() - _last_transcription_time
+                if idle_for >= timeout:
+                    _unload_local_model()
+                    break
+
+        _idle_unload_stop.clear()
+        _idle_unload_thread = threading.Thread(
+            target=_watch, name="hermes-stt-idle-unload", daemon=True
+        )
+        _idle_unload_thread.start()
+
+
+def _touch_transcription_time() -> None:
+    """Record transcription activity (resets the idle timer)."""
+    global _last_transcription_time
+    _last_transcription_time = time.monotonic()
 
 
 def _load_local_whisper_model(

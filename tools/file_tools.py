@@ -648,6 +648,35 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return False
 
 
+def _special_file_kind(path) -> str | None:
+    """Return a human name for non-regular file types that block reads.
+
+    Stat-based sibling of the name-based ``_is_blocked_device`` guard: a
+    FIFO at ``logs/live.pipe`` or a socket in a workspace hangs ``read_file``
+    just as hard as ``/dev/zero``, but carries no recognizable name.
+
+    Returns None for regular files, missing paths, and anything unstattable.
+    """
+    import stat as _stat
+
+    try:
+        st = os.stat(os.fspath(path))  # follows symlinks, matching a real read
+    except OSError:
+        return None
+    mode = st.st_mode
+    if _stat.S_ISREG(mode) or _stat.S_ISDIR(mode):
+        return None
+    if _stat.S_ISFIFO(mode):
+        return "a FIFO (named pipe)"
+    if _stat.S_ISSOCK(mode):
+        return "a socket"
+    if _stat.S_ISCHR(mode):
+        return "a character device"
+    if _stat.S_ISBLK(mode):
+        return "a block device"
+    return "a special (non-regular) file"
+
+
 def _search_result_read_block_error(path: str, task_id: str = "default") -> str | None:
     """Return the read-safety error for a search result path.
 
@@ -1469,6 +1498,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         _resolved = _resolve_path_for_task(path, task_id)
+        kind = _special_file_kind(_resolved)
+        if kind is not None:
+            return json.dumps({
+                "success": False,
+                "note": (
+                    f"'{path}' is {kind}, not a regular file — reading "
+                    "it would block indefinitely, so no read was "
+                    "attempted. Use terminal utilities if you need to "
+                    "interact with it."
+                ),
+            })
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.

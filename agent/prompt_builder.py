@@ -1008,6 +1008,43 @@ STEER_CHANNEL_NOTE += (
     "because it remains in the conversation history."
 )
 
+
+def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
+    """Per-turn note for a message typed into the desktop's floating HUD."""
+    names = valid_tool_names or set()
+    if "read_window_below" not in names:
+        return ""
+
+    sentences = [
+        "[Note: this message came from HUD mode — a small floating Hermes "
+        "window sitting over whatever the user is actually working in, so an "
+        'unqualified "this" or "here" usually means the app behind the HUD '
+        "rather than anything inside Hermes. read_window_below identifies "
+        "that app.",
+        "They move the HUD from app to app mid-conversation, so one you "
+        "identified on an earlier turn is still a live target: a reference "
+        "that does not fit the window below may name one from a turn or two "
+        "ago, and a single message can span both.",
+    ]
+    if "computer_use" in names:
+        sentences.append(
+            "Prefer carrying the work out in that same app — computer_use "
+            "takes its name in `app` — over pulling the task into a surface "
+            "of your own."
+        )
+        if "browser_navigate" in names:
+            sentences.append(
+                "When the app underneath is a browser, that means driving the "
+                "user's browser rather than opening yours with "
+                "browser_navigate."
+            )
+    sentences.append(
+        "This is a prior, not a rule: when the request names its own target, "
+        "follow the request.]"
+    )
+    return " ".join(sentences)
+
+
 # Model name substrings that should use the 'developer' role instead of
 # 'system' for the system prompt.  OpenAI's newer models (GPT-5, Codex)
 # give stronger instruction-following weight to the 'developer' role.
