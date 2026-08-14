@@ -1602,6 +1602,48 @@ def handle_function_call(
                 )
                 return result
 
+        # Circuit-breaker gate: if this tool has tripped its per-tool breaker
+        # (N consecutive failures), refuse the call and return a diagnostic
+        # that tells the model to stop retrying and use an alternative tool.
+        # This prevents the retry-spiral pattern where the agent re-calls a
+        # failing terminal command dozens of times across a session (#942).
+        # #2423 — after cooldown the breaker half-opens and admits one probe.
+        try:
+            from agent.tool_error_recovery import get_breaker
+
+            _breaker = get_breaker(function_name)
+            if _breaker.should_trip():
+                _breaker_count = _breaker._consecutive_failures
+                _breaker_msg = (
+                    f"Circuit breaker open: {function_name} has failed "
+                    f"{_breaker_count} consecutive times. Stop retrying "
+                    f"{function_name} and use an alternative tool "
+                    f"(read_file, search_files, write_file) or report the "
+                    f"blocker. Repeatedly calling {function_name} will keep "
+                    f"failing."
+                    f" One recovery probe is admitted automatically in "
+                    f"{_breaker.seconds_until_retry():.0f}s; if it succeeds, "
+                    f"the breaker closes."
+                )
+                result = json.dumps({"error": _breaker_msg}, ensure_ascii=False)
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="blocked",
+                    error_type="circuit_breaker",
+                    error_message=_breaker_msg,
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
+        except Exception as _cb_err:
+            logger.debug("circuit breaker check error: %s", _cb_err)
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:
