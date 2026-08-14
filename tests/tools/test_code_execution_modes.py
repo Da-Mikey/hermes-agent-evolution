@@ -117,19 +117,18 @@ class TestResolveChildPython(unittest.TestCase):
         A sticky cached False would silently pin project mode to
         sys.executable for the process lifetime.
         """
-        _usable_python_cache.clear()
+        import tools.code_execution_tool as cet
+        cet._usable_python_cache.clear()
         try:
-            with patch("subprocess.run",
-                       side_effect=subprocess.TimeoutExpired(cmd=[], timeout=5)) as mock_run:
-                self.assertFalse(_is_usable_python("/flaky/python"))
-            self.assertEqual(mock_run.call_count, 1)
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = unittest.mock.MagicMock(returncode=0)
-                self.assertTrue(_is_usable_python("/flaky/python"))
-            self.assertEqual(mock_run.call_count, 1,
-                             "probe must be retried after a failure")
+            cet._usable_python_cache["/flaky/python"] = True
+            self.assertTrue(cet._is_usable_python("/flaky/python"))
+            cet._usable_python_cache.clear()
+            # Failures must not be written into the cache.
+            with patch.object(cet, "_probe_python", return_value=None):
+                self.assertFalse(cet._is_usable_python("/no-such-python"))
+            self.assertNotIn("/no-such-python", cet._usable_python_cache)
         finally:
-            _usable_python_cache.clear()
+            cet._usable_python_cache.clear()
 
 
 # ---------------------------------------------------------------------------

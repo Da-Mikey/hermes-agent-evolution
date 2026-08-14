@@ -1650,10 +1650,8 @@ def execute_code(
         # when the subprocess CWD is not tmpdir (project mode).
         _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         _existing_pp = child_env.get("PYTHONPATH", "")
-        _pp_parts = [tmpdir, _hermes_root]
-        if _existing_pp:
-            _pp_parts.append(_existing_pp)
-        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+        # Interpreter is resolved just below; PYTHONPATH is finalized after
+        # that so an external venv does not inherit the Hermes checkout.
         # Inject user's configured timezone so datetime.now() in sandboxed
         # code reflects the correct wall-clock time.  Only TZ is set —
         # HERMES_TIMEZONE is an internal Hermes setting and must not leak
@@ -1676,6 +1674,12 @@ def execute_code(
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
+        _pp_parts = [tmpdir]
+        if _uses_hermes_python_environment(_child_python):
+            _pp_parts.append(_hermes_root)
+        if _existing_pp:
+            _pp_parts.append(_existing_pp)
+        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
 
         proc = subprocess.Popen(
             [_child_python, _script_path],
@@ -2043,7 +2047,8 @@ def _is_usable_python(python_path: str) -> bool:
     if result is None:
         return False
     usable = result.returncode == 0
-    _cache_probe_result(_usable_python_cache, python_path, usable)
+    if usable:
+        _cache_probe_result(_usable_python_cache, python_path, usable)
     return usable
 
 

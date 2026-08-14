@@ -62,6 +62,11 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     goals, so these checks must never run on it.
     """
     if len(task_list) < 2:
+        # A 1-item tasks=[] list is normally a misuse of the batch form,
+        # but a teammate spawn (task.team) has to travel as a task object
+        # so the child can inherit team identity.
+        if any(isinstance(t, dict) and t.get("team") for t in task_list):
+            return None
         return (
             "Batch mode requires at least 2 tasks. For a single task, use "
             "the `goal` parameter instead of `tasks`: "
@@ -3848,6 +3853,7 @@ def delegate_task(
     background: Optional[bool] = None,
     handoff_mode: Optional[str] = None,
     grader: Optional[Dict[str, Any]] = None,
+    output_schema: Optional[Dict[str, Any]] = None,
     parent_agent=None,
 ) -> str:
     """

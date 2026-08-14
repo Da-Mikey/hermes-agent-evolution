@@ -87,6 +87,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # Agent-team tools — only in schema when HERMES_TEAM_ID is set (check_fn).
+    "team_task", "team_message",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
