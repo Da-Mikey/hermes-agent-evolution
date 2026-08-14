@@ -17810,6 +17810,97 @@ _mount_plugin_api_routes()
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 app.include_router(_dashboard_auth_router)
 
+# A2A Agent Card discovery endpoint (issue #879). Registered here, before the
+# SPA catch-all below, so /{full_path:path} doesn't swallow it. Public by
+# design (see skills/a2a/): A2A clients hold no dashboard session, and the card
+# carries only tool/skill names + one-line descriptions -- never secrets. It
+# registers no core tools; it is a read-only view over Hermes' existing tools
+# and skills. The /.well-known/agent.json path is non-/api/, so the legacy
+# loopback auth_middleware never gates it; the OAuth gate allowlists it via
+# dashboard_auth.middleware._GATE_PUBLIC_PREFIXES.
+@app.get("/.well-known/agent.json")
+async def well_known_agent_card(request: Request):
+    """Serve the A2A Agent Card advertising Hermes' tools and skills."""
+    from hermes_cli.a2a import build_agent_card, get_discovery_snapshot
+
+    config, capabilities = get_discovery_snapshot()
+    if not config.get("enabled", True):
+        return JSONResponse(status_code=404, content={"detail": "A2A disabled"})
+    card = build_agent_card(
+        config,
+        capabilities=capabilities,
+        base_url=str(request.base_url).rstrip("/"),
+    )
+    return JSONResponse(card.to_dict(), media_type="application/json")
+
+
+# A2A JSON-RPC server endpoint (issue #881, Slice 3 of #748). Lives at the
+# path the Agent Card advertises (config ``url``, default ``/a2a``) and turns
+# an incoming A2A task into a single dispatch through Hermes' existing tool
+# registry -- it registers NO new core tools.
+#
+# AUTH (this is the security boundary; the discovery card above is public, this
+# is NOT): unlike ``/.well-known/agent.json`` this route is deliberately absent
+# from every public allowlist. ``_require_token`` gates it exactly like the
+# dashboard's other sensitive endpoints:
+#   * loopback / --insecure bind -> the ephemeral ``_SESSION_TOKEN`` (sent as
+#     ``Authorization: Bearer`` or ``X-Hermes-Session-Token``), matching the
+#     card's advertised ``authentication.schemes: [bearer]``;
+#   * non-loopback bind -> the OAuth ``gated_auth_middleware`` runs first and
+#     302/401s any cookieless caller before this handler; ``_require_token``
+#     then confirms the verified session.
+# So an unauthenticated caller can never reach tool execution. A second layer
+# in a2a_server only dispatches tools ADVERTISED on the card (honouring the
+# ``exclude`` blocklist); requests are size-capped here and each tool runs
+# under a wall-clock timeout in a worker thread (no event-loop / stream stall).
+@app.post("/a2a")
+async def a2a_rpc(request: Request):
+    """Accept an A2A JSON-RPC task submission and map it to a Hermes tool call."""
+    from hermes_cli import a2a_server
+    from hermes_cli.a2a import get_discovery_snapshot
+
+    _require_token(request)
+
+    config, _capabilities = get_discovery_snapshot()
+    if not config.get("enabled", True):
+        return JSONResponse(status_code=404, content={"detail": "A2A disabled"})
+
+    # Read the body with a hard cap. Checking Content-Length first rejects an
+    # honestly-declared oversized body cheaply; the streaming accumulator then
+    # also bounds a chunked / spoofed-length body so a client can't OOM us by
+    # streaming an unbounded payload into request.body().
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > a2a_server.MAX_REQUEST_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "request too large"})
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > a2a_server.MAX_REQUEST_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "request too large"})
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    try:
+        payload = json.loads(raw or b"{}")
+    except Exception:
+        # JSON-RPC transport convention: 200 with a parse-error envelope.
+        return JSONResponse(a2a_server.parse_error_response())
+
+    method = payload.get("method") if isinstance(payload, dict) else None
+    if method == "message/stream":
+        from fastapi.responses import StreamingResponse
+
+        return StreamingResponse(
+            a2a_server.sse_stream(payload),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
+    return JSONResponse(await a2a_server.handle_rpc(payload))
+
+
 mount_spa(app)
 
 
