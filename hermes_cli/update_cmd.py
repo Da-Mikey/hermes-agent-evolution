@@ -4301,6 +4301,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
                 _repair_node_deps_on_current_checkout(_print_update_completion)
+            # A no-op update must still heal an earlier missed Evolution
+            # registration.
+            _m()._reconcile_existing_evolution_cron_jobs()
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
@@ -5011,6 +5014,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as exc:
             # Never let the cron safety net break an otherwise-good update.
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
+
+        # Deploy new/revised Evolution stages after migrations and cron
+        # restore, before gateways restart.
+        _m()._reconcile_existing_evolution_cron_jobs()
 
         print()
         if node_failures:

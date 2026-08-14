@@ -9386,6 +9386,90 @@ def _size_delta_label(saved_mb: float) -> str:
     return f"grew by {-saved_mb:.1f} MB"
 
 
+def _reconcile_existing_evolution_cron_jobs() -> list[str]:
+    """Refresh Evolution cron only for profiles that previously opted in.
+
+    An existing ``evolution-*`` job is the durable opt-in signal. This
+    avoids creating scheduled jobs in unrelated profiles while still healing
+    missed registrations and deploying newly added stages/scripts.
+    """
+    registrar = PROJECT_ROOT / "scripts" / "register_evolution_cron.py"
+    definitions = PROJECT_ROOT / "cron" / "evolution"
+    if not registrar.is_file() or not definitions.is_dir():
+        return []
+
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        profiles = list_profiles()
+    except Exception as exc:
+        logger.debug("Could not enumerate profiles for Evolution cron reconcile: %s", exc)
+        return []
+
+    opted_in = []
+    for profile in profiles:
+        jobs_path = Path(profile.path) / "cron" / "jobs.json"
+        try:
+            payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+            jobs = payload.get("jobs", []) if isinstance(payload, dict) else payload
+            if not isinstance(jobs, list):
+                continue
+            if any(
+                str(job.get("name", "")).strip().startswith("evolution-")
+                for job in jobs
+                if isinstance(job, dict)
+            ):
+                opted_in.append(profile)
+        except (OSError, ValueError, TypeError):
+            continue
+
+    if not opted_in:
+        return []
+
+    print()
+    print("→ Reconciling enabled Evolution schedules / Узгодження розкладів Evolution...")
+    reconciled: list[str] = []
+    for profile in opted_in:
+        from tools.environments.local import build_subprocess_env
+
+        env = build_subprocess_env(
+            inherit_profile_home=False,
+            scrub_secrets=False,
+            extra={"HERMES_HOME": str(profile.path)},
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(registrar)],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"  ⚠ {profile.name}: Evolution cron reconcile failed / "
+                f"не вдалося узгодити cron: {exc}"
+            )
+            continue
+
+        if result.stderr.strip():
+            print(result.stderr.rstrip(), file=sys.stderr)
+        summary = (result.stdout or "").strip().splitlines()
+        if result.returncode == 0:
+            reconciled.append(profile.name)
+            detail = summary[0] if summary else "ok"
+            print(f"  ✓ {profile.name}: {detail}")
+        else:
+            detail = summary[-1] if summary else f"exit {result.returncode}"
+            print(
+                f"  ⚠ {profile.name}: Evolution cron reconcile failed / "
+                f"не вдалося узгодити cron: {detail}"
+            )
+    return reconciled
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
