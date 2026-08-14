@@ -48,6 +48,21 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+def _active_cron_provider_name() -> str:
+    """Name of the resolved cron scheduler provider ('builtin', 'chronos', …).
+
+    Best-effort + offline (``resolve_cron_scheduler`` reads config and the
+    provider's ``is_available()`` contract forbids network). Returns 'builtin'
+    on any failure so callers fall back to the historical ticker-based checks.
+    """
+    try:
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        return resolve_cron_scheduler().name or "builtin"
+    except Exception:
+        return "builtin"
+
+
 def _warn_if_gateway_not_running() -> None:
     """Warn that scheduled jobs won't fire unless the gateway is running.
 
@@ -56,8 +71,17 @@ def _warn_if_gateway_not_running() -> None:
     gateway, ``next_run_at`` passes but jobs never fire and ``last_run_at``
     stays null — the most common cron support report (#51038). Surfacing this
     at create/list time, when the user is right there, prevents it.
+
+    An external provider (e.g. Chronos) fires jobs via a NAS-mediated webhook,
+    NOT the in-process ticker, so a momentarily-absent gateway process does not
+    mean jobs won't fire — the warning would be a false alarm. Stay quiet for
+    any non-builtin provider; the gateway-process heuristic only speaks to the
+    built-in ticker's trigger.
     """
     try:
+        if _active_cron_provider_name() != "builtin":
+            return
+
         from hermes_cli.gateway import find_gateway_pids
 
         if find_gateway_pids():
@@ -89,11 +113,15 @@ def cron_list(show_all: bool = False):
     print(color("└─────────────────────────────────────────────────────────────────────────┘", Colors.CYAN))
     print()
 
+    from cron.jobs import effective_job_state
+
     for job in jobs:
         job_id = job.get("id", "?")
         name = job.get("name", "(unnamed)")
         schedule = job.get("schedule_display", job.get("schedule", {}).get("value", "?"))
-        state = job.get("state", "scheduled" if job.get("enabled", True) else "paused")
+        # Derive from the scheduler-honoured flag — never show [paused] when
+        # enabled=true (half-paused contradiction must not look frozen).
+        state = effective_job_state(job)
         next_run = job.get("next_run_at", "?")
 
         # `repeat` may be present-but-null in the job record (e.g. a one-shot
@@ -134,6 +162,12 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        monitor_source = job.get("monitor_script") or job.get("monitor_url")
+        if monitor_source:
+            print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
+            mon_state = job.get("monitor_state") or {}
+            if mon_state.get("last_changed_at"):
+                print(f"    Changed:   {mon_state['last_changed_at']}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
         workdir = job.get("workdir")
@@ -170,19 +204,6 @@ def cron_tick():
     """Run due jobs once and exit."""
     from cron.scheduler import tick
     tick(verbose=True)
-
-
-def _active_cron_provider_name() -> str:
-    """Name of the resolved cron scheduler provider ('builtin', 'chronos', ...).
-
-    Best-effort + offline; returns 'builtin' on any failure.
-    """
-    try:
-        from cron.scheduler_provider import resolve_cron_scheduler
-
-        return resolve_cron_scheduler().name or "builtin"
-    except Exception:
-        return "builtin"
 
 
 def cron_runs(job_id: Optional[str] = None, limit: int = 20):
@@ -341,6 +362,8 @@ def cron_create(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        monitor_script=getattr(args, "monitor_script", None),
+        monitor_url=getattr(args, "monitor_url", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -353,6 +376,10 @@ def cron_create(args):
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
+    if job_data.get("monitor_script"):
+        print(f"  Monitor: {job_data['monitor_script']} (agent runs only on output change)")
+    if job_data.get("monitor_url"):
+        print(f"  Monitor: {job_data['monitor_url']} (agent runs only on output change)")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
@@ -406,6 +433,8 @@ def cron_edit(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),
+        monitor_script=getattr(args, "monitor_script", None),
+        monitor_url=getattr(args, "monitor_url", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -421,6 +450,10 @@ def cron_edit(args):
         print("  Skills: none")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
+    if updated.get("monitor_script"):
+        print(f"  Monitor: {updated['monitor_script']} (agent runs only on output change)")
+    if updated.get("monitor_url"):
+        print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
@@ -449,6 +482,69 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     return 0
 
 
+def cron_notepad(args) -> int:
+    """Handle ``hermes cron notepad <job_id> [get|set|delete|list]``.
+
+    The per-job durable KV scratchpad (``cron/notepad.py``). This CLI is the
+    write path — a running cron agent updates its own notepad by invoking
+    these commands via its terminal tool; the scheduler injects non-empty
+    notepads into the job prompt on each run.
+    """
+    from cron import notepad
+
+    job_id = str(getattr(args, "job_id", "") or "")
+    action = getattr(args, "notepad_action", None) or "list"
+    key = getattr(args, "key", None)
+    value = getattr(args, "value", None)
+
+    if not job_id:
+        print(color("A job ID is required.", Colors.RED))
+        return 1
+
+    try:
+        if action == "set":
+            if key is None or value is None:
+                print(color("Usage: hermes cron notepad <job_id> set <key> <value>", Colors.RED))
+                return 1
+            notepad.set_note(job_id, key, value)
+            print(color(f"Set notepad key '{key}' for job {job_id}.", Colors.GREEN))
+            return 0
+
+        if action == "get":
+            if key is None:
+                print(color("Usage: hermes cron notepad <job_id> get <key>", Colors.RED))
+                return 1
+            stored = notepad.get_note(job_id, key)
+            if stored is None:
+                print(color(f"No notepad key '{key}' for job {job_id}.", Colors.YELLOW))
+                return 1
+            print(stored)
+            return 0
+
+        if action == "delete":
+            if key is None:
+                print(color("Usage: hermes cron notepad <job_id> delete <key>", Colors.RED))
+                return 1
+            if notepad.delete_note(job_id, key):
+                print(color(f"Deleted notepad key '{key}' for job {job_id}.", Colors.GREEN))
+                return 0
+            print(color(f"No notepad key '{key}' for job {job_id}.", Colors.YELLOW))
+            return 1
+
+        # list (default)
+        notes = notepad.list_notes(job_id)
+        if not notes:
+            print(color(f"Notepad for job {job_id} is empty.", Colors.DIM))
+            return 0
+        for note in notes:
+            print(f"  {color(note['key'], Colors.YELLOW)} = {note['value']}")
+            print(f"    {color('updated: ' + str(note['updated_at']), Colors.DIM)}")
+        return 0
+    except ValueError as exc:
+        print(color(f"Notepad error: {exc}", Colors.RED))
+        return 1
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -470,6 +566,9 @@ def cron_command(args):
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
 
+    if subcmd == "notepad":
+        return cron_notepad(args)
+
     if subcmd in {"create", "add"}:
         return cron_create(args)
 
@@ -488,68 +587,6 @@ def cron_command(args):
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")
 
-    if subcmd == "notepad":
-        return cron_notepad(args)
-
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick|notepad]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
     sys.exit(1)
-
-
-def cron_notepad(args) -> int:
-    """Manage persistent key-value notepad entries for a cron job."""
-    from cron import notepad
-
-    job_id = getattr(args, "job_id", None)
-    if not job_id:
-        print("Error: job_id is required")
-        return 1
-
-    action = getattr(args, "notepad_action", "list") or "list"
-
-    if action == "list":
-        notes = notepad.list_notes(job_id)
-        if not notes:
-            print(f"No notepad entries for job {job_id}")
-            return 0
-        for item in notes:
-            print(f"{item['key']}: {item['value']}")
-        return 0
-
-    if action == "get":
-        key = getattr(args, "key", None)
-        if not key:
-            print("Error: key is required for get")
-            return 1
-        val = notepad.get_note(job_id, key)
-        if val is None:
-            print(f"Key not found: {key}")
-            return 1
-        print(val)
-        return 0
-
-    if action == "set":
-        key = getattr(args, "key", None)
-        val = getattr(args, "value", None)
-        if key is None or val is None:
-            print("Error: key and value are required for set")
-            return 1
-        try:
-            notepad.set_note(job_id, key, val)
-            print(f"Set {key} for job {job_id}")
-            return 0
-        except Exception as e:
-            print(f"Error: {e}")
-            return 1
-
-    if action in {"delete", "del", "rm"}:
-        key = getattr(args, "key", None)
-        if not key:
-            print("Error: key is required for delete")
-            return 1
-        notepad.delete_note(job_id, key)
-        print(f"Deleted {key} for job {job_id}")
-        return 0
-
-    print(f"Unknown notepad action: {action}")
-    return 1

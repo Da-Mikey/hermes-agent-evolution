@@ -60,6 +60,18 @@ class _StubCLI:
         raise AssertionError("picker should not open when a model name is given")
 
 
+def _bind_switch_helpers(cli_mod, stub):
+    """Upstream split confirm+apply onto a worker-thread helper; bind it."""
+    stub._confirm_and_apply_cli_model_switch = (
+        cli_mod.HermesCLI._confirm_and_apply_cli_model_switch.__get__(stub)
+    )
+    if hasattr(cli_mod.HermesCLI, "_snapshot_model_runtime"):
+        stub._snapshot_model_runtime = cli_mod.HermesCLI._snapshot_model_runtime.__get__(
+            stub
+        )
+    return stub
+
+
 def _run_switch(monkeypatch, result, cmd="/model MiniMax-M3 --global"):
     import cli as cli_mod
 
@@ -75,7 +87,7 @@ def _run_switch(monkeypatch, result, cmd="/model MiniMax-M3 --global"):
         "hermes_cli.inventory.load_picker_context",
         lambda: (_ for _ in ()).throw(RuntimeError("no picker context in test")),
     )
-    cli_mod.HermesCLI._handle_model_switch(_StubCLI(), cmd)
+    cli_mod.HermesCLI._handle_model_switch(_bind_switch_helpers(cli_mod, _StubCLI()), cmd)
     return saved
 
 
@@ -104,7 +116,10 @@ def test_session_only_switch_does_not_touch_config(monkeypatch):
         lambda: (_ for _ in ()).throw(RuntimeError("no picker context in test")),
     )
 
-    cli_mod.HermesCLI._handle_model_switch(_StubCLI(), "/model MiniMax-M3 --session")
+    cli_mod.HermesCLI._handle_model_switch(
+        _bind_switch_helpers(cli_mod, _StubCLI()),
+        "/model MiniMax-M3 --session",
+    )
 
     assert save_calls == []
 
