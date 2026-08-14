@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -43,6 +44,56 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+_PLACEHOLDER_GOAL_RE = re.compile(r"^(todo|task\s*\d+)$", re.IGNORECASE)
+_TEMPLATE_MARKER_RE = re.compile(
+    r"<[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+>"
+    r"|\{[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+\}"
+)
+_MIN_BATCH_GOAL_LEN = 10
+
+
+def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
+    """Validate a tasks=[...] batch beyond per-task goal presence.
+
+    Returns an actionable error string, or None when the batch is valid.
+    Batch-only by design: the single-`goal` form legitimately uses short
+    goals, so these checks must never run on it.
+    """
+    if len(task_list) < 2:
+        return (
+            "Batch mode requires at least 2 tasks. For a single task, use "
+            "the `goal` parameter instead of `tasks`: "
+            'delegate_task(goal="...", context="...").'
+        )
+
+    for i, task in enumerate(task_list):
+        goal = str(task.get("goal", "")).strip()
+        normalized = " ".join(goal.lower().split())
+
+        if _PLACEHOLDER_GOAL_RE.match(normalized):
+            return (
+                f"Task {i} has a placeholder goal ({goal!r}). Replace it "
+                "with a specific, self-contained description of what the "
+                "subagent should accomplish."
+            )
+        marker = _TEMPLATE_MARKER_RE.search(goal)
+        if marker:
+            return (
+                f"Task {i} goal contains an unexpanded template marker "
+                f"({marker.group(0)!r}). Substitute the real value before "
+                "calling delegate_task — subagents cannot resolve "
+                "placeholders."
+            )
+        if len(goal) < _MIN_BATCH_GOAL_LEN:
+            return (
+                f"Task {i} goal is too short ({goal!r}). Write a specific, "
+                "self-contained goal of at least "
+                f"{_MIN_BATCH_GOAL_LEN} characters so the subagent knows "
+                "exactly what to do."
+            )
+    return None
 
 
 # Tools that children must never have access to
@@ -3920,6 +3971,11 @@ def delegate_task(
             return tool_error(f"Task {i} must be an object, got {type(task).__name__}.")
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    if tasks is not None and isinstance(tasks, list):
+        batch_error = _validate_batch_tasks(task_list)
+        if batch_error:
+            return tool_error(batch_error)
 
     # Handoff collapse-mode (#319): when requested, condense the parent's
     # recent conversation into each task's `context` via the existing

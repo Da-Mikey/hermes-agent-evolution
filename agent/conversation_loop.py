@@ -4191,6 +4191,7 @@ def _run_conversation_impl(
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success
+                agent._cross_turn_overload_hits = 0
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -6090,6 +6091,7 @@ def _run_conversation_impl(
                         # still activate fallback_providers after stale
                         # pre-recovery fallback/credential-pool bookkeeping.
                         _retry.has_retried_429 = False
+                        agent._cross_turn_overload_hits = 0
                         agent._fallback_index = 0
                         agent._fallback_activated = False
                         continue

@@ -187,12 +187,13 @@ class TestVacuumUsesPassive:
         ]
         assert result["ok"] is True
         assert result["vacuumed"] is True
-        assert truncate_calls == []
-        assert passive_calls == ["PRAGMA wal_checkpoint(PASSIVE)"]
+        # optimize_fts_storage() checkpoints TRUNCATE after VACUUM so the
+        # WAL that VACUUM itself wrote is reclaimed (#45383).
+        assert truncate_calls == ["PRAGMA wal_checkpoint(TRUNCATE)"]
         assert vacuum_calls == ["VACUUM"]
         assert tracking_conn.execute_calls.index(
             vacuum_calls[0]
-        ) < tracking_conn.execute_calls.index(passive_calls[0])
+        ) < tracking_conn.execute_calls.index(truncate_calls[0])
 
 
 class TestCheckpointFrequency:

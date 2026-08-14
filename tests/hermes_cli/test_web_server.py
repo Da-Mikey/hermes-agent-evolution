@@ -1998,12 +1998,11 @@ class TestNewEndpoints:
 
         resp = self.client.put("/api/tools/toolsets/discord", json={"enabled": True})
         assert resp.status_code == 200
-        assert resp.json() == {
-            "ok": True,
-            "name": "discord",
-            "platform": "discord",
-            "enabled": True,
-        }
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["name"] == "discord"
+        assert body["platform"] == "discord"
+        assert body["enabled"] is True
 
         config = load_config()
         assert "discord" in config["platform_toolsets"]["discord"]
