@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.base import BaseEnvironment, EnvironmentConnectionError, _popen_bash
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
@@ -787,9 +787,13 @@ def _ensure_docker_available() -> None:
             "or known install locations. Install Docker Desktop and ensure the "
             "CLI is available."
         )
-        raise RuntimeError(
+        raise EnvironmentConnectionError(
             "Docker executable not found in PATH or known install locations. "
-            "Install Docker and ensure the 'docker' command is available."
+            "Install Docker and ensure the 'docker' command is available.",
+            retry_hint=(
+                "Install Docker (or fix PATH) and retry, or switch "
+                "terminal.backend to 'local'."
+            ),
         )
 
     try:
@@ -817,8 +821,12 @@ def _ensure_docker_available() -> None:
             docker_exe,
             exc_info=True,
         )
-        raise RuntimeError(
-            "Docker daemon is not responding. Ensure Docker is running and try again."
+        raise EnvironmentConnectionError(
+            "Docker daemon is not responding. Ensure Docker is running and try again.",
+            retry_hint=(
+                "Start the Docker daemon (e.g. `systemctl start docker` or "
+                "launch Docker Desktop), then retry the same command."
+            ),
         )
     except Exception:
         logger.error(

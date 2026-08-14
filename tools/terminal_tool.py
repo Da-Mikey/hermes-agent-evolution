@@ -60,6 +60,7 @@ from tools.terminal_failure_classifier import (
     streak_recommendation,
 )
 from tools.path_validation import suggest_nearby_paths, format_nearby_hint
+from tools.environments.base import EnvironmentConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -3954,6 +3955,45 @@ def terminal_tool(
                 result_dict["sudo_cache_cleared"] = True
 
             return json.dumps(result_dict, ensure_ascii=False)
+
+    except EnvironmentConnectionError as e:
+        # Infrastructure/connection-class failure (SSH host down, Docker
+        # daemon unreachable) — distinct from a command failing with a
+        # nonzero exit code.  Config gate ``terminal.degraded_mode``:
+        #   warn (default) — return a structured degraded result the model
+        #                    can act on (reason + retry hint, no traceback).
+        #   fail           — preserve the historical error+traceback result.
+        degraded_mode = os.getenv("TERMINAL_DEGRADED_MODE", "warn").strip().lower()
+        if degraded_mode == "fail":
+            import traceback
+            tb_str = traceback.format_exc()
+            logger.error("terminal_tool exception:\n%s", tb_str)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": f"Failed to execute command: {e}",
+                "traceback": tb_str,
+                "status": "error"
+            }, ensure_ascii=False)
+
+        logger.warning("terminal backend degraded: %s", e.reason)
+        # Never keep a possibly-broken backend cached: evict it so the next
+        # call re-creates the environment from scratch and simply works once
+        # the backend is reachable again.
+        try:
+            with _env_lock:
+                _active_environments.pop(task_id, None)
+                _last_activity.pop(task_id, None)
+        except Exception:
+            logger.debug("degraded-env eviction failed", exc_info=True)
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "status": "degraded",
+            "reason": e.reason,
+            "retry_hint": e.retry_hint,
+            "error": f"Terminal backend degraded: {e.reason}",
+        }, ensure_ascii=False)
 
     except Exception as e:
         import traceback

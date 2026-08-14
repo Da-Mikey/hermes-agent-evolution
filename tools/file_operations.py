@@ -1560,7 +1560,7 @@ class ShellFileOperations(FileOperations):
 
         # Read with pagination using sed
         end_line = offset + limit - 1
-        read_cmd = f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)}"
+        read_cmd = f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)} | cut -b1-8001"
         read_result = self._exec(read_cmd)
 
         if read_result.exit_code != 0:
@@ -3315,7 +3315,7 @@ class ShellFileOperations(FileOperations):
         context: int,
     ) -> SearchResult:
         """Fallback search using grep."""
-        cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
+        cmd_parts = ["grep", "-rnHE"]  # -H forces filenames; -E matches rg regex behavior
 
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.

@@ -61,6 +61,16 @@ class EnvironmentConnectionError(RuntimeError):
     lets generic callers catch it alongside subprocess/OS failures.
     """
 
+    def __init__(self, reason: str, *, retry_hint: str = ""):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_hint = retry_hint or (
+            "This is an infrastructure failure, not a command failure. "
+            "Verify the backend is reachable (network, service running, "
+            "credentials), then retry the same command — recovery is "
+            "automatic once the backend is back."
+        )
+
 
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text.
