@@ -519,15 +519,17 @@ def test_delegate_task_with_team_grants_agent_team_toolset(monkeypatch, tmp_path
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     parent = _make_mock_parent()
 
-    captured = {}
+    captured = []
 
     def _fake_build(*args, **kwargs):
         # Capture the toolsets that delegate_task computed for the teammate.
-        captured["toolsets"] = kwargs.get("toolsets")
         # Confirm the team identity is bound on THIS (build) thread so the
         # team tools' check_fn would pass during the child's tool resolution.
-        captured["team_id_at_build"] = current_team_id()
-        captured["member_at_build"] = current_member()
+        captured.append({
+            "toolsets": kwargs.get("toolsets"),
+            "team_id_at_build": current_team_id(),
+            "member_at_build": current_member(),
+        })
         child = MagicMock()
         child.run_conversation.return_value = {
             "final_response": "teammate done",
@@ -548,14 +550,21 @@ def test_delegate_task_with_team_grants_agent_team_toolset(monkeypatch, tmp_path
                 parent_agent=parent,
                 tasks=[
                     {
-                        "goal": "research the api",
+                        "goal": "research the api endpoint",
                         "team": {"team_id": "teamE", "member": "alice"},
-                    }
+                    },
+                    {
+                        "goal": "review the generated schemas",
+                        "team": {"team_id": "teamE", "member": "bob"},
+                    },
                 ],
             )
         )
 
     assert result["results"][0]["status"] == "completed"
-    assert "agent_team" in captured["toolsets"]
-    assert captured["team_id_at_build"] == "teamE"
-    assert captured["member_at_build"] == "alice"
+    assert "agent_team" in captured[0]["toolsets"]
+    assert captured[0]["team_id_at_build"] == "teamE"
+    assert captured[0]["member_at_build"] == "alice"
+    assert "agent_team" in captured[1]["toolsets"]
+    assert captured[1]["team_id_at_build"] == "teamE"
+    assert captured[1]["member_at_build"] == "bob"

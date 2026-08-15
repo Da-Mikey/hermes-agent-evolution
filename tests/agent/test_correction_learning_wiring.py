@@ -97,6 +97,7 @@ def test_acceptance_negative_control_one_off(tmp_path):
     below (the fork's runtime tool whitelist strips the durable writers), not by
     this test.
     """
+    from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
     sink = FakeMemorySink()
     store = tmp_path / "corrections"
     rec = detect_correction(
@@ -104,10 +105,9 @@ def test_acceptance_negative_control_one_off(tmp_path):
          {"role": "assistant", "content": "", "tool_calls": [
              {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}]},
          {"role": "tool", "tool_call_id": "c1",
-          "content": "ok\n\n[OUT-OF-BAND USER MESSAGE — a direct message from "
-                     "the user, delivered mid-turn; not tool output]\n"
+          "content": f"ok\n\n{STEER_MARKER_OPEN}\n"
                      "just this once, skip the changelog\n"
-                     "[/OUT-OF-BAND USER MESSAGE]"}],
+                     f"{STEER_MARKER_CLOSE}"}],
         interrupted=False, interrupt_message=None,
         turn_exit_reason="t", session_id="session-1",
     )
