@@ -7672,6 +7672,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
+    def finalize_preloaded_skills(self) -> None:
+        """Join the background --skills preload and fold it into the prompt.
+
+        Idempotent; no-op when no preload was requested. Called from
+        ``_init_agent`` (before the agent snapshots ``self.system_prompt``)
+        and safe to call from any other consumer of the system prompt.
+        Raises ``ValueError`` when EVERY requested skill was unknown —
+        the same contract the old synchronous path enforced in cmd_chat.
+        """
+        if getattr(self, "_preload_skills_finalized", False):
+            return
+        thread = getattr(self, "_preload_skills_thread", None)
+        if thread is None:
+            self._preload_skills_finalized = True
+            return
+        thread.join(timeout=120)
+        self._preload_skills_finalized = True
+        err = getattr(self, "_preload_skills_error", None)
+        if err is not None:
+            raise err
+        result = getattr(self, "_preload_skills_result", None)
+        if not result:
+            return
+        skills_prompt, loaded_skills, missing_skills = result
+        if missing_skills:
+            missing_display = ", ".join(missing_skills)
+            # If at least one skill loaded, degrade gracefully: skip the
+            # unknown ones and continue. A typo'd skill name should not crash
+            # the worker (which auto-blocks the Kanban task after retries).
+            # Only when EVERY requested skill is missing do we hard-fail, so a
+            # fully-misconfigured worker fails loudly instead of running blind.
+            if loaded_skills:
+                logger.warning(
+                    "Unknown skill(s) requested, skipping: %s. "
+                    "Continuing with: %s. "
+                    "List available skills with `hermes skills list`.",
+                    missing_display,
+                    ", ".join(loaded_skills),
+                )
+            else:
+                raise ValueError(f"Unknown skill(s): {missing_display}")
+        if skills_prompt:
+            self.system_prompt = "\n\n".join(
+                part for part in (self.system_prompt, skills_prompt) if part
+            ).strip()
+            self.preloaded_skills = loaded_skills
+
     def _show_security_advisories(self):
         """Show a startup banner if any unacked security advisories match.
 
