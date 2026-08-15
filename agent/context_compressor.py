@@ -1592,7 +1592,23 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
         goal = _str_arg(args, "goal")
         if len(goal) > 60:
             goal = goal[:57] + "..."
-        return f"[delegate_task] '{goal}' ({content_len:,} chars result)"
+        provenance_hint = ""
+        try:
+            parsed = json.loads(content) if content else None
+            if isinstance(parsed, dict) and "results" in parsed:
+                results = parsed["results"]
+                if isinstance(results, list):
+                    summaries = []
+                    for item in results:
+                        if isinstance(item, dict):
+                            hint = item.get("summary") or item.get("error") or ""
+                            if hint:
+                                summaries.append(str(hint)[:80])
+                    if summaries:
+                        provenance_hint = " → " + " | ".join(summaries[:3])
+        except Exception:
+            pass
+        return f"[delegate_task] '{goal}' ({content_len:,} chars result){provenance_hint}"
 
     if tool_name == "execute_code":
         code_str = _str_arg(args, "code")
@@ -4255,6 +4271,10 @@ Example:
 2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
 3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
 Be specific with file paths, commands, line numbers, and results.]
+
+## Delegations Performed
+[If delegate_task results appear in the input, list each child's goal and
+outcome so later turns keep the evidence chain. Omit this section if none.]
 
 ## Active State
 [Current working state — include:

@@ -838,8 +838,9 @@ check_node() {
     # enough for the desktop build AND an npm that can read our .npmrc. A
     # bad-band npm (see npm_supports_npmrc) fails `npm ci` outright, and the
     # managed Node we install instead bundles one that works.
-    if command -v node &> /dev/null && node_satisfies_build "$(node --version)"; then
-        if ! command -v npm &> /dev/null || npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
+    if command -v node &> /dev/null && command -v npm &> /dev/null \
+        && node_satisfies_build "$(node --version)"; then
+        if npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
             log_success "Node.js $(node --version) found"
             HAS_NODE=true
             return 0
@@ -851,14 +852,17 @@ check_node() {
     fi
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
-    if [ -x "$HERMES_HOME/node/bin/node" ] && node_satisfies_build "$("$HERMES_HOME/node/bin/node" --version)"; then
+    if [ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \
+        && node_satisfies_build "$("$HERMES_HOME/node/bin/node" --version)"; then
         export PATH="$HERMES_HOME/node/bin:$PATH"
         log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
         HAS_NODE=true
         return 0
     fi
 
-    if command -v node &> /dev/null; then
+    if command -v node &> /dev/null && ! command -v npm &> /dev/null; then
+        log_warn "node found but npm is not on PATH (stray node symlink?) — installing Hermes-managed Node $NODE_VERSION LTS..."
+    elif command -v node &> /dev/null; then
         log_warn "Node.js $(node --version) is too old (Hermes requires Node >=26) — installing Hermes-managed Node $NODE_VERSION..."
     elif [ "$DISTRO" = "termux" ]; then
         log_info "Node.js not found — installing Node.js via pkg..."

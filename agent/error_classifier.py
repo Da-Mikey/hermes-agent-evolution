@@ -1303,6 +1303,12 @@ def _classify_by_status(
     if status_code == 408:
         return result_fn(FailoverReason.timeout, retryable=True)
 
+    # 504 Gateway Timeout — a hop timed out, not an application 5xx.
+    # Distinct from 503/529 overload: retry via the timeout path and the
+    # consecutive-timeout breaker, never via compression.
+    if status_code == 504:
+        return result_fn(FailoverReason.timeout, retryable=True)
+
     # Other 4xx — non-retryable
     if 400 <= status_code < 500:
         return result_fn(
