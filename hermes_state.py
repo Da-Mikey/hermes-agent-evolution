@@ -3926,11 +3926,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Close the database connection.
 
         Drains queued token deltas first (the background writer needs the
-        connection). Writable connections then attempt a PASSIVE WAL
-        checkpoint (NOT TRUNCATE: transient per-cron-run connections close
-        many times an hour, and a TRUNCATE fires a full WAL reset that
-        races the gateway's live writer and tears B-tree pages — issue
-        #45383). Read-only connections never request a checkpoint.
+        connection). Writable connections then attempt a TRUNCATE WAL
+        checkpoint so exiting writer processes help shrink the WAL file.
+        Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
@@ -3954,18 +3952,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             if self._conn:
                 if not self.read_only:
-                    # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
-                    # transient SessionDB, so a TRUNCATE here fires a full WAL
-                    # reset many times/hour, racing the gateway's long-lived
-                    # writer on large WAL databases and tearing hot B-tree
-                    # pages -- the #45383 corruption this class's own periodic
-                    # checkpoint was already made PASSIVE to avoid. TRUNCATE
-                    # belongs only on a sole-opener/quiescent connection.
                     try:
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     except Exception as exc:
                         logger.debug(
-                            "WAL checkpoint (PASSIVE) at close failed: %s",
+                            "WAL checkpoint (TRUNCATE) at close failed: %s",
                             exc,
                         )
                 self._conn.close()
@@ -11435,13 +11426,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             result["pruned"] = pruned
 
-            # Only VACUUM if we actually freed rows, and no more often than
-            # once every min_vacuum_interval_days -- a large prune (e.g. the
-            # first one to cross retention_days on a DB with tens of
-            # thousands of rows) can free enough pages that pruned > 0 fires
-            # on every subsequent startup even though a VACUUM already ran
-            # recently. VACUUM on this DB's size (FTS5 shadow tables) is not
-            # cheap -- it holds an exclusive lock for the full rewrite.
+            # VACUUM when either (a) we freed rows this pass, or (b) the DB
+            # file exceeds db_size_vacuum_threshold bytes — issue #2373: the
+            # database grows monotonically even when nothing is prunable, so a
+            # ``pruned > 0``-only gate lets the file balloon past the 1 GiB
+            # backup limit and snapshots get silently skipped for 24h+.
+            # Throttled to once every min_vacuum_interval_days regardless of
+            # which condition triggered it — VACUUM on this DB's size (FTS5
+            # shadow tables) is not cheap; it holds an exclusive lock for the
+            # full rewrite.
             last_vacuum_raw = self.get_meta("last_vacuum")
             vacuum_due = True
             if last_vacuum_raw:
@@ -11449,7 +11442,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     vacuum_due = (now - float(last_vacuum_raw)) >= min_vacuum_interval_days * 86400
                 except (TypeError, ValueError):
                     vacuum_due = True
-            if vacuum and pruned > 0 and vacuum_due:
+
+            db_over_size = False
+            threshold = db_size_vacuum_threshold or 0
+            if threshold > 0:
+                try:
+                    db_over_size = (
+                        self.db_path.exists()
+                        and self.db_path.stat().st_size > threshold
+                    )
+                except OSError:
+                    db_over_size = False
+
+            if vacuum and vacuum_due and (pruned > 0 or db_over_size):
                 try:
                     self.vacuum()
                     result["vacuumed"] = True

@@ -1291,8 +1291,16 @@ class ShellFileOperations(FileOperations):
         # Fall through to init-time self.cwd only if the env doesn't track cwd.
         effective_cwd = cwd or getattr(self.env, "cwd", None) or self.cwd
         result = self.env.execute(command, cwd=effective_cwd, **kwargs)
+        exit_code = result.get("returncode", 0)
+        # A stdin write failure with an otherwise-clean child exit is still
+        # a failure: the child never received the intended input. write_file
+        # rejects such content up front; this mapping is defense-in-depth
+        # for any other stdin caller.
+        if result.get("stdin_error") and exit_code == 0:
+            exit_code = 1
         return ExecuteResult(
-            stdout=result.get("output", ""), exit_code=result.get("returncode", 0)
+            stdout=result.get("output", ""),
+            exit_code=exit_code,
         )
 
     def _has_command(self, cmd: str) -> bool:
@@ -2038,6 +2046,22 @@ class ShellFileOperations(FileOperations):
         if denied:
             return WriteResult(error=denied)
 
+        # Reject lone surrogates up front with a regex scan (no encode, no
+        # subprocess). surrogateescape-decoded content (U+DC80–U+DCFF)
+        # round-trips through the pipe fine, but surrogates outside that
+        # range cannot be encoded at all — and letting them reach the pipe
+        # would spawn a child that then hangs, or truncates the target via
+        # empty-stdin `cat`. Refuse synchronously before any subprocess.
+        m = re.search(r"[\ud800-\udc7f\udd00-\udfff]", content)
+        if m:
+            return WriteResult(
+                error=(
+                    f"Refusing to write '{path}': content contains a lone "
+                    f"surrogate character ({m.group(0)!r}) that cannot be "
+                    "encoded as UTF-8. The file was NOT created or modified."
+                )
+            )
+
         # ── Fail-closed pre-write syntax gate ───────────────────────────
         # Validate the CANDIDATE content BEFORE any bytes touch disk —
         # previously this only ran as a post-write lint *report* that the
@@ -2158,19 +2182,33 @@ class ShellFileOperations(FileOperations):
         # the atomic swap doesn't silently widen or narrow permissions, and
         # clean the temp up on any failure so we never leak a ``.hermes-tmp``
         # turd next to the user's file.
+        # Encode once for byte count + sha256. surrogateescape is the exact
+        # inverse of the decode that may have produced this content, so these
+        # are the bytes the pipe transmits and the bytes on disk. The early
+        # rejection above guarantees this cannot raise; the try/except is
+        # defense for future callers that bypass it.
+        try:
+            content_bytes = content.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError as exc:
+            return WriteResult(
+                error=(
+                    f"Refusing to write '{path}': content contains a lone "
+                    f"surrogate character ({exc}) that cannot be encoded as "
+                    "UTF-8. The file was NOT created or modified."
+                )
+            )
         write_result = self._atomic_write(path, content)
 
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
 
-        # Get bytes written (wc -c is POSIX, works on Linux + macOS)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
-
-        try:
-            bytes_written = int(stat_result.stdout.strip())
-        except ValueError:
-            bytes_written = len(content.encode("utf-8"))
+        # Bytes written — computed from the exact bytes we just wrote (len
+        # matches wc -c) instead of spawning a ``wc -c`` subprocess. The
+        # encode happened up front with surrogateescape — the inverse of the
+        # decode that produces surrogate content — so content_bytes == what
+        # rode stdin == what is on disk, and the sha256 below compares like
+        # with like.
+        bytes_written = len(content_bytes)
 
         # Post-write content verification (cheap, one shell call): compare
         # the on-disk sha256 to the intended content's hash. Production
@@ -2185,7 +2223,7 @@ class ShellFileOperations(FileOperations):
             hash_result = self._exec(hash_cmd)
             if hash_result.exit_code == 0 and hash_result.stdout.strip():
                 disk_sha = hash_result.stdout.strip().split()[0]
-                expected_sha = hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest()
+                expected_sha = hashlib.sha256(content_bytes).hexdigest()
                 content_verified = disk_sha == expected_sha
                 if not content_verified:
                     return WriteResult(
