@@ -31,6 +31,30 @@ class HonchoAuthError(RuntimeError):
     """
 
 
+# Matched narrowly: a false positive spends a token rotation, and a lost rotation revokes the grant.
+_AUTH_ERROR_MARKERS = (
+    "invalid or expired access token",
+    "authentication failed",
+    "unauthorized",
+)
+
+# A 401 in text counts only with HTTP context ("HTTP 401", "status 401"), never as a bare number.
+_HTTP_401_RE = re.compile(r"\b(?:http|status(?:[ _]code)?\s*[:=]?)\s*401\b")
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 401:
+        return True
+    # The transport reported a concrete non-auth status; trust it over text.
+    if isinstance(status, int) and status not in (0, 401):
+        return False
+    text = str(exc).lower()
+    if _HTTP_401_RE.search(text):
+        return True
+    return any(marker in text for marker in _AUTH_ERROR_MARKERS)
+
+
 @dataclass
 class HonchoSession:
     """

@@ -720,6 +720,44 @@ def _crop_image_region(
         return None, None, f"Failed to crop region: {exc}"
 
 
+def _build_scale_note(
+    scale_info: Optional[dict],
+    crop_offset: Optional[dict],
+) -> Optional[str]:
+    """Build a coordinate-mapping disclosure note for the analysis result."""
+    parts = []
+    if scale_info:
+        ow, oh = scale_info["orig_width"], scale_info["orig_height"]
+        nw, nh = scale_info["new_width"], scale_info["new_height"]
+        fx = ow / nw if nw else 1.0
+        fy = oh / nh if nh else 1.0
+        if f"{fx:.2f}" == f"{fy:.2f}":
+            factor_clause = (
+                f"multiply any coordinates you report by {fx:.2f} "
+                f"to map back to the original image."
+            )
+        else:
+            factor_clause = (
+                f"multiply any x coordinates you report by {fx:.2f} and "
+                f"any y coordinates by {fy:.2f} to map back to the "
+                "original image."
+            )
+        parts.append(
+            f"Image downscaled from {ow}x{oh} to {nw}x{nh} for vision; "
+            f"{factor_clause}"
+        )
+    if crop_offset:
+        parts.append(
+            f"Analysis was performed on a cropped region of the original "
+            f"image starting at offset ({crop_offset['x']}, "
+            f"{crop_offset['y']}); coordinates are relative to that crop "
+            "origin — add the offset to map back to the full image."
+        )
+    if not parts:
+        return None
+    return " ".join(parts)
+
+
 def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
                               max_base64_bytes: int = _RESIZE_TARGET_BYTES,
                               max_dimension: Optional[int] = None) -> str:

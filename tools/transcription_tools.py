@@ -248,6 +248,31 @@ def _find_ffmpeg_binary() -> Optional[str]:
     return _find_binary("ffmpeg")
 
 
+def _find_ffprobe_binary() -> Optional[str]:
+    return _find_binary("ffprobe")
+
+
+_STT_M4A_ENCODE_ARGS = (
+    "-vn", "-ac", "1", "-ar", "16000",
+    "-c:a", "aac", "-b:a", "32k", "-movflags", "+faststart",
+)
+
+
+def _run_ffmpeg_stt_encode(
+    ffmpeg: str, input_path: str, output_path: str, *, audio_filter: Optional[str] = None
+) -> None:
+    """Run the shared STT m4a encode, optionally with an ``-af`` filter."""
+    command = [ffmpeg, "-y", "-i", input_path]
+    if audio_filter:
+        command += ["-af", audio_filter]
+    command += [*_STT_M4A_ENCODE_ARGS, output_path]
+    subprocess.run(
+        command, check=True, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=120,
+        stdin=subprocess.DEVNULL, creationflags=windows_hide_flags(),
+    )
+
+
 def _transcode_audio_for_stt(
     file_path: str, work_dir: str
 ) -> tuple[Optional[str], Optional[str]]:
@@ -410,6 +435,115 @@ BUILTIN_STT_PROVIDERS = frozenset({
     "elevenlabs",
     "deepinfra",
 })
+
+# Built-in providers that upload audio to a remote API.
+CLOUD_STT_PROVIDERS = frozenset(BUILTIN_STT_PROVIDERS - {"local", "local_command"})
+
+_CLOUD_TRIM_THRESHOLD_DB_DEFAULT = -40
+_CLOUD_TRIM_KEEP_MS_DEFAULT = 300
+_CLOUD_TRIM_MIN_SAVING = 0.10
+_CLOUD_TRIM_MIN_RESULT_SECONDS = 0.3
+_CLOUD_TRIM_MIN_INPUT_SECONDS = 12.0
+
+
+def _probe_audio_duration(file_path: str) -> Optional[float]:
+    """Return the audio duration in seconds via ffprobe, or None."""
+    ffprobe = _find_ffprobe_binary()
+    if not ffprobe:
+        return None
+    command = [
+        ffprobe, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path,
+    ]
+    try:
+        result = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+            stdin=subprocess.DEVNULL, creationflags=windows_hide_flags(),
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def _cloud_trim_settings(stt_config: Dict[str, Any]) -> tuple[bool, int, int]:
+    """Resolve (enabled, threshold_db, keep_ms) for the cloud silence trim."""
+    cfg = stt_config if isinstance(stt_config, dict) else {}
+    enabled = is_truthy_value(cfg.get("cloud_trim_silence", True), default=True)
+    try:
+        threshold_db = int(cfg.get("cloud_trim_threshold_db", _CLOUD_TRIM_THRESHOLD_DB_DEFAULT))
+    except (TypeError, ValueError):
+        threshold_db = _CLOUD_TRIM_THRESHOLD_DB_DEFAULT
+    try:
+        keep_ms = int(cfg.get("cloud_trim_keep_ms", _CLOUD_TRIM_KEEP_MS_DEFAULT))
+    except (TypeError, ValueError):
+        keep_ms = _CLOUD_TRIM_KEEP_MS_DEFAULT
+    return enabled, threshold_db, max(keep_ms, 0)
+
+
+def _trim_silence_for_cloud_stt(
+    file_path: str, stt_config: Dict[str, Any]
+) -> Optional[str]:
+    """Return a silence-trimmed copy of *file_path* for cloud upload, or None."""
+    enabled, threshold_db, keep_ms = _cloud_trim_settings(stt_config)
+    if not enabled:
+        return None
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        logger.debug("Cloud STT silence trim skipped: ffmpeg not found")
+        return None
+    original_duration = _probe_audio_duration(file_path)
+    if not original_duration or original_duration <= 0:
+        logger.debug("Cloud STT silence trim skipped: could not probe %s", file_path)
+        return None
+    if original_duration < _CLOUD_TRIM_MIN_INPUT_SECONDS:
+        logger.debug(
+            "Cloud STT silence trim skipped for %s: %.1fs is below the %.0fs gate",
+            Path(file_path).name, original_duration, _CLOUD_TRIM_MIN_INPUT_SECONDS,
+        )
+        return None
+
+    keep_seconds = keep_ms / 1000.0
+    filter_expr = (
+        f"silenceremove="
+        f"start_periods=1:start_threshold={threshold_db}dB:start_silence={keep_seconds}:"
+        f"stop_periods=-1:stop_threshold={threshold_db}dB:stop_silence={keep_seconds}"
+    )
+    work_dir = tempfile.mkdtemp(prefix="hermes-stt-trim-")
+    trimmed_path = os.path.join(work_dir, f"{Path(file_path).stem or 'audio'}-trimmed.m4a")
+    min_result_seconds = max(_CLOUD_TRIM_MIN_RESULT_SECONDS, 2 * keep_seconds)
+    keep_result = False
+    try:
+        _run_ffmpeg_stt_encode(ffmpeg, file_path, trimmed_path, audio_filter=filter_expr)
+        trimmed_duration = _probe_audio_duration(trimmed_path)
+        if not trimmed_duration or trimmed_duration < min_result_seconds:
+            logger.debug(
+                "Cloud STT silence trim discarded for %s: trimmed result ~empty (%.2fs)",
+                Path(file_path).name, trimmed_duration or 0.0,
+            )
+            return None
+        if trimmed_duration > original_duration * (1 - _CLOUD_TRIM_MIN_SAVING):
+            logger.debug(
+                "Cloud STT silence trim discarded for %s: saves <%.0f%% (%.1fs -> %.1fs)",
+                Path(file_path).name, _CLOUD_TRIM_MIN_SAVING * 100,
+                original_duration, trimmed_duration,
+            )
+            return None
+        logger.info(
+            "Trimmed silence from %s before cloud STT upload (%.1fs -> %.1fs, -%d%%)",
+            Path(file_path).name, original_duration, trimmed_duration,
+            round((1 - trimmed_duration / original_duration) * 100),
+        )
+        keep_result = True
+        return trimmed_path
+    except Exception as exc:
+        logger.debug("Cloud STT silence trim failed for %s: %s", file_path, exc)
+        return None
+    finally:
+        if not keep_result:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

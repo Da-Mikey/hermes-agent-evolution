@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from hermes_constants import display_hermes_home
 
@@ -98,6 +98,49 @@ def _reset_cron_failure(task_id: Optional[str]) -> None:
         return
     with _cron_failure_tracker_lock:
         _cron_failure_tracker.pop(task_id, None)
+
+
+def _format_cron_error(
+    exc: Exception,
+    operation: str,
+    cli_output: Optional[str] = None,
+) -> str:
+    """Return a rich error string for cron failures.
+
+    Includes the operation name, the exception message, and any captured CLI
+    output so the user can see the root cause without re-running manually.
+    """
+    parts = [f"Cron operation '{operation}' failed: {exc}"]
+    if cli_output:
+        parts.append(f"Underlying output:\n{cli_output}")
+    return "\n".join(parts)
+
+
+def _validate_cron_action(action: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Normalize and validate the cron action parameter.
+
+    Returns ``(normalized_action, error)``; ``error`` is ``None`` when valid.
+    """
+    normalized = (action or "").strip().lower()
+    if not normalized:
+        return "", "action is required"
+    allowed = {
+        "create",
+        "list",
+        "update",
+        "pause",
+        "resume",
+        "remove",
+        "run",
+        "run_now",
+        "trigger",
+    }
+    if normalized not in allowed:
+        return (
+            normalized,
+            f"Unknown cron action '{action}'. Allowed: {', '.join(sorted(allowed - {'run_now', 'trigger'}))}",
+        )
+    return normalized, None
 
 
 def _cron_preflight_check() -> Optional[str]:

@@ -1213,6 +1213,11 @@ def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
     when present, otherwise 1, so the session subagent cap reflects real spawns
     rather than delegate_task invocations.
     """
+    action = ""
+    if isinstance(args, Mapping):
+        action = str(args.get("action") or "").strip().lower()
+    if action in {"list", "steer", "stop"}:
+        return 0
     tasks = args.get("tasks") if isinstance(args, Mapping) else None
     if isinstance(tasks, list) and tasks:
         return len(tasks)

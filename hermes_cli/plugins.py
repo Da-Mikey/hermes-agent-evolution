@@ -1418,6 +1418,36 @@ class PluginContext:
                 return True
         return False
 
+    def _within_trusted_plugin_root(self) -> bool:
+        """True when this plugin lives under the profile's trusted plugins dir."""
+        raw_path = getattr(self.manifest, "path", None)
+        if not raw_path:
+            return False
+        try:
+            plugin_path = Path(raw_path).resolve(strict=True)
+            trusted_root = (get_hermes_home() / "plugins").resolve(strict=True)
+        except OSError:
+            return False
+        return plugin_path == trusted_root or trusted_root in plugin_path.parents
+
+    def _hook_trust_allowed(self) -> bool:
+        """Return True if this plugin is trusted to register hooks."""
+        source = getattr(self.manifest, "source", "") or ""
+        if source == "bundled":
+            return True
+        if source == "user" and self._within_trusted_plugin_root():
+            return True
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            return False
+        plugin_id = self.manifest.key or self.manifest.name
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        entry = entries.get(f"{source}:{plugin_id}") or {}
+        return bool(entry.get("allow_hooks", False))
+
     # -- namespaced config and durable state --------------------------------
 
     def get_config(self, key: str, default: Any = None) -> Any:
@@ -3113,6 +3143,21 @@ class PluginContext:
         Unknown hook names produce a warning but are still stored so
         forward-compatible plugins don't break.
         """
+        if not self._hook_trust_allowed():
+            logger.warning(
+                "Plugin '%s' (source=%s) is not trusted to register hooks; "
+                "set plugins.entries.%s:%s.allow_hooks: true to opt in",
+                self.manifest.name,
+                getattr(self.manifest, "source", "") or "unknown",
+                getattr(self.manifest, "source", "") or "unknown",
+                self.manifest.key or self.manifest.name,
+            )
+            return PluginRegistration(
+                kind="hook",
+                key=hook_name,
+                release=lambda: None,
+                plugin_key=self.manifest.key or self.manifest.name,
+            )
         if hook_name not in VALID_HOOKS:
             logger.warning(
                 "Plugin '%s' registered unknown hook '%s' "

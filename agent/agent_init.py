@@ -1610,6 +1610,9 @@ def init_agent(
     
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
+    # Caller-supplied session_db is almost always the SHARED launch handle.
+    # Dedicated handles set this True at transfer; lazy self-open also sets it.
+    agent._owns_session_db = False
     agent._parent_session_id = parent_session_id
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
