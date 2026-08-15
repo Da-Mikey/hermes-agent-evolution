@@ -2024,10 +2024,18 @@ def _transcribe_local(
 
     try:
         local_cfg = _load_stt_config().get("local") or {}
+        # Reset the idle timer BEFORE loading/transcribing so the idle-unload
+        # watcher can't count a long in-flight transcription as idle time and
+        # unload mid-use.
+        _touch_transcription_time()
         # Lazy-load the model (downloads on first use, ~150 MB for 'base').
         # Double-checked lock: concurrent voice messages must not both
         # download/load the model (#24767).
-        if _local_model is None or _local_model_name != model_name:
+        # ``model`` is a strong local reference bound under the lock: the idle
+        # watcher may null the module global at any time, but this
+        # transcription keeps using the instance it grabbed.
+        model = _local_model
+        if model is None or _local_model_name != model_name:
             with _local_model_lock:
                 if _local_model is None or _local_model_name != model_name:
                     logger.info(
@@ -2045,6 +2053,7 @@ def _transcribe_local(
                         compute_type=local_cfg.get("compute_type", "auto"),
                     )
                     _local_model_name = model_name
+                model = _local_model
 
         # Shared hardened kwargs: VAD filter (default on), no cross-window
         # conditioning, language/initial_prompt resolution — one owner for
@@ -2058,13 +2067,13 @@ def _transcribe_local(
             transcribe_kwargs["initial_prompt"] = prompt
 
         try:
-            if not _local_model:
+            if not model:
                 return {
                     "success": False,
                     "transcript": "",
                     "error": "Local STT model failed to load",
                 }
-            transcribe_result = _local_model.transcribe(file_path, **transcribe_kwargs)
+            transcribe_result = model.transcribe(file_path, **transcribe_kwargs)
             try:
                 segments, info = transcribe_result
             except (TypeError, ValueError):

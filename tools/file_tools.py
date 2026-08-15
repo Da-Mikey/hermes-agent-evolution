@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
+import base64
 import errno
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 import sys
 import tempfile
 import threading
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -27,6 +29,49 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+# Invisible / compatibility spaces that render like a normal space in a
+# terminal. Folding them (plus NFC) lets read_file recover a path the
+# model retyped visually-correctly but with the wrong bytes.
+_FILENAME_SPACE_FOLDS = (
+    "\u00a0",  # no-break space
+    "\u202f",  # narrow no-break space
+    "\u2007",  # figure space
+    "\u2009",  # thin space
+    "\u200a",  # hair space
+)
+
+
+def _fold_filename_for_unicode_match(name: str) -> str:
+    folded = unicodedata.normalize("NFC", name)
+    for src in _FILENAME_SPACE_FOLDS:
+        folded = folded.replace(src, " ")
+    return folded
+
+
+def _find_unicode_equivalent_path(requested: Path) -> Path | None:
+    """Return the single same-dir file that is a unicode-equivalent of *requested*.
+
+    Conservative: only NFC + invisible-space folding, and only when exactly
+    one sibling matches. Visible differences (straight vs curly quote,
+    missing accents) stay as not-found + similar_files.
+    """
+    try:
+        parent = requested.parent
+        if not parent.is_dir():
+            return None
+        target = _fold_filename_for_unicode_match(requested.name)
+        matches = [
+            entry
+            for entry in parent.iterdir()
+            if entry.is_file()
+            and _fold_filename_for_unicode_match(entry.name) == target
+        ]
+    except OSError:
+        return None
+    if len(matches) == 1 and matches[0].name != requested.name:
+        return matches[0]
+    return None
 
 
 def _expand_tilde(path: str) -> str:
@@ -646,6 +691,31 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     if _is_blocked_device_path(resolved):
         return True
     return False
+
+
+def _read_document_bytes(file_ops, path: str, max_bytes: int):
+    """Fetch document bytes across the backend boundary when possible.
+
+    Prefer ``file_ops.read_file_bytes`` (remote backends + tests). Fall
+    back to a host-path read so local extraction still works when the
+    file-operations backend has not yet grown a byte reader.
+    """
+    reader = getattr(file_ops, "read_file_bytes", None)
+    if callable(reader):
+        return reader(path, max_bytes=max_bytes)
+
+    from tools.file_operations import ReadResult
+
+    try:
+        size = os.path.getsize(path)
+        data = Path(path).read_bytes()
+        return ReadResult(
+            base64_content=base64.b64encode(data).decode("ascii"),
+            file_size=size,
+            is_binary=True,
+        )
+    except OSError as exc:
+        return ReadResult(error=str(exc))
 
 
 def _special_file_kind(path) -> str | None:
@@ -1735,44 +1805,89 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         _resolved = _resolve_path_for_task(path, task_id)
-        kind = _special_file_kind(_resolved)
-        if kind is not None:
-            return json.dumps({
-                "success": False,
-                "note": (
-                    f"'{path}' is {kind}, not a regular file — reading "
-                    "it would block indefinitely, so no read was "
-                    "attempted. Use terminal utilities if you need to "
-                    "interact with it."
-                ),
-            })
+
+        # ── Special-file type guard (stat-based) ──────────────────────
+        # The name blocklist above catches /dev/* and /proc/* aliases; this
+        # catches the class — any FIFO/socket/device wherever it lives. A
+        # read on a FIFO blocks until the exec timeout: a self-shipped DoS.
+        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+            kind = _special_file_kind(_resolved)
+            if kind is not None:
+                return json.dumps({
+                    "success": False,
+                    "note": (
+                        f"'{path}' is {kind}, not a regular file — reading "
+                        "it would block indefinitely, so no read was "
+                        "attempted. Use terminal utilities if you need to "
+                        "interact with it."
+                    ),
+                })
+            if os.path.isdir(_resolved):
+                return tool_error(
+                    f"Cannot read '{path}': not a regular file (directory). "
+                    "Use search_files or list the directory instead."
+                )
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
         from tools.read_extract import (
+            ANYDOC_EXTENSIONS,
+            EXTRACTABLE_EXTENSIONS,
+            MAX_DOCUMENT_BYTES,
             ExtractionError,
-            extract_document_text,
+            extract_document_bytes,
             is_extractable_document,
         )
 
         if is_extractable_document(str(_resolved)):
+            file_ops = _get_file_ops(task_id)
             try:
-                extracted_text = extract_document_text(str(_resolved))
-            except ExtractionError:
+                binary = _read_document_bytes(
+                    file_ops, str(_resolved), MAX_DOCUMENT_BYTES
+                )
+                if binary.error or binary.base64_content is None:
+                    raise ExtractionError(binary.error or "Document bytes unavailable")
+                document_bytes = base64.b64decode(
+                    binary.base64_content, validate=True
+                )
+                extracted_text = extract_document_bytes(
+                    document_bytes, str(_resolved)
+                )
+            except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
+                # For binary document formats, surface the specific failure
+                # (size cap, encrypted, malformed…) instead of falling through
+                # — the fallthrough path can only produce a generic
+                # binary-file error or garbage raw bytes, hiding the
+                # actionable reason (e.g. "Document too large to convert").
+                # .ipynb stays on the fallthrough path: it is plain JSON text
+                # and a raw read is genuinely useful.  Byte-transport issues
+                # (ValueError / binascii) keep the fallthrough too — only a
+                # specific ExtractionError carries an actionable reason.
+                _doc_ext = _resolved.suffix.lower()
+                _binary_doc = _doc_ext in ANYDOC_EXTENSIONS or (
+                    _doc_ext in EXTRACTABLE_EXTENSIONS and _doc_ext != ".ipynb"
+                )
+                if (
+                    _binary_doc
+                    and isinstance(exc, ExtractionError)
+                    and not str(exc).startswith("Unsupported document type")
+                ):
+                    return tool_error(
+                        f"Cannot read '{path}' ({_doc_ext}): document "
+                        f"extraction failed — {exc}. Use terminal utilities "
+                        "to inspect or convert the file."
+                    )
             else:
-                file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
-                page_text = "\n".join(lines[offset - 1 : end_line])
+                page_text = "\n".join(lines[offset - 1:end_line])
                 result_dict = {
-                    "content": file_ops._add_line_numbers(page_text, offset)
-                    if page_text
-                    else "",
+                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
-                    "file_size": os.path.getsize(_resolved),
+                    "file_size": binary.file_size,
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
                 }
@@ -1934,18 +2049,35 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # optimization; recording must stay side-effect-identical.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
-            # #2293 — if the shell-based _suggest_similar_files found nothing
-            # (no similar_files), fall back to the shared pure-Python module
-            # so the agent still gets a nearby-files hint. This exercises the
-            # reusable path-validation layer in a real call site (Slice B
-            # extends it to terminal/search_files/patch).
-            if not result_dict.get("similar_files"):
-                _nearby = suggest_nearby_paths(str(_resolved))
-                _hint = format_nearby_hint(str(_resolved), _nearby)
-                if _hint:
-                    result_dict["error"] = _err + "\n\n" + _hint
-            _not_found_json = json.dumps(result_dict, ensure_ascii=False)
-            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
+            unicode_hit = _find_unicode_equivalent_path(Path(str(_resolved)))
+            if unicode_hit is not None:
+                repaired = file_ops.read_file(str(unicode_hit), offset, limit)
+                repaired_dict = repaired.to_dict()
+                if not repaired_dict.get("error"):
+                    existing_hint = repaired_dict.get("hint") or ""
+                    note = (
+                        f"Opened unicode-equivalent filename {unicode_hit.name!r} "
+                        f"instead of {Path(str(_resolved)).name!r}."
+                    )
+                    repaired_dict["hint"] = (
+                        f"{existing_hint} {note}".strip() if existing_hint else note
+                    )
+                    result = repaired
+                    result_dict = repaired_dict
+                    _err = ""
+            if isinstance(_err, str) and _err.startswith("File not found:"):
+                # #2293 — if the shell-based _suggest_similar_files found nothing
+                # (no similar_files), fall back to the shared pure-Python module
+                # so the agent still gets a nearby-files hint. This exercises the
+                # reusable path-validation layer in a real call site (Slice B
+                # extends it to terminal/search_files/patch).
+                if not result_dict.get("similar_files"):
+                    _nearby = suggest_nearby_paths(str(_resolved))
+                    _hint = format_nearby_hint(str(_resolved), _nearby)
+                    if _hint:
+                        result_dict["error"] = _err + "\n\n" + _hint
+                _not_found_json = json.dumps(result_dict, ensure_ascii=False)
+                _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Per-session read_file failure-rate directive (#1370) ──────
         # read_file has the highest failure rate of any core tool (10.6%,

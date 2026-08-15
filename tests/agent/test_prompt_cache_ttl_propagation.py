@@ -200,7 +200,7 @@ class TestFailoverRestartsPreflight:
     def test_every_fallback_activation_restarts_preflight(self):
         from agent import conversation_loop
 
-        tree = ast.parse(inspect.getsource(conversation_loop.run_conversation))
+        tree = ast.parse(inspect.getsource(conversation_loop._run_conversation_impl))
 
         # Parent map so each site can be bound to its nearest enclosing loop.
         parents = {}
@@ -280,7 +280,7 @@ class TestFailoverRestartsPreflight:
         fresh preflight against the fallback's context window (#84733)."""
         from agent import conversation_loop
 
-        tree = ast.parse(inspect.getsource(conversation_loop.run_conversation))
+        tree = ast.parse(inspect.getsource(conversation_loop._run_conversation_impl))
         handlers = [
             node
             for node in ast.walk(tree)

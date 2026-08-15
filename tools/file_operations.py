@@ -1736,7 +1736,14 @@ class ShellFileOperations(FileOperations):
         # Check if truncated
         truncated = total_lines > end_line
         hint = None
-        if truncated:
+        if total_lines == 0:
+            hint = "This file is empty."
+        elif offset > total_lines:
+            hint = (
+                f"offset={offset} is beyond the end of the file "
+                f"({total_lines} lines). Use offset=1 to reread from the start."
+            )
+        elif truncated:
             hint = f"Use offset={end_line + 1} to continue reading (showing {offset}-{end_line} of {total_lines} lines)"
 
         # ``cut`` (unlike sed -n p) always newline-terminates its output,

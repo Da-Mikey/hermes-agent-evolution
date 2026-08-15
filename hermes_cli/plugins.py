@@ -1565,8 +1565,15 @@ class PluginContext:
         release: Callable[[], None],
     ) -> PluginRegistration:
         """Record host-owned cleanup for a successful registration."""
-        return self._manager._track_registration(
-            self.manifest, kind, key, release
+        tracker = getattr(self._manager, "_track_registration", None)
+        if callable(tracker):
+            return tracker(self.manifest, kind, key, release)
+        # Lightweight test stubs (SimpleNamespace managers) have no tracker.
+        return PluginRegistration(
+            kind=kind,
+            key=key,
+            release=release,
+            plugin_key=self.manifest.key or self.manifest.name,
         )
 
     def _track_replacement(
@@ -3172,9 +3179,19 @@ class PluginContext:
             "hook", hook_name,
             lambda: self._manager._remove_callback(
                 self._manager._hooks, hook_name, callback
-            ),
+            ) if hasattr(self._manager, "_remove_callback") else None,
         )
-        logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
+        source = getattr(self.manifest, "source", "") or ""
+        # Audit trail (#1389 requirement 3): every accepted hook is recorded
+        # with the source that earned it, so an operator can reconstruct what
+        # was allowed to run and why.
+        logger.info(
+            "Hook registered: plugin='%s' hook='%s' source='%s' trust='%s'",
+            self.manifest.name,
+            hook_name,
+            source,
+            "default" if source in ("bundled", "user") else "explicit-opt-in",
+        )
         return handle
 
     def register_system_prompt_section(

@@ -1107,6 +1107,7 @@ def _serve_plugin_skill(
     skill_md: Path,
     namespace: str,
     bare: str,
+    file_path: str | None = None,
     *,
     preprocess: bool = True,
     session_id: str | None = None,
@@ -1143,12 +1144,75 @@ def _serve_plugin_skill(
     except Exception:
         pass
 
+    qualified_name = f"{namespace}:{bare}"
+    if _is_skill_disabled(qualified_name):
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Skill '{qualified_name}' is disabled.",
+            },
+            ensure_ascii=False,
+        )
+
     if not skill_matches_platform(parsed_frontmatter):
         return json.dumps(
             {
                 "success": False,
                 "error": f"Skill '{namespace}:{bare}' is not supported on this platform.",
                 "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
+            },
+            ensure_ascii=False,
+        )
+
+    if file_path:
+        from tools.path_security import has_traversal_component, validate_within_dir
+
+        skill_root = skill_md.parent
+        if has_traversal_component(file_path):
+            return json.dumps(
+                {"success": False, "error": "Path traversal ('..') is not allowed."},
+                ensure_ascii=False,
+            )
+        target = skill_root / file_path
+        path_error = validate_within_dir(target, skill_root)
+        if path_error:
+            return json.dumps(
+                {"success": False, "error": path_error}, ensure_ascii=False
+            )
+        if not target.is_file():
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"File '{file_path}' not found in skill '{namespace}:{bare}'.",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            content = target.read_text(encoding="utf-8-sig", errors="replace")
+        except UnicodeDecodeError:
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": f"{namespace}:{bare}",
+                    "file": file_path,
+                    "content": f"[Binary file: {target.name}, size: {target.stat().st_size} bytes]",
+                    "is_binary": True,
+                },
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            return json.dumps(
+                {"success": False, "error": f"Failed to read '{file_path}': {exc}"},
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "success": True,
+                "name": f"{namespace}:{bare}",
+                "file": file_path,
+                "content": content,
+                "file_type": target.suffix,
+                "_source_path": str(target),
             },
             ensure_ascii=False,
         )
@@ -1208,11 +1272,30 @@ def _serve_plugin_skill(
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
-            "linked_files": None,
+            "linked_files": _plugin_skill_linked_files(skill_md.parent),
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
         ensure_ascii=False,
     )
+
+
+def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
+    from tools.path_security import validate_within_dir
+
+    linked: Dict[str, List[str]] = {}
+    for category in ("references", "templates", "assets", "scripts"):
+        base = skill_root / category
+        if not base.is_dir():
+            continue
+        files = [
+            str(path.relative_to(skill_root))
+            for path in sorted(base.rglob("*"))
+            if path.is_file()
+            and validate_within_dir(path, skill_root) is None
+        ]
+        if files:
+            linked[category] = files
+    return linked or None
 
 
 def _suggest_skill_names(name: str, all_names: List[str], n: int = 3) -> List[str]:
@@ -1315,7 +1398,41 @@ def skill_view(
 
             discover_plugins()  # idempotent
             pm = get_plugin_manager()
+            active_memory_provider = None
+            try:
+                from plugins.memory import (
+                    _get_active_memory_provider,
+                    _prune_inactive_memory_provider_skills,
+                )
+
+                active_memory_provider = _get_active_memory_provider()
+                _prune_inactive_memory_provider_skills(active_memory_provider)
+            except Exception as exc:
+                logger.debug(
+                    "Failed pruning inactive memory-provider skills: %s",
+                    exc,
+                )
+
             plugin_skill_md = pm.find_plugin_skill(name)
+
+            # Memory provider plugins are loaded through plugins.memory rather
+            # than the general PluginManager. If a memory provider shim also
+            # registers skills, load the namespaced provider once so its
+            # collector can forward those skills into the plugin skill registry
+            # before declaring the qualified skill missing.
+            if plugin_skill_md is None:
+                try:
+                    from plugins.memory import load_memory_provider
+
+                    if namespace == active_memory_provider:
+                        load_memory_provider(namespace)
+                        plugin_skill_md = pm.find_plugin_skill(name)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed lazy memory-provider skill load for %s: %s",
+                        namespace,
+                        exc,
+                    )
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
@@ -1337,6 +1454,7 @@ def skill_view(
                     plugin_skill_md,
                     namespace,
                     bare,
+                    file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
                 )
@@ -2335,7 +2453,11 @@ def _skill_view_with_bump(args, **kw):
                 # view but NOT use — it must not reset the Curator stale timer,
                 # which keys off last_used_at (see agent/curator.py).
                 if not schema_only:
-                    bump_use(str(resolved))
+                    bump_use(
+                        str(resolved),
+                        task_id=task_id,
+                        session_id=kw.get("session_id"),
+                    )
                     # Record a successful invocation outcome for provenance
                     # tracking (#2190).
                     try:

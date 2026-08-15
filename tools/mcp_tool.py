@@ -275,24 +275,10 @@ if not _MCP_AVAILABLE:
     logger.debug("mcp package not installed -- MCP tool support disabled")
 
 ClientSession: Any = None
-StdioServerParameters = None
-stdio_client = None
-streamablehttp_client = None
-streamable_http_client = None
-CreateMessageResult = None
-CreateMessageResultWithTools = None
-ErrorData = None
-SamplingCapability = None
-SamplingToolsCapability = None
-TextContent = None
-ToolUseContent = None
-ElicitRequestParams = None
-ElicitResult = None
-ServerNotification = None
-ToolListChangedNotification = None
-PromptListChangedNotification = None
-ResourceListChangedNotification = None
-sse_client = None
+# Remaining SDK symbols are bound on first use by _ensure_mcp_sdk() via
+# module-level __getattr__ (PEP 562). Do NOT pre-assign them to None —
+# that would shadow __getattr__ and make `from tools.mcp_tool import
+# CreateMessageResultWithTools` resolve to None (not a type).
 _MCP_SDK_IMPORT_ATTEMPTED = False
 _MCP_SDK_IMPORT_LOCK = threading.Lock()
 
