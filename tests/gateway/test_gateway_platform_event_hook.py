@@ -629,7 +629,7 @@ class TestFixturePluginObservationPath:
         """Adapter -> normalized source/envelope -> runner auth -> real plugin bus."""
         manager = PluginManager()
         context = PluginContext(
-            PluginManifest(name="reaction-fixture", source="user"), manager,
+            PluginManifest(name="reaction-fixture", source="bundled"), manager,
         )
         seen = []
         context.register_hook(

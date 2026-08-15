@@ -766,6 +766,7 @@ class TestPreflightCompression:
         """
         agent.compression_enabled = False
         agent._experience_injection = True
+        agent._experience_block = None
         save_patterns([
             ExperiencePattern(
                 id="session-a",
@@ -978,7 +979,7 @@ class TestPreflightCompression:
 
         def _rough_estimate(*_args, **_kwargs):
             _rough_calls["n"] += 1
-            return 125_000 if _rough_calls["n"] == 1 else 40_000
+            return 160_000 if _rough_calls["n"] == 1 else 40_000
 
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),

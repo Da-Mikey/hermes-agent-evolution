@@ -1,10 +1,15 @@
 ---
 name: evolution-analysis
-description: Analyze issues and PRs to prioritize implementation
+description: Analyze issues and PRs to prioritize implementation.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
 mode: PUBLIC
+metadata:
+  hermes:
+    tags: [evolution, analysis, triage]
 ---
 
 # Evolution Analysis Skill

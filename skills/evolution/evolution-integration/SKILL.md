@@ -1,10 +1,15 @@
 ---
 name: evolution-integration
-description: Merge ready, green-CI evolution PRs into main and self-update
+description: Merge green evolution PRs into main and self-update.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
 mode: PUBLIC
+metadata:
+  hermes:
+    tags: [evolution, integration, merge]
 ---
 
 # Evolution Integration Skill

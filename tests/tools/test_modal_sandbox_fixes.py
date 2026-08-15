@@ -43,7 +43,13 @@ class TestToolResolution:
         )
         names = {t["function"]["name"] for t in tools}
         expected = {"terminal", "process", "read_file", "write_file", "search_files", "patch", "repo_map"}
-        assert expected == names, f"Expected {expected}, got {names}"
+        missing = expected - names
+        assert not missing, f"missing {missing}, got {names}"
+        # tool_search / tool_describe / tool_call are assembled by default
+        # when tool-search is not "off"; they are not part of the static
+        # terminal+file bundle but they are an intentional always-on bridge.
+        extras = names - expected - {"tool_search", "tool_call", "tool_describe"}
+        assert not extras, f"unexpected extras {extras}"
 
     def test_terminal_tool_present(self):
         """The terminal tool must be present (not silently dropped)."""

@@ -1,6 +1,6 @@
 ---
 name: self-critique
-description: Audit a completed task against the user's original request before declaring done. Catches omitted constraints, misread scope, partially-met requirements, and unsupported "it's done" claims after long multi-tool loops. Opt-in quality gate — run it, report the verdict, never silently re-loop.
+description: Audit a finished task against the original request.
 version: 1.0.0
 author: Nous Research (proposed by @dimokru, issue #372)
 license: Apache-2.0

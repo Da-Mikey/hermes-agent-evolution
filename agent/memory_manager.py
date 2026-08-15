@@ -605,6 +605,37 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
+    def describe_recall(self) -> str:
+        """Build a deterministic, model-independent recall indicator line.
+
+        Call right after :meth:`prefetch_all` on the turn thread. Collects each
+        provider's :meth:`MemoryProvider.recall_status` and renders a single
+        status string (e.g. ``"🧠 Provider — recalled 3 memories"``) so the
+        user SEES memory was used regardless of whether the model mentions it.
+        Returns ``""`` when no provider injected memory this turn — callers can
+        emit the result unconditionally.
+        """
+        segments: List[str] = []
+        for provider in self._providers:
+            try:
+                status = provider.recall_status()
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' recall_status failed (non-fatal): %s",
+                    provider.name, e,
+                )
+                continue
+            if status is None:
+                continue
+            if status.count == 1:
+                detail = "recalled 1 memory"
+            elif status.count > 1:
+                detail = f"recalled {status.count} memories"
+            else:
+                detail = "recalled relevant memory"
+            segments.append(f"{status.glyph} {status.provider_label} — {detail}")
+        return "  ".join(segments)
+
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Collect prefetch context from all providers.
 

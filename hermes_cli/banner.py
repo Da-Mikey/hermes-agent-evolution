@@ -193,6 +193,52 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     return (result.stdout or "").strip()
 
 
+def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
+    """Exact behind-count via the GitHub compare API for uncountable graphs.
+
+    Shallow installer clones and ls-remote-only probes know the two tip SHAs
+    but have no local history to run ``rev-list --count`` across. GitHub's
+    ``GET /repos/<owner>/<repo>/compare/<current>...<target>`` knows the full
+    graph regardless of local clone depth and returns ``ahead_by`` — exactly
+    the behind count the local graph lost. Unauthenticated, bounded, and
+    best-effort: any failure (offline, rate limit, diverged/unknown SHAs)
+    returns None so callers keep the honest UPDATE_AVAILABLE_NO_COUNT.
+    """
+    if not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
+        return None
+    url = (
+        "https://api.github.com/repos/nousresearch/hermes-agent/"
+        f"compare/{current_rev}...{target_rev}"
+    )
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                # api.github.com 403s requests without a User-Agent.
+                "User-Agent": "hermes-cli-update-check",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    ahead = payload.get("ahead_by") if isinstance(payload, dict) else None
+    if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
+        return ahead
+    return None
+
+
+def _is_full_sha(value: Optional[str]) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(c in "0123456789abcdefABCDEF" for c in value)
+    )
+
+
 def _check_via_rev(local_rev: str) -> Optional[int]:
     """Compare an embedded git revision to upstream main via ls-remote.
 
@@ -212,7 +258,14 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     upstream_rev = result.stdout.split()[0]
     if not upstream_rev:
         return None
-    return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
+    if upstream_rev == local_rev:
+        return 0
+    # Behind, but ls-remote only knows tip SHAs. Try to recover the exact
+    # count from the GitHub compare API before falling back to the sentinel.
+    # ahead_by == 0 with differing tips means the remote tip is reachable from
+    # our HEAD — a local-ahead checkout, i.e. NOT behind.
+    counted = _github_compare_behind(local_rev, upstream_rev)
+    return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
@@ -220,10 +273,17 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        checked = _check_via_rev(head_rev) if head_rev else None
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
-        return checked
+        # ls-remote against the upstream URL only tells us tip SHAs — there
+        # is no local history to count commits against. Return the
+        # UPDATE_AVAILABLE_NO_COUNT sentinel so the banner and CLI renderers
+        # print "update available" instead of fabricating a "1 commit behind"
+        # message. The dashboard's REST /api/hermes/update/check already
+        # treats any nonzero behind as update_available=true (see
+        # hermes_cli/web_server.py::check_hermes_update), and the desktop
+        # store clamps behind<=0 to 0 and reads update_available separately
+        # (apps/desktop/src/store/updates.ts::mapBackendCheck), so no UI
+        # consumer depends on a fabricated count here.
+        return _check_via_rev(head_rev) if head_rev else None
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
@@ -268,7 +328,14 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         )
         if not head_rev or not target_rev:
             return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        if head_rev == target_rev:
+            return 0
+        # Tips differ but the shallow boundary hides the history between them.
+        # Recover the exact count from the GitHub compare API when possible
+        # (ahead_by == 0 means local-ahead ⇒ up to date); otherwise report the
+        # honest "update available, count unknown" sentinel.
+        counted = _github_compare_behind(head_rev, target_rev)
+        return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
     try:
         result = subprocess.run(

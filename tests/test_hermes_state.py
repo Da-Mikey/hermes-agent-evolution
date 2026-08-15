@@ -104,7 +104,7 @@ class TestConnectionLifecycle:
         writable.close()
 
         assert any(
-            "pragma wal_checkpoint(truncate)" == " ".join(sql.lower().split())
+            "pragma wal_checkpoint(passive)" == " ".join(sql.lower().split())
             for sql in executed
         )
 

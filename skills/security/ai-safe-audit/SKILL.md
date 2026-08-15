@@ -1,6 +1,13 @@
 ---
 name: ai-safe-audit
-description: Use when building, modifying, reviewing, or auditing an AI agent / agentic or LLM system, or whenever an agent processes external or untrusted data (email, documents, web pages, RAG context, tool or MCP descriptions, API responses). Triggers include agent security audit, prompt injection, indirect prompt injection, tool poisoning, jailbreak, RAG or vector-DB security, MCP server risks, unsafe LLM output handling, over-privileged agent tools, sensitive data or PII leakage, Denial of Wallet.
+description: Audit AI agents for injection and privilege risks.
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [security, audit, prompt-injection, agent-safety]
 ---
 
 # AI-SAFE Audit

@@ -165,7 +165,7 @@ TIPS = [
     # --- Memory ---
     "Memory is a frozen snapshot — changes appear in the system prompt only at next session start.",
     "Memory entries are automatically scanned for prompt injection and exfiltration patterns.",
-    "The agent has two memory stores: personal notes (~4000 chars) and user profile (~2500 chars).",
+    "The agent has two memory stores: personal notes (~2200 chars) and user profile (~1375 chars).",
     "Corrections you give the agent (\"no, do it this way\") are often auto-saved to memory.",
 
     # --- Skills ---
@@ -388,7 +388,7 @@ TIPS = [
 
     # --- Env Vars & Config Gates ---
     "display.tool_progress_command: true exposes /verbose on messaging platforms; it's CLI-only by default.",
-    'HERMES_BACKGROUND_NOTIFICATIONS=result only pings when background tasks finish (vs all/error/off).',
+    'HERMES_BACKGROUND_NOTIFICATIONS=result only pings when background tasks finish (vs concise/all/error/off).',
     'HERMES_WRITE_SAFE_ROOT restricts write_file/patch to directory prefixes; multiple paths via os.pathsep (: or ;).',
     'HERMES_IGNORE_RULES skips auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills.',
     'HERMES_ACCEPT_HOOKS auto-approves unseen shell hooks declared in config.yaml without a TTY prompt.',

@@ -223,11 +223,5 @@ def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
 
     data = compute_prompt_breakdown("cli")
 
-    # Fork delta: repo_map self-registers into the ``file`` toolset
-    # (tools/repo_map.py), so our minimal surface is 7, not upstream's 6.
-    # Upstream dropped this test in the v2026.7.30 range because the baseline
-    # count churns; the fork keeps it, and it earns its place — the count went
-    # to 9 while repo_map was being deferred behind the tool_search bridge
-    # (3 bridge tools in, repo_map out), which is exactly the regression the
-    # _HERMES_CORE_TOOLS entry now prevents.
+    # Blank Slate is file + terminal (5 file + 2 terminal = 7 schemas).
     assert data["tools"]["count"] == 7

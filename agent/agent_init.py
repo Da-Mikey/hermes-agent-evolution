@@ -61,6 +61,40 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+# Memory providers we've already warned are unavailable. Deduped because the
+# gateway builds a fresh AIAgent per message, so an un-deduped warning would
+# fire on every turn.
+_warned_unavailable_providers: set[str] = set()
+
+
+def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
+    """Warn (once per provider) when a configured memory provider is unavailable.
+
+    ``is_available()`` is a fast, side-effect-free hot-path check, so it can't
+    log for itself. Without this warning a provider whose credentials/config are
+    missing is silently dropped — the user has ``memory.provider`` set but gets
+    no memory and no diagnostic. A common trigger is systemd/gateway services
+    not inheriting ``~/.hermes/.env``. See NousResearch/hermes-agent#2765.
+
+    ``reason`` is the provider's ``unavailable_reason()`` — a provider-specific,
+    actionable hint (e.g. which package to install). Because an unavailable
+    provider is never initialized, this is the only place such a hint can reach
+    the user, so it is appended to the warning when present (#7718).
+    """
+    if name in _warned_unavailable_providers:
+        return
+    _warned_unavailable_providers.add(name)
+    logger.warning(
+        "Memory provider %r is selected but reports unavailable — external memory "
+        "is disabled for this session (built-in memory still works). Check the "
+        "provider's credentials/config with 'hermes memory status'. Note: "
+        "systemd/gateway services do not inherit ~/.hermes/.env automatically; set "
+        "any required variables in the service environment.%s",
+        name,
+        f" {reason}" if reason else "",
+    )
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -161,6 +195,17 @@ def _provider_default_routes(provider: str) -> set[str]:
     except Exception:
         pass
 
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+
+        for cp in get_compatible_custom_providers() or []:
+            if _normalize_custom_provider_name(cp.get("name")) == provider:
+                route = _normalize_route_base_url(cp.get("base_url", ""))
+                if route:
+                    routes.add(route)
+    except Exception:
+        pass
+
     if provider == "gemini":
         routes.update(
             f"{route.rstrip('/')}/openai"
@@ -209,7 +254,15 @@ def _context_route_mismatch(
 
     if active_route:
         configured_routes = _provider_default_routes(configured_provider)
-        return not configured_routes or active_route not in configured_routes
+        if configured_routes:
+            return active_route not in configured_routes
+        # Named/custom providers have no catalog default routes. An empty
+        # configured URL with a matching provider identity is still the same
+        # route — agent_init fills base_url from custom_providers before this
+        # check, but gateway display/hygiene paths historically compared the
+        # raw empty model.base_url and falsely dropped model.context_length.
+        if active_provider and configured_provider == active_provider:
+            return False
     return bool(
         configured_provider
         and active_provider
@@ -508,6 +561,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -602,6 +656,7 @@ def init_agent(
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent.skip_background_review = bool(skip_background_review)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1563,6 +1618,9 @@ def init_agent(
     
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
+    # Caller-supplied session_db is almost always the SHARED launch handle.
+    # Dedicated handles set this True at transfer; lazy self-open also sets it.
+    agent._owns_session_db = False
     agent._parent_session_id = parent_session_id
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
@@ -2177,6 +2235,26 @@ def init_agent(
             codex_app_server_auto_compaction,
         )
         codex_app_server_auto_compaction = "native"
+    from utils import is_truthy_value as _is_truthy
+
+    codex_responses_native_compaction = _is_truthy(
+        _compression_cfg.get("codex_responses_native", False)
+    )
+    _native_threshold_raw = _compression_cfg.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(_native_threshold_raw, bool):
+            raise ValueError
+        codex_responses_compact_threshold = int(_native_threshold_raw)
+        if codex_responses_compact_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        _ra().logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; defaulting to 200,000.",
+            _native_threshold_raw,
+        )
+        codex_responses_compact_threshold = 200_000
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2633,6 +2711,8 @@ def init_agent(
             compression_micro_compact_defrag_tokens
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
+    agent.codex_responses_native_compaction = codex_responses_native_compaction
+    agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds

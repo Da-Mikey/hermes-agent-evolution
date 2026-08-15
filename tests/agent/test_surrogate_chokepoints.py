@@ -176,7 +176,8 @@ def test_conversation_loop_sanitizes_api_kwargs_after_build():
 
     import agent.conversation_loop as cl
 
-    src = inspect.getsource(cl.run_conversation)
+    fn = getattr(cl, "_run_conversation_impl", cl.run_conversation)
+    src = inspect.getsource(fn)
     build_idx = src.index("api_kwargs = agent._build_api_kwargs(api_messages)")
     sanitize_idx = src.index("_sanitize_structure_surrogates(api_kwargs)")
     perform_idx = src.index("def _perform_api_call")

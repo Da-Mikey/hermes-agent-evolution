@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -43,6 +44,60 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+_PLACEHOLDER_GOAL_RE = re.compile(r"^(todo|task\s*\d+)$", re.IGNORECASE)
+_TEMPLATE_MARKER_RE = re.compile(
+    r"<[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+>"
+    r"|\{[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+\}"
+)
+_MIN_BATCH_GOAL_LEN = 10
+
+
+def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
+    """Validate a tasks=[...] batch beyond per-task goal presence.
+
+    Returns an actionable error string, or None when the batch is valid.
+    Batch-only by design: the single-`goal` form legitimately uses short
+    goals, so these checks must never run on it.
+
+    Duplicate goals are deliberately NOT rejected: identical-goal fan-outs
+    are a legitimate pattern (best-of-N / ensemble sampling), and blocking
+    them broke real workflows (post-merge audit of #81141).
+    """
+    if len(task_list) < 2:
+        return (
+            "Batch mode requires at least 2 tasks. For a single task, use "
+            "the `goal` parameter instead of `tasks`: "
+            'delegate_task(goal="...", context="...").'
+        )
+
+    for i, task in enumerate(task_list):
+        goal = str(task.get("goal", "")).strip()
+        normalized = " ".join(goal.lower().split())
+
+        if _PLACEHOLDER_GOAL_RE.match(normalized):
+            return (
+                f"Task {i} has a placeholder goal ({goal!r}). Replace it "
+                "with a specific, self-contained description of what the "
+                "subagent should accomplish."
+            )
+        marker = _TEMPLATE_MARKER_RE.search(goal)
+        if marker:
+            return (
+                f"Task {i} goal contains an unexpanded template marker "
+                f"({marker.group(0)!r}). Substitute the real value before "
+                "calling delegate_task — subagents cannot resolve "
+                "placeholders."
+            )
+        if len(goal) < _MIN_BATCH_GOAL_LEN:
+            return (
+                f"Task {i} goal is too short ({goal!r}). Write a specific, "
+                "self-contained goal of at least "
+                f"{_MIN_BATCH_GOAL_LEN} characters so the subagent knows "
+                "exactly what to do."
+            )
+    return None
 
 
 # Tools that children must never have access to
@@ -266,13 +321,40 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     sid = record.get("subagent_id")
     if not sid:
         return
+    record.setdefault("accepting_steer", True)
     with _active_subagents_lock:
         _active_subagents[sid] = record
 
 
-def _unregister_subagent(subagent_id: str) -> None:
+def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
     with _active_subagents_lock:
-        _active_subagents.pop(subagent_id, None)
+        record = _active_subagents.get(subagent_id)
+        if record is not None and (agent is None or record.get("agent") is agent):
+            _active_subagents.pop(subagent_id, None)
+
+
+def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
+    """Atomically close steer acceptance and drain its final durable artifact.
+
+    ``steer_subagent`` holds the same registry lock through ``agent.steer``.
+    Therefore either acceptance wins and this drain sees its exact text, or
+    closure wins and the caller is rejected. Exact agent identity prevents a
+    finishing child with a recycled public id from closing its replacement.
+    """
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None or record.get("agent") is not agent:
+            return None
+        record["accepting_steer"] = False
+        drain = getattr(agent, "_drain_pending_steer", None)
+        if not callable(drain):
+            return None
+        try:
+            pending = drain()
+        except Exception as exc:
+            logger.debug("final steer drain for %s failed: %s", subagent_id, exc)
+            return None
+        return pending if isinstance(pending, str) and pending.strip() else None
 
 
 def interrupt_subagent(subagent_id: str) -> bool:
@@ -299,6 +381,219 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
+def _get_worktree_isolation() -> bool:
+    """Read delegation.worktree_isolation from config (bool, default False).
+
+    Inspired by Muse Code's ``--subagent-worktree-isolation`` (Meta, Aug
+    2026): when enabled, each delegated child gets its own git worktree
+    checked out from the parent's current commit so parallel children never
+    contend for the same working copy. Opt-in and git-only — in a non-git
+    workspace or on a non-local terminal backend the flag is ignored without
+    an error and children share the parent's workspace as before.
+    """
+    cfg = _load_config()
+    return bool(cfg.get("worktree_isolation", False))
+
+
+def steer_subagent(
+    subagent_id: str,
+    text: str,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> bool:
+    """Queue steering text into a single running subagent without stopping it.
+
+    The redirection-side mirror of interrupt_subagent(): resolves the live
+    child in the registry and calls AIAgent.steer(), which appends the text
+    to the child's last tool result at its next iteration boundary — the
+    current tool call is never cut. Returns True if a matching subagent
+    QUEUED the text while the child was still accepting work; False for an
+    unknown/closed id, an ownership mismatch, a record with no live agent, or
+    empty text. ``owner_session_id=None`` deliberately preserves the internal
+    in-process helper contract; gateway callers must pass exact authority.
+
+    Acceptance and completion are linearized by the registry lock. If
+    acceptance wins but no delivery boundary remains, ``_run_single_child``
+    drains the exact text into the completion entry as ``missed_steer``.
+    """
+    if not text or not text.strip():
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or not record.get("accepting_steer", False):
+            return False
+        if owner_session_id is not None:
+            if (
+                record.get("owner_session_id") != owner_session_id
+                or owner_transport is None
+                or record.get("owner_transport") is not owner_transport
+                or owner_session_record is None
+                or record.get("owner_session_record") is not owner_session_record
+            ):
+                return False
+        agent = record.get("agent")
+        if agent is None:
+            return False
+        try:
+            return bool(agent.steer(text))
+        except Exception as exc:
+            logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
+            return False
+
+
+def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
+    """True when *child_agent* sits below *parent_agent* in the spawn tree."""
+    if child_agent is None or parent_agent is None:
+        return False
+    cur = child_agent
+    for _ in range(max_hops):
+        ref = getattr(cur, "_delegate_parent_ref", None)
+        ancestor = ref() if callable(ref) else None
+        if ancestor is None:
+            return False
+        if ancestor is parent_agent:
+            return True
+        cur = ancestor
+    return False
+
+
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+
+
+def _handle_control_action(
+    action: str,
+    subagent_id: Optional[str],
+    message: Optional[str],
+    parent_agent: Any,
+) -> str:
+    """Synchronous control plane for delegate_task: list/steer/stop."""
+    if action == "list":
+        with _active_subagents_lock:
+            records = list(_active_subagents.values())
+        entries = []
+        for r in records:
+            agent = r.get("agent")
+            if not _is_descendant_of(agent, parent_agent):
+                continue
+            started = r.get("started_at")
+            entries.append(
+                {
+                    "subagent_id": r.get("subagent_id"),
+                    "parent_id": r.get("parent_id"),
+                    "goal": r.get("goal"),
+                    "model": r.get("model"),
+                    "status": r.get("status"),
+                    "running_seconds": (
+                        round(time.time() - started, 1)
+                        if isinstance(started, (int, float))
+                        else None
+                    ),
+                    "accepting_steer": bool(r.get("accepting_steer", False)),
+                    "live_transcript": getattr(agent, "_live_transcript_path", None),
+                }
+            )
+        payload: Dict[str, Any] = {
+            "action": "list",
+            "count": len(entries),
+            "subagents": entries,
+        }
+        if not entries:
+            payload["note"] = (
+                "No live subagents right now. Children that already finished "
+                "have delivered (or will deliver) their results as normal "
+                "completion messages — there is nothing to steer or stop."
+            )
+        return json.dumps(payload, ensure_ascii=False)
+
+    sid = (subagent_id or "").strip()
+    if not sid:
+        return tool_error(
+            f"action='{action}' requires subagent_id (from the spawn dispatch "
+            "response or action='list')."
+        )
+    with _active_subagents_lock:
+        record = _active_subagents.get(sid)
+        target_agent = record.get("agent") if record else None
+    if record is None or not _is_descendant_of(target_agent, parent_agent):
+        return tool_error(
+            f"No live subagent '{sid}' in this conversation's spawn tree. It "
+            "may have already finished (its result arrives as a normal "
+            "completion message). Use action='list' to see live children."
+        )
+
+    if action == "stop":
+        if interrupt_subagent(sid):
+            return json.dumps(
+                {
+                    "action": "stop",
+                    "subagent_id": sid,
+                    "status": "interrupt_requested",
+                    "note": (
+                        "The subagent stops at its next iteration boundary "
+                        "(in-flight tool calls are asked to cancel). Its "
+                        "partial result still re-enters the conversation as a "
+                        "completion message — do not wait or poll."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        return tool_error(
+            f"Could not interrupt '{sid}' — it likely finished in the last "
+            "moment. Its result arrives as a normal completion message."
+        )
+
+    if action == "steer":
+        text = (message or "").strip()
+        if not text:
+            return tool_error(
+                "action='steer' requires a non-empty 'message' describing the "
+                "course correction."
+            )
+        if steer_subagent(sid, text):
+            return json.dumps(
+                {
+                    "action": "steer",
+                    "subagent_id": sid,
+                    "status": "queued",
+                    "note": (
+                        "Steering text queued. The subagent sees it appended "
+                        "to its next tool result — the current tool call is "
+                        "never cut. If the child finishes before a delivery "
+                        "boundary remains, the text is reported back as "
+                        "missed_steer in its completion entry."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        return tool_error(
+            f"Subagent '{sid}' is no longer accepting steering (finishing or "
+            "already finished). Its result arrives as a normal completion "
+            "message; re-delegate a follow-up task if more work is needed."
+        )
+
+    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+
+
+def _capture_gateway_steer_authority(
+    owner_session_id: Optional[str],
+) -> tuple[Any, Any]:
+    """Capture exact request transport + live session generation, if any.
+
+    This is intentionally an in-process bridge, not a serializable capability.
+    Non-gateway hosts (including the CLI helper path) receive ``(None, None)``.
+    """
+    if not owner_session_id:
+        return None, None
+    try:
+        from tui_gateway.server import _current_session_steer_authority
+
+        return _current_session_steer_authority(owner_session_id)
+    except Exception:
+        return None, None
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -307,7 +602,18 @@ def list_active_subagents() -> List[Dict[str, Any]]:
     """
     with _active_subagents_lock:
         return [
-            {k: v for k, v in r.items() if k != "agent"}
+            {
+                k: v
+                for k, v in r.items()
+                if k
+                not in {
+                    "agent",
+                    "owner_session_id",
+                    "owner_transport",
+                    "owner_session_record",
+                    "accepting_steer",
+                }
+            }
             for r in _active_subagents.values()
         ]
 
@@ -2571,6 +2877,10 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2709,6 +3019,19 @@ def _run_single_child(
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
     if _subagent_id:
+        if owner_session_id is None:
+            try:
+                from gateway.session_context import get_session_env
+
+                owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
+            except Exception:
+                owner_session_id = None
+        if owner_session_id and (
+            owner_transport is None or owner_session_record is None
+        ):
+            owner_transport, owner_session_record = (
+                _capture_gateway_steer_authority(owner_session_id)
+            )
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
@@ -2726,6 +3049,9 @@ def _run_single_child(
             "status": "running",
             "tool_count": 0,
             "agent": child,
+            "owner_session_id": owner_session_id,
+            "owner_transport": owner_transport,
+            "owner_session_record": owner_session_record,
         })
 
     try:
@@ -2807,6 +3133,17 @@ def _run_single_child(
         )
         try:
             result = _child_future.result(timeout=child_timeout)
+            _late_pending_steer = (
+                _close_subagent_steering(_subagent_id, child) if _subagent_id else None
+            )
+            if _late_pending_steer:
+                _existing_pending = result.get("pending_steer") if isinstance(result, dict) else None
+                if isinstance(result, dict):
+                    result["pending_steer"] = (
+                        f"{_existing_pending}\n{_late_pending_steer}"
+                        if isinstance(_existing_pending, str) and _existing_pending
+                        else _late_pending_steer
+                    )
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2856,6 +3193,10 @@ def _run_single_child(
                         task_index,
                         diagnostic_path,
                     )
+
+            _late_pending_steer = (
+                _close_subagent_steering(_subagent_id, child) if _subagent_id else None
+            )
 
             if child_progress_cb:
                 try:
@@ -2914,6 +3255,11 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                **(
+                    {"missed_steer": _late_pending_steer}
+                    if _late_pending_steer
+                    else {}
+                ),
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -3031,7 +3377,22 @@ def _run_single_child(
         _child_is_orchestrator = (
             getattr(child, "_delegate_role", None) == "orchestrator"
         )
-        if status == "completed" and not tool_trace and not _child_is_orchestrator:
+        _summary_is_json = False
+        if summary:
+            try:
+                _parsed_summary = json.loads(str(summary).strip())
+                _summary_is_json = isinstance(_parsed_summary, (dict, list))
+            except (TypeError, ValueError):
+                _summary_is_json = False
+        if (
+            status == "completed"
+            and not tool_trace
+            and not _child_is_orchestrator
+            and not isinstance(
+                getattr(child, "_delegate_output_schema", None), dict
+            )
+            and not _summary_is_json
+        ):
             retry_budget = _get_shallow_retry_budget()
             while shallow_retries < retry_budget and not tool_trace:
                 shallow_retries += 1
@@ -3133,6 +3494,17 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        # Per-delegation spend, serialized back to the model alongside
+        # tokens/api_calls so the parent can see what each delegation cost.
+        # Mirrors _child_cost_usd (which is stripped pre-serialization and
+        # only feeds the parent session rollup).
+        # Inspired by: Perplexity Agent API result shape (idea-level).
+        entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
+        _cost_status = getattr(child, "session_cost_status", None)
+        entry["cost_status"] = (
+            _cost_status if isinstance(_cost_status, str) and _cost_status
+            else "unknown"
+        )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -3141,6 +3513,57 @@ def _run_single_child(
         # no retry was attempted, to avoid noise on the healthy path.
         if shallow_retries:
             entry["shallow_retries"] = shallow_retries
+
+        _missed_steer = result.get("pending_steer")
+        if isinstance(_missed_steer, str) and _missed_steer.strip():
+            entry["missed_steer"] = _missed_steer
+            _miss_note = (
+                "[steer did not land — the subagent finished before it could "
+                f"be delivered: {_missed_steer}]"
+            )
+            entry["summary"] = f"{summary}\n\n{_miss_note}" if summary else _miss_note
+
+        _output_schema = getattr(child, "_delegate_output_schema", None)
+        if not isinstance(_output_schema, dict):
+            _output_schema = None
+        if _output_schema:
+            from tools.delegation_output_schema import (
+                MAX_SCHEMA_RETRIES,
+                build_retry_message,
+                validate_output,
+            )
+
+            if status != "completed" or not (summary or "").strip():
+                entry["schema_valid"] = False
+            else:
+                _schema_ok, _schema_errors = validate_output(summary, _output_schema)
+                _schema_retries = 0
+                if not _schema_ok:
+                    _schema_retries = min(1, MAX_SCHEMA_RETRIES)
+                    try:
+                        _schema_retry = child.run_conversation(
+                            user_message=build_retry_message(_schema_errors),
+                            task_id=child_task_id,
+                        )
+                        _schema_retry_outcome = _derive_child_outcome(_schema_retry)
+                        _retry_summary = _schema_retry_outcome.get("summary") or ""
+                        _schema_ok, _schema_errors = validate_output(
+                            _retry_summary, _output_schema
+                        )
+                        if _schema_ok:
+                            summary = _retry_summary
+                            entry["summary"] = summary
+                    except Exception as _schema_retry_exc:
+                        logger.debug(
+                            "Subagent %d schema retry failed: %s",
+                            task_index,
+                            _schema_retry_exc,
+                        )
+                entry["schema_valid"] = bool(_schema_ok)
+                if _schema_retries:
+                    entry["schema_retries"] = _schema_retries
+                if not _schema_ok:
+                    entry["schema_errors"] = _schema_errors
 
         # #1369: surface the toolset auto-adjustment so the parent agent sees
         # a structured signal (not a free-text refusal) that `terminal` was
@@ -3164,7 +3587,13 @@ def _run_single_child(
         # Issue #323: by this point the bounded auto-retry above has already
         # tried (and failed) to recover, so this only fires when retries were
         # exhausted or disabled — the warning still tells the parent to act.
-        if status == "completed" and not tool_trace:
+        if (
+            status == "completed"
+            and not tool_trace
+            and not isinstance(
+                getattr(child, "_delegate_output_schema", None), dict
+            )
+        ):
             entry["shallow_result"] = True
             _retry_note = (
                 f" Auto-retry exhausted ({shallow_retries} attempt(s)) and the "
@@ -3180,6 +3609,12 @@ def _run_single_child(
                 "either re-delegate with explicit tool instructions or do "
                 "the work inline." + _retry_note + "\n\n" + summary
             )
+            if entry.get("missed_steer"):
+                _miss_note = (
+                    "[steer did not land — the subagent finished before it could "
+                    f"be delivered: {entry['missed_steer']}]"
+                )
+                entry["summary"] = f"{entry['summary']}\n\n{_miss_note}"
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -3312,7 +3747,7 @@ def _run_single_child(
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
-            _unregister_subagent(_subagent_id)
+            _unregister_subagent(_subagent_id, agent=child)
 
         if child_pool is not None and leased_cred_id is not None:
             try:
@@ -3735,7 +4170,11 @@ def delegate_task(
     background: Optional[bool] = None,
     handoff_mode: Optional[str] = None,
     grader: Optional[Dict[str, Any]] = None,
+    output_schema: Optional[Dict[str, Any]] = None,
     parent_agent=None,
+    action: Optional[str] = None,
+    subagent_id: Optional[str] = None,
+    message: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -3762,6 +4201,13 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+    action_name = (action or "spawn").strip().lower()
+    if action_name in _CONTROL_ACTIONS:
+        return _handle_control_action(action_name, subagent_id, message, parent_agent)
+    if action_name not in {"spawn", ""}:
+        return tool_error(
+            f"Unknown action '{action}'. Use spawn, list, steer, or stop."
+        )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -3846,6 +4292,8 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [{"goal": goal, "context": context, "role": top_role}]
+        if output_schema is not None:
+            task_list[0]["output_schema"] = output_schema
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -3858,6 +4306,25 @@ def delegate_task(
             return tool_error(f"Task {i} must be an object, got {type(task).__name__}.")
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    if tasks is not None and isinstance(tasks, list):
+        batch_error = _validate_batch_tasks(task_list)
+        if batch_error:
+            return tool_error(batch_error)
+
+    from tools.delegation_output_schema import (
+        append_output_contract,
+        coerce_output_schema,
+    )
+
+    for i, task in enumerate(task_list):
+        raw_schema = task.get("output_schema")
+        schema, schema_err = coerce_output_schema(raw_schema)
+        if schema_err:
+            return tool_error(schema_err)
+        task["_coerced_schema"] = schema
+        if schema:
+            task["context"] = append_output_contract(task.get("context"), schema)
 
     # Handoff collapse-mode (#319): when requested, condense the parent's
     # recent conversation into each task's `context` via the existing
@@ -3899,6 +4366,15 @@ def delegate_task(
     from tools.async_delegation import _current_origin_session_id
 
     _origin_wake_sid = _current_origin_session_id()
+    try:
+        from gateway.session_context import get_session_env
+
+        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+    except Exception:
+        _origin_ui_session_id = ""
+    _origin_owner_transport, _origin_owner_session_record = (
+        _capture_gateway_steer_authority(_origin_ui_session_id)
+    )
 
     # Save parent tool names BEFORE any child construction mutates the global.
     # Constructing a child calls AIAgent(), which calls get_tool_definitions()
@@ -3964,6 +4440,8 @@ def delegate_task(
                     ),
                     role=effective_role,
                 )
+            if t.get("_coerced_schema"):
+                child._delegate_output_schema = t["_coerced_schema"]
             # ── Empty-toolset validation (#1387) ───────────────────────────
             # After construction, check whether the child actually resolved
             # to ≥1 tool.  If not, append a structured error entry to results
@@ -4065,7 +4543,12 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child(
+                _i, _t["goal"], child, parent_agent,
+                owner_session_id=_origin_ui_session_id or None,
+                owner_transport=_origin_owner_transport,
+                owner_session_record=_origin_owner_session_record,
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -4083,6 +4566,9 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        owner_session_id=_origin_ui_session_id or None,
+                        owner_transport=_origin_owner_transport,
+                        owner_session_record=_origin_owner_session_record,
                     )
                     futures[future] = i
 
@@ -5009,6 +5495,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "output_schema": {
+                            "type": "object",
+                            "description": (
+                                "Optional JSON Schema the child's FINAL answer "
+                                "must satisfy. Validated by the parent; one "
+                                "bounded retry on failure."
+                            ),
+                        },
                         "team": {
                             "type": "object",
                             "description": (
@@ -5050,6 +5544,14 @@ DELEGATE_TASK_SCHEMA = {
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "output_schema": {
+                "type": "object",
+                "description": (
+                    "Optional JSON Schema the child's FINAL answer must "
+                    "satisfy (single-goal form). Validated by the parent; "
+                    "one bounded retry on failure."
+                ),
             },
             "role": {
                 "type": "string",

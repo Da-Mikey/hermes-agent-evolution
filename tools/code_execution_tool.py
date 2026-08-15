@@ -46,6 +46,9 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
+_PROBE_CACHE_MAX = 32
+_python_prefix_cache: dict = {}
+_usable_python_cache: dict = {}
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
@@ -581,9 +584,12 @@ _COMMON_HELPERS = '''\
 # ---------------------------------------------------------------------------
 
 def json_parse(text: str):
-    """Parse JSON tolerant of control characters (strict=False).
+    """Parse JSON tolerant of control characters and UTF-8 BOM (strict=False).
     Use this instead of json.loads() when parsing output from terminal()
-    or web_extract() that may contain raw tabs/newlines in strings."""
+    or web_extract() that may contain raw tabs/newlines in strings,
+    or from tools/files that prepend a UTF-8 BOM (salvage #57870, credit @woxinwuhen713-bit)."""
+    if isinstance(text, str) and text.startswith("\ufeff"):
+        text = text[1:]
     return json.loads(text, strict=False)
 
 
@@ -1457,7 +1463,11 @@ def execute_code(
         )
 
     if not code or not code.strip():
-        return tool_error("No code provided.")
+        return tool_error(
+            "No code provided. execute_code requires a non-empty 'code' "
+            "parameter containing Python source. To run shell commands, use "
+            "terminal(command=...) instead."
+        )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
@@ -1647,10 +1657,8 @@ def execute_code(
         # when the subprocess CWD is not tmpdir (project mode).
         _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         _existing_pp = child_env.get("PYTHONPATH", "")
-        _pp_parts = [tmpdir, _hermes_root]
-        if _existing_pp:
-            _pp_parts.append(_existing_pp)
-        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+        # Interpreter is resolved just below; PYTHONPATH is finalized after
+        # that so an external venv does not inherit the Hermes checkout.
         # Inject user's configured timezone so datetime.now() in sandboxed
         # code reflects the correct wall-clock time.  Only TZ is set —
         # HERMES_TIMEZONE is an internal Hermes setting and must not leak
@@ -1673,6 +1681,12 @@ def execute_code(
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
+        _pp_parts = [tmpdir]
+        if _uses_hermes_python_environment(_child_python):
+            _pp_parts.append(_hermes_root)
+        if _existing_pp:
+            _pp_parts.append(_existing_pp)
+        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
 
         proc = subprocess.Popen(
             [_child_python, _script_path],
@@ -1994,6 +2008,86 @@ def _kill_process_group(proc, escalate: bool = False):
                     logger.debug("Could not kill process: %s", e2, exc_info=True)
 
 
+def _cache_probe_result(cache: dict, key: str, value):
+    """Insert into a bounded probe cache, FIFO-evicting at the cap."""
+    if len(cache) >= _PROBE_CACHE_MAX:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
+def _probe_python(python_path: str, code: str, *, text: bool = False):
+    """Run ``python_path -c code`` with the standard interpreter-probe guards.
+
+    Returns the ``CompletedProcess``, or ``None`` when the interpreter is
+    missing, can't be spawned, or hangs past the 5s timeout.
+    """
+    try:
+        from agent.delegation_context import delegated_child_subprocess_env
+
+        return subprocess.run(
+            [python_path, "-c", code],
+            timeout=5,
+            capture_output=True,
+            text=text,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            stdin=subprocess.DEVNULL,
+            env=delegated_child_subprocess_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        return None
+
+
+def _is_usable_python(python_path: str) -> bool:
+    """Check whether a candidate Python interpreter is usable for execute_code.
+
+    Requires Python 3.8+ (f-strings and stdlib modules the RPC stubs need).
+    Successful probes are cached per interpreter path; failures are retried
+    (a sticky False would silently pin project mode to sys.executable).
+    """
+    cached = _usable_python_cache.get(python_path)
+    if cached is not None:
+        return cached
+    result = _probe_python(
+        python_path,
+        "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)",
+    )
+    if result is None:
+        return False
+    usable = result.returncode == 0
+    if usable:
+        _cache_probe_result(_usable_python_cache, python_path, usable)
+    return usable
+
+
+def _uses_hermes_python_environment(python_path: str) -> bool:
+    """Whether *python_path* belongs to Hermes's active Python environment."""
+    if python_path == sys.executable or (
+        os.path.realpath(python_path) == os.path.realpath(sys.executable)
+    ):
+        return True
+    return _python_environment_prefix(python_path) == os.path.realpath(sys.prefix)
+
+
+def _python_environment_prefix(python_path: str) -> str:
+    """Return the resolved ``sys.prefix`` reported by *python_path*, if any.
+
+    Successful probes are cached per interpreter path (bounded, FIFO-evicted).
+    Failures are NOT cached: a transient probe failure (fork pressure, 5s
+    timeout on a loaded host) must not stick for the process lifetime — a
+    sticky empty result would silently drop the hermes root from every
+    subsequent execute_code call's PYTHONPATH.
+    """
+    cached = _python_prefix_cache.get(python_path)
+    if cached is not None:
+        return cached
+    result = _probe_python(python_path, "import sys; print(sys.prefix)", text=True)
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        prefix = os.path.realpath(result.stdout.strip())
+        _cache_probe_result(_python_prefix_cache, python_path, prefix)
+        return prefix
+    return ""
+
+
 def _load_config() -> dict:
     """Load code_execution config without importing the interactive CLI.
 
@@ -2050,33 +2144,6 @@ def _get_execution_mode() -> str:
         DEFAULT_EXECUTION_MODE,
     )
     return DEFAULT_EXECUTION_MODE
-
-
-@functools.lru_cache(maxsize=32)
-def _is_usable_python(python_path: str) -> bool:
-    """Check whether a candidate Python interpreter is usable for execute_code.
-
-    Requires Python 3.8+ (f-strings and stdlib modules the RPC stubs need).
-    Cached so we don't fork a subprocess on every execute_code call.
-    """
-    try:
-        from agent.delegation_context import delegated_child_subprocess_env
-
-        result = subprocess.run(
-            [
-                python_path,
-                "-c",
-                "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)",
-            ],
-            timeout=5,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-            stdin=subprocess.DEVNULL,
-            env=delegated_child_subprocess_env(),
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
-        return False
 
 
 def _resolve_child_python(mode: str) -> str:
@@ -2301,15 +2368,47 @@ EXECUTE_CODE_SCHEMA = build_execute_code_schema()
 # --- Registry ---
 from tools.registry import registry, tool_error
 
+
+def _execute_code_handler(args: dict, **kwargs) -> str:
+    """Recover misdirected calls before dispatching to ``execute_code``.
+
+    Models sometimes reuse terminal's ``command`` argument or send a
+    non-string ``code`` payload; both get an actionable redirect instead
+    of a generic failure.
+    """
+    # Help models recover when they reuse terminal's ``command`` argument.
+    if "code" not in args and "command" in args:
+        logger.warning(
+            "execute_code received 'command' instead of the required 'code' argument"
+        )
+        return tool_error(
+            "execute_code received a 'command' parameter, but it requires "
+            "Python source in 'code'. Use terminal(command=...) for shell "
+            "commands; for Python, retry as execute_code(code=...)."
+        )
+
+    code = args.get("code", "")
+    if code is not None and not isinstance(code, str):
+        # A non-string payload (int, dict, list) would otherwise surface as
+        # a generic AttributeError from code.strip() — redirect instead.
+        return tool_error(
+            f"execute_code received a {type(code).__name__} in 'code', but it "
+            "requires Python source as a string. Retry as "
+            "execute_code(code=\"...\")."
+        )
+
+    return execute_code(
+        code=code or "",
+        task_id=kwargs.get("task_id"),
+        enabled_tools=kwargs.get("enabled_tools"),
+    )
+
+
 registry.register(
     name="execute_code",
     toolset="code_execution",
     schema=EXECUTE_CODE_SCHEMA,
-    handler=lambda args, **kw: execute_code(
-        code=args.get("code", ""),
-        task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools"),
-    ),
+    handler=_execute_code_handler,
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,

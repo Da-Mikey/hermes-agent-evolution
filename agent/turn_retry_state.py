@@ -58,6 +58,7 @@ class TurnRetryState:
     # ── Format / payload recovery guards ─────────────────────────────────
     thinking_sig_retry_attempted: bool = False
     invalid_encrypted_content_retry_attempted: bool = False
+    native_compaction_reject_retry_attempted: bool = False
     image_shrink_retry_attempted: bool = False
     multimodal_tool_content_retry_attempted: bool = False
     oauth_1m_beta_retry_attempted: bool = False
@@ -66,27 +67,13 @@ class TurnRetryState:
     # ── Transport / rate-limit recovery ──────────────────────────────────
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
-    # Consecutive rate-limit errors on this attempt where NO recovery fired
-    # (pool rotation didn't recover, no fallback activated). At 2 the loop
-    # fails fast with a structured diagnostic instead of burning the rest of
-    # the retry budget against a provider whose quota window hasn't reset
-    # (#704). Reset whenever rotation or fallback succeeds.
     consecutive_rate_limit_hits: int = 0
-    # Consecutive 503/overloaded errors from the same provider. After 2 the
-    # loop fails over to the next provider instead of continuing backoff
-    # retries on a genuinely overloaded provider (#943). Reset on successful
-    # fallback or any non-overloaded response.
     consecutive_overload_hits: int = 0
-    # Consecutive timeout errors from the same provider (#1142). After 2
-    # consecutive timeouts, the loop fails over to the next provider instead
-    # of continuing backoff-and-retry against the same degraded endpoint —
-    # a provider that is timing out repeatedly won't recover within the retry
-    # window, so backoff alone just burns the retry budget. Reset on
-    # successful fallback or any non-timeout response.
     consecutive_timeout_hits: int = 0
 
     # ── Fail-fast guard for non-retryable client errors ─────────────────
     fail_fast_attempted: bool = False
+
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider
     # credential-refresh attempt above failed) to the fallback chain, so we

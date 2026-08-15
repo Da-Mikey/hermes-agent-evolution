@@ -2494,11 +2494,11 @@ def _terminal_task_cwd_with_source(session: dict | None) -> tuple[str, str]:
                 raw = ""
         if raw and raw not in {".", "auto", "cwd"}:
             return raw, "process"
-        if backend == "ssh":
-            return "~", "process"
 
     if session and session.get("cwd"):
         return str(session["cwd"]), "session"
+    if backend == "ssh":
+        return "~", "process"
     return _completion_cwd(), "process"
 
 
@@ -10284,6 +10284,39 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+
+            if (
+                status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+                and isinstance(text, str)
+                and text.strip()
+            ):
+                try:
+                    from agent.title_generator import maybe_auto_title
+
+                    main_runtime = (
+                        {
+                            "model": getattr(agent, "model", None),
+                            "provider": getattr(agent, "provider", None),
+                            "base_url": getattr(agent, "base_url", None),
+                            "api_key": getattr(agent, "api_key", None),
+                            "api_mode": getattr(agent, "api_mode", None),
+                        }
+                        if agent
+                        else None
+                    )
+
+                    maybe_auto_title(
+                        _get_db(),
+                        session.get("session_key") or sid,
+                        text,
+                        raw,
+                        session.get("history", []),
+                        main_runtime=main_runtime,
+                    )
+                except Exception:
+                    pass
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

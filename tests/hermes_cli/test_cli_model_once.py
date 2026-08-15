@@ -40,6 +40,9 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     stub = _StubCLI()
     stub.agent = _FakeAgent()
     stub._snapshot_model_runtime = cli_mod.HermesCLI._snapshot_model_runtime.__get__(stub)
+    stub._confirm_and_apply_cli_model_switch = (
+        cli_mod.HermesCLI._confirm_and_apply_cli_model_switch.__get__(stub)
+    )
     printed = []
 
     monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: printed.append(str(s)))

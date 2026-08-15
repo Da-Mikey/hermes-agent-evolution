@@ -459,6 +459,7 @@ class TestDelegationCleanup:
         relay_runtime._reset_for_tests()
         profile_home = tmp_path / "profile-timeout"
         profile_token = set_hermes_home_override(profile_home)
+        profile_key = relay_runtime.current_profile_key()
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
@@ -476,7 +477,7 @@ class TestDelegationCleanup:
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
-                profile_key=relay_runtime.current_profile_key(),
+                profile_key=profile_key,
                 session_id=child.session_id,
                 platform="subagent",
             )
@@ -521,7 +522,7 @@ class TestDelegationCleanup:
             )
             assert result["status"] == "timeout"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=str(profile_home),
+                profile_key=profile_key,
                 session_id=child.session_id,
             )
             relay_host.unregister_subagent.assert_not_called()
@@ -529,7 +530,7 @@ class TestDelegationCleanup:
             release_child.set()
             assert child_finished.wait(timeout=5)
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=str(profile_home),
+                profile_key=profile_key,
                 session_id=child.session_id,
             )
         finally:

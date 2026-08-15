@@ -1,16 +1,15 @@
 ---
 name: a2a
-description: |
-  Agent2Agent (A2A) interoperability for Hermes. Slice 1 exposes Hermes'
-  existing tools and skills as an A2A Agent Card served at
-  /.well-known/agent.json, so other A2A-speaking agents can discover what
-  this Hermes instance can do. Discovery only -- no A2A JSON-RPC server yet.
+description: Advertise Hermes capabilities via an A2A Agent Card.
 version: 0.1.0
+author: Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [a2a, interoperability, agent-card, discovery]
     category: interoperability
-    related_skills: [autonomous-ai-agents]
+    related_skills: [hermes-agent]
 ---
 
 # A2A Agent Card (discovery)

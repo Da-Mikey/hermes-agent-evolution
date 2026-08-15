@@ -288,7 +288,7 @@ Hermes: when working in this repo, follow these rules.
 - No `print()` in production code — use the `logger`.
 ```
 
-That file at `/home/me/projects/myrepo/.hermes.md` is auto-loaded when Hermes runs in any subdirectory of `/home/me/projects/myrepo`, but not when it runs in `/home/me/other-project`.
+That file at `~/projects/myrepo/.hermes.md` is auto-loaded when Hermes runs in any subdirectory of `~/projects/myrepo`, but not when it runs in `~/other-project`.
 
 ## Security & Privacy Toggles
 

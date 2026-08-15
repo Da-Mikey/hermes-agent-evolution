@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import shutil
 import sys
@@ -69,6 +70,8 @@ from hermes_constants import (
     agent_browser_runnable,
     get_hermes_home,
     get_hermes_home_override,
+    hermes_home_key,
+    node_tool_runnable,
 )
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -165,6 +168,16 @@ from agent.browser_provider import BrowserProvider as CloudBrowserProvider  # no
 from agent.browser_registry import (  # noqa: F401  (test-patchable surface)
     get_provider as _registry_get_browser_provider,
 )
+try:
+    from agent.browser_registry import (
+        registry_generation as _browser_registry_generation,
+    )
+except ImportError:
+    # A few isolated compatibility tests intentionally install a minimal
+    # ``agent.browser_registry`` stub exposing only ``get_provider``. Those
+    # harnesses have no mutable registry, so a constant generation is exact.
+    def _browser_registry_generation(*, scope=None):
+        return (0, 0)
 from plugins.browser.browserbase.provider import (  # noqa: F401  (legacy import surface)
     BrowserbaseBrowserProvider as BrowserbaseProvider,
 )
@@ -182,6 +195,12 @@ try:
     from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
+
+# Browser Use CLI (optional)
+try:
+    from tools.browser_use_cli import is_browser_use_cli_mode as _is_browser_use_cli_mode
+except ImportError:
+    _is_browser_use_cli_mode = lambda: False  # noqa: E731
 
 logger = logging.getLogger(__name__)
 
@@ -678,6 +697,11 @@ _DEFAULT_PROVIDER_REGISTRY: Dict[str, type] = dict(_PROVIDER_REGISTRY)
 
 _cached_cloud_provider: Optional[CloudBrowserProvider] = None
 _cloud_provider_resolved = False
+_cached_cloud_provider_scope: Optional[str] = None
+_cached_cloud_providers: Dict[
+    tuple[str, tuple[int, int]], Optional[CloudBrowserProvider]
+] = {}
+_cloud_provider_cache_lock = threading.RLock()
 _allow_private_urls_resolved = False
 _cached_allow_private_urls: Optional[bool] = None
 _cached_agent_browser: Optional[str] = None
@@ -733,6 +757,46 @@ def _ensure_browser_plugins_loaded() -> None:
 
 
 def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
+    """Return the provider cached for the active Hermes profile."""
+    global _cached_cloud_provider, _cloud_provider_resolved
+    global _cached_cloud_provider_scope
+
+    scope = hermes_home_key()
+    with _cloud_provider_cache_lock:
+        # Tests and legacy reset paths clear the boolean. Treat that as a full
+        # reset even if a previous scoped resolution remains mirrored here.
+        if not _cloud_provider_resolved:
+            _cached_cloud_provider_scope = None
+            _cached_cloud_providers.clear()
+        while True:
+            before_generation = _browser_registry_generation(scope=scope)
+            cache_key = (scope, before_generation)
+            if cache_key in _cached_cloud_providers:
+                _cached_cloud_provider = _cached_cloud_providers[cache_key]
+                _cloud_provider_resolved = True
+                _cached_cloud_provider_scope = scope
+                return _cached_cloud_provider
+
+            _cached_cloud_provider = None
+            _cloud_provider_resolved = False
+            resolved = _resolve_cloud_provider_uncached()
+            after_generation = _browser_registry_generation(scope=scope)
+            if before_generation != after_generation:
+                # A force reload replaced/unloaded this profile's provider
+                # while resolution was in progress. Discard the stale result
+                # and resolve against the new registry generation.
+                continue
+            if _cloud_provider_resolved:
+                _cached_cloud_provider_scope = scope
+                for stale_key in [
+                    key for key in _cached_cloud_providers if key[0] == scope
+                ]:
+                    _cached_cloud_providers.pop(stale_key, None)
+                _cached_cloud_providers[cache_key] = resolved
+            return resolved
+
+
+def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
     """Return the configured cloud browser provider, or None for local mode.
 
     Reads ``config["browser"]["cloud_provider"]`` once and caches the result
@@ -750,8 +814,6 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     ``_is_legacy_provider_registry_overridden``.
     """
     global _cached_cloud_provider, _cloud_provider_resolved
-    if _cloud_provider_resolved:
-        return _cached_cloud_provider
 
     resolved: Optional[CloudBrowserProvider] = None
     try:
@@ -1193,8 +1255,8 @@ def _run_chrome_fallback_command(
     # bare container), fall back to the bare name and let Popen raise with
     # a readable "FileNotFoundError: 'npx'" rather than WinError 193.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+        _npx_bin = _resolve_npx_bin() or "npx"
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
@@ -2319,6 +2381,113 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
 
 
+NPX_AGENT_BROWSER_SENTINEL = "npx agent-browser"
+
+# Pinned to match scripts/install.sh / scripts/install.ps1 so a git-clone
+# install resolving agent-browser via bare npx gets the same version as a
+# managed install. Update both together.
+AGENT_BROWSER_NPX_SPEC = "agent-browser@^0.26.0"
+
+
+def _is_npx_agent_browser_sentinel(browser_cmd: str) -> bool:
+    return browser_cmd.strip() == NPX_AGENT_BROWSER_SENTINEL
+
+
+def _resolve_npx_bin() -> Optional[str]:
+    """Resolve a runnable npx binary, preferring the Hermes-managed/Homebrew
+    extended search over a bare ambient PATH lookup.
+    """
+    extended_path = _merge_browser_path("")
+    if extended_path:
+        extended_npx = shutil.which("npx", path=extended_path)
+        if extended_npx and node_tool_runnable(extended_npx):
+            return extended_npx
+    npx_path = shutil.which("npx")
+    if npx_path and node_tool_runnable(npx_path):
+        return npx_path
+    return None
+
+
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Best-effort kill of *proc* and any descendants it spawned."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        return
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    for sig in (signal.SIGTERM, sigkill):
+        try:
+            killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+
+def warm_agent_browser_npx_cache(timeout: float = 60.0) -> bool:
+    """Best-effort pre-fetch of the agent-browser npm package via npx."""
+    npx_bin = _resolve_npx_bin()
+    if not npx_bin:
+        return False
+
+    env = _build_browser_env()
+    env["PATH"] = _merge_browser_path(env.get("PATH", ""))
+
+    popen_kwargs: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+        "creationflags": windows_hide_flags(),
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    cmd = [
+        npx_bin,
+        "--ignore-scripts",
+        "--prefer-offline",
+        "-y",
+        AGENT_BROWSER_NPX_SPEC,
+        "--version",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, **popen_kwargs)
+    except Exception:
+        return False
+    try:
+        proc.communicate(timeout=timeout)
+        return proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return False
+    except Exception:
+        _kill_process_tree(proc)
+        return False
+
+
 def _agent_browser_candidate_present(path: str | None) -> bool:
     if not path:
         return False
@@ -2366,7 +2535,11 @@ def _find_agent_browser(*, validate: bool = True) -> str:
 
     # Check if it's in PATH (global install)
     which_result = shutil.which("agent-browser")
-    if which_result and agent_browser_runnable(which_result):
+    if which_result and (
+        agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
+    ):
+        if not validate:
+            return which_result
         _cached_agent_browser = which_result
         _agent_browser_resolved = True
         return which_result
@@ -2376,7 +2549,11 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     extended_path = _merge_browser_path("")
     if extended_path:
         which_result = shutil.which("agent-browser", path=extended_path)
-        if which_result and agent_browser_runnable(which_result):
+        if which_result and (
+            agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
+        ):
+            if not validate:
+                return which_result
             _cached_agent_browser = which_result
             _agent_browser_resolved = True
             return which_result
@@ -2393,15 +2570,17 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     local_bin_dir = repo_root / "node_modules" / ".bin"
     if local_bin_dir.is_dir():
         local_which = shutil.which("agent-browser", path=str(local_bin_dir))
-        if local_which and agent_browser_runnable(local_which):
+        if local_which and (
+            agent_browser_runnable(local_which) if validate else _agent_browser_candidate_present(local_which)
+        ):
+            if not validate:
+                return local_which
             _cached_agent_browser = local_which
             _agent_browser_resolved = True
             return _cached_agent_browser
 
-    # Check common npx locations (also search the extended fallback PATH)
-    npx_path = shutil.which("npx")
-    if not npx_path and extended_path:
-        npx_path = shutil.which("npx", path=extended_path)
+    # Check common npx locations (prefer Hermes-managed npx).
+    npx_path = _resolve_npx_bin()
     if npx_path:
         if not validate:
             return "npx agent-browser"
@@ -2562,8 +2741,8 @@ def _run_browser_command(
     # Only the synthetic npx fallback needs to expand into multiple argv items.
     # shutil.which resolves npx → npx.cmd on Windows; bare "npx" stays on POSIX.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+        _npx_bin = _resolve_npx_bin() or "npx"
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
 
@@ -2965,6 +3144,43 @@ def _redact_browser_output(value: Any) -> Any:
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
+
+def evaluate_url_safety(url: str) -> Optional[dict]:
+    """Run URL safety checks; None if safe, else an error dict."""
+    import urllib.parse
+    from agent.redact import _PREFIX_RE
+
+    _secret = {
+        "success": False,
+        "error": (
+            "Blocked: URL contains what appears to be an API key or token. "
+            "Secrets must not be sent in URLs."
+        ),
+    }
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return _secret
+    url = _normalize_url_for_request(url)
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return _secret
+
+    local = _is_local_backend()
+    sensitive_query_key = _sensitive_query_param_name(url)
+    if sensitive_query_key and not local:
+        return {
+            "success": False,
+            "error": (
+                "Blocked: URL contains a credential-like query parameter "
+                f"({sensitive_query_key}). Cloud browser backends are third-party "
+                "readers; use a local browser/CDP session or remove the sensitive "
+                "query parameter before navigating."
+            ),
+        }
+    if _is_always_blocked_url(url):
+        return {"success": False, "error": "Blocked: URL targets a cloud metadata endpoint"}
+    if not local and not _allow_private_urls() and not _is_safe_url(url):
+        return {"success": False, "error": "Blocked: URL targets a private or internal address"}
+    return None
+
 
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
@@ -4875,8 +5091,14 @@ def _maybe_autoinstall_chromium() -> bool:
     except FileNotFoundError:
         return False
 
-    if browser_cmd == "npx agent-browser":
-        install_cmd = [shutil.which("npx") or "npx", "-y", "agent-browser", "install"]
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        install_cmd = [
+            _resolve_npx_bin() or "npx",
+            "--ignore-scripts",
+            "-y",
+            AGENT_BROWSER_NPX_SPEC,
+            "install",
+        ]
     else:
         install_cmd = [browser_cmd, "install"]
 
@@ -4935,6 +5157,12 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
+    # Browser Use CLI backend — browser_exec replaces the whole browser_*
+    # surface (including browser_cdp/browser_dialog, whose check_fns funnel
+    # through here), so hide these tools from the model.
+    if _is_browser_use_cli_mode():
+        return False
+
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():
         return True

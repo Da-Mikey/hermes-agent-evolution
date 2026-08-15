@@ -97,7 +97,7 @@ def test_list_and_get_latest_failure(tmp_path):
 
 
 def test_run_one_job_writes_failure_record_on_agent_failure(monkeypatch):
-    def fake_run_job(job):
+    def fake_run_job(job, **kw):
         return False, "agent output", "", "provider 429 rate limit"
 
     monkeypatch.setattr(scheduler, "run_job", fake_run_job)
@@ -123,7 +123,7 @@ def test_run_one_job_skips_failure_record_on_success(monkeypatch):
     Previously, success=true records flooded the directory making it useless.
     Now only genuine failures get persisted.
     """
-    def fake_run_job(job):
+    def fake_run_job(job, **kw):
         return True, "all good", "final response", None
 
     monkeypatch.setattr(scheduler, "run_job", fake_run_job)
@@ -193,7 +193,7 @@ def test_build_digest_ignores_success_records_and_old_failures(monkeypatch, tmp_
 
 
 def test_run_one_job_failure_record_logs_warning(caplog, monkeypatch):
-    def fake_run_job(job):
+    def fake_run_job(job, **kw):
         return False, "out", "", "bang"
 
     monkeypatch.setattr(scheduler, "run_job", fake_run_job)

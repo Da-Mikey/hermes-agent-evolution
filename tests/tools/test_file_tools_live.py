@@ -185,11 +185,11 @@ class TestPatchReplace:
 
         result = ops.patch_replace(path, "world", "world")
 
-        assert result.success is False
-        assert result.error is not None
-        assert "No edit was applied" in result.error
-        assert "existing text to replace in old_string" in result.error
-        assert "replacement text in new_string" in result.error
+        # Live contract: identical old/new is a landed no-op (success=True,
+        # no_change=True) so the model does not enter a retry spiral.
+        assert result.success is True
+        assert result.no_change is True
+        assert "identical" in (result.note or "")
         assert Path(path).read_text() == "hello world\n"
 
     def test_multiline_patch(self, ops, tmp_path):

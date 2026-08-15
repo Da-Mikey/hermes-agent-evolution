@@ -1,10 +1,15 @@
 ---
 name: evolution-upstream-sync
-description: Keep the fork current with upstream Hermes Agent by merging its published RELEASE tags (not bleeding-edge main)
+description: Merge upstream Hermes release tags into the fork.
 version: 3.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
 mode: PRIVATE
+metadata:
+  hermes:
+    tags: [evolution, upstream, sync]
 ---
 
 # Evolution Upstream Sync Skill

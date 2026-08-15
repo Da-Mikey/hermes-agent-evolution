@@ -292,6 +292,8 @@ class TestCmdUpdateBranchFallback:
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
+            "hermes_cli.update_cmd._reload_config_modules"
+        ), patch(
             "hermes_cli.config.get_missing_env_vars", return_value=["MISSING_KEY"]
         ), patch(
             "hermes_cli.config.get_missing_config_fields",
@@ -334,6 +336,8 @@ class TestCmdUpdateMigrationPrompt:
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
+            "hermes_cli.update_cmd._reload_config_modules"
+        ), patch(
             "hermes_cli.config.get_missing_env_vars", return_value=[]
         ), patch(
             "hermes_cli.config.get_missing_config_fields", return_value=[]
@@ -370,6 +374,8 @@ class TestCmdUpdateMigrationPrompt:
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input", return_value="n"), patch(
+            "hermes_cli.update_cmd._reload_config_modules"
+        ), patch(
             "hermes_cli.config.get_missing_env_vars", return_value=env_items
         ), patch(
             "hermes_cli.config.get_missing_config_fields", return_value=cfg_items
@@ -860,7 +866,7 @@ class TestNodeRuntimeNpmResolution:
         )
 
         failed = hm._update_node_dependencies()
-        assert failed == ["repo root"]
+        assert failed == ["ui-tui, web workspaces"]
         out = capsys.readouterr().out
         assert "mixed state" in out
 

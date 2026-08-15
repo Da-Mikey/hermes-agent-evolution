@@ -34,34 +34,13 @@ def _make_runner():
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
+    runner._update_prompt_pending = {}
     return runner
 
 
 # ---------------------------------------------------------------------------
 # _handle_update_command
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _no_real_update_spawn():
-    """Hard guard: never spawn the real ``hermes update --gateway``.
-
-    The platform-allowlist tests (``TestUpdateCommandPlatformGate``'s
-    ``test_allows_*``) drive the real handler all the way to the spawn.
-    Without this guard they launch a REAL detached (setsid)
-    ``hermes update --gateway`` against the repo checkout the tests run
-    from: the orphaned updater then runs ``git fetch origin main;
-    git checkout main`` mid-test-run, deleting every file that is new
-    relative to main. On CI (detached merge-ref HEAD) the tree never
-    switches back, which deterministically broke any PR adding new test
-    files (issue #85).
-
-    Module-level autouse so every present and future test in this file is
-    covered. Tests that assert on spawn behaviour still patch
-    ``subprocess.Popen`` themselves; their inner patch nests inside this one.
-    """
-    with patch("subprocess.Popen") as popen_guard:
-        yield popen_guard
 
 
 class TestHandleUpdateCommand:
@@ -436,6 +415,83 @@ class TestSendUpdateNotification:
         # The marker stays in its canonical pending location (claim restored).
         assert not (hermes_home / ".update_pending.claimed.json").exists()
 
+    @pytest.mark.asyncio
+    async def test_deferred_notification_delivers_after_reconnect(self, tmp_path):
+        """A deferred completion is delivered once the platform reconnects.
+
+        Regression for the late-reconnect /update bug: the update finishes while
+        the target platform is offline, the markers survive the deferral, and
+        the next call (after the adapter is registered) delivers the result and
+        cleans up — exactly once.
+        """
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {"platform": "discord", "chat_id": "111", "user_id": "222"}
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps(pending))
+        output_path.write_text("✓ Update complete!")
+        exit_code_path.write_text("0")
+
+        # First pass: target platform (discord) is still offline → defer.
+        with patch("gateway.run._hermes_home", hermes_home):
+            first = await runner._send_update_notification()
+
+        assert first is False
+        assert pending_path.exists()
+
+        # Platform reconnects: the reconnect watcher adds the adapter back.
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.DISCORD: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            second = await runner._send_update_notification()
+
+        assert second is True
+        mock_adapter.send.assert_called_once()
+        sent_text = mock_adapter.send.call_args[0][1]
+        assert "Update complete" in sent_text
+        # Now everything is cleaned up — no duplicate deliveries possible.
+        assert not pending_path.exists()
+        assert not output_path.exists()
+        assert not exit_code_path.exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_completion_notification_tolerates_invalid_utf8_output(self, tmp_path):
+        """Completion-only update notifications must not crash on bad bytes."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {"platform": "discord", "chat_id": "111", "user_id": "222"}
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps(pending))
+        output_path.write_bytes(b"ok before\ninvalid byte: \x96\ncontinued after\n")
+        exit_code_path.write_text("0")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.DISCORD: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            delivered = await runner._send_update_notification()
+
+        assert delivered is True
+        mock_adapter.send.assert_called_once()
+        sent_text = mock_adapter.send.call_args[0][1]
+        assert "ok before" in sent_text
+        assert "invalid byte" in sent_text
+        assert "continued after" in sent_text
+        assert "Hermes update finished" in sent_text
+        assert not pending_path.exists()
+        assert not output_path.exists()
+        assert not exit_code_path.exists()
+
 
 # ---------------------------------------------------------------------------
 # /update in help and known_commands
@@ -454,3 +510,32 @@ class TestUpdateInHelp:
         import inspect
         source = inspect.getsource(GatewayRunner._handle_message)
         assert '"update"' in source
+
+class TestWatchUpdateProgress:
+    @pytest.mark.asyncio
+    async def test_invalid_utf8_update_output_does_not_crash_watcher(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "67890",
+            "user_id": "12345",
+        }))
+        (hermes_home / ".update_output.txt").write_bytes(
+            b"ok before\n\xe2\x9c invalid-continuation: \x96\ncontinued after\n"
+        )
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(poll_interval=0.01, stream_interval=0.01, timeout=1.0)
+
+        sent = "\n".join(call.args[1] for call in mock_adapter.send.call_args_list)
+        assert "ok before" in sent
+        assert "continued after" in sent
+        assert "Hermes update finished" in sent
+        assert not (hermes_home / ".update_pending.json").exists()

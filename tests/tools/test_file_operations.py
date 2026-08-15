@@ -549,10 +549,12 @@ class TestShellFileOpsHelpers:
         result = ops.read_file(r"C:\Users\alice\notes.txt")
 
         assert result.error is None
-        assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
-        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
+        quoted = "'/c/Users/alice/notes.txt'"
+        assert commands, "read_file must exec at least one command"
+        assert all(quoted in cmd for cmd in commands), commands
+        assert any(cmd.startswith("wc -c") for cmd in commands)
+        assert any(cmd.startswith("head -c") for cmd in commands)
+        assert any(cmd.startswith("sed -n") for cmd in commands)
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True

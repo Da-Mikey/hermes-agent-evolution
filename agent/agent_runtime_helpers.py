@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from agent.message_sanitization import _FULL_ARGS_LOG_BOUND
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -98,7 +99,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task", "compact_context"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "setup_mcp", "delegate_task", "compact_context"}
 )
 
 
@@ -385,10 +386,19 @@ def sanitize_tool_call_arguments(
                 # itself becomes an orphan (#58168).
                 tool_call_id = _ra().AIAgent._get_tool_call_id_static(tool_call) or None
                 function_name = function.get("name", "?")
-                preview = arguments[:80]
+                # Log the FULL original argument string (bounded), not an
+                # 80-char preview: this branch is about to overwrite the
+                # only copy of these bytes in the transcript with "{}", and
+                # for a truncated write_file/patch call the destroyed
+                # arguments contain real user content (#80498 — streamed
+                # file content survived only as a log preview). A corrupted
+                # call is rare, so the oversized WARNING is a fair price for
+                # making the data recoverable from agent.log.
+                preview = arguments[:_FULL_ARGS_LOG_BOUND]
                 log.warning(
                     "Corrupted tool_call arguments repaired before request "
-                    "(session=%s, message_index=%s, tool_call_id=%s, function=%s, preview=%r)",
+                    "(session=%s, message_index=%s, tool_call_id=%s, function=%s, "
+                    "original_arguments=%r)",
                     session_id or "-",
                     message_index,
                     tool_call_id or "-",
@@ -1020,6 +1030,13 @@ def recover_with_credential_pool(
         }
         if _credential_id:
             kwargs["credential_id"] = _credential_id
+        # Hand the pool the classified semantics, not just the status. A
+        # billing 403 (OpenRouter "key limit exceeded", xAI spending limit)
+        # and an edge-throttle 403 are the same number but need opposite
+        # cooldowns — the pool can only tell them apart if we say which.
+        # ``effective_reason`` is resolved below; this closure runs after.
+        if effective_reason is not None:
+            kwargs["failure_reason"] = effective_reason.value
         return pool.mark_exhausted_and_rotate(**kwargs)
 
     effective_reason = classified_reason
@@ -1064,33 +1081,6 @@ def recover_with_credential_pool(
             )
             agent._swap_credential(next_entry)
             return True, False
-        # Pool exhausted for billing — attempt cross-PROVIDER fallback so
-        # the session isn't blocked when one provider's credits run out but
-        # a fallback chain is configured. See issue #1043.
-        _ra().logger.info(
-            "Credential pool exhausted (billing %s) for provider %s — "
-            "attempting cross-provider fallback",
-            rotate_status,
-            pool_provider or current_provider or "(unknown)",
-        )
-        try:
-            activated = agent._try_activate_fallback(reason=FailoverReason.billing)
-        except Exception as exc:  # noqa: BLE001 — never let fallback errors mask the original 402
-            _ra().logger.warning("Cross-provider fallback raised: %s", exc)
-            activated = False
-        if activated:
-            _ra().logger.info(
-                "Billing pool exhausted — switched to fallback provider %s",
-                getattr(agent, "provider", "?"),
-            )
-            return True, False
-        # All providers exhausted: no pool credentials AND no usable fallback.
-        _ra().logger.error(
-            "All providers exhausted for billing (status %s): no pool "
-            "credentials remain and no fallback provider is available. "
-            "Add credits or configure fallback_providers to recover.",
-            rotate_status,
-        )
         return False, has_retried_429
 
     if effective_reason == FailoverReason.rate_limit:
@@ -1729,6 +1719,7 @@ def restore_primary_runtime(agent) -> bool:
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
+        agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
@@ -2018,6 +2009,20 @@ def cache_ttl_means_disabled(ttl: Any) -> bool:
     return str(ttl).lower() in ("off", "false", "disabled", "no", "none")
 
 
+# The two cache_ttl tiers accepted by config (anything else is either a
+# disable synonym or ignored). Shared by the config readers below and
+# mirrored by agent_init's live-agent snapshot.
+VALID_CACHE_TTLS = ("5m", "1h")
+
+
+def _raw_cache_ttl_from_config() -> Any:
+    """Read the raw ``prompt_caching.cache_ttl`` config value (may raise)."""
+    from hermes_cli.config import load_config_readonly
+
+    pc_cfg = load_config_readonly().get("prompt_caching", {}) or {}
+    return pc_cfg.get("cache_ttl", "5m")
+
+
 def prompt_caching_disabled_from_config() -> bool:
     """Return True when ``prompt_caching.cache_ttl`` is configured as off.
 
@@ -2027,13 +2032,26 @@ def prompt_caching_disabled_from_config() -> bool:
     ``AIAgent`` (#76085 / #33555).
     """
     try:
-        from hermes_cli.config import load_config_readonly
-
-        pc_cfg = load_config_readonly().get("prompt_caching", {}) or {}
-        ttl = pc_cfg.get("cache_ttl", "5m")
+        ttl = _raw_cache_ttl_from_config()
     except Exception:
         return False
     return cache_ttl_means_disabled(ttl)
+
+
+def configured_cache_ttl() -> Optional[str]:
+    """Return the configured ``prompt_caching.cache_ttl`` tier, if valid.
+
+    Mirrors ``agent_init``'s reading of the same key (``5m``/``1h`` accepted,
+    anything else ignored) so stub-based paths without a live ``AIAgent``
+    (auxiliary fallback replan) stop regressing a configured ``1h`` to the
+    5m default (#84733). Returns ``None`` for unset/disabled/unknown values;
+    ``effective_cache_ttl`` resolves ``None`` to ``5m`` downstream.
+    """
+    try:
+        ttl = _raw_cache_ttl_from_config()
+    except Exception:
+        return None
+    return ttl if ttl in VALID_CACHE_TTLS else None
 
 
 def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
@@ -2069,6 +2087,8 @@ def plan_cache_sections_for_destination(
     api_mode: str,
     model: str,
     cache_disabled: Optional[bool] = None,
+    cache_ttl: Optional[str] = None,
+    static_system_prefix: Optional[str] = None,
 ) -> Tuple[list, list]:
     """Plan request-local cache sections for one resolved destination.
 
@@ -2086,9 +2106,18 @@ def plan_cache_sections_for_destination(
     disable into the blank policy stub. When omitted, the live config is
     consulted so MoA/auxiliary paths cannot re-enable markers after the
     user turned caching off (#76085).
+
+    ``cache_ttl`` threads the operator's configured tier (default ``5m``)
+    into the destination plan so MoA/auxiliary requests stop regressing to
+    the 5m default while the main loop honors ``1h`` (#84733); it is
+    clamped per-destination by :func:`effective_cache_ttl` (Qwen → 5m).
+    ``static_system_prefix`` threads the builder-declared stable prefix so
+    the destination system prompt receives the same early breakpoint the
+    main loop applies instead of marking the whole prompt as a breakpoint.
     """
     from agent.prompt_caching import (
         build_prompt_cache_plan,
+        effective_cache_ttl,
         strip_anthropic_cache_control,
         strip_anthropic_tool_cache_control,
     )
@@ -2108,7 +2137,19 @@ def plan_cache_sections_for_destination(
     plan = build_prompt_cache_plan(
         messages,
         tools,
+        cache_ttl=effective_cache_ttl(
+            # effective_cache_ttl resolves None → "5m"; markers are only
+            # emitted at all when should_cache passed above, so a
+            # cache-disabled agent (_cache_ttl=None) never reaches here
+            # with caching active.
+            cache_ttl,
+            provider=provider,
+            model=model,
+        ),
         native_anthropic=native_layout,
+        static_system_prefix=(
+            static_system_prefix if isinstance(static_system_prefix, str) else None
+        ),
         direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
             stub,
             provider=provider,
@@ -2235,6 +2276,52 @@ def anthropic_prompt_cache_policy(
         and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
     )
 
+    # A custom Anthropic-compatible route may use a bare model alias that is
+    # canonicalized only after Hermes sends the request. In that case model
+    # spelling cannot prove cache support. Honor an exact route+model
+    # capability declaration instead; explicit false is authoritative too.
+    # This preserves the runtime model id (and therefore request/cache keys)
+    # while avoiding unsafe alias-name guesses.
+    custom_prompt_caching = None
+    if is_anthropic_wire:
+        try:
+            from hermes_cli.config import get_custom_provider_model_capability
+
+            custom_prompt_caching = get_custom_provider_model_capability(
+                model=eff_model,
+                base_url=eff_base_url,
+                capability="prompt_caching",
+                custom_providers=getattr(agent, "_custom_providers", None),
+            )
+        except Exception as _cap_exc:
+            logger.debug(
+                "custom-provider prompt_caching capability lookup failed: %s",
+                _cap_exc,
+            )
+    if custom_prompt_caching is not None:
+        return custom_prompt_caching, custom_prompt_caching
+
+    # MiniMax-M3 rides MiniMax's server-side automatic prefix cache on the
+    # Anthropic wire (content-keyed, no marker needed); explicit cache_control
+    # is documented for M2.7/M2.5/M2.1/M2 only, so markers on M3 are dead
+    # weight — never observable (cache_creation always 0) nor billable.
+    # Checked BEFORE the native-Anthropic return: provider="anthropic"
+    # pointed at a MiniMax /anthropic proxy is a supported override
+    # (_anthropic_base_url_override_ok) that would otherwise return
+    # (True, True) above this exclusion.
+    # Docs: https://platform.minimax.io/docs/api-reference/text-prompt-caching
+    is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
+    is_minimax_host = (
+        base_url_host_matches(eff_base_url, "api.minimax.io")
+        or base_url_host_matches(eff_base_url, "api.minimaxi.com")
+    )
+    is_minimax_route = is_minimax_provider or is_minimax_host
+    if is_anthropic_wire and is_minimax_route:
+        from agent.model_metadata import _model_name_suggests_minimax_m3
+
+        if _model_name_suggests_minimax_m3(eff_model):
+            return False, False
+
     if is_native_anthropic:
         return True, True
     # Envelope layout is an OpenAI-wire construct. Portal Claude on the native
@@ -2267,16 +2354,11 @@ def anthropic_prompt_cache_policy(
     # explicitly via provider id or host match so users on
     # provider=minimax / minimax-cn (or custom endpoints pointing at
     # api.minimax.io/anthropic / api.minimaxi.com/anthropic) get the
-    # same cost reduction as Claude traffic.
+    # same cost reduction as Claude traffic.  MiniMax-M3 never reaches
+    # here — it is excluded before the native-Anthropic return above.
     # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
-    if is_anthropic_wire:
-        is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
-        is_minimax_host = (
-            base_url_host_matches(eff_base_url, "api.minimax.io")
-            or base_url_host_matches(eff_base_url, "api.minimaxi.com")
-        )
-        if is_minimax_provider or is_minimax_host:
-            return True, True
+    if is_anthropic_wire and is_minimax_route:
+        return True, True
 
     # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
     # transport that accepts Anthropic-style cache_control markers and
@@ -2288,10 +2370,13 @@ def anthropic_prompt_cache_policy(
     # OpenCode Zen's relay rejects the Anthropic-style content block
     # format that cache markers produce (content becomes a block array
     # instead of a plain string), causing HTTP 400 (#77217).
-    model_is_qwen = "qwen" in model_lower
-    provider_is_alibaba_family = provider_lower in {
-        "opencode", "opencode-zen", "opencode-go", "alibaba",
-    }
+    # Single source of truth for the family set and the qwen-model
+    # predicate — shared with the effective_cache_ttl clamp so the
+    # opt-in and the TTL clamp can never desync (#84733).
+    from agent.prompt_caching import ALIBABA_FAMILY_PROVIDERS, is_qwen_model
+
+    model_is_qwen = is_qwen_model(model_lower)
+    provider_is_alibaba_family = provider_lower in ALIBABA_FAMILY_PROVIDERS
     if provider_is_alibaba_family and model_is_qwen:
         # Envelope layout (native_anthropic=False): markers on inner
         # content parts, not top-level tool messages.  Matches
@@ -2716,6 +2801,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     )
 
     # ── Re-evaluate prompt caching ──
+    # Refresh the custom-provider snapshot from the config just loaded above
+    # so the per-model ``prompt_caching`` capability lookup sees the same
+    # live list the context-length resolution used — without this, a flag
+    # added to config.yaml after session start is invisible to a /model
+    # switch (the policy would read the stale init-time snapshot).
+    if _sm_custom_providers is not None:
+        agent._custom_providers = _sm_custom_providers
     agent._use_prompt_caching, agent._use_native_cache_layout = (
         agent._anthropic_prompt_cache_policy(
             provider=new_provider,
@@ -2898,14 +2990,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
 
-    # Stamp tqmemory writes with model-identity metadata (#2234).
-    try:
-        from agent.tqmemory_model_filter import is_tqmemory_write, stamp_model_metadata
-        if is_tqmemory_write(function_name):
-            function_args = stamp_model_metadata(function_args, getattr(agent, "model", None))
-    except Exception:
-        pass
-
     # Check plugin hooks for a block or approval directive before executing.
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
@@ -2949,25 +3033,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     def _finish_agent_tool(result: Any, observed_args: Optional[dict] = None) -> Any:
         hook_args = observed_args if isinstance(observed_args, dict) else function_args
-        # Stash the per-call duration for the turn's trajectory capture (#1442).
-        # This is the only point where it exists: the capture runs in
-        # finalize_turn, by which time nothing carries per-call timing, so
-        # without this every entry's duration_ms stays None and the
-        # failure-trajectory timestamp framework has nothing to place its
-        # t_fail / t_detect / t_recover against.
-        #
-        # A plain dict on the agent, keyed by tool_call_id, drained by the
-        # capture. Guarded because a timing that fails to record must not take
-        # the tool result down with it.
-        try:
-            if tool_call_id:
-                timings = getattr(agent, "_turn_call_timings", None)
-                if timings is None:
-                    timings = {}
-                    agent._turn_call_timings = timings
-                timings[tool_call_id] = int((time.monotonic() - tool_start_time) * 1000)
-        except Exception:
-            pass
         try:
             from model_tools import _emit_post_tool_call_hook
             _emit_post_tool_call_hook(
@@ -3019,31 +3084,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 next_args,
             )
     elif function_name == "memory":
-        # #977 — memory circuit breaker: after 3 consecutive failures the
-        # memory tool returns a "proceed without persistence" directive so
-        # the agent continues the task instead of looping on a broken
-        # storage backend. Uses a dedicated breaker (threshold=3) separate
-        # from the generic tool breaker (threshold=5) because memory
-        # failures are cheaper to route around — the agent can work
-        # without persistence — so we trip sooner.
-        from agent.tool_error_recovery import get_breaker as _get_mem_breaker
-        _mem_breaker = _get_mem_breaker("memory", threshold=3)
-
         def _execute(next_args: dict) -> Any:
-            # If the breaker is already open, short-circuit with a directive.
-            if _mem_breaker.should_trip():
-                _mem_breaker_count = _mem_breaker._consecutive_failures
-                _mem_msg = (
-                    f"Memory is unavailable — proceed without persistence. "
-                    f"Memory tool has failed {_mem_breaker_count} consecutive "
-                    f"times. Continue the task without reading or writing "
-                    f"memory. Do not retry the memory tool."
-                )
-                logger.warning("memory circuit breaker open after %d failures", _mem_breaker_count)
-                return _finish_agent_tool(
-                    json.dumps({"success": False, "error": _mem_msg}, ensure_ascii=False),
-                    next_args,
-                )
             target = next_args.get("target", "memory")
             operations = next_args.get("operations")
             from tools.memory_tool import memory_tool as _memory_tool
@@ -3055,25 +3096,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 operations=operations,
                 store=agent._memory_store,
             )
-            # Track success/failure for the memory breaker.
-            try:
-                _parsed = json.loads(result) if isinstance(result, str) else result
-                _ok = bool(_parsed.get("success", True)) if isinstance(_parsed, dict) else True
-            except Exception:
-                _ok = True
-            if _ok:
-                _mem_breaker.record_success()
-            else:
-                _mem_breaker.record_failure()
-                if _mem_breaker.should_trip():
-                    logger.warning(
-                        "memory circuit breaker tripped — returning "
-                        "proceed-without-persistence directive"
-                    )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
             # (MemoryManager.notify_memory_tool_write).
-            if agent._memory_manager and _ok:
+            if agent._memory_manager:
                 agent._memory_manager.notify_memory_tool_write(
                     result,
                     next_args,
@@ -3109,6 +3135,38 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "read_preview":
+        def _execute(next_args: dict) -> Any:
+            from tools.read_preview_tool import read_preview_tool as _read_preview_tool
+            return _finish_agent_tool(
+                _read_preview_tool(
+                    start=next_args.get("start"),
+                    count=next_args.get("count"),
+                    callback=getattr(agent, "read_preview_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "read_window_below":
+        def _execute(next_args: dict) -> Any:
+            from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
+            return _finish_agent_tool(
+                _read_window_below_tool(
+                    callback=getattr(agent, "read_window_below_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "setup_mcp":
+        def _execute(next_args: dict) -> Any:
+            from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool
+            return _finish_agent_tool(
+                _setup_mcp_tool(
+                    server=next_args.get("server", ""),
+                    action=next_args.get("action", "install"),
+                    reason=next_args.get("reason", ""),
+                    callback=getattr(agent, "setup_mcp_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
@@ -3132,9 +3190,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             # tool, check whether this exact semantic intent already succeeded
             # (result observed). If so, replay the prior outcome instead of
             # re-executing — a checkpoint-restore must not duplicate a
-            # real-world side effect (second email, double charge). A call
-            # whose intent differs from anything logged forks (executes
-            # normally) and is never silently re-run as a duplicate.
+            # real-world side effect (second email, double charge).
             try:
                 from tools.tool_call_log import replay_or_fork
 
@@ -3143,9 +3199,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     return _replay
             except Exception:
                 pass  # fail-open: never block a tool on log bookkeeping
-            # #2236 — record non-atomic tool calls in the live dispatch path
-            # (rework: the prior PR shipped the module as dead code). Guarded
-            # by is_non_atomic() because record() raises for atomic tools.
+            # #2236 — record non-atomic tool calls in the live dispatch path.
+            # Guarded by is_non_atomic() because record() raises for atomic tools.
             try:
                 from tools.tool_call_log import get_default_log, is_non_atomic
                 if is_non_atomic(function_name):
@@ -3174,30 +3229,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
 
     if skip_tool_execution_middleware:
-        result = _execute(function_args)
-    else:
-        from hermes_cli.middleware import run_tool_execution_middleware
-        result = run_tool_execution_middleware(
-            function_name,
-            function_args,
-            lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
-            original_args=function_args,
-            task_id=effective_task_id or "",
-            session_id=getattr(agent, "session_id", "") or "",
-            tool_call_id=tool_call_id or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-        )
+        return _execute(function_args)
 
-    # Filter tqmemory reads by model family — down-weight cross-family notes (#2234).
-    try:
-        from agent.tqmemory_model_filter import is_tqmemory_read, filter_by_model_family
-        if is_tqmemory_read(function_name) and isinstance(result, str):
-            result = filter_by_model_family(result, getattr(agent, "model", None))
-    except Exception:
-        pass
+    from hermes_cli.middleware import run_tool_execution_middleware
 
-    return result
+    return run_tool_execution_middleware(
+        function_name,
+        function_args,
+        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        original_args=function_args,
+        task_id=effective_task_id or "",
+        session_id=getattr(agent, "session_id", "") or "",
+        tool_call_id=tool_call_id or "",
+        turn_id=getattr(agent, "_current_turn_id", "") or "",
+        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+    )
 
 
 

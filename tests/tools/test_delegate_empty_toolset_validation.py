@@ -115,7 +115,10 @@ class TestEmptyToolsetValidation(unittest.TestCase):
         parent = _make_mock_parent()
         with patch("tools.delegate_tool._build_child_agent") as MockBuild:
             MockBuild.return_value = _make_mock_child(empty=True)
-            tasks = [{"goal": "A", "context": None}, {"goal": "B", "context": None}]
+            tasks = [
+                {"goal": "Investigate module A", "context": None},
+                {"goal": "Investigate module B", "context": None},
+            ]
             result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
 
         self.assertEqual(len(result["results"]), 2)
@@ -150,8 +153,8 @@ class TestEmptyToolsetValidation(unittest.TestCase):
         with patch("tools.delegate_tool._build_child_agent") as MockBuild:
             MockBuild.side_effect = [empty, valid]
             tasks = [
-                {"goal": "Empty", "context": None},
-                {"goal": "Valid", "context": None},
+                {"goal": "Investigate empty task", "context": None},
+                {"goal": "Investigate valid task", "context": None},
             ]
             result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
 
