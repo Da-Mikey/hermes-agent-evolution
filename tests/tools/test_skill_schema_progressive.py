@@ -230,4 +230,4 @@ class TestHandlerUsageBump:
             ):
                 _skill_view_with_bump({"name": "loaded"})
         mock_view.assert_called_once_with("loaded")
-        mock_use.assert_called_once_with("loaded")
+        mock_use.assert_called_once_with("loaded", task_id=None, session_id=None)

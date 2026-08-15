@@ -86,16 +86,14 @@ class TestBlankSlateMinimalToolsets:
         names = sorted(
             {(d.get("function") or {}).get("name") or d.get("name") for d in defs}
         )
-        # Blank Slate is file + terminal plus the tool_search bridge trio.
+        # Blank Slate is file + terminal tools.
         assert names == [
             "patch",
             "process",
             "read_file",
+            "repo_map",
             "search_files",
             "terminal",
-            "tool_call",
-            "tool_describe",
-            "tool_search",
             "write_file",
         ]
 
@@ -120,16 +118,14 @@ class TestBlankSlateMinimalToolsets:
         names = sorted(
             {(d.get("function") or {}).get("name") or d.get("name") for d in defs}
         )
-        # Blank Slate is file + terminal plus the tool_search bridge trio.
+        # Blank Slate is file + terminal tools.
         assert names == [
             "patch",
             "process",
             "read_file",
+            "repo_map",
             "search_files",
             "terminal",
-            "tool_call",
-            "tool_describe",
-            "tool_search",
             "write_file",
         ]
 

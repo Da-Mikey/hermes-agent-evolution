@@ -2670,6 +2670,8 @@ class TestExecuteToolCalls:
 
     def test_sequential_tool_calls_run_without_delay(self, agent):
         """Two sequential tool calls execute back-to-back with no sleep between them."""
+        from tools import env_probe
+        env_probe.get_environment_probe_line()
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])

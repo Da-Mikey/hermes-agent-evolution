@@ -3953,10 +3953,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if self._conn:
                 if not self.read_only:
                     try:
-                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug(
-                            "WAL checkpoint (TRUNCATE) at close failed: %s",
+                            "WAL checkpoint (PASSIVE) at close failed: %s",
                             exc,
                         )
                 self._conn.close()

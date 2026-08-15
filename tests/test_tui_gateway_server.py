@@ -977,10 +977,10 @@ def test_voice_toggle_returns_configured_record_key(monkeypatch):
     # review on #19835).
     monkeypatch.setenv("HERMES_VOICE", "0")
 
-    on_resp = server.dispatch(
+    on_resp = server.handle_request(
         {"id": "voice-on", "method": "voice.toggle", "params": {"action": "on"}}
     )
-    status_resp = server.dispatch(
+    status_resp = server.handle_request(
         {"id": "voice-status", "method": "voice.toggle", "params": {"action": "status"}}
     )
 
@@ -1008,7 +1008,7 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
     for bad in (True, "cmd+b", None, 42, ["ctrl+b"]):
         monkeypatch.setattr(server, "_load_cfg", lambda b=bad: {"voice": b})
 
-        status_resp = server.dispatch(
+        status_resp = server.handle_request(
             {
                 "id": "voice-status",
                 "method": "voice.toggle",
@@ -1027,7 +1027,7 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
     for bad_root in (True, None, [], "ctrl+b", 42):
         monkeypatch.setattr(server, "_load_cfg", lambda r=bad_root: r)
 
-        status_resp = server.dispatch(
+        status_resp = server.handle_request(
             {
                 "id": "voice-status-root",
                 "method": "voice.toggle",
@@ -1068,7 +1068,7 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         captured.clear()
         monkeypatch.setattr(server, "_load_cfg", lambda b=bad: {"voice": b})
 
-        resp = server.dispatch(
+        resp = server.handle_request(
             {
                 "id": "voice-record",
                 "method": "voice.record",
@@ -1096,7 +1096,7 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         captured.clear()
         monkeypatch.setattr(server, "_load_cfg", lambda c=bad_bool_cfg: {"voice": c})
 
-        resp = server.dispatch(
+        resp = server.handle_request(
             {
                 "id": "voice-record-bool",
                 "method": "voice.record",
@@ -1129,7 +1129,7 @@ def test_voice_record_stop_forces_transcription(monkeypatch):
         ),
     )
 
-    resp = server.dispatch(
+    resp = server.handle_request(
         {
             "id": "voice-record-stop",
             "method": "voice.record",
@@ -1152,7 +1152,7 @@ def test_voice_record_stop_updates_event_session_id(monkeypatch):
     )
     monkeypatch.setattr(server, "_voice_event_sid", "old-session")
 
-    resp = server.dispatch(
+    resp = server.handle_request(
         {
             "id": "voice-record-stop-session",
             "method": "voice.record",
@@ -1176,7 +1176,7 @@ def test_voice_record_start_reports_busy_when_stop_is_in_progress(monkeypatch):
     monkeypatch.setenv("HERMES_VOICE", "1")
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {}})
 
-    resp = server.dispatch(
+    resp = server.handle_request(
         {
             "id": "voice-record-busy",
             "method": "voice.record",
@@ -1211,7 +1211,7 @@ def test_voice_toggle_tts_branch_also_carries_record_key(monkeypatch):
     monkeypatch.setenv("HERMES_VOICE", "1")
     monkeypatch.delenv("HERMES_VOICE_TTS", raising=False)
 
-    tts_resp = server.dispatch(
+    tts_resp = server.handle_request(
         {"id": "voice-tts", "method": "voice.toggle", "params": {"action": "tts"}}
     )
 
@@ -1433,7 +1433,12 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
 
     assert server._history_to_messages(history) == [
         {"role": "user", "text": "first prompt"},
-        {"context": "resume", "name": "search_files", "role": "tool"},
+        {
+            "args": {"pattern": "resume"},
+            "context": "resume",
+            "name": "search_files",
+            "role": "tool",
+        },
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second prompt"},
     ]
@@ -2052,12 +2057,15 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     assert "provider_override" not in ov
     assert ov["model_override"]["provider"] is None
 
-    for bare in ("auto", "openrouter", "custom"):
+    for bare in ("auto", "custom"):
         ov = server._stored_session_runtime_overrides({"model": "m", "billing_provider": bare})
         assert "provider_override" not in ov
 
-    # A real provider in billing_provider is still restored.
+    # A real provider (including openrouter per #57588) in billing_provider is still restored.
     ov = server._stored_session_runtime_overrides({"model": "m", "billing_provider": "anthropic"})
+    assert ov["provider_override"] == "anthropic"
+    ov_or = server._stored_session_runtime_overrides({"model": "m", "billing_provider": "openrouter"})
+    assert ov_or["provider_override"] == "openrouter"
     assert ov["provider_override"] == "anthropic"
     assert ov["model_override"]["provider"] == "anthropic"
 
@@ -2519,7 +2527,7 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
         },
     )
     monkeypatch.setattr("run_agent.AIAgent", fake_agent)
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *a, **kw: ["file"])
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     agent = server._make_agent("sid", "session-key")
@@ -2540,7 +2548,7 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
         _fallback_chain=chain,
     )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *a, **kw: ["file"])
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     kwargs = server._background_agent_kwargs(agent, "task-id")
@@ -2564,7 +2572,7 @@ def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
             ],
         },
     )
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *a, **kw: ["file"])
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     kwargs = server._background_agent_kwargs(agent, "task-id")
@@ -3313,6 +3321,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
                     "session_id": "trunc-sid",
                     "text": "next",
                     "truncate_before_user_ordinal": -1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -6563,11 +6572,11 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
+        stored = (server._desktop_attachment_dir(server._sessions["sid"]) / "report.txt").resolve()
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
-        assert resp["result"]["path"] == str(stored)
-        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report.txt"
+        assert Path(resp["result"]["path"]).resolve() == stored
+        assert resp["result"]["ref_text"] == f"@file:{stored}"
         assert stored.read_text(encoding="utf-8") == "hello world"
     finally:
         server._sessions.pop("sid", None)
@@ -6596,10 +6605,10 @@ def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, 
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "outside.txt"
+        stored = (server._desktop_attachment_dir(server._sessions["sid"]) / "outside.txt").resolve()
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
-        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/outside.txt"
+        assert resp["result"]["ref_text"] == f"@file:{stored}"
         assert stored.read_text(encoding="utf-8") == "outside workspace"
     finally:
         server._sessions.pop("sid", None)
@@ -6690,7 +6699,8 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         )
 
         assert resp["result"]["attached"] is True
-        assert resp["result"]["ref_text"] == "@file:`.hermes/desktop-attachments/my exam schedule.csv`"
+        stored = (server._desktop_attachment_dir(server._sessions["sid"]) / "my exam schedule.csv").resolve()
+        assert resp["result"]["ref_text"] == f"@file:`{stored}`"
     finally:
         server._sessions.pop("sid", None)
 
@@ -7568,7 +7578,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, *args, **kwargs):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -7587,6 +7597,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
                 "session_id": "sid",
                 "text": "edited second",
                 "truncate_before_user_ordinal": 1,
+                "confirm_truncate": True,
             },
         })
         assert resp.get("result"), f"got error: {resp.get('error')}"
@@ -7642,6 +7653,7 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
                     "session_id": "trunc-fail-sid",
                     "text": "edited second",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -10825,7 +10837,7 @@ def _setup_make_agent_mocks(monkeypatch, cfg):
     monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "off")
     monkeypatch.setattr(server, "_load_reasoning_config", lambda model="": None)
     monkeypatch.setattr(server, "_load_service_tier", lambda: None)
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: None)
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *a, **kw: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
 
@@ -12723,7 +12735,7 @@ class TestResolveRuntimeWithFallback:
             fake_resolve,
         )
         monkeypatch.setattr("run_agent.AIAgent", fake_agent)
-        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *a, **kw: ["file"])
         monkeypatch.setattr(server, "_get_db", lambda: None)
 
         agent = server._make_agent(
@@ -13126,7 +13138,7 @@ def test_voice_toggle_on_carries_stop_hint(monkeypatch):
     )
     monkeypatch.setenv("HERMES_VOICE", "0")
 
-    on_resp = server.dispatch({
+    on_resp = server.handle_request({
         "id": "voice-on",
         "method": "voice.toggle",
         "params": {"action": "on"},
@@ -13142,7 +13154,7 @@ def test_voice_toggle_on_carries_stop_hint(monkeypatch):
             voice_stop_hint=lambda: "",
         ),
     )
-    on_resp = server.dispatch({
+    on_resp = server.handle_request({
         "id": "voice-on2",
         "method": "voice.toggle",
         "params": {"action": "on"},
@@ -13150,7 +13162,7 @@ def test_voice_toggle_on_carries_stop_hint(monkeypatch):
     assert on_resp["result"]["stop_hint"] == ""
 
     # off carries no hint text (mode is ending).
-    off_resp = server.dispatch({
+    off_resp = server.handle_request({
         "id": "voice-off",
         "method": "voice.toggle",
         "params": {"action": "off"},
@@ -13250,7 +13262,7 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
     state = {"owner": None, "callback": None, "paused": False}
     voice_callbacks = {}
 
-    def start_listening(callback, *, owner, config):
+    def start_listening(callback, *, owner, config, **_kw):
         if state["owner"] is not None and state["owner"] is not owner:
             raise wake_word.WakeWordInUse
         state.update(owner=owner, callback=callback, paused=False)
@@ -13339,38 +13351,43 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
     server._wake_owner_transport = None
     server._wake_owner_surface = ""
     try:
-        started = server.dispatch(
-            {
-                "id": "wake-1",
-                "method": "wake.start",
-                "params": {"surface": "gui", "session_id": "first-session"},
-            },
-            transport=first,
-        )
-        denied = server.dispatch(
-            {
-                "id": "wake-2",
-                "method": "wake.start",
-                "params": {"surface": "tui", "session_id": "second-session"},
-            },
-            transport=second,
-        )
-        denied_stop = server.dispatch(
-            {
-                "id": "wake-stop-2",
-                "method": "wake.stop",
-                "params": {},
-            },
-            transport=second,
-        )
-        denied_voice_stop = server.dispatch(
-            {
-                "id": "voice-stop-2",
-                "method": "voice.record",
-                "params": {"action": "stop"},
-            },
-            transport=second,
-        )
+        t_first = server.bind_transport(first)
+        try:
+            started = server.handle_request(
+                {
+                    "id": "wake-1",
+                    "method": "wake.start",
+                    "params": {"surface": "gui", "session_id": "first-session"},
+                }
+            )
+        finally:
+            server.reset_transport(t_first)
+
+        t_second = server.bind_transport(second)
+        try:
+            denied = server.handle_request(
+                {
+                    "id": "wake-2",
+                    "method": "wake.start",
+                    "params": {"surface": "tui", "session_id": "second-session"},
+                }
+            )
+            denied_stop = server.handle_request(
+                {
+                    "id": "wake-stop-2",
+                    "method": "wake.stop",
+                    "params": {},
+                }
+            )
+            denied_voice_stop = server.handle_request(
+                {
+                    "id": "voice-stop-2",
+                    "method": "voice.record",
+                    "params": {"action": "stop"},
+                }
+            )
+        finally:
+            server.reset_transport(t_second)
 
         assert started["result"]["started"] is True
         assert denied["result"] == {
@@ -13399,64 +13416,68 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
         ]
         assert state["paused"] is True
 
-        voice_started = server.dispatch(
-            {
-                "id": "voice-start-1",
-                "method": "voice.record",
-                "params": {"action": "start", "session_id": "first-session"},
-            },
-            transport=first,
-        )
-        assert voice_started["result"]["status"] == "recording"
-        voice_callbacks["on_status"]("idle")
-        assert state["paused"] is False
+        t_first = server.bind_transport(first)
+        try:
+            voice_started = server.handle_request(
+                {
+                    "id": "voice-start-1",
+                    "method": "voice.record",
+                    "params": {"action": "start", "session_id": "first-session"},
+                }
+            )
+            assert voice_started["result"]["status"] == "recording"
+            voice_callbacks["on_status"]("idle")
+            assert state["paused"] is False
 
-        stopped = server.dispatch(
-            {
-                "id": "wake-stop-1",
-                "method": "wake.stop",
-                "params": {},
-            },
-            transport=first,
-        )
-        assert stopped["result"] == {
-            "stopped": True,
-            "reason": None,
-            "disabled_persisted": False,
-        }
+            stopped = server.handle_request(
+                {
+                    "id": "wake-stop-1",
+                    "method": "wake.stop",
+                    "params": {},
+                }
+            )
+            assert stopped["result"] == {
+                "stopped": True,
+                "reason": None,
+                "disabled_persisted": False,
+            }
+        finally:
+            server.reset_transport(t_first)
 
-        reclaimed = server.dispatch(
-            {
-                "id": "wake-reclaim-2",
-                "method": "wake.start",
-                "params": {"surface": "tui", "session_id": "second-session"},
-            },
-            transport=second,
-        )
-        assert reclaimed["result"]["started"] is True
-        assert state["owner"] is second
+        t_second = server.bind_transport(second)
+        try:
+            reclaimed = server.handle_request(
+                {
+                    "id": "wake-reclaim-2",
+                    "method": "wake.start",
+                    "params": {"surface": "tui", "session_id": "second-session"},
+                }
+            )
+            assert reclaimed["result"]["started"] is True
+            assert state["owner"] is second
 
-        state["callback"]()
-        assert emitted[-1] == (
-            "wake.detected",
-            "second-session",
-            {"phrase": "hey hermes", "profile": None, "start_new_session": True},
-            second,
-        )
+            state["callback"]()
+            assert emitted[-1] == (
+                "wake.detected",
+                "second-session",
+                {"phrase": "hey hermes", "profile": None, "start_new_session": True},
+                second,
+            )
 
-        stopped_again = server.dispatch(
-            {
-                "id": "wake-stop-2-after-reclaim",
-                "method": "wake.stop",
-                "params": {},
-            },
-            transport=second,
-        )
-        assert stopped_again["result"] == {
-            "stopped": True,
-            "reason": None,
-            "disabled_persisted": False,
-        }
+            stopped_again = server.handle_request(
+                {
+                    "id": "wake-stop-2-after-reclaim",
+                    "method": "wake.stop",
+                    "params": {},
+                }
+            )
+            assert stopped_again["result"] == {
+                "stopped": True,
+                "reason": None,
+                "disabled_persisted": False,
+            }
+        finally:
+            server.reset_transport(t_second)
     finally:
         server._wake_owner_transport = None
         server._wake_owner_surface = ""
@@ -13494,7 +13515,7 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
     monkeypatch.setattr(
         wake_word,
         "start_listening",
-        lambda callback, *, owner, config: listener.update(owner=owner),
+        lambda callback, *, owner, config, **_kw: listener.update(owner=owner),
     )
     monkeypatch.setattr(
         wake_word,
@@ -13509,56 +13530,56 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
     server._wake_owner_transport = None
     server._wake_owner_surface = ""
     try:
-        # Passive auto-arm (no persist): refused, config untouched.
-        passive = server.dispatch(
-            {
-                "id": "wake-passive",
-                "method": "wake.start",
-                "params": {"surface": "gui"},
-            },
-            transport=transport,
-        )
-        assert passive["result"] == {"started": False, "reason": "disabled"}
-        assert persisted == []
+        t_tok = server.bind_transport(transport)
+        try:
+            # Passive auto-arm (no persist): refused, config untouched.
+            passive = server.handle_request(
+                {
+                    "id": "wake-passive",
+                    "method": "wake.start",
+                    "params": {"surface": "gui"},
+                }
+            )
+            assert passive["result"] == {"started": False, "reason": "disabled"}
+            assert persisted == []
 
-        # Explicit gesture: enables in config AND arms.
-        clicked = server.dispatch(
-            {
-                "id": "wake-click",
-                "method": "wake.start",
-                "params": {"surface": "gui", "persist": True},
-            },
-            transport=transport,
-        )
-        assert clicked["result"]["started"] is True
-        assert clicked["result"]["enabled_persisted"] is True
-        assert persisted == [True]
+            # Explicit gesture: enables in config AND arms.
+            clicked = server.handle_request(
+                {
+                    "id": "wake-click",
+                    "method": "wake.start",
+                    "params": {"surface": "gui", "persist": True},
+                }
+            )
+            assert clicked["result"]["started"] is True
+            assert clicked["result"]["enabled_persisted"] is True
+            assert persisted == [True]
 
-        # Explicit stop: disables in config.
-        stopped = server.dispatch(
-            {
-                "id": "wake-click-off",
-                "method": "wake.stop",
-                "params": {"persist": True},
-            },
-            transport=transport,
-        )
-        assert stopped["result"]["stopped"] is True
-        assert stopped["result"]["disabled_persisted"] is True
-        assert persisted == [True, False]
+            # Explicit stop: disables in config.
+            stopped = server.handle_request(
+                {
+                    "id": "wake-click-off",
+                    "method": "wake.stop",
+                    "params": {"persist": True},
+                }
+            )
+            assert stopped["result"]["stopped"] is True
+            assert stopped["result"]["disabled_persisted"] is True
+            assert persisted == [True, False]
 
-        # persist does NOT override an explicit surface scoping.
-        config.update(enabled=True, surface="tui")
-        scoped = server.dispatch(
-            {
-                "id": "wake-scoped",
-                "method": "wake.start",
-                "params": {"surface": "gui", "persist": True},
-            },
-            transport=transport,
-        )
-        assert scoped["result"] == {"started": False, "reason": "disabled_for_surface"}
-        assert persisted == [True, False]
+            # persist does NOT override an explicit surface scoping.
+            config.update(enabled=True, surface="tui")
+            scoped = server.handle_request(
+                {
+                    "id": "wake-scoped",
+                    "method": "wake.start",
+                    "params": {"surface": "gui", "persist": True},
+                }
+            )
+            assert scoped["result"] == {"started": False, "reason": "disabled_for_surface"}
+            assert persisted == [True, False]
+        finally:
+            server.reset_transport(t_tok)
     finally:
         server._wake_owner_transport = None
         server._wake_owner_surface = ""
@@ -13607,10 +13628,13 @@ def test_wake_status_reports_configured_input_device_and_windows_silence_hint(
     server._wake_owner_transport = transport
     server._wake_owner_surface = "gui"
     try:
-        response = server.dispatch(
-            {"id": "wake-status", "method": "wake.status", "params": {}},
-            transport=transport,
-        )
+        t_tok = server.bind_transport(transport)
+        try:
+            response = server.handle_request(
+                {"id": "wake-status", "method": "wake.status", "params": {}}
+            )
+        finally:
+            server.reset_transport(t_tok)
         assert response["result"]["configured_surface"] == "gui"
         assert response["result"]["input_device"] == device
         assert response["result"]["audio_silent"] is True
@@ -13655,7 +13679,7 @@ def test_voice_record_start_forwards_max_recording_seconds(monkeypatch):
         captured.clear()
         monkeypatch.setattr(server, "_load_cfg", lambda c=cfg: {"voice": c})
 
-        resp = server.dispatch({
+        resp = server.handle_request({
             "id": "voice-record-cap",
             "method": "voice.record",
             "params": {"action": "start"},
@@ -13997,6 +14021,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                 "session_id": "empty-trunc-sid",
                 "text": "fresh typed message",
                 "truncate_before_user_ordinal": 0,
+                "confirm_truncate": True,
             },
         })
         assert resp["error"]["code"] == 4028
@@ -14010,6 +14035,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                     "session_id": "empty-trunc-sid",
                     "text": "fresh typed message",
                     "truncate_before_user_ordinal": 0,
+                    "confirm_truncate": True,
                     "confirm_empty_truncate": falsey,
                 },
             })
@@ -14050,7 +14076,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             self._target()
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, *args, **kwargs):
             replaced.append((key, list(messages)))
 
     history = [
@@ -14077,6 +14103,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
                 "session_id": "confirm-empty-sid",
                 "text": "first",
                 "truncate_before_user_ordinal": 0,
+                "confirm_truncate": True,
                 "confirm_empty_truncate": True,
             },
         })
@@ -14791,7 +14818,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, *args, **kwargs):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -14812,6 +14839,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
                 "session_id": "sid",
                 "text": "edited first",
                 "truncate_before_user_ordinal": 1,
+                "confirm_truncate": True,
             },
         })
         assert resp.get("result"), f"got error: {resp.get('error')}"

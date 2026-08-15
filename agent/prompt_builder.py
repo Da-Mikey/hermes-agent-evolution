@@ -979,7 +979,8 @@ COMPUTER_USE_GUIDANCE = computer_use_guidance("darwin")
 # so treating every historical occurrence as a new message can replay actions.
 STEER_MARKER_OPEN = (
     "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered "
-    "mid-turn; not tool output]"
+    "once at this position; not tool output and not a new delivery when replayed "
+    "from conversation history]"
 )
 STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 

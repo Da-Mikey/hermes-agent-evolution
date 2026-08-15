@@ -223,7 +223,5 @@ def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
 
     data = compute_prompt_breakdown("cli")
 
-    # Blank Slate is file + terminal, plus the tool_search bridge trio
-    # (tool_search / tool_describe / tool_call) that now ships in the core
-    # waist. That is 9 schemas (6 file/terminal + 3 bridge).
-    assert data["tools"]["count"] == 9
+    # Blank Slate is file + terminal (5 file + 2 terminal = 7 schemas).
+    assert data["tools"]["count"] == 7

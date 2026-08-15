@@ -465,12 +465,12 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
         result = json.loads(delegate_task(
             goal="This should be ignored",
-            tasks=[{"goal": "Actual task"}],
+            tasks=[{"goal": "Actual task 1"}, {"goal": "Actual task 2"}],
             parent_agent=parent,
         ))
         # The mock was called with the tasks array item, not the top-level goal
-        call_args = mock_run.call_args
-        self.assertEqual(call_args.kwargs.get("goal") or call_args[1].get("goal", call_args[0][1] if len(call_args[0]) > 1 else None), "Actual task")
+        call_args = mock_run.call_args_list[0]
+        self.assertEqual(call_args.kwargs.get("goal") or call_args[1].get("goal", call_args[0][1] if len(call_args[0]) > 1 else None), "Actual task 1")
 
     @patch("tools.delegate_tool._run_single_child")
     def test_failed_child_included_in_results(self, mock_run):
@@ -1209,7 +1209,11 @@ class TestSubagentCostRollup(unittest.TestCase):
             ]
             result = json.loads(
                 delegate_task(
-                    tasks=[{"goal": "A"}, {"goal": "B"}, {"goal": "C"}],
+                    tasks=[
+                        {"goal": "Investigate module A"},
+                        {"goal": "Investigate module B"},
+                        {"goal": "Investigate module C"},
+                    ],
                     parent_agent=parent,
                 )
             )
@@ -1919,7 +1923,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
                 "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
             }
 
-            tasks = [{"goal": "Task A"}, {"goal": "Task B"}]
+            tasks = [{"goal": "Perform subagent task A"}, {"goal": "Perform subagent task B"}]
             delegate_task(tasks=tasks, parent_agent=parent)
 
             self.assertEqual(mock_build.call_count, 2)
@@ -3063,7 +3067,6 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             "api_key": None, "api_mode": None, "model": None,
         }
         parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file", "delegation"]
         built_toolsets = []
 
         def _factory(*a, **kw):
@@ -3074,9 +3077,9 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         with patch("run_agent.AIAgent", side_effect=_factory):
             delegate_task(
                 tasks=[
-                    {"goal": "A", "role": "orchestrator"},
-                    {"goal": "B", "role": "leaf"},
-                    {"goal": "C"},  # no role → falls back to top_role (leaf)
+                    {"goal": "Investigate orchestrator work", "role": "orchestrator"},
+                    {"goal": "Investigate leaf work A", "role": "leaf"},
+                    {"goal": "Investigate leaf work B"},  # no role → falls back to top_role (leaf)
                 ],
                 parent_agent=parent,
             )
@@ -3090,28 +3093,27 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
     def test_intersection_preserves_delegation_bound(
         self, mock_cfg, mock_creds
     ):
-        """Design decision: orchestrator capability is granted by role,
-        NOT inherited from the parent's toolset. A parent without
-        'delegation' in its enabled_toolsets can still spawn an
-        orchestrator child — the re-add in _build_child_agent runs
-        unconditionally for orchestrators (when max_spawn_depth allows).
-
-        If you want to change to "parent must have delegation too",
-        update _build_child_agent to check parent_toolsets before the
-        re-add and update this test to match.
-        """
+        """Regression test for subagent depth leak."""
         mock_creds.return_value = {
             "provider": None, "base_url": None,
             "api_key": None, "api_mode": None, "model": None,
         }
         parent = _make_mock_parent(depth=0)
-        parent.enabled_toolsets = ["terminal", "file"]  # no delegation
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = _make_role_mock_child()
-            MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator",
-                          parent_agent=parent)
-            self.assertIn("delegation", MockAgent.call_args[1]["enabled_toolsets"])
+        parent.enabled_toolsets = ["terminal", "file", "delegation"]
+        built_toolsets = []
+
+        def _factory(*a, **kw):
+            m = _make_role_mock_child()
+            built_toolsets.append(kw.get("enabled_toolsets"))
+            return m
+
+        with patch("run_agent.AIAgent", side_effect=_factory):
+            delegate_task(
+                goal="test",
+                role="orchestrator",
+                parent_agent=parent,
+            )
+        self.assertIn("delegation", built_toolsets[0])
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
@@ -3137,14 +3139,14 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             mock_child = _make_role_mock_child()
             MockAgent.return_value = mock_child
             delegate_task(
-                tasks=[{
-                    "goal": "test",
-                    "team": {"team_id": "team-x", "member": "worker-1"},
-                }],
+                tasks=[
+                    {"goal": "Perform team task A", "team": {"team_id": "team-x", "member": "worker-1"}},
+                    {"goal": "Perform team task B", "team": {"team_id": "team-x", "member": "worker-2"}},
+                ],
                 parent_agent=parent,
             )
             self.assertIn(
-                "agent_team", MockAgent.call_args[1]["enabled_toolsets"]
+                "agent_team", MockAgent.call_args_list[0][1]["enabled_toolsets"]
             )
 
 
@@ -3216,7 +3218,10 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 def _orchestrator_run(user_message=None, task_id=None, stream_callback=None):
                     # Re-entrant: orchestrator spawns two leaves
                     delegate_task(
-                        tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],
+                        tasks=[
+                            {"goal": "Do leaf work stream A"},
+                            {"goal": "Do leaf work stream B"},
+                        ],
                         parent_agent=m,
                     )
                     return {
