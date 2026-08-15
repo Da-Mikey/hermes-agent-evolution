@@ -978,6 +978,11 @@ class ToolCallGuardrailController:
             if not cap:
                 return None
             spawn_count = _subagent_spawn_count(args)
+            if spawn_count == 0:
+                # Control action (list/steer/stop) — spawns nothing. Never
+                # block: once the spawn cap is hit, steering/stopping the
+                # existing children is exactly what should still work.
+                return None
             if self._turn_subagent_count >= cap:
                 decision = ToolGuardrailDecision(
                     action="block",

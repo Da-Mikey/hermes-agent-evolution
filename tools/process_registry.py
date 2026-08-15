@@ -535,6 +535,25 @@ class ProcessRegistry:
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
 
+    def reset(self) -> None:
+        """Drop in-memory process state. Tests use this for isolation."""
+        with self._lock:
+            self._running.clear()
+            self._finished.clear()
+            self.pending_watchers.clear()
+            self._completion_consumed.clear()
+            self._poll_observed.clear()
+        while True:
+            try:
+                self.completion_queue.get_nowait()
+            except Exception:
+                break
+        with self._global_watch_lock:
+            self._global_watch_window_start = 0.0
+            self._global_watch_window_hits = 0
+            self._global_watch_tripped_until = 0.0
+            self._global_watch_suppressed_during_trip = 0
+
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
         """Strip shell startup warnings from the beginning of output."""

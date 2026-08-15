@@ -3059,6 +3059,32 @@ def _transcribe_prepared_audio(
             logger.info("STT provider unavailable, falling back to local STT command")
             provider = "local_command"
 
+    # Pre-upload silence trim for built-in cloud providers. Best-effort:
+    # any failure uploads the original untouched. Dispatcher owns cleanup
+    # of the trim temp dir (tests assert the parent is gone after return).
+    trim_cleanup_dir: Optional[str] = None
+    if provider in CLOUD_STT_PROVIDERS:
+        trimmed = _trim_silence_for_cloud_stt(file_path, stt_config)
+        if trimmed:
+            file_path = trimmed
+            trim_cleanup_dir = os.path.dirname(trimmed)
+
+    try:
+        return _dispatch_prepared_audio_after_trim(
+            file_path, provider, stt_config, model, source
+        )
+    finally:
+        if trim_cleanup_dir:
+            shutil.rmtree(trim_cleanup_dir, ignore_errors=True)
+
+
+def _dispatch_prepared_audio_after_trim(
+    file_path: str,
+    provider: str,
+    stt_config: Dict[str, Any],
+    model: Optional[str],
+    source: Optional[str],
+) -> Dict[str, Any]:
     prompt = stt_config.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = None

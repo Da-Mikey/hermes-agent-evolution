@@ -760,7 +760,8 @@ def _build_scale_note(
 
 def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
                               max_base64_bytes: int = _RESIZE_TARGET_BYTES,
-                              max_dimension: Optional[int] = None) -> str:
+                              max_dimension: Optional[int] = None,
+                              scale_out: Optional[dict] = None) -> str:
     """Convert an image to a base64 data URL, auto-resizing if too large.
 
     Tries Pillow first to progressively downscale oversized images.  If Pillow
@@ -849,8 +850,17 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
     # For JPEG, also try reducing quality at each size step.
     # For PNG, quality is irrelevant — only dimension reduction helps.
     quality_steps = (85, 70, 50) if pil_format == "JPEG" else (None,)
+    orig_dims = (img.width, img.height)
     prev_dims = (img.width, img.height)
     candidate = None  # will be set on first loop iteration
+
+    def _record_scale(w: int, h: int) -> None:
+        """Publish the downscale into ``scale_out`` when dims changed."""
+        if scale_out is not None and (w, h) != orig_dims:
+            scale_out["orig_width"] = orig_dims[0]
+            scale_out["orig_height"] = orig_dims[1]
+            scale_out["new_width"] = w
+            scale_out["new_height"] = h
 
     def _dims_ok(w: int, h: int) -> bool:
         """True if both pixel dimensions are within the limit."""
@@ -892,6 +902,7 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
                 logger.info("Auto-resized image fits: %.1f MB (quality=%s, %dx%d)",
                             len(candidate) / (1024 * 1024), q,
                             img.width, img.height)
+                _record_scale(img.width, img.height)
                 return candidate
 
     # If we still can't get it small enough, return the best attempt
@@ -899,6 +910,7 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
     if candidate is not None:
         logger.warning("Auto-resize could not fit image under %.1f MB (best: %.1f MB)",
                        max_base64_bytes / (1024 * 1024), len(candidate) / (1024 * 1024))
+        _record_scale(img.width, img.height)
         return candidate
 
     # Shouldn't reach here, but fall back to full encode
@@ -1355,9 +1367,12 @@ async def vision_analyze_tool(
 
         # Optional region zoom: crop BEFORE the encode/downscale pipeline so
         # the cropped area keeps the full resolution budget.
+        _crop_offset: dict = {}
+        _scale_info: dict = {}
         if region is not None:
             cropped_path, cropped_mime, crop_err = await asyncio.to_thread(
                 _crop_image_region, temp_image_path, region,
+                offset_out=_crop_offset,
             )
             if crop_err or cropped_path is None:
                 raise ValueError(crop_err or "Region crop failed.")
@@ -1386,7 +1401,8 @@ async def vision_analyze_tool(
             # Try to resize down to 5 MB before giving up.
             image_data_url = await _run_encode_on_cpu_executor(
                 _resize_image_for_vision,
-                temp_image_path, mime_type=detected_mime_type)
+                temp_image_path, mime_type=detected_mime_type,
+                scale_out=_scale_info)
             if len(image_data_url) > _MAX_BASE64_BYTES:
                 raise ValueError(
                     f"Image too large for vision API: base64 payload is "
@@ -1470,7 +1486,8 @@ async def vision_analyze_tool(
                     )
                     image_data_url = await _run_encode_on_cpu_executor(
                         _resize_image_for_vision,
-                        temp_image_path, mime_type=detected_mime_type)
+                        temp_image_path, mime_type=detected_mime_type,
+                        scale_out=_scale_info)
                     messages[0]["content"][1]["image_url"]["url"] = image_data_url
                     # Size retry is separate from transient retry — reset attempt counter.
                     _attempt = -1  # type: ignore[assignment]
@@ -1504,10 +1521,16 @@ async def vision_analyze_tool(
         logger.info("Image analysis completed (%s characters)", analysis_length)
         
         # Prepare successful response
+        analysis = analysis or "There was a problem with the request and the image could not be analyzed."
+        scale_note = _build_scale_note(
+            _scale_info or None, _crop_offset or None,
+        )
         result = {
             "success": True,
-            "analysis": analysis or "There was a problem with the request and the image could not be analyzed."
+            "analysis": f"[{scale_note}] {analysis}" if scale_note else analysis,
         }
+        if scale_note:
+            result["scale_note"] = scale_note
         
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length

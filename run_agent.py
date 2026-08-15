@@ -428,6 +428,11 @@ class AIAgent:
     for AI models that support function calling.
     """
 
+    # Default False: caller-supplied SessionDB is almost always a shared
+    # launch handle. Dedicated handles set this True at transfer; tests that
+    # construct via __new__ must not AttributeError on the class.
+    _owns_session_db = False
+
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
@@ -627,6 +632,9 @@ class AIAgent:
             from hermes_state import SessionDB
 
             self._session_db = SessionDB()
+            # We opened it here, so nothing else holds a reference — this agent
+            # is its only owner and close() must release it.
+            self._owns_session_db = True
             return self._session_db
         except Exception as exc:
             logger.debug("SessionDB unavailable for %s", reason, exc_info=True)
@@ -4706,12 +4714,24 @@ class AIAgent:
         # must leave it open). end_session() is first-reason-wins and no-ops on
         # an already-ended row, so this never clobbers a 'compression' /
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
+        session_db = getattr(self, "_session_db", None)
         try:
             if getattr(self, "_end_session_on_close", True):
-                session_db = getattr(self, "_session_db", None)
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     session_db.end_session(session_id, "agent_close")
+        except Exception:
+            pass
+
+        # 9. Close the SQLite handle itself, but ONLY when this agent owns it.
+        # end_session() above finalizes the session ROW; it does not release the
+        # connection. For the shared launch handle that is correct — it outlives
+        # every agent — so _owns_session_db defaults False and this is a no-op.
+        # Cleared first so the documented idempotency of close() holds.
+        try:
+            if getattr(self, "_owns_session_db", False) and session_db is not None:
+                self._owns_session_db = False
+                session_db.close()
         except Exception:
             pass
 
