@@ -2930,7 +2930,7 @@ class AIAgent:
         try:
             if hasattr(value, "model_dump"):
                 try:
-                    dumped = value.model_dump(mode="json")
+                    dumped = value.model_dump(mode="json", warnings=False)
                 except TypeError:
                     dumped = value.model_dump()
                 return cls._hook_jsonable(

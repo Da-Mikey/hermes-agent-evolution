@@ -5202,6 +5202,20 @@ def _run_conversation_impl(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
+                # Track consecutive 503/overloaded errors for the overload
+                # circuit breaker (#943). After 2 consecutive overloaded
+                # errors, fail over immediately instead of waiting for the
+                # generic transport retry_count >= 2 gate.
+                if classified.reason == FailoverReason.overloaded:
+                    _retry.consecutive_overload_hits += 1
+                    agent._cross_turn_overload_hits = (
+                        getattr(agent, "_cross_turn_overload_hits", 0) + 1
+                    )
+                else:
+                    _retry.consecutive_overload_hits = 0
+                    _ct_oh = getattr(agent, "_cross_turn_overload_hits", 0)
+                    if _ct_oh > 0:
+                        agent._cross_turn_overload_hits = max(0, _ct_oh - 1)
                 # Z.AI Coding Plan GLM-5.2 overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
                 # is excluded from `is_rate_limited` — the gate for the adaptive
@@ -5217,6 +5231,14 @@ def _run_conversation_impl(
                 _should_fallback = (
                     is_rate_limited
                     or (_is_transport_failure and retry_count >= 2)
+                    or (
+                        classified.reason == FailoverReason.overloaded
+                        and _retry.consecutive_overload_hits >= 2
+                    )
+                    or (
+                        classified.reason == FailoverReason.overloaded
+                        and getattr(agent, "_cross_turn_overload_hits", 0) >= 3
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -5261,6 +5283,21 @@ def _run_conversation_impl(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
+
+                # #1263 — When the overload breaker trips but no fallback is
+                # activated (no chain configured, chain exhausted, or pool
+                # rotation preferred), emit a clear status so the agent/user
+                # can distinguish "backing off" from "permanently failed".
+                if classified.reason == FailoverReason.overloaded and (
+                    _retry.consecutive_overload_hits >= 2
+                    or getattr(agent, "_cross_turn_overload_hits", 0) >= 3
+                ):
+                    agent._buffer_status(
+                        "⚠️ Provider overloaded (503) — circuit breaker "
+                        "tripped, no fallback activated. Backing off with "
+                        "extended delay; the provider may recover. "
+                        "Configure a fallback provider to auto-recover."
+                    )
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
