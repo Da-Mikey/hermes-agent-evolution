@@ -1,9 +1,14 @@
 ---
 name: evolution-research
-description: Research other AI agents, papers, and trends for Hermes Evolution improvements
+description: Research other agents, papers, and trends.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
+metadata:
+  hermes:
+    tags: [evolution, research]
 ---
 
 # Evolution Research Skill

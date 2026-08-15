@@ -1,9 +1,14 @@
 ---
 name: evolution-issues
-description: Create GitHub issues and PRs based on research findings
+description: Create GitHub issues and PRs based on research findings.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
+metadata:
+  hermes:
+    tags: [evolution, github, issues]
 ---
 
 # Evolution Issues Skill

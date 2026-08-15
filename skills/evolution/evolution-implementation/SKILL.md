@@ -1,10 +1,15 @@
 ---
 name: evolution-implementation
-description: Implement selected issues and self-update
+description: Implement selected issues and self-update.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
 mode: PUBLIC
+metadata:
+  hermes:
+    tags: [evolution, implementation]
 ---
 
 # Evolution Implementation Skill

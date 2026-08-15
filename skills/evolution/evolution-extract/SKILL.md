@@ -1,9 +1,14 @@
 ---
 name: evolution-extract
-description: Extract the concrete technique from ONE high-value research paper into a structured, validated draft the pipeline can act on
+description: Extract one paper's technique into a validated draft.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
+metadata:
+  hermes:
+    tags: [evolution, research, extract]
 ---
 
 # Evolution Extract Skill

@@ -1,10 +1,15 @@
 ---
 name: evolution-introspection
-description: Analyze the agent's real sessions with users to find what blocks practical task completion, and turn those findings into improvement issues
+description: Find session blockers and file improvement issues.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
 mode: PUBLIC
+metadata:
+  hermes:
+    tags: [evolution, introspection, sessions]
 ---
 
 # Evolution Introspection Skill

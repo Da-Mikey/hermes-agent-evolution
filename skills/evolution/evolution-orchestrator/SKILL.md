@@ -1,9 +1,14 @@
 ---
 name: evolution-orchestrator
-description: Decompose a research sub-task into N worker prompts, fan them out via delegate_task, collect candidate outputs
+description: Fan a research sub-task out to parallel workers.
 version: 1.0.0
 author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 category: evolution
+metadata:
+  hermes:
+    tags: [evolution, delegation, orchestrator]
 ---
 
 # Evolution Orchestrator Skill

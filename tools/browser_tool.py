@@ -5037,8 +5037,14 @@ def _maybe_autoinstall_chromium() -> bool:
     except FileNotFoundError:
         return False
 
-    if browser_cmd == "npx agent-browser":
-        install_cmd = [shutil.which("npx") or "npx", "-y", "agent-browser", "install"]
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        install_cmd = [
+            _resolve_npx_bin() or "npx",
+            "--ignore-scripts",
+            "-y",
+            AGENT_BROWSER_NPX_SPEC,
+            "install",
+        ]
     else:
         install_cmd = [browser_cmd, "install"]
 

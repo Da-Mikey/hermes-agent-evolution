@@ -60,12 +60,17 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     Returns an actionable error string, or None when the batch is valid.
     Batch-only by design: the single-`goal` form legitimately uses short
     goals, so these checks must never run on it.
+
+    Duplicate goals are deliberately NOT rejected: identical-goal fan-outs
+    are a legitimate pattern (best-of-N / ensemble sampling), and blocking
+    them broke real workflows (post-merge audit of #81141).
     """
     if len(task_list) < 2:
-        # Allow 1-item tasks=[] so callers that already built a task object
-        # (team spawn, or a single child with per-task fields) still run.
-        # Empty lists are neutralized before this helper is called.
-        return None
+        return (
+            "Batch mode requires at least 2 tasks. For a single task, use "
+            "the `goal` parameter instead of `tasks`: "
+            'delegate_task(goal="...", context="...").'
+        )
 
     for i, task in enumerate(task_list):
         goal = str(task.get("goal", "")).strip()
@@ -84,6 +89,13 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
                 f"({marker.group(0)!r}). Substitute the real value before "
                 "calling delegate_task — subagents cannot resolve "
                 "placeholders."
+            )
+        if len(goal) < _MIN_BATCH_GOAL_LEN:
+            return (
+                f"Task {i} goal is too short ({goal!r}). Write a specific, "
+                "self-contained goal of at least "
+                f"{_MIN_BATCH_GOAL_LEN} characters so the subagent knows "
+                "exactly what to do."
             )
     return None
 
@@ -3482,6 +3494,17 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        # Per-delegation spend, serialized back to the model alongside
+        # tokens/api_calls so the parent can see what each delegation cost.
+        # Mirrors _child_cost_usd (which is stripped pre-serialization and
+        # only feeds the parent session rollup).
+        # Inspired by: Perplexity Agent API result shape (idea-level).
+        entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
+        _cost_status = getattr(child, "session_cost_status", None)
+        entry["cost_status"] = (
+            _cost_status if isinstance(_cost_status, str) and _cost_status
+            else "unknown"
+        )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
