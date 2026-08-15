@@ -1410,7 +1410,27 @@ def cronjob(
     session_id: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
-    del task_id  # unused but kept for handler signature compatibility
+    normalized, action_error = _validate_cron_action(action)
+    if action_error:
+        return tool_error(action_error, success=False)
+
+    # Retry-rate limiter: noisy failure loops are capped per task.
+    # Only *check* the current streak — do NOT increment here. The counter
+    # is incremented only on actual failures and reset on success.
+    failure_streak = _get_cron_failure_streak(task_id)
+    if failure_streak > _MAX_CONSECUTIVE_CRON_FAILURES:
+        return tool_error(
+            f"Cron tool has failed {failure_streak} consecutive times for this task "
+            "(too many attempts). Please inspect the earlier errors or run "
+            "cronjob(action='list') before retrying.",
+            success=False,
+        )
+
+    # Preflight: ensure cron is available before invoking backend operations.
+    preflight_error = _cron_preflight_check()
+    if preflight_error:
+        _record_cron_failure(task_id)
+        return tool_error(preflight_error, success=False)
 
     try:
         normalized = (action or "").strip().lower()
@@ -1525,6 +1545,7 @@ def cronjob(
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            _reset_cron_failure(task_id)
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
@@ -1799,6 +1820,7 @@ def cronjob(
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
     except Exception as e:
+        _record_cron_failure(task_id)
         return tool_error(str(e), success=False)
 
 

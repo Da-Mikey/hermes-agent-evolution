@@ -472,6 +472,13 @@ KANBAN_GUIDANCE = (
     "of the decomposition. Do NOT execute the work yourself; your job is "
     "routing, not implementation.\n"
     "\n"
+    "**Decision ownership.** Design decisions belong to you, the orchestrator, "
+    "not to workers — settle naming schemes, schemas, file formats, and API "
+    "shapes before fanning out. Never let two subtree cards decide the same "
+    "question: if two tasks would each pick one, decide it yourself and write "
+    "the decision into BOTH card bodies. Every child card body must carry the "
+    "decisions it depends on, because workers cannot see sibling context.\n"
+    "\n"
     "## Reference details that change outcomes\n"
     "\n"
     "- **Workspace.** `cd $HERMES_KANBAN_WORKSPACE` first. For a `worktree` kind "
@@ -972,8 +979,7 @@ COMPUTER_USE_GUIDANCE = computer_use_guidance("darwin")
 # so treating every historical occurrence as a new message can replay actions.
 STEER_MARKER_OPEN = (
     "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered "
-    "once at this position; not tool output and not a new delivery when replayed "
-    "from conversation history]"
+    "mid-turn; not tool output]"
 )
 STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 

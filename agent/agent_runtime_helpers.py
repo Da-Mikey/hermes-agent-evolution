@@ -3186,6 +3186,27 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     else:
         def _execute(next_args: dict) -> Any:
+            # #2237 (Slice B) — replay-or-fork: before executing a non-atomic
+            # tool, check whether this exact semantic intent already succeeded
+            # (result observed). If so, replay the prior outcome instead of
+            # re-executing — a checkpoint-restore must not duplicate a
+            # real-world side effect (second email, double charge).
+            try:
+                from tools.tool_call_log import replay_or_fork
+
+                _replay = replay_or_fork(function_name, next_args)
+                if _replay is not None:
+                    return _replay
+            except Exception:
+                pass  # fail-open: never block a tool on log bookkeeping
+            # #2236 — record non-atomic tool calls in the live dispatch path.
+            # Guarded by is_non_atomic() because record() raises for atomic tools.
+            try:
+                from tools.tool_call_log import get_default_log, is_non_atomic
+                if is_non_atomic(function_name):
+                    get_default_log().record(function_name, next_args)
+            except Exception:
+                pass
             dispatch_kwargs = dict(
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
