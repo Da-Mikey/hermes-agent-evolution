@@ -588,6 +588,23 @@ def direct_api_call(agent, api_kwargs: dict):
     agent._touch_activity("waiting for non-streaming API response")
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
+    activity_hb_stop = threading.Event()
+
+    def _activity_heartbeat() -> None:
+        # Lightweight ticker so a slow-but-healthy inline wait is not
+        # mistaken for a frozen child by the stall monitor.
+        while not activity_hb_stop.wait(_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS):
+            try:
+                agent._touch_activity("waiting for non-streaming API response")
+            except Exception:
+                pass
+
+    activity_hb = threading.Thread(
+        target=_activity_heartbeat,
+        name="direct-api-activity-hb",
+        daemon=True,
+    )
+    activity_hb.start()
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
@@ -634,6 +651,8 @@ def direct_api_call(agent, api_kwargs: dict):
         succeeded = True
         return response
     finally:
+        activity_hb_stop.set()
+        activity_hb.join(timeout=2.0)
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:

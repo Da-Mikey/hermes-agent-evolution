@@ -1201,8 +1201,8 @@ def _run_chrome_fallback_command(
     # bare container), fall back to the bare name and let Popen raise with
     # a readable "FileNotFoundError: 'npx'" rather than WinError 193.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+        _npx_bin = _resolve_npx_bin() or "npx"
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
@@ -2481,7 +2481,11 @@ def _find_agent_browser(*, validate: bool = True) -> str:
 
     # Check if it's in PATH (global install)
     which_result = shutil.which("agent-browser")
-    if which_result and agent_browser_runnable(which_result):
+    if which_result and (
+        agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
+    ):
+        if not validate:
+            return which_result
         _cached_agent_browser = which_result
         _agent_browser_resolved = True
         return which_result
@@ -2491,7 +2495,11 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     extended_path = _merge_browser_path("")
     if extended_path:
         which_result = shutil.which("agent-browser", path=extended_path)
-        if which_result and agent_browser_runnable(which_result):
+        if which_result and (
+            agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
+        ):
+            if not validate:
+                return which_result
             _cached_agent_browser = which_result
             _agent_browser_resolved = True
             return which_result
@@ -2508,7 +2516,11 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     local_bin_dir = repo_root / "node_modules" / ".bin"
     if local_bin_dir.is_dir():
         local_which = shutil.which("agent-browser", path=str(local_bin_dir))
-        if local_which and agent_browser_runnable(local_which):
+        if local_which and (
+            agent_browser_runnable(local_which) if validate else _agent_browser_candidate_present(local_which)
+        ):
+            if not validate:
+                return local_which
             _cached_agent_browser = local_which
             _agent_browser_resolved = True
             return _cached_agent_browser
@@ -2675,8 +2687,8 @@ def _run_browser_command(
     # Only the synthetic npx fallback needs to expand into multiple argv items.
     # shutil.which resolves npx → npx.cmd on Windows; bare "npx" stays on POSIX.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+        _npx_bin = _resolve_npx_bin() or "npx"
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
 
