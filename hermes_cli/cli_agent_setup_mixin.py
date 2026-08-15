@@ -345,7 +345,10 @@ class CLIAgentSetupMixin:
         # Join the background preloaded-skills load (cli.py cmd_chat starts
         # it when --skills/-s is passed) BEFORE the agent snapshots
         # self.system_prompt below. No-op when nothing was requested.
-        self.finalize_preloaded_skills()
+        # getattr: #2418 landed the mixin without the matching cli.py method.
+        finalize = getattr(self, "finalize_preloaded_skills", None)
+        if callable(finalize):
+            finalize()
 
         _prepare_deferred_agent_startup()
         self._install_tool_callbacks()

@@ -7607,7 +7607,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
-
     def _show_security_advisories(self):
         """Show a startup banner if any unacked security advisories match.
 
