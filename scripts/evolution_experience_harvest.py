@@ -65,17 +65,62 @@ from typing import Any, Dict, List, Optional
 # crashing every cron tick (mirrors evolution_watchdog.py's ImportError fallback).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Add the Hermes repo root so `agent.*` modules resolve when this script runs
+# from HERMES_HOME/scripts (outside the repo). The repo is the editable
+# install source; its root must be on sys.path for `agent` imports.
+_REPO_ROOT = "/config/hermes-evo-review"
+if _REPO_ROOT not in sys.path and Path(_REPO_ROOT).is_dir():
+    sys.path.insert(0, _REPO_ROOT)
 
-from agent.display import _detect_tool_failure  # noqa: E402
-from agent.experience_bank import (  # noqa: E402
-    CATEGORY_TO_DIMENSION,
-    ExperienceEntry,
-    append_entry,
-    experience_lock,
-    get_harvest_state,
-    iter_entries,
-    set_harvest_state,
-)
+try:
+    from agent.display import _detect_tool_failure  # noqa: E402
+except ImportError:
+    def _detect_tool_failure(tool_name: str, result):  # type: ignore[no-redef]
+        """Fallback when agent.display is unavailable (outside the repo)."""
+        import json as _json
+        if result is None or not isinstance(result, str):
+            return False, ""
+        try:
+            data = _json.loads(result)
+        except (ValueError, TypeError):
+            lower = result[:500].lower()
+            if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
+                return True, " [error]"
+            return False, ""
+        if isinstance(data, dict):
+            exit_code = data.get("exit_code")
+            if exit_code is not None and exit_code != 0:
+                return True, f" [exit {exit_code}]"
+            err = data.get("error") or data.get("message")
+            if err and (data.get("success") is False or "error" in data):
+                return True, f" [{str(err)[:80]}]"
+        return False, ""
+
+    print(
+        "[experience-harvest] agent.display unavailable — "
+        "using heuristic fallback for _detect_tool_failure.",
+        file=sys.stderr,
+    )
+
+try:
+    from agent.experience_bank import (  # noqa: E402
+        CATEGORY_TO_DIMENSION,
+        ExperienceEntry,
+        append_entry,
+        experience_lock,
+        get_harvest_state,
+        iter_entries,
+        set_harvest_state,
+    )
+except ImportError:
+    CATEGORY_TO_DIMENSION = {}
+    print(
+        "[experience-harvest] agent.experience_bank unavailable — "
+        "harvest will skip this cycle.",
+        file=sys.stderr,
+    )
+    import sys as _sys
+    _sys.exit(0)
 
 try:
     from evolution.lib.root_cause_diagnosis import ErrorClassifier  # noqa: E402
