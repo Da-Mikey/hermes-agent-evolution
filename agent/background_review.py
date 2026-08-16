@@ -977,6 +977,7 @@ def _run_review_in_thread(
                 else:
                     agent._active_children.append(review_agent)
 
+            from model_tools import get_tool_definitions
             from hermes_cli.plugins import (
                 set_thread_tool_whitelist,
                 clear_thread_tool_whitelist,

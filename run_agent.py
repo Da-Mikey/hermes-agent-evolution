@@ -486,6 +486,9 @@ class AIAgent:
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
         read_terminal_callback: callable = None,
+        read_preview_callback: callable = None,
+        read_window_below_callback: callable = None,
+        setup_mcp_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -573,6 +576,9 @@ class AIAgent:
             reasoning_callback=reasoning_callback,
             clarify_callback=clarify_callback,
             read_terminal_callback=read_terminal_callback,
+            read_preview_callback=read_preview_callback,
+            read_window_below_callback=read_window_below_callback,
+            setup_mcp_callback=setup_mcp_callback,
             step_callback=step_callback,
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
@@ -1910,6 +1916,7 @@ class AIAgent:
         review_skills: bool = False,
         correction_hint: Optional[Dict[str, Any]] = None,
         block_durable_writes: bool = False,
+        focus: Optional[str] = None,
     ) -> None:
         """Spawn the background memory/skill review thread.
 
@@ -1924,6 +1931,10 @@ class AIAgent:
         ``{kind, signature, context, target}`` dict steers the review prompt
         to capture THAT correction rather than relying on the generic
         nudge-driven pass.
+
+        ``focus`` is optional user-supplied steering (from ``/refine``)
+        appended to the review prompt — e.g. "save the deploy workflow as a
+        skill". The automatic post-turn triggers never set it.
         """
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
@@ -1935,6 +1946,7 @@ class AIAgent:
             review_skills=review_skills,
             correction_hint=correction_hint,
             block_durable_writes=block_durable_writes,
+            focus=focus,
         )
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
@@ -2428,10 +2440,26 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
+                    # Standalone reference handoffs are always hidden, even
+                    # when the summarized transcript contained a user turn —
+                    # otherwise they occupy the active user slot in
+                    # retry/undo/session dispatch (#80622). Merge-into-tail
+                    # carriers keep prior visibility rules so preserved tail
+                    # content stays readable.
                     "display_kind": (
                         "hidden"
-                        if msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
-                        and not msg.get("_compressed_summary_has_user_turn")
+                        if (
+                            msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                            and (
+                                ContextCompressor.classify_summary_content(
+                                    msg.get("content")
+                                )
+                                == "standalone"
+                                or not msg.get(
+                                    "_compressed_summary_has_user_turn"
+                                )
+                            )
+                        )
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
@@ -2467,6 +2495,13 @@ class AIAgent:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
+            # This is the one place the underlying SQLite error is visible
+            # before it is swallowed into a bare ``False`` — classify it here
+            # so the turn-end explanation can distinguish lock contention
+            # ("storage was busy, send it again") from disk-full/read-only.
+            from hermes_state import classify_persistence_error
+
+            self._last_persistence_error_cause = classify_persistence_error(e)
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
@@ -2711,7 +2746,8 @@ class AIAgent:
         while current is not None and id(current) not in seen:
             seen.add(id(current))
             if any(
-                marker in str(current).lower() for marker in network_resolution_markers
+                marker in str(current).lower()
+                for marker in network_resolution_markers
             ):
                 return (
                     "Hermes can't reach the model provider. You may be offline. "
@@ -2719,7 +2755,10 @@ class AIAgent:
                 )
             current = current.__cause__ or current.__context__
 
-        if isinstance(error, ValueError) and "expected ident at line" in raw.lower():
+        if (
+            isinstance(error, ValueError)
+            and "expected ident at line" in raw.lower()
+        ):
             return f"Malformed provider streaming response: {raw[:300]}"
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
@@ -2937,9 +2976,15 @@ class AIAgent:
         try:
             if hasattr(value, "model_dump"):
                 try:
+                    # warnings=False: pydantic's serializer UserWarnings on
+                    # generic-union SDK models (Anthropic ParsedMessage etc.)
+                    # would otherwise leak to the terminal mid-response.
                     dumped = value.model_dump(mode="json", warnings=False)
                 except TypeError:
-                    dumped = value.model_dump()
+                    try:
+                        dumped = value.model_dump(mode="json")
+                    except TypeError:
+                        dumped = value.model_dump()
                 return cls._hook_jsonable(
                     dumped,
                     depth=depth + 1,
@@ -3997,14 +4042,16 @@ class AIAgent:
             cause = persistence_cause or "unknown"
             if cause == "locked":
                 return (
-                    prefix + "the turn was stopped because session storage was busy "
+                    prefix
+                    + "the turn was stopped because session storage was busy "
                     "(another Hermes process was writing to the state "
                     "database). Your message should already be saved — "
                     "please send it again in a moment."
                 )
             if cause == "disk":
                 return (
-                    prefix + "the turn was stopped because session storage could not "
+                    prefix
+                    + "the turn was stopped because session storage could not "
                     "be written (the transcript would have been lost on "
                     "restart). This is often a full disk — free some space "
                     "(or fix state.db permissions), then send your message "
@@ -4733,6 +4780,12 @@ class AIAgent:
         # end_session() above finalizes the session ROW; it does not release the
         # connection. For the shared launch handle that is correct — it outlives
         # every agent — so _owns_session_db defaults False and this is a no-op.
+        # A DEDICATED handle (the gateway's per-profile state.db opens, and the
+        # lazy self-open in _get_session_db_for_recall) has no other owner: left
+        # unclosed it keeps its db/-wal/-shm fds and its background token-writer
+        # thread, and once that writer has started the instance pins ITSELF via
+        # atexit.register(_drain_token_queue_at_exit) — which only close()
+        # unregisters — so it survives for the life of the process.
         # Cleared first so the documented idempotency of close() holds.
         try:
             if getattr(self, "_owns_session_db", False) and session_db is not None:
@@ -5087,7 +5140,6 @@ class AIAgent:
 
         if has_compaction_checkpoint(msg.get("codex_reasoning_items")):
             return False
-        # Content is empty-ish. Is there reasoning to make it thinking-only?
         reasoning = msg.get("reasoning_content") or msg.get("reasoning")
         if isinstance(reasoning, str) and reasoning.strip():
             return True
@@ -6029,9 +6081,7 @@ class AIAgent:
 
             env_url = ""
             if pconfig.base_url_env_var:
-                env_url = (
-                    get_env_prefer_dotenv(pconfig.base_url_env_var).strip().rstrip("/")
-                )
+                env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip().rstrip("/")
             default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
             base_url = env_url or default_base
             if self.provider == "kimi-coding":
@@ -6071,9 +6121,7 @@ class AIAgent:
             # Custom providers pin their endpoint in config, not env — the
             # config base_url is both the resolved and the "default" base, so
             # only key edits are ever adopted here.
-            default_base = (
-                str(custom_provider.get("base_url") or "").strip().rstrip("/")
-            )
+            default_base = str(custom_provider.get("base_url") or "").strip().rstrip("/")
             base_url = default_base
         else:
             return False
@@ -6120,9 +6168,9 @@ class AIAgent:
 
         from hermes_cli.route_identity import normalize_route_base_url
 
-        route_changed = normalize_route_base_url(
-            self.base_url
-        ) != normalize_route_base_url(base_url)
+        route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
+            base_url
+        )
         prior_api_key = self.api_key
         prior_base_url = self.base_url
         prior_client_kwargs = dict(self._client_kwargs)
@@ -6425,7 +6473,8 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
-            self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+            from agent.auxiliary_client import _AI_GATEWAY_HEADERS
+            self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):
@@ -7033,15 +7082,11 @@ class AIAgent:
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
-            enqueue_plugin_stream_hook(
-                "on_stream_start", **self._stream_hook_base_payload()
-            )
+            enqueue_plugin_stream_hook("on_stream_start", **self._stream_hook_base_payload())
         except Exception:
             logger.debug("on_stream_start plugin hook enqueue failed", exc_info=True)
 
-    def _emit_stream_end(
-        self, *, final_text: str, finished: bool, error: str | None
-    ) -> None:
+    def _emit_stream_end(self, *, final_text: str, finished: bool, error: str | None) -> None:
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -7142,10 +7187,7 @@ class AIAgent:
             except Exception:
                 pass
         try:
-            from agent.plugin_stream_hooks import (
-                enqueue_plugin_stream_hook,
-                stream_reasoning_deltas_enabled,
-            )
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook, stream_reasoning_deltas_enabled
 
             if stream_reasoning_deltas_enabled():
                 enqueue_plugin_stream_hook(
@@ -7155,10 +7197,7 @@ class AIAgent:
                     kind="reasoning",
                 )
         except Exception:
-            logger.debug(
-                "reasoning on_stream_delta plugin hook enqueue failed",
-                exc_info=True,
-            )
+            logger.debug("reasoning on_stream_delta plugin hook enqueue failed", exc_info=True)
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
@@ -7858,6 +7897,31 @@ class AIAgent:
             pass
 
         model = (self.model or "").lower()
+        # Live-catalog metadata first (ported from
+        # PrimeIntellect-ai/prime-agent#1258): OpenRouter's /v1/models entries
+        # advertise reasoning support via supported_parameters + a reasoning
+        # object, which covers every routed vendor without a hand-maintained
+        # prefix list. The static prefix allowlist below repeatedly went
+        # stale one vendor at a time (nvidia/ missing → #75386; same class
+        # as tencent/, xiaomi/ additions before it) — metadata makes new
+        # vendors work without a code change. One catalog fetch per process,
+        # cached; unknown (catalog unreachable / unlisted model) falls back
+        # to the static list.
+        try:
+            from hermes_cli.models import (
+                openrouter_model_reasoning_capabilities,
+                warm_openrouter_reasoning_caps_async,
+            )
+            caps = openrouter_model_reasoning_capabilities(self.model)
+            if caps is None:
+                # Cache cold (no picker run this process) — warm it in the
+                # background so subsequent turns get metadata; never block
+                # this turn on HTTP.
+                warm_openrouter_reasoning_caps_async()
+        except Exception:
+            caps = None
+        if caps is not None:
+            return bool(caps.get("supports_reasoning"))
         reasoning_model_prefixes = (
             "deepseek/",
             "anthropic/",
@@ -8862,6 +8926,9 @@ class AIAgent:
             role=function_args.get("role"),
             background=(not _is_subagent),
             handoff_mode=function_args.get("handoff_mode"),
+            action=function_args.get("action"),
+            subagent_id=function_args.get("subagent_id"),
+            message=function_args.get("message"),
             parent_agent=self,
         )
 
@@ -9196,6 +9263,9 @@ class AIAgent:
             # or finish shared-metrics task scopes. finish_task used to fall
             # back to task-id-only matching and would pop another session's
             # in-flight task that happened to share this caller-supplied id.
+            # The None check also keeps existing tests and external
+            # relay-runtime shims that return a minimal turn object
+            # compatible with the opt-out flag.
             if relay_turn is not None and getattr(relay_turn, "relay_enabled", True):
                 start_task_run(
                     **task_context,

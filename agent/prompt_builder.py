@@ -15,7 +15,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from typing import List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -440,9 +440,10 @@ KANBAN_GUIDANCE = (
     "infer (missing credentials, UX choice, paywalled source, peer output you "
     "need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. "
     "The user will unblock with context and the dispatcher will respawn you.\n"
-    "5. **Complete with structured handoff.** Call `kanban_complete(summary=..., "
-    "metadata=...)`. `summary` is 1–3 human-readable sentences naming concrete "
-    "artifacts. If `kanban_show()` lists child IDs, inspect those cards with "
+    "5. **Finish with the review model encoded by the task graph.** Always "
+    "include the structured handoff (`summary`, `metadata`) on the lifecycle "
+    "transition itself; never put secrets, tokens, or raw PII in these durable "
+    "fields. If `kanban_show()` lists child IDs, inspect those cards with "
     "`kanban_show(task_id=...)` before choosing the terminal action. When any "
     "pre-created review, QA, or release child depends on your task, call "
     "`kanban_complete`: your implementation phase is done, and completion is "
@@ -454,23 +455,18 @@ KANBAN_GUIDANCE = (
     "reviewer=<optional-profile>)`. The reviewer approves with "
     "`kanban_complete`, returns actionable rework with "
     "`kanban_request_changes`, or uses `kanban_block` only for a genuine "
-    "external escalation. "
-    "`metadata` is machine-readable facts "
-    "(`{changed_files: [...], tests_run: N, decisions: [...]}`). Downstream "
-    "workers read both via their own `kanban_show`. Never put secrets / "
-    "tokens / raw PII in either field — run rows are durable forever. "
-    "Exception: if your output is a code change that needs human review "
-    "before counting as merged/done (most coding tasks), drop the "
-    "structured metadata (changed_files / tests_run / diff_path) into a "
-    "`kanban_comment` first, then end with "
-    "`kanban_block(reason=\"review-required: <one-line summary>\")` so a "
-    "reviewer can approve+unblock or request changes. Reviewing-then-"
-    "completing is more honest than auto-completing work that still needs "
-    "eyes on it.\n"
+    "external escalation. Review is not a block, so repeated review cycles do "
+    "not trip unblock-loop detection.\n"
     "6. **If follow-up work appears, create it; don't do it.** Use "
     "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "
     "to spawn a child task for the appropriate specialist profile instead of "
     "scope-creeping into the next thing.\n"
+    "7. **Flag collision hotspots; don't pile on.** If your change keeps "
+    "colliding with sibling branches in one file, or a file your diff touches "
+    "shows up in other cards' recent comments, do not silently add more to it: "
+    "leave a `kanban_comment` starting with `hotspot: <path> — <one-line reason>` "
+    "on your card and repeat the flag in your completion metadata, so the "
+    "orchestrator can decompose that file before more work lands on it.\n"
     "\n"
     "## Orchestrator mode\n"
     "\n"
@@ -1026,7 +1022,31 @@ STEER_CHANNEL_NOTE += (
 
 
 def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
-    """Per-turn note for a message typed into the desktop's floating HUD."""
+    """Per-turn note for a message typed into the desktop's floating HUD.
+
+    HUD mode is a strip of Hermes floating over another application, so the
+    user is rarely asking about Hermes — they are asking about the thing behind
+    it, and the work they want done usually belongs in that app rather than in
+    a surface of our own. Left to itself the model answers from its own
+    browser and panes, which is the wrong half of the screen.
+
+    It is a per-turn fact, not a platform — one desktop session can be driven
+    from the app window on one turn and the HUD on the next — so it rides the
+    model-bound message beside the reaction / speech-interrupted notes rather
+    than the system prompt, which has to stay byte-stable for a conversation's
+    whole life.
+
+    The same is true one level down: the app underneath changes as the user
+    drags the strip around, and they carry a thought across the move ("pause
+    that and play X here"). Earlier windows are already in context as
+    read_window_below results, so the note only has to say they still count —
+    without that, the latest window reads as the only one and half of a
+    two-app request is silently dropped.
+
+    Each sentence is gated on the tool it names — naming a tool outside this
+    agent's schema invites a hallucinated call — and the note as a whole is
+    withheld without the one it rests on.
+    """
     names = valid_tool_names or set()
     if "read_window_below" not in names:
         return ""
@@ -1191,7 +1211,11 @@ PLATFORM_HINTS = {
         "in your response. Images (.png, .jpg, .webp) appear inline, audio and "
         "video play inline, and other files arrive as download links. You can "
         "also include image URLs in markdown format ![alt](url) and they "
-        "render inline as photos."
+        "render inline as photos. "
+        "When the user asks to add, enable, or authorize an MCP server (or a "
+        "task clearly needs one that is missing), use the setup_mcp tool if "
+        "it is available — it shows an inline consent card right in the chat; "
+        "never hand-edit mcp_servers config for them."
     ),
     "sms": (
         "You are communicating via SMS. Keep responses concise and use plain text "
@@ -1319,7 +1343,8 @@ PLATFORM_HINTS = {
 }
 
 # Telegram rich-messages extension — only injected when the user has opted in
-# to ``platforms.telegram.extra.rich_messages: true``.  The base
+# to ``gateway.platforms.telegram.extra.rich_messages: true`` (or the
+# top-level ``platforms.telegram.extra.rich_messages``).  The base
 # PLATFORM_HINTS["telegram"] covers MarkdownV2-compatible constructs; this
 # extension adds the Bot API 10.1 rich-Markdown guidance (tables, task lists,
 # collapsible details, math, etc.).
@@ -1391,6 +1416,26 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 _BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
 
 
+def _windows_marketing_version() -> str:
+    """Return the marketing Windows version ("10", "11", ...) for the prompt.
+
+    ``platform.release()`` reports the kernel version, which is ``10`` for
+    BOTH Windows 10 and Windows 11 — the prompt then claims "Windows (10)"
+    on Windows 11 hosts and misleads the model about the OS (#51755).
+    Windows 11 is distinguished by build number: >= 22000 is 11.
+    Falls back to ``platform.release()`` on any lookup failure.
+    """
+    try:
+        build = sys.getwindowsversion().build  # type: ignore[attr-defined]
+        if build >= 22000:
+            return "11"
+        return "10"
+    except Exception:
+        import platform
+
+        return platform.release()
+
+
 _WINDOWS_BASH_SHELL_HINT = (
     "Shell: on this Windows host your `terminal` tool runs commands through "
     "bash (git-bash / MSYS), NOT PowerShell or cmd.exe. Use POSIX shell "
@@ -1398,7 +1443,20 @@ _WINDOWS_BASH_SHELL_HINT = (
     "calls. MSYS-style paths like `/c/Users/<user>/...` work alongside "
     "native `C:\\Users\\<user>\\...` paths. PowerShell builtins "
     "(`Get-ChildItem`, `$env:FOO`, `Select-String`) will NOT work — use their "
-    "POSIX equivalents (`ls`, `$FOO`, `grep`)."
+    "POSIX equivalents (`ls`, `$FOO`, `grep`). Path arguments for NATIVE "
+    "Windows programs (git, rg, node, python, ...) are NOT translated: MSYS "
+    "path conversion is disabled here, so `git -C /c/Users/x` or "
+    "`node /tmp/a.js` fails with 'cannot change to'/'not found' even though "
+    "`cd /c/Users/x` (a bash builtin) works. Pass `C:/Users/x`-style "
+    "forward-slash native paths to native tools, and prefer "
+    "`$LOCALAPPDATA/Temp` over `/tmp` for scratch files a native tool must "
+    "read. When answering prompts in a "
+    "pty background process, use process(submit) — never process(write) "
+    "with a bare trailing newline: Enter on a Windows PTY is a carriage "
+    "return, and a lone `\\n` is not delivered as a line terminator, so the "
+    "child's prompt silently never returns. When a CLI offers a "
+    "non-interactive path (flags, `--with-token`, config files, an OAuth "
+    "device flow polled with curl), prefer it over driving prompts."
 )
 
 
@@ -2467,53 +2525,120 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         return ""
 
 
-def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
-    """AGENTS.md per the AGENTS.md standard (nested walk + overrides).
+def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
+    """Directories to check for AGENTS.md: git root first, cwd last.
 
-    Walks from the git root down to *cwd*, collecting every ``AGENTS.md``
-    (root-first, so the nearest file's instructions come last and win on
-    conflict). ``AGENTS.override.md`` files are gathered separately and
-    appended after all ``AGENTS.md`` content, giving them the highest
-    precedence. Each file is scanned for prompt injection individually; the
-    merged blob is size-capped as a whole. The set of loaded files is logged
-    at debug level so users can verify which rules were applied.
+    Ported from superagent-ai/grok-cli ``src/utils/instructions.ts``
+    (``directoryChain``): the chain runs from the git repository root down
+    through every intermediate directory to *cwd*, so deeper directories can
+    add more specific guidance that appears later (and therefore takes
+    precedence) in the merged prompt.  Without a git root — or when *cwd*
+    sits outside it — only *cwd* itself is checked, matching the historical
+    single-directory behavior.
     """
-    git_root = _find_git_root(cwd_path) or cwd_path
-    base: list[str] = []
-    overrides: list[str] = []
-    loaded_paths: list[Path] = []
+    current = cwd_path.resolve()
+    root = _find_git_root(current)
+    if root is None or root == current:
+        return [current]
+    try:
+        rel = current.relative_to(root)
+    except ValueError:
+        return [current]
+    chain = [root]
+    acc = root
+    for part in rel.parts:
+        acc = acc / part
+        chain.append(acc)
+    return chain
 
-    for directory in _dirs_root_to_cwd(cwd_path):
-        for name in _AGENTS_MD_NAMES:
+
+def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+    """AGENTS.md — merged directory chain from git root down to cwd.
+
+    Each directory on the chain (see ``_agents_md_directory_chain``)
+    contributes its ``AGENTS.md`` / ``agents.md`` (first name wins per
+    directory) as its own provenance-labelled section.  Identical content
+    encountered again further down the chain (copied or symlinked files) is
+    deduplicated.  ``AGENTS.override.md`` files gathered along the same chain
+    are appended after all ``AGENTS.md`` content, giving them the highest
+    precedence.  Each file is scanned for prompt injection individually and
+    the joined bodies are additionally seam-scanned; the merged blob is
+    size-capped as a whole.  The set of loaded files is logged at debug level
+    so users can verify which rules were applied.  With a single match — the
+    common case, and always the case outside a git repo — output is identical
+    to the historical single-file behavior.
+    """
+    cwd_resolved = cwd_path.resolve()
+    sections: List[str] = []
+    overrides: List[str] = []
+    seen_content: set = set()
+    loaded_paths: list[Path] = []
+    for directory in _agents_md_directory_chain(cwd_resolved):
+        for name in ["AGENTS.md", "agents.md"]:
             candidate = directory / name
-            if candidate.is_file():
-                section = _read_context_section(candidate, git_root)
-                if section:
-                    base.append(section)
-                    loaded_paths.append(candidate)
-                    _record_context_load(
-                        str(candidate),
-                        KIND_AGENTS,
-                        chars=len(_section_body(section)),
-                        section=section.split("\n", 1)[0],
-                    )
-                break  # one AGENTS.md per directory
+            if not candidate.exists():
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8").strip()
+            except Exception as e:
+                logger.debug("Could not read %s: %s", candidate, e)
+                continue
+            if not content:
+                continue
+            if content in seen_content:
+                break  # identical copy along the chain — skip duplicate
+            seen_content.add(content)
+            if directory == cwd_resolved:
+                label = name
+            else:
+                label = os.path.relpath(candidate, cwd_resolved)
+            scanned = _scan_context_content(content, label)
+            section = f"## {label}\n\n{scanned}"
+            section = _truncate_content(
+                section, label, context_length=context_length,
+                read_path=str(candidate),
+            )
+            sections.append(section)
+            loaded_paths.append(candidate)
+            _record_context_load(
+                str(candidate),
+                KIND_AGENTS,
+                chars=len(content),
+                section=f"## {label}",
+            )
+            break  # first name match wins per directory
         for name in _AGENTS_OVERRIDE_NAMES:
             candidate = directory / name
-            if candidate.is_file():
-                section = _read_context_section(candidate, git_root)
-                if section:
-                    overrides.append(section)
-                    loaded_paths.append(candidate)
-                    _record_context_load(
-                        str(candidate),
-                        KIND_AGENTS,
-                        chars=len(_section_body(section)),
-                        section=section.split("\n", 1)[0],
-                    )
-                break
+            if not candidate.exists():
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8").strip()
+            except Exception as e:
+                logger.debug("Could not read %s: %s", candidate, e)
+                continue
+            if not content:
+                continue
+            if content in seen_content:
+                break  # identical copy along the chain — skip duplicate
+            seen_content.add(content)
+            label = os.path.relpath(candidate, cwd_resolved)
+            scanned = _scan_context_content(content, label)
+            section = f"## {label}\n\n{scanned}"
+            section = _truncate_content(
+                section, label, context_length=context_length,
+                read_path=str(candidate),
+            )
+            overrides.append(section)
+            loaded_paths.append(candidate)
+            _record_context_load(
+                str(candidate),
+                KIND_AGENTS,
+                chars=len(content),
+                section=f"## {label}",
+            )
+            break
 
-    if not base and not overrides:
+    if not sections and not overrides:
         return ""
 
     logger.debug(
@@ -2524,14 +2649,19 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     # AGENTS.md files (each scanned clean individually) by scanning the joined
     # bodies (without the ## headers) as one stream.
     seam_block = _scan_context_seams(
-        "\n".join(_section_body(s) for s in [*base, *overrides]), "AGENTS.md"
+        "\n".join(_section_body(s) for s in [*sections, *overrides]), "AGENTS.md"
     )
     if seam_block:
         return seam_block
-    merged = "\n\n".join([*base, *overrides])
+    if len(sections) == 1 and not overrides:
+        return sections[0]
+    # Per-file budgets were already applied above; also cap the merged chain
+    # so a deep monorepo cannot multiply the context-file budget unbounded.
+    merged = "\n\n".join([*sections, *overrides])
     return _truncate_content(
-        merged, "AGENTS.md", context_length=context_length,
-        read_path=str(loaded_paths[-1]) if loaded_paths else "AGENTS.md",
+        merged, "AGENTS.md (directory chain)",
+        context_length=context_length,
+        read_path=str(cwd_resolved / "AGENTS.md"),
     )
 
 

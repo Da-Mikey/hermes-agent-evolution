@@ -157,6 +157,7 @@ def _codex_curated_models() -> list[str]:
 _XAI_STATIC_FALLBACK: list[str] = [
     "grok-4.6",
     "grok-build-0.1",
+    "grok-4.6",
     "grok-4.5",
     "grok-4.3",
     "grok-4.20-0309-reasoning",

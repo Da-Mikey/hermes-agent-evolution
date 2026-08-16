@@ -18,7 +18,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from tools.environments.base import BaseEnvironment, EnvironmentConnectionError, _popen_bash
+from tools.environments.base import (
+    BaseEnvironment,
+    EnvironmentConnectionError,
+    _popen_bash,
+)
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
@@ -811,8 +815,9 @@ def _ensure_docker_available() -> None:
             docker_exe,
             exc_info=True,
         )
-        raise RuntimeError(
-            "Docker executable could not be executed. Check your Docker installation."
+        raise EnvironmentConnectionError(
+            "Docker executable could not be executed. Check your Docker installation.",
+            retry_hint="Repair the Docker installation and retry.",
         )
     except subprocess.TimeoutExpired:
         logger.error(
@@ -843,9 +848,13 @@ def _ensure_docker_available() -> None:
                 result.returncode,
                 result.stderr.strip(),
             )
-            raise RuntimeError(
+            raise EnvironmentConnectionError(
                 "Docker command is available but 'docker version' failed. "
-                "Check your Docker installation."
+                "Check your Docker installation.",
+                retry_hint=(
+                    "The Docker daemon may be down or the current user lacks "
+                    "permission (docker group). Fix and retry."
+                ),
             )
 
 
@@ -881,7 +890,7 @@ class DockerEnvironment(BaseEnvironment):
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
-        host_cwd: str = None,
+        host_cwd: Optional[str] = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
         extra_args: list = None,
@@ -893,6 +902,10 @@ class DockerEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=timeout)
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
+        # Set by terminal_tool._create_environment when this container is
+        # scoped to a single session (docker + container_persistent: false):
+        # survives between turns, removed at session close / idle timeout.
+        self._session_scoped = False
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)

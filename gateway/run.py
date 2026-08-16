@@ -17730,6 +17730,222 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return True
 
+    async def _mark_durable_active_turn(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+    ) -> bool:
+        """Persist the exact resolved routing key for this running turn."""
+        try:
+            token = await self.async_session_store.mark_turn_active(session_key)
+        except Exception as exc:
+            logger.warning(
+                "Could not persist active-turn marker for %s: %s",
+                session_key,
+                exc,
+            )
+            return False
+        if not token:
+            return False
+        # Private event attributes are process-local ownership state.  Keep the
+        # token out of public metadata, transcripts, and platform payloads.
+        setattr(event, "_gateway_active_turn_session_key", session_key)
+        setattr(event, "_gateway_active_turn_token", token)
+        return True
+
+    async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
+        """Best-effort CAS clear of the marker owned by *event*."""
+        session_key = getattr(event, "_gateway_active_turn_session_key", None)
+        token = getattr(event, "_gateway_active_turn_token", None)
+        try:
+            if not session_key or not token:
+                return False
+            last_error: Optional[Exception] = None
+            for attempt in range(1, 4):
+                try:
+                    return bool(
+                        await self.async_session_store.clear_turn_active(
+                            session_key, token
+                        )
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 3:
+                        logger.debug(
+                            "Retrying active-turn marker cleanup for %s (%d/3): %s",
+                            session_key,
+                            attempt,
+                            exc,
+                        )
+            # Never let marker cleanup block in-memory agent/lease release.  A
+            # stale marker is bounded by the configured agent timeout and the
+            # clean-start orphan-marker discard path.
+            logger.warning(
+                "Could not clear active-turn marker for %s after 3 attempts: %s",
+                session_key,
+                last_error,
+            )
+            return False
+        finally:
+            for attr in (
+                "_gateway_active_turn_session_key",
+                "_gateway_active_turn_token",
+            ):
+                try:
+                    delattr(event, attr)
+                except AttributeError:
+                    pass
+
+    def _install_plugin_message_injector(self) -> None:
+        """Publish this live gateway's plugin message scheduler."""
+        from hermes_cli.plugins import get_plugin_manager
+
+        get_plugin_manager().set_gateway_message_injector(
+            self,
+            self._schedule_plugin_message_injection,
+        )
+
+    def _clear_plugin_message_injector(self) -> None:
+        """Remove this runner's scheduler without clobbering a newer owner."""
+        from hermes_cli.plugins import get_plugin_manager
+
+        get_plugin_manager().clear_gateway_message_injector(self)
+
+    def _schedule_plugin_message_injection(
+        self,
+        *,
+        session_key: str,
+        content: str,
+        plugin_id: str,
+    ) -> bool:
+        """Schedule a plugin-triggered turn on the live gateway loop."""
+        loop = getattr(self, "_gateway_loop", None)
+        if not getattr(self, "_running", False) or loop is None or loop.is_closed():
+            return False
+
+        coro = self._dispatch_plugin_message_injection(
+            session_key=session_key,
+            content=content,
+            plugin_id=plugin_id,
+        )
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is loop:
+            try:
+                future = loop.create_task(coro)
+            except Exception:
+                coro.close()
+                logger.warning(
+                    "Plugin message injection scheduling failed",
+                    exc_info=True,
+                )
+                return False
+            self._background_tasks.add(future)
+            future.add_done_callback(self._background_tasks.discard)
+        else:
+            future = safe_schedule_threadsafe(
+                coro,
+                loop,
+                logger=logger,
+                log_message="Plugin message injection scheduling failed",
+                log_level=logging.WARNING,
+            )
+            if future is None:
+                return False
+
+        def _log_result(completed) -> None:
+            try:
+                accepted = completed.result()
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                return
+            except Exception:
+                logger.warning(
+                    "Plugin message injection failed: plugin=%s session=%s",
+                    plugin_id,
+                    session_key,
+                    exc_info=True,
+                )
+                return
+            if not accepted:
+                logger.warning(
+                    "Plugin message injection was not routed: plugin=%s session=%s",
+                    plugin_id,
+                    session_key,
+                )
+
+        future.add_done_callback(_log_result)
+        return True
+
+    async def _dispatch_plugin_message_injection(
+        self,
+        *,
+        session_key: str,
+        content: str,
+        plugin_id: str,
+    ) -> bool:
+        """Route a plugin-triggered turn through the session's live adapter."""
+        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            return False
+
+        entry = await self.async_session_store.lookup_by_session_key(session_key)
+        if entry is None or entry.origin is None:
+            return False
+        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            return False
+
+        source = dataclasses.replace(entry.origin)
+        try:
+            if not self._is_user_authorized(
+                source,
+                allow_adapter_delegation=False,
+            ):
+                logger.warning(
+                    "Plugin message injection denied by current gateway authorization: "
+                    "plugin=%s session=%s",
+                    plugin_id,
+                    session_key,
+                )
+                return False
+        except Exception:
+            logger.warning(
+                "Plugin message injection authorization check failed: "
+                "plugin=%s session=%s",
+                plugin_id,
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+
+        event = MessageEvent(
+            text=content,
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            allow_gateway_control=False,
+            metadata={
+                "hermes_plugin_id": plugin_id,
+                "hermes_plugin_injection": True,
+                "gateway_session_key": session_key,
+                "gateway_session_id": entry.session_id,
+                "gateway_session_strict": True,
+            },
+        )
+        await adapter.handle_message(event)
+        logger.info(
+            "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
+            plugin_id,
+            session_key,
+            entry.session_id,
+        )
+        return True
+
     def _get_cached_session_source(self, session_key: str):
         if not session_key:
             return None
@@ -21102,6 +21318,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
+
+    def _resolve_enabled_toolsets_for_source(
+        self,
+        user_config: dict,
+        source: "SessionSource",
+        platform_key: str,
+    ) -> list:
+        """Resolve enabled toolsets for an agent run, honoring per-source overrides.
+
+        Asks the receiving adapter for a ``toolsets_for_source()`` override
+        (e.g. per-route webhook toolsets). When present, the override list is
+        validated through the SAME ``_get_platform_tools`` path as normal
+        platform config — by substituting it as the platform's toolset list —
+        so unknown names and platform-restricted toolsets are dropped rather
+        than trusted. When absent, falls back to standard
+        ``platform_toolsets.<platform>`` resolution.
+        """
+        from hermes_cli.tools_config import _get_platform_tools
+
+        override = None
+        try:
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                override = adapter.toolsets_for_source(source)
+        except Exception:
+            override = None
+
+        if override and isinstance(override, list):
+            cfg = dict(user_config)
+            pts = dict(cfg.get("platform_toolsets") or {})
+            pts[platform_key] = [str(t) for t in override]
+            cfg["platform_toolsets"] = pts
+            return sorted(_get_platform_tools(cfg, platform_key))
+
+        return sorted(_get_platform_tools(user_config, platform_key))
 
     def _resolve_enabled_toolsets_for_source(
         self,

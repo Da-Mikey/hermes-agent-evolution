@@ -40,6 +40,7 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
+from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -1266,7 +1267,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
         if _elapsed > _stale_timeout:
-            _est_ctx = estimate_request_context_tokens(api_kwargs)
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -1274,26 +1274,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _silent_hint = _hint_fn(model=api_kwargs.get("model"))
                 except Exception:
                     _silent_hint = None
-            logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
-                _elapsed,
-                _stale_timeout,
-                api_kwargs.get("model", "unknown"),
-                f"{_est_ctx:,}",
+            _report_stale_nonstream_kill(
+                agent, api_kwargs, _elapsed, _stale_timeout, hint=_silent_hint
             )
-            if _silent_hint:
-                agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"{_silent_hint}"
-                )
-            else:
-                agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Aborting call."
-                )
             try:
                 # #67142: routes by client kind — anthropic now aborts the
                 # request-local client's sockets from this poll (stranger)
@@ -1304,9 +1287,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
-            agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
-            )
+            _touch_stale_kill_activity(agent, _elapsed)
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
@@ -1415,6 +1396,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             or agent._base_url_hostname == "api.x.ai"
         )
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
+
+        # Native server-side compaction (gpt-5.6 on direct OpenAI API /
+        # ChatGPT Codex routes only) — None on every other route/model, in
+        # which case the request is unchanged from pre-feature behavior.
+        from agent.native_compaction import native_compaction_context_management
+        _context_management = native_compaction_context_management(
+            agent,
+            is_codex_backend=is_codex_backend,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+        )
 
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
@@ -1805,7 +1797,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             elif hasattr(d, "__dict__"):
                 preserved.append(d.__dict__)
             elif hasattr(d, "model_dump"):
-                preserved.append(d.model_dump())
+                try:
+                    # warnings=False: avoid pydantic serializer UserWarnings
+                    # on generic-union SDK models leaking to the terminal.
+                    preserved.append(d.model_dump(warnings=False))
+                except TypeError:
+                    preserved.append(d.model_dump())
         if preserved:
             msg["reasoning_details"] = preserved
 
@@ -1897,7 +1894,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             extra = getattr(tool_call, "extra_content", None)
             if extra is not None:
                 if hasattr(extra, "model_dump"):
-                    extra = extra.model_dump()
+                    try:
+                        extra = extra.model_dump(warnings=False)
+                    except TypeError:
+                        extra = extra.model_dump()
                 tc_dict["extra_content"] = extra
             tool_calls.append(tc_dict)
         msg["tool_calls"] = tool_calls
@@ -1995,6 +1995,12 @@ def try_activate_fallback(
         if (not fallback_already_active) or (
             primary_provider and _current_provider == primary_provider
         ):
+            # Exponential backoff: keep upstream's 60s first-hit cooldown and
+            # escalate on CONSECUTIVE rate-limits: 60s -> 2m -> 4m -> 8m -> ... ->
+            # 4h cap. The first 429 must NOT bench the primary for half an
+            # hour -- fast primary restore is the common case; escalation only
+            # punishes providers that keep 429ing.
+            # Counter is reset by restore_primary_runtime on successful restore.
             _ra_headers = getattr(getattr(api_error, "response", None), "headers", None)
             _retry_after_raw = None
             if _ra_headers and hasattr(_ra_headers, "get"):
@@ -2005,7 +2011,7 @@ def try_activate_fallback(
             agent._rate_limit_backoff_count = backoff_count + 1
             _cooldown = min(60.0 * (2 ** backoff_count), 14400.0)
             # Billing exhaustion (403/402 credits depleted) is a permanent
-            # failure for that provider until the account is topped up — a
+            # failure for that provider until the account is topped up -- a
             # 60-second cooldown causes the agent to retry the same dead
             # provider every minute, producing the 61x recurrence pattern
             # documented in #1231. Use a 1-hour cooldown so the provider
@@ -2018,6 +2024,10 @@ def try_activate_fallback(
                     _cooldown = max(_cooldown, _parsed)
             _until = time.monotonic() + _cooldown
             agent._rate_limited_until = _until
+            logger.info(
+                "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
+                backoff_count, int(_cooldown), _cooldown / 60, backoff_count + 1,
+            )
             _provider_cooldowns = getattr(agent, "_rate_limited_providers", None)
             if _provider_cooldowns is None:
                 _provider_cooldowns = {}
@@ -2229,11 +2239,11 @@ def try_activate_fallback(
                 or fb_base_url.rstrip("/").lower().endswith("/anthropic")
                 or base_url_hostname(fb_base_url) == "api.anthropic.com"
             ):
-                # Custom providers (e.g. cron-anthropic) point at the native
-                # api.anthropic.com host with no "/anthropic" path suffix, so the
-                # name/suffix checks above miss them and they default to
-                # chat_completions → POST /v1/chat/completions → 404. Match the
-                # host the same way determine_api_mode() and _detect_api_mode_for_url()
+                # Named custom providers (e.g. cron-anthropic) resolve their
+                # base_url from config rather than the fallback entry, so the
+                # pre-resolve hint check above never sees it; a provider named
+                # "anthropic" needs the same treatment. Match the host
+                # the same way determine_api_mode() and _detect_api_mode_for_url()
                 # do on the primary path. (#32243, #49247)
                 fb_api_mode = "anthropic_messages"
             elif _fb_is_azure:
@@ -2505,7 +2515,7 @@ def try_activate_fallback(
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    print(
+    agent._safe_print(
         f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     )
 
@@ -2529,11 +2539,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             defer_logical_completion=True,
         )
 
-    summary_request = (
-        "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
-    )
+    # Shared constant so compaction recognizers can identify this runtime nudge
+    # by its stable content after SessionDB projection strips metadata flags
+    # (see MAX_ITERATIONS_SUMMARY_REQUEST / _is_synthetic_compression_user_turn).
+    from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+
+    summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
     messages.append({"role": "user", "content": summary_request})
 
     try:
@@ -2544,7 +2555,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         for msg in messages:
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
-            for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
+            for internal_field in ("reasoning", "finish_reason"):
                 api_msg.pop(internal_field, None)
             # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go,
             # Mistral, Moonshot/Kimi) reject any message key outside the Chat
@@ -2572,10 +2583,6 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # sidecar-carrying message and re-prefilling the whole transcript
             # at exactly the moment the context is largest.
             substitute_api_content(api_msg)
-            for internal_key in [
-                k for k in api_msg if isinstance(k, str) and k.startswith("_")
-            ]:
-                api_msg.pop(internal_key, None)
             if _needs_sanitize:
                 # In MoA mode, agent.model is the virtual preset name,
                 # not the actual aggregator model.  Resolve the real
@@ -2615,7 +2622,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
         # Same safety net as the main loop: drop thinking-only assistant
         # turns so Anthropic-family providers don't 400 the summary call.
+        # _thinking_prefill must survive until here so the drop pass can
+        # recognize stubs after reasoning fields are stripped.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+
+        # Strip all remaining underscore-prefixed scaffolding keys before the
+        # wire. The summary path calls chat.completions.create() directly,
+        # bypassing the transport's universal underscore-key sweeper.
+        for api_msg in api_messages:
+            if isinstance(api_msg, dict):
+                for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
+                    api_msg.pop(internal_key, None)
 
         summary_extra_body = {}
         try:
@@ -3156,6 +3173,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     token = writer_token["value"]
                     return token is None or stream_writer_is_current(agent, token)
 
+                try:
+                    from agent.plugin_stream_hooks import has_reasoning_stream_observer_hooks
+
+                    plugin_reasoning_observer = has_reasoning_stream_observer_hooks()
+                except Exception:
+                    logger.debug("plugin reasoning stream observer check failed", exc_info=True)
+                    plugin_reasoning_observer = False
+
                 stream = relay_llm.stream(
                     dict(api_kwargs),
                     _open_bedrock_stream,
@@ -3223,10 +3248,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     logger.warning(
                         "Bedrock stream stale for %.0fs (threshold %.0fs) — no events "
                         "received. region=%s model=%s. Aborting call.",
-                        _stale_elapsed,
-                        _bedrock_stale_timeout,
-                        _bedrock_region,
-                        api_kwargs.get("modelId", "unknown"),
+                        _stale_elapsed, _bedrock_stale_timeout,
+                        _bedrock_region, api_kwargs.get("modelId", "unknown"),
                     )
                     agent._buffer_status(
                         f"⚠️ No events from Bedrock for {int(_stale_elapsed)}s "
@@ -3286,11 +3309,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # recovered provider doesn't carry a stale streak into later turns.
             if result["response"] is not None:
                 _reset_stale_streak(agent)
-            _emit_stream_end(
-                final_text=_stream_final_text(result["response"]),
-                finished=True,
-                error=None,
-            )
+            _emit_stream_end(final_text=_stream_final_text(result["response"]), finished=True, error=None)
             return result["response"]
         except Exception as exc:
             _emit_stream_end(final_text="", finished=False, error=str(exc))
@@ -3775,6 +3794,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 delta, "reasoning", None
             )
             if reasoning_text:
+                # Summary-part models (gpt-5.x and other Responses relays) send
+                # one complete markdown block per delta with no separator, so
+                # the parts glue into a single unreadable run. Only the tail of
+                # what's accumulated matters. See agent/reasoning_summaries.py.
+                reasoning_text = separate_glued_reasoning_blocks(
+                    reasoning_parts[-1] if reasoning_parts else "",
+                    reasoning_text,
+                )
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
@@ -3867,7 +3894,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         ).get("extra_content")
                     if extra is not None:
                         if hasattr(extra, "model_dump"):
-                            extra = extra.model_dump()
+                            try:
+                                extra = extra.model_dump(warnings=False)
+                            except TypeError:
+                                extra = extra.model_dump()
                         entry["extra_content"] = extra
                     # Fire once per tool when the full name is available
                     name = entry["function"]["name"]

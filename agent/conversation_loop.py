@@ -5774,7 +5774,43 @@ def _run_conversation_impl(
                                 "failed": True,
                                 "compression_exhausted": True,
                             }
-                        continue
+                        # Also compress the message history so the output-cap
+                        # retry does not just spin on max_tokens alone.  The
+                        # compressor drops the middle window, freeing enough
+                        # tokens for the total to fit inside context_length.
+                        # (#55546)
+                        try:
+                            original_len = len(messages)
+                            original_tokens = estimate_messages_tokens_rough(messages)
+                            _overflow_input = messages
+                            messages, active_system_prompt = agent._compress_context(
+                                messages, system_message,
+                                approx_tokens=request_input_estimate,
+                                task_id=effective_task_id,
+                            )
+                            if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                                compression_attempts -= 1
+                                agent._persist_session(messages, conversation_history)
+                                return _compression_deferred_result(
+                                    agent, messages, api_call_count
+                                )
+                            conversation_history = conversation_history_after_compression(
+                                agent, messages, conversation_history
+                            )
+                            new_tokens = estimate_messages_tokens_rough(messages)
+                            if len(messages) < original_len:
+                                agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
+                            elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
+                                agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        except Exception:
+                            # Compression must never turn an output-cap error
+                            # fatal — fall through and retry on max_tokens alone.
+                            logger.warning(
+                                "%sOutput-cap compression hit an error; retrying on max_tokens only.",
+                                agent.log_prefix,
+                            )
+                        _retry.restart_with_compressed_messages = True
+                        break
 
                     # The error is output-cap-shaped (about max_tokens being
                     # too large) but the provider's wording didn't let us parse

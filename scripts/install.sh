@@ -838,6 +838,13 @@ check_node() {
     # enough for the desktop build AND an npm that can read our .npmrc. A
     # bad-band npm (see npm_supports_npmrc) fails `npm ci` outright, and the
     # managed Node we install instead bundles one that works.
+    #
+    # npm must actually be reachable, not just node: a stray `node` symlink
+    # without a sibling npm (leftover from a node version manager) makes
+    # `command -v node` succeed while every later `npm install` silently
+    # fails and the desktop build dies with an opaque "Node.js / npm
+    # unavailable" (#77003). Node only counts as found when npm resolves on
+    # the same PATH.
     if command -v node &> /dev/null && command -v npm &> /dev/null \
         && node_satisfies_build "$(node --version)"; then
         if npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
@@ -2340,8 +2347,12 @@ install_node_deps() {
         cd "$INSTALL_DIR"
         # Time-boxed: a stalled registry fetch would otherwise hang here with no
         # progress (same #39219 stall class as the desktop build below).
+        # A failed npm install used to still print "✓ Node.js dependencies
+        # installed", hiding the degradation from the user (#77003). Now it
+        # fails the install outright instead of burying the warning (#85297).
         if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
+            restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
         log_success "Node.js dependencies installed"
@@ -2443,8 +2454,11 @@ install_node_deps() {
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
+        # Report success only on actual success, same as node-deps above
+        # (#77003) — and fail the install outright (#85297).
         if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
             log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
+            restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
         log_success "TUI dependencies installed"
@@ -2452,6 +2466,88 @@ install_node_deps() {
 
     # Keep the checkout clean so `hermes update` doesn't autostash every run.
     restore_dirty_lockfiles "$INSTALL_DIR"
+}
+
+install_browser_use_cli() {
+    # The Browser Use CLI is the default browser backend when it is runnable
+    # (tools/browser_use_cli.py). Provision it here so fresh installs don't
+    # silently fall back to the built-in browser tools. Best-effort: any
+    # failure is non-fatal because browser_exec can still run via uvx and
+    # `hermes tools` can install it later.
+    if [ "$SKIP_BROWSER" = true ]; then
+        log_info "Skipping Browser Use CLI install (--skip-browser)"
+        return 0
+    fi
+    if [ "$DISTRO" = "termux" ]; then
+        return 0
+    fi
+    if [ -z "$UV_CMD" ]; then
+        log_info "Skipping Browser Use CLI install (uv unavailable)"
+        return 0
+    fi
+    if command -v browser-use >/dev/null 2>&1 || [ -x "$HERMES_HOME/bin/browser-use" ]; then
+        log_success "Browser Use CLI already installed"
+        return 0
+    fi
+
+    log_info "Installing Browser Use CLI (default browser backend)..."
+    # UV_TOOL_BIN_DIR keeps the binary inside Hermes' managed bin dir, where
+    # the browser tool resolves it — no reliance on the user's PATH.
+    if run_with_timeout 600 env UV_NO_CONFIG=1 UV_TOOL_BIN_DIR="$HERMES_HOME/bin" \
+        "$UV_CMD" tool install browser-use >/dev/null 2>&1; then
+        log_success "Browser Use CLI installed"
+    else
+        log_warn "Browser Use CLI install failed — browser automation falls back to built-in tools."
+        log_info "Install later with: $UV_CMD tool install browser-use  (or via 'hermes tools')"
+    fi
+}
+
+install_computer_use_driver() {
+    # cua-driver powers the computer_use toolset (background desktop control).
+    # Provision it at install time so enabling the tool later — via
+    # `hermes tools`, the dashboard, or the desktop app — is a config flip,
+    # not a surprise multi-minute binary fetch (the confusion this fixes:
+    # users had to discover `hermes computer-use install` on their own).
+    # Best-effort and non-fatal: the enable paths still lazy-install via
+    # install_cua_driver() when this step was skipped or failed.
+    if [ "$SKIP_COMPUTER_USE" = true ]; then
+        log_info "Skipping Computer Use (cua-driver) install (--skip-computer-use)"
+        return 0
+    fi
+    case "$DISTRO" in
+        termux)
+            return 0
+            ;;
+    esac
+    if command -v cua-driver >/dev/null 2>&1; then
+        log_success "Computer Use driver (cua-driver) already installed"
+        return 0
+    fi
+    # Non-admin macOS accounts can't receive the CuaDriver.app bundle in
+    # /Applications; skip cleanly instead of failing loudly (#47865 class).
+    if [ "$(uname -s)" = "Darwin" ] && [ -d /Applications ] && [ ! -w /Applications ]; then
+        log_info "Skipping Computer Use driver (cua-driver): /Applications is not writable"
+        return 0
+    fi
+
+    log_info "Installing Computer Use driver (cua-driver)..."
+    # Same upstream installer `hermes computer-use install` runs; time-boxed
+    # so a stalled GitHub download can't hang the Hermes install. The
+    # upstream installer serializes with its own lock (600s stale window),
+    # so give it a ceiling above that — matching Hermes'
+    # _CUA_INSTALLER_TIMEOUT (660s).
+    local cua_log
+    cua_log="$(mktemp)"
+    if run_with_timeout 660 /bin/bash -c \
+        'curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh | /bin/bash' \
+        >"$cua_log" 2>&1; then
+        log_success "Computer Use driver installed (enable via 'hermes tools' → Computer Use)"
+    else
+        log_warn "Computer Use driver install failed — it will install on demand when you enable the tool."
+        log_info "Install later with: hermes computer-use install"
+        tail -n 5 "$cua_log" >&2 || true
+    fi
+    rm -f "$cua_log"
 }
 
 run_setup_wizard() {
@@ -3259,6 +3355,8 @@ run_stage_body() {
             require_install_dir
             check_node
             install_node_deps || return
+            install_uv
+            install_browser_use_cli
             install_computer_use_driver
             ;;
         path)
@@ -3375,6 +3473,7 @@ main() {
     setup_venv
     install_deps
     install_node_deps || return
+    install_browser_use_cli
     install_computer_use_driver
     setup_path
     copy_config_templates

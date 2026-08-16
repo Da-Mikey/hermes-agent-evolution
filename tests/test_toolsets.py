@@ -252,26 +252,30 @@ class TestResolveToolsetIncludeRegistry:
     """include_registry flag exposes the static (pre-registry-merge) view used
     by platform reverse-mapping. Regression harness for issue #49622."""
 
-    def test_include_registry_false_excludes_registry_tools(self, monkeypatch):
-        # Live contract: desktop GUI tools live in the static desktop_ui
-        # toolset, not as a registry overlay on terminal. Probe the merge
-        # with a throwaway overlay so the include_registry flag is still
-        # pinned (#49622).
-        reg = ToolRegistry()
-        reg.register(
-            name="overlay_probe",
-            toolset="terminal",
-            schema=_make_schema("overlay_probe", "Registry overlay"),
-            handler=_dummy_handler,
-        )
-        monkeypatch.setattr("tools.registry.registry", reg)
+    def test_include_registry_false_excludes_registry_tools(self):
+        from tools.registry import discover_builtin_tools, registry
+        discover_builtin_tools()
 
-        merged = set(resolve_toolset("terminal"))
-        static = set(resolve_toolset("terminal", include_registry=False))
+        # Register a tool into `terminal` at runtime, the way plugins and MCP
+        # servers do, so the split is exercised on the mechanism rather than on
+        # whichever built-in currently happens to live where.
+        registry.register(
+            name="__probe_registry_only_tool__",
+            toolset="terminal",
+            schema={"name": "__probe_registry_only_tool__", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: "",
+        )
+        try:
+            merged = set(resolve_toolset("terminal"))
+            static = set(resolve_toolset("terminal", include_registry=False))
+        finally:
+            registry.deregister("__probe_registry_only_tool__")
 
         assert static == {"terminal", "process"}, static
-        assert "overlay_probe" in merged
-        assert "overlay_probe" not in static
+        # Registered into `terminal` but not part of the static definition — it
+        # must only appear in the merged view.
+        assert "__probe_registry_only_tool__" in merged
+        assert "__probe_registry_only_tool__" not in static
 
 
     def test_static_view_threads_through_includes(self):

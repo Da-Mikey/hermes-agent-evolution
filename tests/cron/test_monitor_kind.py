@@ -48,6 +48,8 @@ def hermes_env(tmp_path, monkeypatch):
     importlib.reload(cron.jobs)
     import cron.monitor
     importlib.reload(cron.monitor)
+    import cron.scheduler
+    importlib.reload(cron.scheduler)
     from hermes_cli import runtime_provider as _rtp
     monkeypatch.setattr(
         _rtp,

@@ -2254,6 +2254,41 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("proactive prune runway clear failed: %s", exc)
 
+    def _load_proactive_prune_rearm_tokens(self) -> None:
+        """Restore the cache-boundary runway for a resumed durable session."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_session_model_config_value", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            value = getter(session_id, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0)
+            self._proactive_prune_rearm_tokens = max(
+                0,
+                int(value) if isinstance(value, (int, float, str)) else 0,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            logger.debug("proactive prune runway lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug("proactive prune runway lookup failed (non-sqlite): %s", exc)
+
+    def _clear_durable_proactive_prune_rearm(self) -> None:
+        """Remove the persisted runway key without touching the transcript.
+
+        Best-effort companion to zeroing the in-memory mirror at sites that
+        void the runway (model switch): without it a restart would reload a
+        runway computed under thresholds that no longer apply.
+        """
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        patcher = getattr(session_db, "patch_session_model_config", None)
+        if not session_id or not callable(patcher):
+            return
+        try:
+            patcher(session_id, {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
+        except Exception as exc:
+            logger.debug("proactive prune runway clear failed: %s", exc)
+
     def _persist_fallback_compression_streak(self) -> None:
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")

@@ -1,4 +1,5 @@
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -42,22 +43,6 @@ def clear_verify_env(monkeypatch):
     ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
-
-
-def test_verify_on_stop_default_is_auto(clear_verify_env):
-    # No env, no explicit config -> surface-aware "auto" default. With no
-    # messaging surface bound, an interactive/unknown surface resolves ON.
-    assert verify_on_stop_enabled({"agent": {}}) is True
-
-
-def test_verify_on_stop_default_auto_off_on_messaging(clear_verify_env):
-    # The "auto" default resolves OFF on a conversational messaging surface.
-    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    assert verify_on_stop_enabled({"agent": {}}) is False
-
-
-def test_verify_on_stop_missing_agent_section_uses_auto(clear_verify_env):
-    assert verify_on_stop_enabled({}) is True
 
 
 def test_verify_on_stop_auto_sentinel_resolves_to_surface_default(clear_verify_env):
@@ -128,13 +113,6 @@ def test_verify_on_stop_auto_on_for_programmatic_surfaces(clear_verify_env, plat
     assert verify_on_stop_enabled({"agent": {"verify_on_stop": "auto"}}) is True
 
 
-def test_default_auto_on_for_interactive_surface(clear_verify_env):
-    # The default is surface-aware "auto": an interactive coding surface
-    # resolves ON without any explicit opt-in.
-    clear_verify_env.setenv("HERMES_SESSION_SOURCE", "cli")
-    assert verify_on_stop_enabled({"agent": {}}) is True
-
-
 def test_env_forces_verify_on_stop_on_for_messaging(clear_verify_env):
     clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "telegram")
     clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "1")
@@ -148,25 +126,29 @@ def test_config_forces_verify_on_stop_on_for_messaging(clear_verify_env):
 
 def test_verify_on_stop_default_path_through_load_config(tmp_path, clear_verify_env):
     # E2E: the sole production caller passes no config, so verify_on_stop_enabled
-    # resolves through load_config() + DEFAULT_CONFIG. The default is now the
-    # surface-aware "auto" sentinel. This is the path the unit-level tests above
-    # cannot exercise.
+    # resolves through load_config() + DEFAULT_CONFIG. The default is now False
+    # (opt-in): fresh installs must not fire the nudge on any surface. This is
+    # the path the unit-level tests above cannot exercise.
     clear_verify_env.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
 
     from hermes_cli.config import load_config
 
     merged = load_config()
-    # Fork contract (v31): default is explicit False, not the upstream
-    # surface-aware "auto" sentinel. An env override still wins.
+    # Both sides converged (v31/v32): the DEFAULT_CONFIG default is explicit
+    # False (opt-in), not a surface-aware "auto" sentinel. Only an explicit
+    # "auto" value opts into surface-aware behavior. An env override still wins.
     assert merged["agent"]["verify_on_stop"] is False
 
     clear_verify_env.setenv("HERMES_SESSION_SOURCE", "cli")
     assert verify_on_stop_enabled() is False
 
+    # A messaging platform also resolves OFF.
+    clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    assert verify_on_stop_enabled() is False
+
     # Env still forces the behavior on even when config default is off.
     clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "1")
     assert verify_on_stop_enabled() is True
-
 
 def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -182,6 +164,16 @@ def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
     )
 
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
+
+
+def test_verify_on_stop_missing_value_defaults_off(clear_verify_env):
+    # A missing/unrecognized config value falls back OFF on every surface,
+    # matching the opt-in DEFAULT_CONFIG default — only an explicit "auto"
+    # opts into the legacy surface-aware behavior.
+    clear_verify_env.setenv("HERMES_SESSION_SOURCE", "cli")
+    assert verify_on_stop_enabled({"agent": {}}) is False
+    assert verify_on_stop_enabled({"agent": {"verify_on_stop": "bogus"}}) is False
+    assert verify_on_stop_enabled({}) is False
 
 
 def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):
@@ -247,18 +239,29 @@ def test_nudge_includes_failed_output_summary(tmp_path, monkeypatch):
     assert "repair the code" in nudge
 
 
-def test_no_suite_nudge_requests_temp_script(tmp_path, monkeypatch):
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Symlinks require elevated privileges on Windows",
+)
+def test_no_suite_nudge_uses_canonical_temp_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
-    changed = str(tmp_path / "src" / "app.ts")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.json").write_text("{}", encoding="utf-8")
+    real_temp = tmp_path / "real-temp"
+    real_temp.mkdir()
+    linked_temp = tmp_path / "linked-temp"
+    linked_temp.symlink_to(real_temp, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(linked_temp))
 
-    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
+    nudge = build_verify_on_stop_nudge(
+        session_id="s1",
+        changed_paths=[str(project / "src" / "app.ts")],
+    )
 
     assert nudge is not None
-    assert tempfile.gettempdir() in nudge
-    assert "ad-hoc verification" in nudge
-    assert "suite green" in nudge
-    assert "creative UI/visual work" in nudge
+    assert str(real_temp) in nudge
+    assert str(linked_temp) not in nudge
 
 
 def test_verify_guidance_can_be_disabled(tmp_path, monkeypatch):

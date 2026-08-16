@@ -2688,6 +2688,7 @@ def count_db_holders(db_path: Path) -> Optional[int]:
         return None
 
 
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -3926,9 +3927,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Close the database connection.
 
         Drains queued token deltas first (the background writer needs the
-        connection). Writable connections then attempt a TRUNCATE WAL
-        checkpoint so exiting writer processes help shrink the WAL file.
-        Read-only connections never request a checkpoint.
+        connection). Writable connections then attempt a PASSIVE WAL
+        checkpoint (NOT TRUNCATE: transient per-cron-run connections close
+        many times an hour, and a TRUNCATE fires a full WAL reset that
+        races the gateway's live writer and tears B-tree pages — issue
+        #45383). Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
@@ -3952,6 +3955,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             if self._conn:
                 if not self.read_only:
+                    # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
+                    # transient SessionDB, so a TRUNCATE here fires a full WAL
+                    # reset many times/hour, racing the gateway's long-lived
+                    # writer on large WAL databases and tearing hot B-tree
+                    # pages -- the #45383 corruption this class's own periodic
+                    # checkpoint was already made PASSIVE to avoid. TRUNCATE
+                    # belongs only on a sole-opener/quiescent connection.
                     try:
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:

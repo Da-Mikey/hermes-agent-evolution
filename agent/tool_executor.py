@@ -137,7 +137,6 @@ class _BatchAbandoned(BaseException):
     the middleware chain cannot swallow it and dispatch the tool anyway.
     """
 
-
 def _parse_tool_arguments(
     raw_arguments: Any, function_name: str = ""
 ) -> tuple[dict, Optional[str]]:

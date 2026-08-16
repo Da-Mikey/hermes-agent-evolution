@@ -537,7 +537,6 @@ _EVENT_EMIT_DEPTH_CAP = 8
 # warning so a blocked subscriber cannot back-pressure the emitter forever.
 _EVENT_PENDING_CAP = 64
 _EVENT_WORKER_STOP = object()
-
 _NS_PARENT = "hermes_plugins"
 _MODULE_NAMESPACE_LOCK = threading.RLock()
 _BARE_MODULE_SCOPE: Dict[str, str] = {}

@@ -2494,11 +2494,11 @@ def _terminal_task_cwd_with_source(session: dict | None) -> tuple[str, str]:
                 raw = ""
         if raw and raw not in {".", "auto", "cwd"}:
             return raw, "process"
+        if backend == "ssh":
+            return "~", "process"
 
     if session and session.get("cwd"):
         return str(session["cwd"]), "session"
-    if backend == "ssh":
-        return "~", "process"
     return _completion_cwd(), "process"
 
 
