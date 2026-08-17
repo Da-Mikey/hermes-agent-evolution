@@ -1891,12 +1891,28 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
+
+        def _trace(conn):
+            if conn is not None:
+                conn.set_trace_callback(statements.append)
+
+        # _read_ctx borrows from a bounded read pool, so every checkout
+        # must be traced — not just the connections reachable at setup
+        # time. The projection invariant under test is how many context
+        # enrichment queries RUN, regardless of which connection ran them.
+        _real_checkout = db._checkout_read_conn
+
+        def _traced_checkout():
+            conn = _real_checkout()
+            _trace(conn)
+            return conn
+
         traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        _trace(db._conn)
+        _checkout_patch = mock.patch.object(
+            db, "_checkout_read_conn", side_effect=_traced_checkout
+        )
+        _checkout_patch.start()
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -1921,6 +1937,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
+            _checkout_patch.stop()
             for conn in traced_connections:
                 conn.set_trace_callback(None)
 

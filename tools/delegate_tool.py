@@ -3809,7 +3809,13 @@ def _run_single_child(
                 "extracted data. If you asked for file contents, search "
                 "results, or computed values, treat this as a failure and "
                 "either re-delegate with explicit tool instructions or do "
-                "the work inline." + _retry_note + "\n\n" + summary
+                "the work inline."
+                + _retry_note
+                + "\n\n"
+                # Build on entry["summary"] (not the raw summary) so the
+                # missed-steer annotation appended above survives this
+                # rewrite instead of being silently discarded.
+                + entry.get("summary", summary)
             )
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent

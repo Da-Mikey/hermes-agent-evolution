@@ -164,7 +164,7 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         # "no changes needed" message instead of a hard error (#889).
         # Using a distinct return shape (match_count=0, strategy="identical")
         # lets callers distinguish "nothing to do" from a genuine failure.
-        return content, 0, "identical", "old_string and new_string are identical"
+        return content, 0, "identical", IDENTICAL_STRINGS_ERROR
 
     # Try each matching strategy in order
     strategies: List[Tuple[str, Callable]] = [
@@ -227,6 +227,21 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                 )
                 if drift_err:
                     return content, 0, None, drift_err
+
+            # Backslash-doubling guard (JSON double-escape): fires under any
+            # strategy when every backslash run in old_string is exactly
+            # twice the matched file region's — the tool-call arguments went
+            # through one extra JSON-escaping pass, and writing new_string
+            # verbatim would double every backslash in the file. An exact
+            # match can never trigger it (old_string equals the region, so
+            # the runs are equal, not doubled).
+            bs_err = _detect_backslash_doubling(
+                content[matches[0][0]:matches[0][1]],
+                old_string,
+                new_string,
+            )
+            if bs_err:
+                return content, 0, None, bs_err
 
             # Perform replacement. When the matched strategy is NOT `exact`,
             # the file's indentation may differ from what the LLM sent in

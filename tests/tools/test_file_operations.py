@@ -1058,7 +1058,7 @@ class TestReadFileErrorDisambiguation:
 
         def side_effect(command, **kwargs):
             # wc -c fails (permission denied), stderr suppressed.
-            if command.startswith("wc -c"):
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
                 return {"output": "", "returncode": 1}
             # _diagnose_read_failure: test -e → yes (file exists).
             if command.startswith("test -e "):
@@ -1081,7 +1081,7 @@ class TestReadFileErrorDisambiguation:
         target = "/tmp/some_dir_1488"
 
         def side_effect(command, **kwargs):
-            if command.startswith("wc -c"):
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
                 return {"output": "", "returncode": 1}
             if command.startswith("test -e "):
                 return {"output": "yes\n", "returncode": 0}
@@ -1104,7 +1104,7 @@ class TestReadFileErrorDisambiguation:
         target = "/tmp/missing_1488.py"
 
         def side_effect(command, **kwargs):
-            if command.startswith("wc -c"):
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
                 return {"output": "", "returncode": 1}
             # _diagnose_read_failure: test -e → no (file absent).
             if command.startswith("test -e "):
@@ -1127,7 +1127,7 @@ class TestReadFileErrorDisambiguation:
         target = "/tmp/locked_raw_1488.txt"
 
         def side_effect(command, **kwargs):
-            if command.startswith("wc -c"):
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
                 return {"output": "", "returncode": 1}
             if command.startswith("test -e "):
                 return {"output": "yes\n", "returncode": 0}
@@ -1148,7 +1148,7 @@ class TestReadFileErrorDisambiguation:
         target = "/tmp/raw_dir_1488"
 
         def side_effect(command, **kwargs):
-            if command.startswith("wc -c"):
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
                 return {"output": "", "returncode": 1}
             if command.startswith("test -e "):
                 return {"output": "yes\n", "returncode": 0}

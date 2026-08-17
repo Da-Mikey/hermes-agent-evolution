@@ -1762,8 +1762,6 @@ class ShellFileOperations(FileOperations):
                 )
                 result.hint = f"{note} {result.hint}" if result.hint else note
                 return result
-            # No equivalent spelling — suggest similar files
-            return self._suggest_similar_files(path)
             # No equivalent spelling — diagnose the real reason (#1488):
             # wc -c with stderr suppressed can't tell us WHY the read
             # failed (missing file, directory, permission denied).

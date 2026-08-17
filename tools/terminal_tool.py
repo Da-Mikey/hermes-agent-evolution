@@ -3906,7 +3906,11 @@ def terminal_tool(
                         "should_retry": False,
                         "terminal_streak": streak,
                     }
-                
+                    rec = streak_recommendation(streak)
+                    if rec:
+                        result_dict["recommendation"] = rec
+                    return json.dumps(result_dict, ensure_ascii=False)
+
                 # Got a result
                 output = result.get("output", "")
                 returncode = result.get("returncode", 0)
