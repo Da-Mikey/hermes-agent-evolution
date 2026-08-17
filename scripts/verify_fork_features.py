@@ -154,6 +154,13 @@ def _symbols_in(ref: str | None) -> dict[str, str]:
                     for t in node.targets
                     if isinstance(t, ast.Name) and not t.id.startswith("__")
                 ]
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                # Annotated module-level assignments (``_x: float = 0.0``) define
+                # the same name a plain assignment would; skipping them makes a
+                # side that annotates look like it lacks the symbol (false
+                # MISSING during sync checks).
+                if not node.target.id.startswith("__"):
+                    names = [node.target.id]
             for name in names:
                 out.setdefault(name, path)
     return out

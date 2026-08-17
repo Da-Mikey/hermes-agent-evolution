@@ -26,11 +26,24 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    escape_like as _escape_like,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
+# Characters FTS5's query grammar rejects outside a quoted phrase. Anything
+# missing from this set reaches MATCH raw and raises, which the execute site
+# swallows into zero results — the failure this strip step exists to prevent.
+# Assembled through re.escape so the backslash cannot be eaten as a regex
+# escape inside the class (it was, while the set was written as a literal).
+#
+# ``%`` is deliberately excluded: a CJK query falls back to a LIKE search that
+# needs it preserved as a literal (that path escapes wildcards itself), so
+# stripping it here widened those queries onto unrelated rows.
+_FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
+_FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
 
 
 class SessionSearchMixin:
@@ -164,6 +177,16 @@ class SessionSearchMixin:
         The trash tables are PLAIN tables (their vtable parent was demoted
         away during the migration), so chunked DELETE + final DROP involve
         no FTS5 machinery at all. Returns True while teardown work remains.
+
+        Single-column-key trash tables (the common shape — FTS shadow
+        tables carry a rowid/integer PK) are drained with a high-water
+        marker mirroring :meth:`fts_rebuild_step`: each chunk deletes only
+        rows after the previously-drained key, so the per-chunk scan is
+        bounded instead of re-scanning from the start of the table every
+        chunk (O(n²) total on large trash tables, #79324). Compound-key
+        trash tables (multi-column PK) cannot use a scalar high-water
+        comparison, so they keep the legacy chunked ``LIMIT`` delete —
+        those shadow tables are small by construction.
         """
         with self._lock:
             trash = [
@@ -179,11 +202,62 @@ class SessionSearchMixin:
         tbl = trash[0]
 
         def _do(conn):
-            pk_cols = [
-                r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")
+            pk_info = [
+                (r[1], (r[2] or "").upper())
+                for r in conn.execute(f"PRAGMA table_info({tbl})")
                 if r[5] > 0
             ]
+            pk_cols = [name for name, _typ in pk_info]
             key = ", ".join(pk_cols) if pk_cols else "rowid"
+
+            if len(pk_cols) == 1 and (not pk_info or pk_info[0][1] == "INTEGER"):
+                # High-water drain: delete only rows past the marker key.
+                # The marker is read/written inside the same BEGIN IMMEDIATE
+                # transaction as the DELETE, so concurrent callers claim
+                # disjoint key ranges instead of re-deleting. Only integer
+                # PKs can anchor a numeric high-water comparison — the FTS
+                # config shadow table (TEXT pk like 'version') falls back to
+                # the legacy chunked delete below.
+                marker_key = f"fts_teardown_{tbl}_progress"
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (marker_key,),
+                ).fetchone()
+                high_water = int(row[0]) if row is not None else 0
+
+                # Claim the chunk's upper bound: the LAST row of the
+                # LIMIT window, so a full chunk is deleted per step.
+                upper_rows = conn.execute(
+                    f"SELECT {key} FROM {tbl} WHERE {key} > ? "
+                    f"ORDER BY {key} LIMIT {self._FTS_REBUILD_CHUNK_ROWS}",
+                    (high_water,),
+                ).fetchall()
+                if not upper_rows:
+                    # Drained — the DROP is cheap now.
+                    conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+                    conn.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                    logger.info("Old FTS shadow table %s torn down.", tbl)
+                    return True
+
+                upper = upper_rows[-1][0]
+                cur = conn.execute(
+                    f"DELETE FROM {tbl} WHERE {key} > ? AND {key} <= ?",
+                    (high_water, upper),
+                )
+                if cur.rowcount > 0:
+                    conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (marker_key, str(upper)),
+                    )
+                return True
+
+            # Compound-key or rowid trash table: legacy chunked delete.
+            # These shadow tables are small, so the quadratic re-scan is
+            # not a concern (#79324 keeps the high-water path for the big
+            # single-key tables).
             cur = conn.execute(
                 f"DELETE FROM {tbl} WHERE ({key}) IN "
                 f"(SELECT {key} FROM {tbl} LIMIT {self._FTS_REBUILD_CHUNK_ROWS})"
@@ -839,12 +913,17 @@ class SessionSearchMixin:
             # its own. Callers must therefore NOT size the result by stat()ing
             # the file; use :meth:`logical_size_bytes`, which is truthful
             # immediately regardless of readers.
+            # PASSIVE, not TRUNCATE: optimize-storage runs from a transient CLI
+            # process; a TRUNCATE reset here would race a live gateway writer
+            # and tear B-tree pages (#45383). (The TRUNCATE was already refused
+            # SQLITE_BUSY while the gateway holds a read-mark, per the note
+            # above; PASSIVE removes the reset attempt entirely.)
             try:
                 with self._lock:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception as exc:
                 logger.debug(
-                    "WAL checkpoint (TRUNCATE) after optimize VACUUM failed: %s",
+                    "WAL checkpoint (PASSIVE) after optimize VACUUM failed: %s",
                     exc,
                 )
 
@@ -1060,6 +1139,9 @@ class SessionSearchMixin:
         # Legacy standalone compaction handoffs (persisted pre-#80622) are
         # durable role='user' rows with NO display_kind — SQL can't see them,
         # so fetch with headroom and drop them in the decode loop below.
+        # Without this, /undo N and rewind pair an in-memory count that
+        # excludes handoffs with a DB pick that includes them, soft-deleting
+        # the wrong turn.
         fetch_limit = int(limit) * 2 + 5
         with self._lock:
             cursor = self._conn.execute(
@@ -1079,6 +1161,7 @@ class SessionSearchMixin:
                 break
             decoded = self._decode_content(row["content"])
             if ContextCompressor._is_context_summary_content(decoded):
+                # Compaction handoff — never a user-originated turn (#80622).
                 continue
             if isinstance(decoded, list):
                 # Multimodal — flatten text parts.
@@ -1160,7 +1243,21 @@ class SessionSearchMixin:
         # single ``content`` column, an unquoted colon query like ``TODO: fix``
         # parses as ``column:term`` and raises "no such column" — swallowed at
         # the execute site into zero results.  Strip it like the others.
-        sanitized = re.sub(r'[+{}():\"^]', " ", sanitized)
+        # The class below is every character FTS5's query grammar rejects
+        # outside a quoted phrase. Anything omitted here reaches MATCH raw and
+        # raises, which the execute site swallows into zero results — the
+        # failure mode this step exists to prevent. Measured against a real
+        # FTS5 table: ``it's``, ``gateway/run.py``, ``user@host``, ``a,b`` and
+        # ``50%`` all raised before the class was completed.
+        sanitized = _FTS5_SPECIAL_RE.sub(" ", sanitized)
+
+        # Step 2b: ``%`` is excluded from the class above only to protect the
+        # CJK LIKE-fallback path (LIKE treats % as a wildcard the fallback
+        # builds itself). A non-CJK query never reaches that fallback
+        # (``is_cjk`` gates it), so ``50%`` would sail into MATCH raw and
+        # raise like the rest. Strip it whenever the query has no CJK.
+        if "%" in sanitized and not SessionSearchMixin._contains_cjk(sanitized):
+            sanitized = sanitized.replace("%", " ")
 
         # Step 3: Collapse repeated * (e.g. "***") into a single one,
         # and remove leading * (prefix-only needs at least one char before *)
@@ -1533,6 +1630,92 @@ class SessionSearchMixin:
             self._trigram_available = False
             self._fts_cjk_available = False
 
+    def _finalize_search_matches(
+        self,
+        matches: List[Dict[str, Any]],
+        result_fields: Optional[Collection[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Attach neighboring messages and trim full content from results.
+
+        Context (1 message before + after each match) is only loaded when
+        the selected result projection consumes it. Each query takes its
+        own fresh read transaction via _read_ctx, so we never hold a lock
+        across N sequential queries.
+        """
+        context_matches = (
+            matches if result_fields is None or "context" in result_fields else ()
+        )
+        for match in context_matches:
+            try:
+                with self._read_ctx() as conn:
+                    ctx_cursor = conn.execute(
+                        """WITH target AS (
+                               SELECT session_id, timestamp, id
+                               FROM messages
+                               WHERE id = ?
+                           )
+                           SELECT role, content
+                           FROM (
+                               SELECT m.id, m.timestamp, m.role, m.content
+                               FROM messages m
+                               JOIN target t ON t.session_id = m.session_id
+                               WHERE (m.timestamp < t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
+                               ORDER BY m.timestamp DESC, m.id DESC
+                               LIMIT 1
+                           )
+                           UNION ALL
+                           SELECT role, content
+                           FROM messages
+                           WHERE id = ?
+                           UNION ALL
+                           SELECT role, content
+                           FROM (
+                               SELECT m.id, m.timestamp, m.role, m.content
+                               FROM messages m
+                               JOIN target t ON t.session_id = m.session_id
+                               WHERE (m.timestamp > t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
+                               ORDER BY m.timestamp ASC, m.id ASC
+                               LIMIT 1
+                           )""",
+                        (match["id"], match["id"]),
+                    )
+                    context_msgs = []
+                    for row in ctx_cursor.fetchall():
+                        decoded = self._decode_content(row["content"])
+                        if isinstance(decoded, list):
+                            text_parts = [
+                                part.get("text", "")
+                                for part in decoded
+                                if isinstance(part, dict)
+                                and part.get("type") == "text"
+                            ]
+                            text = " ".join(t for t in text_parts if t).strip()
+                            preview = text or "[multimodal content]"
+                        elif isinstance(decoded, str):
+                            preview = decoded
+                        else:
+                            preview = ""
+                        context_msgs.append(
+                            {"role": row["role"], "content": preview[:200]}
+                        )
+                match["context"] = context_msgs
+            except Exception:
+                match["context"] = []
+
+        # Remove full content from result (snippet is enough, saves tokens)
+        for match in matches:
+            match.pop("content", None)
+
+        if result_fields is not None:
+            matches = [
+                {field: match[field] for field in result_fields if field in match}
+                for match in matches
+            ]
+
+        return matches
+
     def _search_messages_impl(
         self,
         query: str,
@@ -1587,7 +1770,7 @@ class SessionSearchMixin:
 
         self._refresh_fts_stale_state()
         if self._fts_stale:
-            return self._search_messages_like_fallback(
+            matches = self._search_messages_like_fallback(
                 query,
                 source_filter=source_filter,
                 exclude_sources=exclude_sources,
@@ -1596,6 +1779,9 @@ class SessionSearchMixin:
                 offset=offset,
                 sort=sort,
                 include_inactive=include_inactive,
+            )
+            return self._finalize_search_matches(
+                matches, result_fields=result_fields
             )
         if not self._fts_enabled:
             return []
@@ -1899,7 +2085,7 @@ class SessionSearchMixin:
                 token_clauses = []
                 like_params: list = []
                 for tok in non_op_tokens:
-                    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    esc = _escape_like(tok)
                     token_clauses.append(
                         "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
                     )
@@ -2039,84 +2225,7 @@ class SessionSearchMixin:
                 if tri_matches:
                     matches = tri_matches
 
-        # Add surrounding context (1 message before + after each match) only
-        # when the selected result projection consumes it. Each query takes
-        # its own fresh read transaction via _read_ctx, so we never hold a
-        # lock across N sequential queries.
-        context_matches = (
-            matches if result_fields is None or "context" in result_fields else ()
-        )
-        for match in context_matches:
-            try:
-                with self._read_ctx() as conn:
-                    ctx_cursor = conn.execute(
-                        """WITH target AS (
-                               SELECT session_id, timestamp, id
-                               FROM messages
-                               WHERE id = ?
-                           )
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
-                               ORDER BY m.timestamp DESC, m.id DESC
-                               LIMIT 1
-                           )
-                           UNION ALL
-                           SELECT role, content
-                           FROM messages
-                           WHERE id = ?
-                           UNION ALL
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
-                               ORDER BY m.timestamp ASC, m.id ASC
-                               LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
-                    )
-                    context_msgs = []
-                    for r in ctx_cursor.fetchall():
-                        raw = r["content"]
-                        decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                p.get("text", "") for p in decoded
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
-                        context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
-                        )
-                match["context"] = context_msgs
-            except Exception:
-                match["context"] = []
-
-        # Remove full content from result (snippet is enough, saves tokens)
-        for match in matches:
-            match.pop("content", None)
-
-        if result_fields is not None:
-            matches = [
-                {field: match[field] for field in result_fields if field in match}
-                for match in matches
-            ]
-
-        return matches
+        return self._finalize_search_matches(matches, result_fields=result_fields)
 
     def _search_unindexed_gap(
         self,
@@ -2155,7 +2264,7 @@ class SessionSearchMixin:
         where = ["m.id > ? AND m.id <= ?"]
         params: list = [progress, high_water]
         for term in terms:
-            esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            esc = _escape_like(term)
             where.append(
                 "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' "
                 "OR m.tool_calls LIKE ? ESCAPE '\\')"

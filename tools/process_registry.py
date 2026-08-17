@@ -3090,7 +3090,7 @@ def _handle_process(args, **kw):
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":
             return json.dumps(_redact_process_result(process_registry.read_log(
-                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
+                session_id, offset=args.get("offset"), limit=args.get("limit", 200))), ensure_ascii=False)
         elif action == "wait":
             return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
         elif action == "kill":

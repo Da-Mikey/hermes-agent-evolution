@@ -242,7 +242,10 @@ def load_env() -> Dict[str, str]:
     if not env_path.exists():
         return env_vars
 
-    with env_path.open(encoding="utf-8") as f:
+    # utf-8-sig: users hand-edit .env in Notepad, which prepends a BOM that
+    # would otherwise glue U+FEFF onto the first key name (same dialect as
+    # the canonical readers in hermes_cli/config.py).
+    with env_path.open(encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -840,7 +843,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8")[:4000]
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
                 frontmatter, body = _parse_frontmatter(content)
 
                 if not skill_matches_platform(frontmatter):
@@ -918,18 +921,22 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         active_skills_dir = _skills_dir()
         if not active_skills_dir.exists():
             active_skills_dir.mkdir(parents=True, exist_ok=True)
-            return json.dumps(
-                {
-                    "success": True,
-                    "skills": [],
-                    "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
-                },
-                ensure_ascii=False,
-            )
 
         # Find all skills
         all_skills = _find_all_skills()
+        try:
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            discover_plugins()
+            for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
+                frontmatter = plugin_skill.pop("frontmatter", {})
+                if not skill_matches_platform(frontmatter):
+                    continue
+                if _is_skill_disabled(plugin_skill["name"]):
+                    continue
+                all_skills.append(plugin_skill)
+        except Exception:
+            logger.debug("Plugin skill listing failed", exc_info=True)
 
         if not all_skills:
             return json.dumps(
@@ -1128,7 +1135,12 @@ def _serve_plugin_skill(
         )
 
     try:
-        content = skill_md.read_text(encoding="utf-8")
+        # utf-8-sig + errors="replace": SKILL.md files are user-authored and
+        # sometimes carry a Notepad BOM or stray non-UTF-8 bytes. Pinning
+        # UTF-8 with replacement keeps skill_view deterministic across
+        # platforms — falling back to the machine locale (cp1252/GBK) would
+        # make the same skill render differently per host (see PR #51701).
+        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
     except Exception as e:
         return json.dumps(
             {
@@ -1158,7 +1170,7 @@ def _serve_plugin_skill(
         return json.dumps(
             {
                 "success": False,
-                "error": f"Skill '{namespace}:{bare}' is not supported on this platform.",
+                "error": f"Skill '{qualified_name}' is not supported on this platform.",
                 "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
             },
             ensure_ascii=False,
@@ -1577,7 +1589,7 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
                     continue
                 try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8")
+                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
                     fm, _ = _parse_frontmatter(fm_content)
                 except Exception:
                     fm = {}
@@ -1640,7 +1652,7 @@ def skill_view(
 
         # Read the file once — reused for platform check and main content below
         try:
-            content = skill_md.read_text(encoding="utf-8")
+            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
         except Exception as e:
             return json.dumps(
                 {
@@ -1846,7 +1858,7 @@ def skill_view(
 
             # Read the file content
             try:
-                content = target_file.read_text(encoding="utf-8")
+                content = target_file.read_text(encoding="utf-8-sig", errors="replace")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
                 return json.dumps(
@@ -2076,7 +2088,7 @@ def skill_view(
                                     / "_org"
                                     / prov_org
                                     / ORG_PROVENANCE_FILE
-                                ).read_text(encoding="utf-8")
+                                ).read_text(encoding="utf-8-sig", errors="replace")
                             )
                             author = str(
                                 prov.get("author_device")

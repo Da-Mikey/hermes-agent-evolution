@@ -67,6 +67,12 @@ UNICODE_MAP = {
     "\u3000": " ",  # ideographic (CJK full-width) space
 }
 
+IDENTICAL_STRINGS_ERROR = (
+    "No edit was applied because old_string and new_string are identical. "
+    "Provide the existing text to replace in old_string and the changed "
+    "replacement text in new_string."
+)
+
 
 def _unicode_normalize(text: str) -> str:
     """Normalizes Unicode characters to their standard ASCII equivalents."""
@@ -158,7 +164,7 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         # "no changes needed" message instead of a hard error (#889).
         # Using a distinct return shape (match_count=0, strategy="identical")
         # lets callers distinguish "nothing to do" from a genuine failure.
-        return content, 0, "identical", "old_string and new_string are identical"
+        return content, 0, "identical", IDENTICAL_STRINGS_ERROR
 
     # Try each matching strategy in order
     strategies: List[Tuple[str, Callable]] = [
@@ -221,6 +227,21 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                 )
                 if drift_err:
                     return content, 0, None, drift_err
+
+            # Backslash-doubling guard (JSON double-escape): fires under any
+            # strategy when every backslash run in old_string is exactly
+            # twice the matched file region's — the tool-call arguments went
+            # through one extra JSON-escaping pass, and writing new_string
+            # verbatim would double every backslash in the file. An exact
+            # match can never trigger it (old_string equals the region, so
+            # the runs are equal, not doubled).
+            bs_err = _detect_backslash_doubling(
+                content[matches[0][0]:matches[0][1]],
+                old_string,
+                new_string,
+            )
+            if bs_err:
+                return content, 0, None, bs_err
 
             # Perform replacement. When the matched strategy is NOT `exact`,
             # the file's indentation may differ from what the LLM sent in
@@ -292,9 +313,11 @@ def _detect_escape_drift(
     Returns an error string if drift is detected, None otherwise.
     """
     # Cheap pre-check: bail out unless new_string actually contains a
-    # suspect escape sequence. This keeps the guard free for all the
-    # common, correct cases.
-    if "\\'" not in new_string and '\\"' not in new_string:
+    # suspect escape sequence or any backslash at all (the doubling guard
+    # below only matters when backslashes are present). This keeps the
+    # guard free for all the common, correct cases.
+    has_quote_suspects = "\\'" in new_string or '\\"' in new_string
+    if not has_quote_suspects and "\\" not in old_string:
         return None
 
     # Aggregate matched regions of the file — that's what new_string will
@@ -320,6 +343,63 @@ def _detect_escape_drift(
                 f"backslash-escaping {plain!r} characters."
             )
     return None
+
+
+def _backslash_runs(s: str) -> List[int]:
+    """Return the lengths of maximal backslash runs in ``s``, in order."""
+    runs: List[int] = []
+    n = 0
+    for ch in s:
+        if ch == "\\":
+            n += 1
+        elif n:
+            runs.append(n)
+            n = 0
+    if n:
+        runs.append(n)
+    return runs
+
+
+def _detect_backslash_doubling(matched_regions: str, old_string: str,
+                               new_string: str) -> Optional[str]:
+    """Detect JSON double-escaped backslashes in old_string/new_string.
+
+    Fires when every backslash run in old_string is exactly twice the
+    length of the corresponding run in the matched file region (with the
+    same number of runs, and at least one run of length >= 2 so a single
+    doubled backslash in prose can't trigger it). That pattern means the
+    tool-call arguments went through an extra JSON-escaping pass; writing
+    new_string verbatim would double every backslash in the file.
+    """
+    old_runs = _backslash_runs(old_string)
+    file_runs = _backslash_runs(matched_regions)
+    if not old_runs or not file_runs or len(old_runs) != len(file_runs):
+        return None
+    if old_runs == file_runs:
+        return None
+    # Every old run must be exactly double its file counterpart, and the
+    # doubling must be non-trivial (>= 2 backslashes in the file) for at
+    # least one run — a lone `\` vs `\\` is too weak a signal on its own
+    # unless it is consistent across 2+ runs.
+    if any(o != f * 2 for o, f in zip(old_runs, file_runs)):
+        return None
+    if not (any(f >= 2 for f in file_runs) or len(file_runs) >= 2):
+        return None
+    # new_string must exhibit the same doubling (the model copy-pasted the
+    # doubled form); if it already matches the file's counts, writing it is
+    # harmless and we let the edit through.
+    new_runs = _backslash_runs(new_string)
+    if new_runs == file_runs:
+        return None
+    return (
+        "Escape-drift detected: every backslash run in old_string is exactly "
+        "twice as long as in the matched region of the file (e.g. the file "
+        "has `\\\\` where old_string has `\\\\\\\\`). The tool-call arguments "
+        "were JSON-escaped one extra time; applying new_string verbatim would "
+        "double every backslash in the file. Re-read the file with read_file "
+        "and resend old_string/new_string with the backslash counts exactly "
+        "as they appear in the file."
+    )
 
 
 def _leading_whitespace(line: str) -> str:

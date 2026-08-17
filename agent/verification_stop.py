@@ -136,13 +136,15 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
     Precedence: an explicit ``HERMES_VERIFY_ON_STOP`` env var wins, then an
-    explicit ``agent.verify_on_stop`` config value. The config default is
-    ``"auto"`` (see ``DEFAULT_CONFIG``) — surface-aware: ON for interactive
+    explicit ``agent.verify_on_stop`` config value. The default is ``False``
+    (opt-in — see ``DEFAULT_CONFIG``): the v31/v32 migrations already turn
+    the behavior off for existing installs, so fresh installs match. An
+    explicit bool forces the behavior in either direction, and the ``"auto"``
+    sentinel opts into the legacy surface-aware behavior: ON for interactive
     coding surfaces (CLI, TUI, desktop) and programmatic callers, OFF for
     conversational messaging surfaces (Telegram, Discord, etc.) where the
-    verification narrative would reach a human as chat noise. An explicit
-    bool forces the behavior in either direction. A missing or unrecognized
-    value falls back to the surface-aware ``"auto"`` default.
+    verification narrative would reach a human as chat noise. A missing or
+    unrecognized value falls back to OFF.
     """
     env = os.environ.get("HERMES_VERIFY_ON_STOP")
     if env is not None:
@@ -166,8 +168,10 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
             return False
         if token == "auto":
             return not _session_is_messaging_surface()
-    # Missing or unrecognized value -> surface-aware "auto" default.
-    return not _session_is_messaging_surface()
+    # Missing or unrecognized value -> OFF, matching the DEFAULT_CONFIG
+    # opt-in default. (Only an explicit "auto" opts into the legacy
+    # surface-aware behavior.)
+    return False
 
 
 def _candidate_cwds(paths: Iterable[str]) -> list[Path]:
@@ -245,6 +249,30 @@ def _format_changed_paths(paths: list[str]) -> str:
     if remaining > 0:
         lines.append(f"- ... and {remaining} more")
     return "\n".join(lines)
+
+
+def _workspace_has_runnable_recipe(root: Any) -> bool:
+    """Whether the workspace has a runtime verify recipe ``hermes verify`` can run.
+
+    True when a saved ``.hermes/environment.json`` manifest exists, or when
+    cheap static detection (:func:`agent.verify.recipes.detect_recipe`) finds a
+    recipe with a start command. Deliberately fail-silent and cheap — this only
+    decorates the nudge text; it must never break or slow the nudge path.
+    """
+    if not root:
+        return False
+    try:
+        root_path = Path(str(root))
+        from agent.verify.environment import manifest_path
+
+        if manifest_path(root_path).is_file():
+            return True
+        from agent.verify.recipes import detect_recipe
+
+        recipe = detect_recipe(root_path)
+        return bool(recipe is not None and recipe.start)
+    except Exception:
+        return False
 
 
 def _status_detail(status: dict[str, Any]) -> str:

@@ -947,6 +947,60 @@ class TestPreflightCompression:
             for ev, msg in status_messages
         )
 
+    def test_preflight_compresses_when_projected_real_usage_crosses(self, agent):
+        """Projected real usage (last real + rough growth) crossing the
+        threshold still triggers preflight: 95K real + 12K rough growth =
+        107K >= 100K. Growth alone no longer decides — real usage far below
+        the threshold defers instead (see TestPreflightDeferral)."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.last_prompt_tokens = 95_000
+        agent.context_compressor.last_real_prompt_tokens = 95_000
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message {i} padded"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded"})
+
+        ok_resp = _mock_response(
+            content="Compressed after growth",
+            finish_reason="stop",
+            usage={"prompt_tokens": 50_000, "completion_tokens": 100, "total_tokens": 50_100},
+        )
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        # First rough estimate must clear the threshold so preflight fires
+        # (rough growth since the last fitting request is large, so the
+        # deferral path is NOT taken). Every estimate after compaction is
+        # sub-threshold. Use a callable side_effect rather than a fixed list
+        # so we don't have to predict how many times the loop re-estimates —
+        # the post-response real-token estimate is an extra call that a
+        # 2-element list would exhaust (StopIteration).
+        _rough_calls = {"n": 0}
+
+        def _rough_estimate(*_args, **_kwargs):
+            _rough_calls["n"] += 1
+            return 160_000 if _rough_calls["n"] == 1 else 40_000
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
+                "new system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+
     def test_preflight_compresses_when_rough_growth_after_fit_is_large(self, agent):
         """Large rough growth after a fitting request still triggers preflight."""
         agent.compression_enabled = True
