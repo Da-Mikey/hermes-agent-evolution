@@ -1714,6 +1714,7 @@ def skill_manage(
     absorbed_into: str = None,
     task_id: str = None,
     session_id: str = None,
+    rationale: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -1855,6 +1856,15 @@ def skill_manage(
                         run_id = _os.environ.get("HERMES_SESSION_ID", "") or ""
                         if run_id:
                             set_source_run_id(name, run_id)
+                    except Exception:
+                        pass
+                    # Instruction provenance (#2629): a skill must carry its
+                    # rationale (failure/hypothesis/outcome) or it decays into
+                    # prompt noise. Best-effort; never breaks the create.
+                    try:
+                        from tools.skill_usage import set_rationale
+                        if rationale:
+                            set_rationale(name, rationale)
                     except Exception:
                         pass
                     # Store the source chain accumulated during the
@@ -2030,6 +2040,18 @@ SKILL_MANAGE_SCHEMA = {
                     "rewriting) will have to guess at intent."
                 )
             },
+            "rationale": {
+                "type": "string",
+                "description": (
+                    "Optional but STRONGLY RECOMMENDED for 'create': the *why* "
+                    "behind this skill (the failure that triggered it, the "
+                    "hypothesis it encodes, and the observed outcome). Storing "
+                    "the rationale prevents catastrophic remembering — a "
+                    "rationale-less instruction decays into prompt noise and "
+                    "cannot be pruned later. The curator flags skills whose "
+                    "rationale is missing or has decayed."
+                )
+            },
         },
         "required": ["action", "name"],
     },
@@ -2055,6 +2077,7 @@ registry.register(
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
         task_id=kw.get("task_id"),
-        session_id=kw.get("session_id")),
+        session_id=kw.get("session_id"),
+        rationale=args.get("rationale")),
     emoji="📝",
 )
