@@ -4535,7 +4535,46 @@ def run_job(
     job: dict,
     *,
     defer_agent_teardown: Optional[list] = None,
+    extra_prompt: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Execute a single cron job behind the opt-in OTel span (#167).
 
+    Thin telemetry wrapper: no-op + zero overhead unless
+    telemetry.otel.enabled. The job blocks on the agent future, so this
+    spans the whole job — exactly the unattended-job timing/failure
+    visibility the issue asked for.
+    """
+    import hermes_telemetry
+
+    with hermes_telemetry.span(
+        "cron.job",
+        job=job["id"],
+        job_name=str(job.get("name") or job["id"]),
+        no_agent=bool(job.get("no_agent")),
+    ):
+        # kwargs-only forward keeps monkeypatched impl stubs (tests) working
+        # regardless of which optional params they accept.
+        impl = _run_job_impl
+        kwargs: dict = {}
+        if defer_agent_teardown is not None:
+            kwargs["defer_agent_teardown"] = defer_agent_teardown
+        if extra_prompt is not None:
+            kwargs["extra_prompt"] = extra_prompt
+        if cancel_event is not None:
+            kwargs["cancel_event"] = cancel_event
+        result = impl(job, **kwargs)
+        hermes_telemetry.set_attributes(
+            success=bool(result[0]),
+            error=(result[3] or None),
+        )
+        return result
+
+
+def _run_job_impl(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
 ) -> tuple[bool, str, str, Optional[str]]:

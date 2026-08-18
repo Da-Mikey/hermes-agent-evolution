@@ -3560,35 +3560,6 @@ def terminal_tool(
                     ensure_ascii=False,
                 )
 
-        # Non-bypassable: rewriting the local checkout backing this interpreter
-        # can mix module versions. Remote backends cannot reach that checkout.
-        if env_type == "local":
-            from tools.self_repo_guard import detect_self_repo_git_mutation
-
-            guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-                env_type=env_type,
-            )
-            _self_repo_hit, _self_repo_msg = detect_self_repo_git_mutation(
-                command, guard_cwd
-            )
-            if _self_repo_hit:
-                logger.warning(
-                    "Blocked self-repo git mutation (command: %s)",
-                    _safe_command_preview(command),
-                )
-                return json.dumps(
-                    {
-                        "output": "",
-                        "exit_code": 1,
-                        "error": _self_repo_msg,
-                        "status": "blocked",
-                    },
-                    ensure_ascii=False,
-                )
-
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty

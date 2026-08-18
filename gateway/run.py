@@ -29723,7 +29723,7 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None):
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None, runner=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -30668,6 +30668,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "adapters": runner.adapters,
             "loop": asyncio.get_running_loop(),
             "cron_provider": cron_provider,
+            "runner": runner,
         },
         daemon=True,
         name="gateway-housekeeping",
