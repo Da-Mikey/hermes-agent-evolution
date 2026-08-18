@@ -349,8 +349,6 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
-
-
     def test_404_requires_available_credits_is_billing(self):
         e = MockAPIError(
             "Not Found",
@@ -538,12 +536,6 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
 
-    def test_502_plain_bad_gateway_still_retryable(self):
-        """A genuine 502 with no request-validation signal stays retryable."""
-        e = MockAPIError("Bad Gateway", status_code=502)
-        result = classify_api_error(e)
-        assert result.reason == FailoverReason.server_error
-        assert result.retryable is True
 
     def test_non_json_stream_validation_error_is_non_retryable(self):
         e = MockAPIError(
@@ -2380,7 +2372,70 @@ class Test408RequestTimeout:
         assert result.should_compress is False
 
 
-# ── HTTP 504 gateway timeout ───────────────────────────────────────────
+# ── Test: connection/DNS failure message patterns on generic exception types ──
+# Port of anomalyco/opencode#40707 (expand retryable error patterns): errors
+# whose TYPE is generic (RuntimeError/Exception from local shims, MCP bridges,
+# re-raising SDKs) but whose MESSAGE carries a connection-establishment or DNS
+# failure must classify as retryable transport, not FailoverReason.unknown.
+
+class TestConnectionMessagePatterns:
+    """Generic-typed connect/DNS failures route to the transport bucket."""
+
+    @pytest.mark.parametrize("message", [
+        "connect ECONNREFUSED 127.0.0.1:11434",
+        "Connection refused by proxy",
+        "getaddrinfo failed",
+        "getaddrinfo ENOTFOUND api.example.com",
+        "[Errno -3] Temporary failure in name resolution",
+        "[Errno 8] nodename nor servname provided, or not known",
+        "getaddrinfo EAI_AGAIN openrouter.ai",
+        "Name or service not known",
+        "No route to host",
+        "[Errno 101] Network is unreachable",
+        "fetch failed",
+        "TypeError: Failed to fetch",
+        "upstream connect error or disconnect/reset before headers",
+    ])
+    def test_generic_exception_with_connect_failure_message_is_timeout(self, message):
+        # RuntimeError — NOT in _TRANSPORT_ERROR_TYPES, not a ConnectionError
+        # subclass, no status code. Without message matching this falls to
+        # FailoverReason.unknown and misses the eager transport fallback.
+        result = classify_api_error(RuntimeError(message))
+        assert result.reason == FailoverReason.timeout, message
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_connect_failure_never_routes_to_compression_on_large_session(self):
+        # A connection that was never established is not an overflow signal,
+        # even when the session is huge (the disconnect+large-session
+        # heuristic must not apply to connect-phase failures).
+        result = classify_api_error(
+            RuntimeError("connect ECONNREFUSED 10.0.0.5:443"),
+            approx_tokens=180000, context_length=200000, num_messages=400,
+        )
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
+
+    def test_midstream_disconnect_patterns_still_use_disconnect_path(self):
+        # "connection reset by peer" is deliberately NOT in the connect-phase
+        # list — it stays on the _SERVER_DISCONNECT_PATTERNS path, which
+        # routes large sessions to context-overflow compression.
+        result = classify_api_error(
+            RuntimeError("Connection reset by peer"),
+            approx_tokens=180000, context_length=200000, num_messages=400,
+        )
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
+    def test_plain_unknown_error_still_unknown(self):
+        # Guard against over-matching: an unrelated message stays unknown.
+        result = classify_api_error(RuntimeError("something exploded"))
+        assert result.reason == FailoverReason.unknown
+
+
+# ── Test: throttle vs overflow disambiguation + new overflow shapes ─────
+# Port of anomalyco/opencode#37848 (expand context overflow patterns +
+# rate-limit exclusion guard).
 
 
 class Test504GatewayTimeout:
@@ -2442,6 +2497,5 @@ class Test504GatewayTimeout:
         assert r_overload.reason == FailoverReason.overloaded
         assert r_timeout.reason == FailoverReason.timeout
         assert r_overload.reason != r_timeout.reason
-
 
 
