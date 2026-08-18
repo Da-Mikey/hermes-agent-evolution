@@ -1562,6 +1562,43 @@ class TestClassifyApiError:
             "Malformed message array 400" in r.getMessage() for r in caplog.records
         ), "Expected a distinct warning identifying the malformed-body 400"
 
+    def test_400_empty_tool_calls_array_is_non_retryable_format_error(self):
+        """Empty ``tool_calls: []`` rejection → non-retryable format_error (#33).
+
+        DeepSeek v4 rejects an assistant message carrying ``"tool_calls": []``
+        with HTTP 400 "Invalid 'messages[N].tool_calls': empty array.
+        Expected an array with minimum length 1...". This is a deterministic
+        request-shape rejection — the pre-API sanitizer strips [] at the
+        chokepoint, but if it ever reaches the classifier it must be a
+        non-retryable format_error, not a retry loop on the identical payload.
+        """
+        e = MockAPIError(
+            "Invalid 'messages[2].tool_calls': empty array. Expected an array "
+            "with minimum length 1, but got an empty array instead.",
+            status_code=400,
+        )
+        result = classify_api_error(
+            e,
+            provider="deepseek",
+            model="deepseek-v4",
+            approx_tokens=5000,
+            context_length=200000,
+            num_messages=12,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+
+    def test_400_empty_tool_calls_array_non_apostrophe_variant(self):
+        """Same rejection without the field-path apostrophe → format_error."""
+        e = MockAPIError(
+            "Invalid messages[2].tool_calls: empty array. Expected an array "
+            "with minimum length 1.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="moonshot", model="kimi")
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+
 
 # ── Test: Adversarial / edge cases (from live testing) ─────────────────
 
