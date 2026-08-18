@@ -598,6 +598,26 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APITimeoutError",
 })
 
+# Environmental network-failure signals (#74). DNS / routing / reachability
+# failures are environmental, not provider-side: retrying the identical
+# payload N times cannot succeed while the environment is broken, and only
+# amplifies a transient outage into a retry storm that burns tokens, delays
+# scheduled jobs, and floods the error-capture store. Match these BEFORE the
+# generic transport-timeout heuristic (§8) so a clearly environmental error
+# fails fast (with fallback to the next provider) instead of exhausting the
+# retry budget against an unreachable host. Genuinely transient provider
+# hiccups (read/connect timeouts, resets) still retry via §8.
+_ENV_NETWORK_SIGNALS = (
+    "temporary failure in name resolution",
+    "name or service not known",
+    "getaddrinfo failed",
+    "no route to host",
+    "network is unreachable",
+    "errno -2",   # EAI_NONAME — name resolution failed
+    "errno -3",   # EAI_AGAIN — temporary DNS failure
+    "errno 113",  # EHOSTUNREACH — no route to host
+)
+
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
 # transient transport hiccup OR server-side context overflow rejection
@@ -1087,6 +1107,27 @@ def classify_api_error(
         and "consecutive stale attempts" in error_msg
         and "aborting this call" in error_msg
     ):
+        return _result(
+            FailoverReason.timeout,
+            retryable=False,
+            should_fallback=True,
+        )
+
+    # ── 7c. Environmental network failures → fail fast (#74) ────────
+    # DNS resolution / routing / reachability failures are environmental,
+    # not provider-side: the identical request cannot succeed while the
+    # environment is broken, so the full fixed retry count only amplifies a
+    # transient outage into a retry storm (and, for scheduled jobs, a wall of
+    # failure records + request snapshots). Fail fast with a fallback to the
+    # next provider — if the environment is truly down the fallback also
+    # fails fast, and the loop surfaces a clear reason instead of silently
+    # burning the budget. Checked BEFORE §8 so a message carrying both an
+    # environmental signal and a transport type name does not fall through to
+    # the retryable timeout bucket.
+    if (
+        isinstance(error, OSError)
+        or error_type in _TRANSPORT_ERROR_TYPES
+    ) and any(s in error_msg for s in _ENV_NETWORK_SIGNALS):
         return _result(
             FailoverReason.timeout,
             retryable=False,

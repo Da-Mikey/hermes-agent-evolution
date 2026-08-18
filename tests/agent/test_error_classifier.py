@@ -2380,6 +2380,60 @@ class Test408RequestTimeout:
         assert result.should_compress is False
 
 
+# ── Environmental network failure → fail fast (#74) ─────────────────────
+
+
+class TestEnvironmentalNetworkFailFast:
+    """DNS / routing / reachability failures are environmental, not
+    provider-side — retrying the identical payload cannot succeed while the
+    environment is broken. They must fail fast (non-retryable + fallback)
+    instead of exhausting the retry budget against an unreachable host."""
+
+    def test_dns_name_resolution_fails_fast(self):
+        e = OSError("Temporary failure in name resolution")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_getaddrinfo_fails_fast(self):
+        e = OSError("[Errno -2] Name or service not known")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_no_route_to_host_fails_fast(self):
+        e = OSError("[Errno 113] No route to host")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_network_unreachable_fails_fast(self):
+        e = OSError("Network is unreachable")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_transient_timeout_without_env_signal_still_retries(self):
+        # A plain timeout (no environmental signal) must keep retrying as a
+        # transient transport hiccup — the fail-fast branch is narrow.
+        e = TimeoutError("timed out")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_connection_reset_without_env_signal_still_retries(self):
+        # Connection reset is a provider-side transport hiccup, not an
+        # environmental DNS/route failure — must NOT fail fast.
+        e = ConnectionError("Connection reset by peer")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+
 # ── HTTP 504 gateway timeout ───────────────────────────────────────────
 
 
