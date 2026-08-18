@@ -36,7 +36,11 @@ def test_public_schema_exposes_020_state_and_type_options():
     assert properties["include_screenshot"]["type"] == "boolean"
     assert properties["replace"]["type"] == "boolean"
     assert properties["browser_type_mode"]["enum"] == ["insert_text", "keystrokes"]
-    assert "approval_token" not in properties
+    # Fork: approval_token IS in the public schema — the browser-approve flow
+    # (hermes computer-use browser-approve) mints a five-minute single-use
+    # token that the model must pass here to attach to a browser; upstream
+    # moved it out-of-band, the fork keeps the explicit in-band boundary.
+    assert "approval_token" in properties
 
 
 def test_browser_state_forwards_screenshot_request_and_preserves_mcp_image():

@@ -579,15 +579,13 @@ class InProcessCronScheduler(CronScheduler):
                     )
                 ok = True
                 # Reset backoff on first success.
-                if _consecutive_failures > 0:
+                if consecutive_failures > 0:
                     logger.info(
                         "Cron tick succeeded after %d consecutive failures — "
-                        "resetting backoff (interval %.0fs → %.0fs)",
-                        _consecutive_failures,
-                        _base_interval * (2 ** min(_consecutive_failures - 1, 5)),
-                        _base_interval,
+                        "resetting backoff",
+                        consecutive_failures,
                     )
-                    _consecutive_failures = 0
+                    consecutive_failures = 0
             except BaseException as e:
                 # Catch BaseException (not just Exception) so a SystemExit from
                 # a misbehaving provider SDK / agent retry path does not kill
@@ -596,7 +594,7 @@ class InProcessCronScheduler(CronScheduler):
                 # stop_event (set by the main thread's signal handler), not by
                 # an exception in this daemon thread, so swallowing it and
                 # re-checking stop_event keeps shutdown clean.
-                _consecutive_failures += 1
+                consecutive_failures += 1
                 logger.error("Cron tick error: %s", e, exc_info=True)
                 # Persist the failure reason next to the heartbeat markers so
                 # `hermes cron status`/`list` (separate processes) can show

@@ -1029,6 +1029,22 @@ def classify_api_error(
         if classified is not None:
             return classified
 
+    # ── 4. SSL certificate verification failures → fail fast ────────
+    # A broken certificate chain (TLS-inspecting proxy, missing custom CA,
+    # expired/self-signed cert) is deterministic for the host — every retry
+    # reproduces the identical handshake failure. Fail immediately with
+    # actionable guidance instead of burning the retry budget first.
+    # Checked BEFORE message-pattern matching: cert-verify messages also
+    # carry generic transport phrases ("fetch failed", "[ssl:") that would
+    # otherwise classify them as transient/timeout first.
+    # Inspired by Claude Code v2.1.199 (July 2026).
+    if any(p in error_msg for p in _SSL_CERT_VERIFY_PATTERNS):
+        return _result(
+            FailoverReason.ssl_cert_verification,
+            retryable=False,
+            should_fallback=False,
+        )
+
     # ── 4. Message pattern matching (no status code) ────────────────
 
     classified = _classify_by_message(
@@ -1039,21 +1055,6 @@ def classify_api_error(
     )
     if classified is not None:
         return classified
-
-    # ── 5. SSL certificate verification failures → fail fast ────────
-    # A broken certificate chain (TLS-inspecting proxy, missing custom CA,
-    # expired/self-signed cert) is deterministic for the host — every retry
-    # reproduces the identical handshake failure. Fail immediately with
-    # actionable guidance instead of burning the retry budget first.
-    # Checked BEFORE the transient-SSL patterns: cert-verify messages also
-    # contain "[ssl:" which would otherwise match the transient list.
-    # Inspired by Claude Code v2.1.199 (July 2026).
-    if any(p in error_msg for p in _SSL_CERT_VERIFY_PATTERNS):
-        return _result(
-            FailoverReason.ssl_cert_verification,
-            retryable=False,
-            should_fallback=False,
-        )
 
     # ── 5b. SSL/TLS transient errors → retry as timeout (not compression) ──
     # SSL alerts mid-stream are transport hiccups, not server-side context
