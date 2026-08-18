@@ -2673,6 +2673,7 @@ class MCPServerTask:
         "_recycled_reason",
         "initialize_result",
         "_ping_unsupported",
+        "_list_cache_meta",
         "_reconnect_retries",
         "_last_park_error",
         "_stateless_enabled",
