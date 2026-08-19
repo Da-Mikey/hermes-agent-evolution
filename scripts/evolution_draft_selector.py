@@ -100,13 +100,38 @@ def build_draft_tasks(
     *,
     context: str = "",
     toolsets: Optional[List[str]] = None,
+    memo_path: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Build N identical leaf-worker tasks for parallel draft mode via delegate_task."""
+    """Build N identical leaf-worker tasks for parallel draft mode via delegate_task.
+
+    With ``memo_path`` (shared failure memo, issue #65), the memo is consulted
+    BEFORE the fan-out: when the goal is recorded as a known-failing edit,
+    ``([], n_drafters)`` is returned — the edit is NOT re-attempted this cycle
+    (all drafters dropped and reported, mirroring the orchestrator's
+    dropped-not-silently-queued convention). Otherwise each draft task's
+    context instructs the drafter to consult the memo before re-attempting any
+    edit it previously tried.
+    """
     n = max(1, int(n_drafters))
     ctx = (
         _s(context)
         or "You are one of several independent drafters. Produce your best complete draft."
     )
+    if memo_path:
+        try:
+            from evolution_shared_memo import load_memo
+
+            memo = load_memo(Path(memo_path))
+            if memo.is_known_failing(goal):
+                return [], n
+            ctx = (
+                f"{ctx}\n\nSHARED FAILURE MEMO (issue #65): before re-attempting "
+                f"an edit that previously failed, consult {memo_path} (read it "
+                f"first). If the memo records this goal as a known-failing edit, "
+                f'do NOT re-attempt it — return "skipped: known-failing edit".'
+            )
+        except ImportError:
+            pass
     t = {
         "goal": _s(goal),
         "context": ctx,
@@ -231,7 +256,11 @@ def main(argv: List[str]) -> int:
         ts_str = _flag(args, "--toolsets")
         ts = [t.strip() for t in ts_str.split(",") if t.strip()] if ts_str else None
         tasks, dropped = build_draft_tasks(
-            goal, n, context=_flag(args, "--context") or "", toolsets=ts
+            goal,
+            n,
+            context=_flag(args, "--context") or "",
+            toolsets=ts,
+            memo_path=_flag(args, "--memo"),
         )
         print(json.dumps({"tasks": tasks, "dropped": dropped}, ensure_ascii=False))
         return 0
