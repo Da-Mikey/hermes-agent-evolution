@@ -2617,28 +2617,20 @@ def _mark_job_run_locked(
                     # forward-failure stamp so it only ever describes the
                     # CURRENT auto-fire health, not a healed past incident.
                     job.pop("last_fire_error", None)
-                # Consecutive agent-failure streak. Any successful run resets
-                # it; delivery failures alone do NOT count (the agent did its
-                # job). Read by the scheduler's failure-delivery path to nudge
-                # the user to review a repeatedly-failing automation
-                # (Poke-inspired; see cron/scheduler._failure_streak_nudge).
-                if success:
-                    job["failure_streak"] = 0
-                else:
-                    job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
-                # #70: per-job failure accounting (exponential backoff + circuit
-                # breaker). An error byte-identical to the previous run is
-                # deterministic: the fixed schedule re-running it only burns
-                # tokens/disk and floods the failure store. Backoff skips
-                # 2**(streak-1)-1 scheduled slots (capped, see
-                # failure_backoff_max_skips); a changed error or a success
-                # resets the streak. Synthetic failures (interruption / forced
-                # release — status in _SYNTHETIC_FAILURE_STATUSES) never touch
-                # the streak: a scheduler restart mid-run is not evidence the
-                # job is deterministically broken, and counting it would let
-                # restarts false-positive auto-pause a healthy job.
+                # #70 + Poke-nudge UNIFIED streak: ONE increment per failed
+                # run (the pre-merge code had two independent if/else blocks
+                # each incrementing failure_streak, double-counting). Any
+                # successful run resets it and the backoff skips; delivery
+                # failures alone do NOT count (the agent did its job).
+                # Synthetic failures (interruption / forced release — status
+                # in _SYNTHETIC_FAILURE_STATUSES) never touch the streak: a
+                # scheduler restart mid-run is not evidence the job is
+                # deterministically broken, and counting it would let
+                # restarts false-positive auto-pause a healthy job. The
+                # scheduler's delivery path reads the same field for its
+                # review nudge (cron/scheduler._failure_streak_nudge).
                 if success:
                     job["failure_streak"] = 0
                     job.pop("failure_backoff_skips", None)
