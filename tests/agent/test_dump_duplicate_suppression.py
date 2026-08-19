@@ -124,3 +124,165 @@ def test_dump_payload_includes_failure_category(tmp_path: Path):
     data = json.loads(dump_file.read_text())
     assert data["error"]["failure_category"] == "billing"
     assert data["error"]["retryable"] is False
+
+
+# ── Issue #73: preflight dumps are deduped + capped; the cap counts writes ──
+
+
+def _config_with_request_dump(**kwargs: object) -> dict:
+    """A minimal config dict carrying a ``request_dump`` section."""
+    return {"request_dump": kwargs}
+
+
+def _dump_count(agent: AIAgent) -> int:
+    return int(getattr(agent, "_request_dump_count", 0))
+
+
+def test_preflight_duplicates_suppressed_within_window(tmp_path: Path):
+    agent = _make_agent(tmp_path)
+    api_kwargs = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+    first = dump_api_request_debug(agent, api_kwargs, reason="preflight")
+    assert first is not None
+    assert first.exists()
+
+    second = dump_api_request_debug(agent, api_kwargs, reason="preflight")
+    assert second is None
+
+
+def test_suppressed_duplicates_do_not_burn_cap_budget(tmp_path: Path):
+    """#73 — a suppressed duplicate must not consume the per-session cap.
+
+    A burst of identical preflight attempts writes ONE dump; the suppressed
+    duplicates leave the budget intact, so a genuinely new failure payload is
+    still dumped instead of being silenced for the rest of the session.
+    """
+    agent = _make_agent(tmp_path)
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value=_config_with_request_dump(
+            dedup_window_seconds=60, max_dumps_per_session=2
+        ),
+    ):
+        api_kwargs = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+        # Three identical attempts: only the first is a write.
+        for _ in range(3):
+            dump_api_request_debug(agent, api_kwargs, reason="preflight")
+        assert len(list(agent.logs_dir.glob("request_dump_*.json"))) == 1
+        assert _dump_count(agent) == 1
+
+        # A genuinely new payload still gets dumped: the two suppressed
+        # duplicates did NOT burn the budget.
+        new_kwargs = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "different"}],
+        }
+        second = dump_api_request_debug(agent, new_kwargs, reason="preflight")
+        assert second is not None
+        assert _dump_count(agent) == 2
+
+        # Cap (2) now reached: a third distinct payload is suppressed.
+        third = dump_api_request_debug(
+            agent,
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "another"}]},
+            reason="preflight",
+        )
+        assert third is None
+        assert _dump_count(agent) == 2
+
+
+def test_config_driven_dedup_window(tmp_path: Path):
+    """Changing request_dump.dedup_window_seconds changes suppression."""
+    agent = _make_agent(tmp_path)
+    api_kwargs = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value=_config_with_request_dump(dedup_window_seconds=0),
+    ):
+        # A window of 0 disables dedup: identical preflight bodies all write.
+        first = dump_api_request_debug(agent, api_kwargs, reason="preflight")
+        second = dump_api_request_debug(agent, api_kwargs, reason="preflight")
+        assert first is not None
+        assert second is not None
+
+
+def test_config_driven_cap(tmp_path: Path):
+    """Changing request_dump.max_dumps_per_session changes the cap."""
+    agent = _make_agent(tmp_path)
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value=_config_with_request_dump(
+            dedup_window_seconds=0, max_dumps_per_session=0
+        ),
+    ):
+        # A cap of 0 disables the cap entirely.
+        for content in ("a", "b", "c", "d", "e"):
+            result = dump_api_request_debug(
+                agent,
+                {"model": "gpt-4", "messages": [{"role": "user", "content": content}]},
+                reason="preflight",
+            )
+            assert result is not None
+        assert len(list(agent.logs_dir.glob("request_dump_*.json"))) == 5
+
+
+def test_non_int_config_values_fall_back_to_defaults(tmp_path: Path):
+    """Non-int request_dump values must not crash the dump path."""
+    agent = _make_agent(tmp_path)
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value=_config_with_request_dump(
+            dedup_window_seconds="soon", max_dumps_per_session="lots"
+        ),
+    ):
+        api_kwargs = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+        first = dump_api_request_debug(agent, api_kwargs, reason="preflight")
+        assert first is not None
+
+        # Default window (60s) still suppresses the identical follow-up.
+        second = dump_api_request_debug(agent, api_kwargs, reason="preflight")
+        assert second is None
+
+        # The error path still dumps despite the junk config values.
+        err = ValueError("boom")
+        err.status_code = 500  # type: ignore[attr-defined]
+        error_dump = dump_api_request_debug(agent, api_kwargs, reason="auth", error=err)
+        assert error_dump is not None
+        assert error_dump.exists()
+
+
+def test_error_path_not_capped(tmp_path: Path):
+    """#73 — max_dumps_per_session must not silence error dumps.
+
+    Once the preflight cap is exhausted, the error path still writes its
+    dump: post-mortem debugging must always get its snapshot.
+    """
+    agent = _make_agent(tmp_path)
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value=_config_with_request_dump(
+            dedup_window_seconds=60, max_dumps_per_session=1
+        ),
+    ):
+        api_kwargs = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+
+        first = dump_api_request_debug(agent, api_kwargs, reason="preflight")
+        assert first is not None
+
+        # Cap of 1 reached: a second, distinct preflight dump is suppressed.
+        suppressed = dump_api_request_debug(
+            agent,
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "new"}]},
+            reason="preflight",
+        )
+        assert suppressed is None
+
+        # ...but the error path still dumps after the cap is exhausted.
+        err = ValueError("boom")
+        err.status_code = 500  # type: ignore[attr-defined]
+        error_dump = dump_api_request_debug(agent, api_kwargs, reason="auth", error=err)
+        assert error_dump is not None
+        assert error_dump.exists()
