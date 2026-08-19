@@ -35,12 +35,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import _FULL_ARGS_LOG_BOUND
 from agent.prompt_builder import format_steer_marker
-from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+from agent.tool_dispatch_helpers import (
+    _trajectory_normalize_msg,
+    make_tool_result_message,
+)
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
-from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    env_var_enabled,
+    atomic_json_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +61,20 @@ logger = logging.getLogger(__name__)
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
 
 
-_REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
-_TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
+_REASONING_TAG_NAMES = (
+    "think",
+    "thinking",
+    "reasoning",
+    "REASONING_SCRATCHPAD",
+    "thought",
+)
+_TOOL_CALL_TAG_NAMES = (
+    "tool_call",
+    "tool_calls",
+    "tool_result",
+    "function_call",
+    "function_calls",
+)
 
 _REASONING_BLOCK_PATTERNS = tuple(
     re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE)
@@ -70,24 +90,24 @@ _TOOL_CALL_BLOCK_PATTERNS = tuple(
 # full rationale (sentence-boundary lookbehind + tempered-dot body so a plain
 # prose mention of "function" is never eaten).
 _NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
-    r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*'
-    r'<function\b[^>]*\bname\s*=[^>]*>'
-    r'(?:(?:(?!</function>).)*)</function>',
+    r"(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*"
+    r"<function\b[^>]*\bname\s*=[^>]*>"
+    r"(?:(?:(?!</function>).)*)</function>",
     re.DOTALL | re.IGNORECASE,
 )
 
 _UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
-    rf'(?:^|\n)[ \t]*<(?:{"|".join(_REASONING_TAG_NAMES)})\b[^>]*>.*$',
+    rf"(?:^|\n)[ \t]*<(?:{'|'.join(_REASONING_TAG_NAMES)})\b[^>]*>.*$",
     re.DOTALL | re.IGNORECASE,
 )
 
 _ORPHAN_REASONING_TAG_PATTERN = re.compile(
-    rf'</?(?:{"|".join(_REASONING_TAG_NAMES)})>\s*',
+    rf"</?(?:{'|'.join(_REASONING_TAG_NAMES)})>\s*",
     re.IGNORECASE,
 )
 
 _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
-    rf'</(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function)>\s*',
+    rf"</(?:{'|'.join(_TOOL_CALL_TAG_NAMES)}|function)>\s*",
     re.IGNORECASE,
 )
 
@@ -95,33 +115,48 @@ _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
+
     return run_agent
 
 
-AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "setup_mcp", "delegate_task", "compact_context"}
-)
+AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset({
+    "todo",
+    "session_search",
+    "memory",
+    "clarify",
+    "read_terminal",
+    "read_preview",
+    "read_window_below",
+    "setup_mcp",
+    "delegate_task",
+    "compact_context",
+})
 
 
 def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
     """Return True when an agent-level tool path emits its own post hook."""
     if function_name in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES:
         return True
-    if getattr(agent, "_context_engine_tool_names", None) and function_name in agent._context_engine_tool_names:
+    if (
+        getattr(agent, "_context_engine_tool_names", None)
+        and function_name in agent._context_engine_tool_names
+    ):
         return True
     memory_manager = getattr(agent, "_memory_manager", None)
     return bool(memory_manager and memory_manager.has_tool(function_name))
 
 
-def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
+def convert_to_trajectory_format(
+    agent, messages: List[Dict[str, Any]], user_query: str, completed: bool
+) -> List[Dict[str, Any]]:
     """
     Convert internal message format to trajectory format for saving.
-    
+
     Args:
         messages (List[Dict]): Internal message history
         user_query (str): Original user query
         completed (bool): Whether the conversation completed successfully
-        
+
     Returns:
         List[Dict]: Messages in trajectory format
     """
@@ -130,7 +165,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
     # embedding ~1MB base64 blobs into every saved trajectory.
     messages = [_trajectory_normalize_msg(m) for m in messages]
     trajectory = []
-    
+
     # Add system message with tool definitions
     system_msg = (
         "You are a function calling AI model. You are provided with function signatures within <tools> </tools> XML tags. "
@@ -145,71 +180,70 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
         "Each function call should be enclosed within <tool_call> </tool_call> XML tags.\n"
         "Example:\n<tool_call>\n{'name': <function-name>,'arguments': <args-dict>}\n</tool_call>"
     )
-    
-    trajectory.append({
-        "from": "system",
-        "value": system_msg
-    })
-    
+
+    trajectory.append({"from": "system", "value": system_msg})
+
     # Add the actual user prompt (from the dataset) as the first human message
-    trajectory.append({
-        "from": "human",
-        "value": user_query
-    })
-    
+    trajectory.append({"from": "human", "value": user_query})
+
     # Skip the first message (the user query) since we already added it above.
     # Prefill messages are injected at API-call time only (not in the messages
     # list), so no offset adjustment is needed here.
     i = 1
-    
+
     while i < len(messages):
         msg = messages[i]
-        
+
         if msg["role"] == "assistant":
             # Check if this message has tool calls
             if "tool_calls" in msg and msg["tool_calls"]:
                 # Format assistant message with tool calls
                 # Add <think> tags around reasoning for trajectory storage
                 content = ""
-                
+
                 # Prepend reasoning in <think> tags if available (native thinking tokens)
                 if msg.get("reasoning") and msg["reasoning"].strip():
                     content = f"<think>\n{msg['reasoning']}\n</think>\n"
-                
+
                 if msg.get("content") and msg["content"].strip():
                     # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
                     # (used when native thinking is disabled and model reasons via XML)
                     content += convert_scratchpad_to_think(msg["content"]) + "\n"
-                
+
                 # Add tool calls wrapped in XML tags
                 for tool_call in msg["tool_calls"]:
-                    if not tool_call or not isinstance(tool_call, dict): continue
+                    if not tool_call or not isinstance(tool_call, dict):
+                        continue
                     # Parse arguments - should always succeed since we validate during conversation
                     # but keep try-except as safety net
                     try:
-                        arguments = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
+                        arguments = (
+                            json.loads(tool_call["function"]["arguments"])
+                            if isinstance(tool_call["function"]["arguments"], str)
+                            else tool_call["function"]["arguments"]
+                        )
                     except json.JSONDecodeError:
                         # This shouldn't happen since we validate and retry during conversation,
                         # but if it does, log warning and use empty dict
-                        logger.warning("Unexpected invalid JSON in trajectory conversion: %s", tool_call['function']['arguments'][:100])
+                        logger.warning(
+                            "Unexpected invalid JSON in trajectory conversion: %s",
+                            tool_call["function"]["arguments"][:100],
+                        )
                         arguments = {}
-                    
+
                     tool_call_json = {
                         "name": tool_call["function"]["name"],
-                        "arguments": arguments
+                        "arguments": arguments,
                     }
                     content += f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n"
-                
+
                 # Ensure every gpt turn has a <think> block (empty if no reasoning)
                 # so the format is consistent for training data
                 if "<think>" not in content:
                     content = "<think>\n</think>\n" + content
-                
-                trajectory.append({
-                    "from": "gpt",
-                    "value": content.rstrip()
-                })
-                
+
+                trajectory.append({"from": "gpt", "value": content.rstrip()})
+
                 # Collect all subsequent tool responses
                 tool_responses = []
                 j = i + 1
@@ -217,7 +251,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                     tool_msg = messages[j]
                     # Format tool response with XML tags
                     tool_response = "<tool_response>\n"
-                    
+
                     # Try to parse tool content as JSON if it looks like JSON
                     tool_content = tool_msg["content"]
                     try:
@@ -225,63 +259,59 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                             tool_content = json.loads(tool_content)
                     except (json.JSONDecodeError, AttributeError):
                         pass  # Keep as string if not valid JSON
-                    
+
                     tool_index = len(tool_responses)
                     tool_name = (
                         msg["tool_calls"][tool_index]["function"]["name"]
                         if tool_index < len(msg["tool_calls"])
                         else "unknown"
                     )
-                    tool_response += json.dumps({
-                        "tool_call_id": tool_msg.get("tool_call_id", ""),
-                        "name": tool_name,
-                        "content": tool_content
-                    }, ensure_ascii=False)
+                    tool_response += json.dumps(
+                        {
+                            "tool_call_id": tool_msg.get("tool_call_id", ""),
+                            "name": tool_name,
+                            "content": tool_content,
+                        },
+                        ensure_ascii=False,
+                    )
                     tool_response += "\n</tool_response>"
                     tool_responses.append(tool_response)
                     j += 1
-                
+
                 # Add all tool responses as a single message
                 if tool_responses:
                     trajectory.append({
                         "from": "tool",
-                        "value": "\n".join(tool_responses)
+                        "value": "\n".join(tool_responses),
                     })
                     i = j - 1  # Skip the tool messages we just processed
-            
+
             else:
                 # Regular assistant message without tool calls
                 # Add <think> tags around reasoning for trajectory storage
                 content = ""
-                
+
                 # Prepend reasoning in <think> tags if available (native thinking tokens)
                 if msg.get("reasoning") and msg["reasoning"].strip():
                     content = f"<think>\n{msg['reasoning']}\n</think>\n"
-                
+
                 # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
                 # (used when native thinking is disabled and model reasons via XML)
                 raw_content = msg["content"] or ""
                 content += convert_scratchpad_to_think(raw_content)
-                
+
                 # Ensure every gpt turn has a <think> block (empty if no reasoning)
                 if "<think>" not in content:
                     content = "<think>\n</think>\n" + content
-                
-                trajectory.append({
-                    "from": "gpt",
-                    "value": content.strip()
-                })
-        
-        elif msg["role"] == "user":
-            trajectory.append({
-                "from": "human",
-                "value": msg["content"]
-            })
-        
-        i += 1
-    
-    return trajectory
 
+                trajectory.append({"from": "gpt", "value": content.strip()})
+
+        elif msg["role"] == "user":
+            trajectory.append({"from": "human", "value": msg["content"]})
+
+        i += 1
+
+    return trajectory
 
 
 def sanitize_tool_call_arguments(
@@ -322,7 +352,10 @@ def sanitize_tool_call_arguments(
         prev_prefix = cursor.get("prefix")
         if isinstance(prev_prefix, list):
             limit = min(len(prev_prefix), len(messages))
-            while start_index < limit and messages[start_index] is prev_prefix[start_index]:
+            while (
+                start_index < limit
+                and messages[start_index] is prev_prefix[start_index]
+            ):
                 start_index += 1
 
     repaired = 0
@@ -411,7 +444,10 @@ def sanitize_tool_call_arguments(
                 scan_index = message_index + 1
                 while scan_index < len(messages):
                     candidate = messages[scan_index]
-                    if not isinstance(candidate, dict) or candidate.get("role") != "tool":
+                    if (
+                        not isinstance(candidate, dict)
+                        or candidate.get("role") != "tool"
+                    ):
                         break
                     if candidate.get("tool_call_id") == tool_call_id:
                         existing_tool_msg = candidate
@@ -715,7 +751,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         role = msg.get("role")
         if role == "assistant":
             known_tool_ids = set()
-            for tc in (msg.get("tool_calls") or []):
+            for tc in msg.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
                 for key in ("id", "call_id"):
@@ -814,12 +850,9 @@ def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
                 1 for m in messages if id(m) in pre_repair_flushed_ids
             )
         else:
-            agent._last_flushed_db_idx = min(
-                agent._last_flushed_db_idx, len(messages)
-            )
+            agent._last_flushed_db_idx = min(agent._last_flushed_db_idx, len(messages))
 
     return repairs
-
 
 
 def strip_think_blocks(agent, content: str) -> str:
@@ -892,32 +925,31 @@ def strip_think_blocks(agent, content: str) -> str:
     #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
     #    the unterminated-tag pass and take trailing content with them.
     for _pattern in _REASONING_BLOCK_PATTERNS:
-        content = _pattern.sub('', content)
+        content = _pattern.sub("", content)
     # 1b. Tool-call XML blocks (openclaw/openclaw#67318). Handle the
     #     generic tag names first — they have no attribute gating since
     #     a literal <tool_call> in prose is already vanishingly rare.
     for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
-        content = _pattern.sub('', content)
+        content = _pattern.sub("", content)
     # 1c. <function name="...">...</function> — Gemma-style standalone
     #     tool call. Only strip when the tag sits at a block boundary
     #     (start of text, after a newline, or after sentence-ending
     #     punctuation) AND carries a name="..." attribute. This keeps
     #     prose mentions like "Use <function> to declare" safe.
-    content = _NAMED_FUNCTION_BLOCK_PATTERN.sub('', content)
+    content = _NAMED_FUNCTION_BLOCK_PATTERN.sub("", content)
     # 2. Unterminated reasoning block — open tag at a block boundary
     #    (start of text, or after a newline) with no matching close.
     #    Strip from the tag to end of string.  Fixes #8878 / #9568
     #    (MiniMax M2.7 leaking raw reasoning into assistant content).
-    content = _UNTERMINATED_REASONING_BLOCK_PATTERN.sub('', content)
+    content = _UNTERMINATED_REASONING_BLOCK_PATTERN.sub("", content)
     # 3. Stray orphan open/close tags that slipped through.
-    content = _ORPHAN_REASONING_TAG_PATTERN.sub('', content)
+    content = _ORPHAN_REASONING_TAG_PATTERN.sub("", content)
     # 3b. Stray tool-call closers. (We do NOT strip bare <function> or
     #     unterminated <function name="..."> because a truncated tail
     #     during streaming may still be valuable to the user; matches
     #     OpenClaw's intentional asymmetry.)
-    content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', content)
+    content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub("", content)
     return content
-
 
 
 def sync_credential_pool_entry_id(agent) -> None:
@@ -1003,6 +1035,7 @@ def recover_with_credential_pool(
         if current_provider == "custom" and pool_provider.startswith("custom:"):
             try:
                 from agent.credential_pool import get_custom_provider_pool_key
+
                 _agent_base = (getattr(agent, "base_url", "") or "").strip()
                 _custom_match = bool(_agent_base) and (
                     (get_custom_provider_pool_key(_agent_base) or "").strip().lower()
@@ -1014,7 +1047,8 @@ def recover_with_credential_pool(
             _ra().logger.warning(
                 "Credential pool provider mismatch: pool=%s, agent=%s — "
                 "skipping pool mutation to avoid cross-provider contamination",
-                pool_provider, current_provider,
+                pool_provider,
+                current_provider,
             )
             return False, has_retried_429
 
@@ -1064,6 +1098,7 @@ def recover_with_credential_pool(
                 # Ambiguous billing body (#82154): persist the ambiguity so
                 # the cooldown is sized as transient, not a 1-hour bench.
                 from agent.credential_pool import FAILURE_REASON_BILLING_UNVERIFIED
+
                 _failure_reason = FAILURE_REASON_BILLING_UNVERIFIED
             kwargs["failure_reason"] = _failure_reason
         return pool.mark_exhausted_and_rotate(**kwargs)
@@ -1082,7 +1117,9 @@ def recover_with_credential_pool(
         # rate-limiting the aggregator's traffic — the user's credential is
         # healthy. Do NOT rotate or mark exhausted; let the caller's fallback
         # path switch to a different model entirely.
-        upstream = (error_context or {}).get("upstream_provider") if error_context else None
+        upstream = (
+            (error_context or {}).get("upstream_provider") if error_context else None
+        )
         if upstream:
             _ra().logger.info(
                 "Upstream provider %s rate-limited via aggregator — skipping "
@@ -1132,7 +1169,9 @@ def recover_with_credential_pool(
             )
         if current_entry is None:
             current_entry = pool.current()
-        current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
+        current_last_status = (
+            getattr(current_entry, "last_status", None) if current_entry else None
+        )
         if current_last_status == STATUS_EXHAUSTED:
             _ra().logger.info(
                 "Credential already exhausted (last_status=%s) — rotating immediately instead of retrying",
@@ -1205,7 +1244,8 @@ def recover_with_credential_pool(
         if (
             not is_entitlement
             and status_code == 403
-            and "oauth authentication is currently not allowed for this organization" in _auth_haystack
+            and "oauth authentication is currently not allowed for this organization"
+            in _auth_haystack
         ):
             is_entitlement = True
         if (
@@ -1215,7 +1255,11 @@ def recover_with_credential_pool(
             and getattr(agent, "api_mode", "") == "anthropic_messages"
         ):
             is_entitlement = True
-        if not is_entitlement and status_code == 403 and (agent.provider or "") == "xai-oauth":
+        if (
+            not is_entitlement
+            and status_code == 403
+            and (agent.provider or "") == "xai-oauth"
+        ):
             _is_xai_auth_failure = (
                 "[wke=unauthenticated:" in _auth_haystack
                 or "oauth2 access token could not be validated" in _auth_haystack
@@ -1264,7 +1308,10 @@ def recover_with_credential_pool(
                         refreshed_id,
                     )
                     return False, has_retried_429
-            _ra().logger.info("Credential auth failure — refreshed pool entry %s", getattr(refreshed, 'id', '?'))
+            _ra().logger.info(
+                "Credential auth failure — refreshed pool entry %s",
+                getattr(refreshed, "id", "?"),
+            )
             agent._swap_credential(refreshed)
             return True, has_retried_429
         # Refresh failed — rotate to next credential instead of giving up.
@@ -1283,9 +1330,12 @@ def recover_with_credential_pool(
     return False, has_retried_429
 
 
-
 def try_recover_primary_transport(
-    agent, api_error: Exception, *, retry_count: int, max_retries: int,
+    agent,
+    api_error: Exception,
+    *,
+    retry_count: int,
+    max_retries: int,
 ) -> bool:
     """Attempt one extra primary-provider recovery cycle for transient transport failures.
 
@@ -1333,7 +1383,8 @@ def try_recover_primary_transport(
         if getattr(agent, "client", None) is not None:
             try:
                 agent._retire_shared_openai_client(
-                    agent.client, reason="primary_recovery",
+                    agent.client,
+                    reason="primary_recovery",
                 )
             except Exception:
                 pass
@@ -1352,10 +1403,12 @@ def try_recover_primary_transport(
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
+
             agent._anthropic_api_key = rt["anthropic_api_key"]
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
-                rt["anthropic_api_key"], rt["anthropic_base_url"],
+                rt["anthropic_api_key"],
+                rt["anthropic_base_url"],
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
@@ -1387,8 +1440,8 @@ def try_recover_primary_transport(
         logger.warning("Primary transport recovery failed: %s", e)
         return False
 
-# ── End provider fallback ──────────────────────────────────────────────
 
+# ── End provider fallback ──────────────────────────────────────────────
 
 
 def drop_thinking_only_and_merge_users(
@@ -1417,7 +1470,8 @@ def drop_thinking_only_and_merge_users(
 
     # Pass 1: drop thinking-only assistant turns.
     kept = [
-        m for m in messages
+        m
+        for m in messages
         if not _ra().AIAgent._is_thinking_only_assistant(
             m,
             drop_codex_reasoning_items=drop_codex_reasoning_items,
@@ -1432,11 +1486,7 @@ def drop_thinking_only_and_merge_users(
     merges = 0
     for m in kept:
         prev = merged[-1] if merged else None
-        if (
-            prev is not None
-            and prev.get("role") == "user"
-            and m.get("role") == "user"
-        ):
+        if prev is not None and prev.get("role") == "user" and m.get("role") == "user":
             prev_content = prev.get("content", "")
             cur_content = m.get("content", "")
             # Work on a copy of ``prev`` so the caller's input dicts are
@@ -1482,7 +1532,6 @@ def drop_thinking_only_and_merge_users(
         merges,
     )
     return merged
-
 
 
 def restore_primary_runtime(agent) -> bool:
@@ -1533,9 +1582,9 @@ def restore_primary_runtime(agent) -> bool:
     # happens at most once per restore.
     prefetched_primary_pool = None
     try:
-        primary_provider = str(
-            (agent._primary_runtime or {}).get("provider") or ""
-        ).strip().lower()
+        primary_provider = (
+            str((agent._primary_runtime or {}).get("provider") or "").strip().lower()
+        )
         pool = getattr(agent, "_credential_pool", None)
         if not credential_pool_matches_provider(
             pool,
@@ -1574,7 +1623,7 @@ def restore_primary_runtime(agent) -> bool:
         agent.model = rt["model"]
         agent.provider = rt["provider"]
         agent.requested_provider = rt.get("requested_provider", agent.provider)
-        agent.base_url = rt["base_url"]           # setter updates _base_url_lower
+        agent.base_url = rt["base_url"]  # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
@@ -1608,10 +1657,12 @@ def restore_primary_runtime(agent) -> bool:
             agent._anthropic_client = None
         elif agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
+
             agent._anthropic_api_key = rt["anthropic_api_key"]
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
-                rt["anthropic_api_key"], rt["anthropic_base_url"],
+                rt["anthropic_api_key"],
+                rt["anthropic_base_url"],
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
@@ -1644,17 +1695,18 @@ def restore_primary_runtime(agent) -> bool:
         pool = getattr(agent, "_credential_pool", None)
         pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
         pool_matches_primary = pool_provider == primary_provider
-        if (
-            primary_provider == "custom"
-            and pool_provider.startswith("custom:")
-        ):
+        if primary_provider == "custom" and pool_provider.startswith("custom:"):
             try:
                 from agent.credential_pool import get_custom_provider_pool_key
 
                 primary_key = (
-                    get_custom_provider_pool_key(str(rt.get("base_url") or "")) or ""
-                ).strip().lower()
-                pool_matches_primary = bool(primary_key) and primary_key == pool_provider
+                    (get_custom_provider_pool_key(str(rt.get("base_url") or "")) or "")
+                    .strip()
+                    .lower()
+                )
+                pool_matches_primary = (
+                    bool(primary_key) and primary_key == pool_provider
+                )
             except Exception:
                 pool_matches_primary = False
         if pool is not None and pool_provider and not pool_matches_primary:
@@ -1689,7 +1741,9 @@ def restore_primary_runtime(agent) -> bool:
         if pool is not None and pool.has_available():
             entry = pool.select()
             if entry is not None:
-                entry_provider = str(getattr(entry, "provider", "") or "").strip().lower()
+                entry_provider = (
+                    str(getattr(entry, "provider", "") or "").strip().lower()
+                )
                 entry_matches_primary = entry_provider == primary_provider
                 # Custom endpoints all carry the generic ``custom`` provider on
                 # the agent while the pool entry is keyed ``custom:<name>`` (see
@@ -1700,24 +1754,28 @@ def restore_primary_runtime(agent) -> bool:
                 # disambiguates multiple custom providers that share one gateway
                 # base_url. Fixes #56885.
                 from agent.credential_pool import CUSTOM_POOL_PREFIX
-                if (
-                    primary_provider == "custom"
-                    and entry_provider.startswith(CUSTOM_POOL_PREFIX)
+
+                if primary_provider == "custom" and entry_provider.startswith(
+                    CUSTOM_POOL_PREFIX
                 ):
                     entry_matches_primary = False
                     try:
                         from agent.credential_pool import get_custom_provider_pool_key
+
                         primary_base_url = str(rt.get("base_url") or "").strip()
                         primary_key = (
-                            get_custom_provider_pool_key(primary_base_url) or ""
-                        ).strip().lower()
-                        entry_matches_primary = bool(primary_key) and primary_key == entry_provider
+                            (get_custom_provider_pool_key(primary_base_url) or "")
+                            .strip()
+                            .lower()
+                        )
+                        entry_matches_primary = (
+                            bool(primary_key) and primary_key == entry_provider
+                        )
                     except Exception:
                         entry_matches_primary = False
 
-                entry_key = (
-                    getattr(entry, "runtime_api_key", None)
-                    or getattr(entry, "access_token", "")
+                entry_key = getattr(entry, "runtime_api_key", None) or getattr(
+                    entry, "access_token", ""
                 )
                 if entry_key and entry_matches_primary:
                     # ``_swap_credential`` rebuilds the OpenAI/Anthropic client,
@@ -1754,70 +1812,83 @@ def restore_primary_runtime(agent) -> bool:
         # the FALLBACK provider we're leaving; the restored primary deserves
         # a fresh stream attempt before the breaker can trip again.
         from agent.chat_completion_helpers import _reset_stale_streak
+
         _reset_stale_streak(agent)
 
         # Undo the fallback's identity rewrite so the prompt is
         # byte-identical to the stored copy again (prefix cache match).
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
+
         rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
 
         logger.info(
             "Primary runtime restored for new turn: %s (%s)",
-            agent.model, agent.provider,
+            agent.model,
+            agent.provider,
         )
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
 
+
 # Which error types indicate a transient transport failure worth
 # one more attempt with a rebuilt client / connection pool.
 _TRANSIENT_TRANSPORT_ERRORS = frozenset({
-    "ReadTimeout", "ConnectTimeout", "PoolTimeout",
-    "ConnectError", "RemoteProtocolError",
-    "APIConnectionError", "APITimeoutError",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "PoolTimeout",
+    "ConnectError",
+    "RemoteProtocolError",
+    "APIConnectionError",
+    "APITimeoutError",
 })
-
 
 
 def extract_reasoning(agent, assistant_message) -> Optional[str]:
     """
     Extract reasoning/thinking content from an assistant message.
-    
+
     OpenRouter and various providers can return reasoning in multiple formats:
     1. message.reasoning - Direct reasoning field (DeepSeek, Qwen, etc.)
     2. message.reasoning_content - Alternative field (Moonshot AI, Novita, etc.)
     3. message.reasoning_details - Array of {type, summary, ...} objects (OpenRouter unified)
-    
+
     Args:
         assistant_message: The assistant message object from the API response
-        
+
     Returns:
         Combined reasoning text, or None if no reasoning found
     """
     reasoning_parts = []
-    
+
     # Check direct reasoning field
-    if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
+    if hasattr(assistant_message, "reasoning") and assistant_message.reasoning:
         reasoning_parts.append(assistant_message.reasoning)
-    
+
     # Check reasoning_content field (alternative name used by some providers)
-    if hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
+    if (
+        hasattr(assistant_message, "reasoning_content")
+        and assistant_message.reasoning_content
+    ):
         # Don't duplicate if same as reasoning
         if assistant_message.reasoning_content not in reasoning_parts:
             reasoning_parts.append(assistant_message.reasoning_content)
-    
+
     # Check reasoning_details array (OpenRouter unified format)
     # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
-    if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
+    if (
+        hasattr(assistant_message, "reasoning_details")
+        and assistant_message.reasoning_details
+    ):
         for detail in assistant_message.reasoning_details:
             if isinstance(detail, dict):
                 # Extract summary from reasoning detail object
                 summary = (
-                    detail.get('summary')
-                    or detail.get('thinking')
-                    or detail.get('content')
-                    or detail.get('text')
+                    detail.get("summary")
+                    or detail.get("thinking")
+                    or detail.get("content")
+                    or detail.get("text")
                 )
                 if summary and summary not in reasoning_parts:
                     reasoning_parts.append(summary)
@@ -1853,13 +1924,12 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
                 cleaned = block.strip()
                 if cleaned and cleaned not in reasoning_parts:
                     reasoning_parts.append(cleaned)
-    
+
     # Combine all reasoning parts
     if reasoning_parts:
         return "\n\n".join(reasoning_parts)
-    
-    return None
 
+    return None
 
 
 def dump_api_request_debug(
@@ -1902,6 +1972,59 @@ def dump_api_request_debug(
             },
         }
 
+        # ── #73: per-session dump cap + preflight dedup ──────────────────
+        # The preflight call site (conversation_loop.py) fires on EVERY API
+        # call when HERMES_DUMP_REQUESTS is set, with no dedup — that is the
+        # "8 dumps within ~19 s" spam shape (a full multi-hundred-KB snapshot
+        # per call). Content-hash the request body so a re-dump of an identical
+        # payload within the window is skipped, and cap total dumps per session
+        # so a long-lived session cannot flood the logs dir.
+        import hashlib
+
+        _body_for_hash = json.dumps(body, sort_keys=True, default=str)
+        _body_hash = hashlib.sha256(_body_for_hash.encode("utf-8")).hexdigest()[:32]
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _dump_cfg = (load_config_readonly() or {}).get("request_dump") or {}
+        except Exception:
+            _dump_cfg = {}
+        _dedup_window = int(_dump_cfg.get("dedup_window_seconds", 60))
+        _cap = int(_dump_cfg.get("max_dumps_per_session", 8))
+
+        # Per-session cap: at most N dumps per session (0 disables the cap).
+        _dump_count = int(getattr(agent, "_request_dump_count", 0)) + 1
+        agent._request_dump_count = _dump_count
+        if _cap > 0 and _dump_count > _cap:
+            _ra().logger.info(
+                "Suppressing request dump for session %s: cap %d reached",
+                agent.session_id,
+                _cap,
+            )
+            return None
+
+        if error is None:
+            # Preflight dumps (no error) previously bypassed dedup entirely.
+            # Dedup them by (session, reason, body hash) within the window; the
+            # error path below keeps its finer-grained failure-category key.
+            _dump_cache_key = (agent.session_id, reason, _body_hash)
+            _dump_cache = getattr(agent, "_request_dump_cache", None)
+            if _dump_cache is None:
+                _dump_cache = {}
+                agent._request_dump_cache = _dump_cache
+            _now = time.time()
+            _last_dump_time = _dump_cache.get(_dump_cache_key)
+            if _last_dump_time is not None and (_now - _last_dump_time) < _dedup_window:
+                _ra().logger.info(
+                    "Suppressing duplicate request dump for session %s (%s, %s) within %ss",
+                    agent.session_id,
+                    reason,
+                    _body_hash,
+                    _dedup_window,
+                )
+                return None
+            _dump_cache[_dump_cache_key] = _now
+
         if error is not None:
             error_info: Dict[str, Any] = {
                 "type": type(error).__name__,
@@ -1919,10 +2042,14 @@ def dump_api_request_debug(
             response_obj = getattr(error, "response", None)
             if response_obj is not None:
                 try:
-                    error_info["response_status"] = getattr(response_obj, "status_code", None)
+                    error_info["response_status"] = getattr(
+                        response_obj, "status_code", None
+                    )
                     error_info["response_text"] = response_obj.text
                 except Exception as e:
-                    _ra().logger.debug("Could not extract error response details: %s", e)
+                    _ra().logger.debug(
+                        "Could not extract error response details: %s", e
+                    )
 
             # Structured failure category from the shared classifier (#236): so a
             # RuntimeError and a BadRequestError from the same model no longer look
@@ -1949,10 +2076,8 @@ def dump_api_request_debug(
             # dead endpoint wastes disk I/O and can leak identical secrets
             # repeatedly.  Cache the last dump per (session, failure category,
             # request body hash) tuple and skip if the same dump was written
-            # within 60 seconds.
-            import hashlib
-            _body_for_hash = json.dumps(body, sort_keys=True, default=str)
-            _body_hash = hashlib.sha256(_body_for_hash.encode("utf-8")).hexdigest()[:32]
+            # within the dedup window. (`_body_hash` and `_dedup_window` are
+            # computed above, before the error branch.)
             _failure_category = error_info.get("failure_category", "unknown")
             _dump_cache_key = (agent.session_id, _failure_category, _body_hash)
             _dump_cache = getattr(agent, "_request_dump_cache", None)
@@ -1961,12 +2086,13 @@ def dump_api_request_debug(
                 agent._request_dump_cache = _dump_cache
             _now = time.time()
             _last_dump_time = _dump_cache.get(_dump_cache_key)
-            if _last_dump_time is not None and (_now - _last_dump_time) < 60:
+            if _last_dump_time is not None and (_now - _last_dump_time) < _dedup_window:
                 _ra().logger.info(
-                    "Suppressing duplicate request dump for session %s (%s, %s) within 60s",
+                    "Suppressing duplicate request dump for session %s (%s, %s) within %ss",
                     agent.session_id,
                     _failure_category,
                     _body_hash,
+                    _dedup_window,
                 )
                 return None
             _dump_cache[_dump_cache_key] = _now
@@ -1986,21 +2112,27 @@ def dump_api_request_debug(
         # output, then hand the resulting payload back to the shared atomic
         # JSON writer so request dumps keep the same write semantics as before.
         from agent.redact import redact_sensitive_text
-        _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
+
+        _serialized = json.dumps(
+            dump_payload, ensure_ascii=False, indent=2, default=str
+        )
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
 
-        agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
+        agent._vprint(
+            f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}"
+        )
 
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
-            print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))
+            print(
+                json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str)
+            )
 
         return dump_file
     except Exception as dump_error:
         if agent.verbose_logging:
             logger.warning("Failed to dump API request debug payload: %s", dump_error)
         return None
-
 
 
 def _direct_native_anthropic_tool_cache_capability(
@@ -2307,8 +2439,8 @@ def anthropic_prompt_cache_policy(
         return False, False
 
     if isinstance(eff_model, dict):
-        eff_model = eff_model.get('model') or eff_model.get('default') or ''
-    eff_model = eff_model if isinstance(eff_model, str) else str(eff_model or '')
+        eff_model = eff_model.get("model") or eff_model.get("default") or ""
+    eff_model = eff_model if isinstance(eff_model, str) else str(eff_model or "")
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()
     is_claude = "claude" in model_lower
@@ -2320,18 +2452,17 @@ def anthropic_prompt_cache_policy(
     # 1% → 67% → 84% → 97% (#25970).  Reuses the canonical family matcher
     # (covers bare k1./k2./k25 release slugs the substring check missed).
     from agent.anthropic_adapter import _model_name_is_kimi_family
-    is_kimi = (
-        _model_name_is_kimi_family(eff_model) or "moonshot" in model_lower
-    )
+
+    is_kimi = _model_name_is_kimi_family(eff_model) or "moonshot" in model_lower
     is_openrouter = base_url_host_matches(eff_base_url, "openrouter.ai")
     # Nous Portal proxies to OpenRouter behind the scenes — identical
     # OpenAI-wire envelope cache_control semantics. Treat it as an
     # OpenRouter-equivalent endpoint for caching layout purposes.
     is_nous_portal = base_url_host_matches(eff_base_url, "nousresearch.com")
     is_anthropic_wire = eff_api_mode == "anthropic_messages"
-    is_native_anthropic = (
-        is_anthropic_wire
-        and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
+    is_native_anthropic = is_anthropic_wire and (
+        eff_provider == "anthropic"
+        or base_url_hostname(eff_base_url) == "api.anthropic.com"
     )
 
     # A custom Anthropic-compatible route may use a bare model alias that is
@@ -2388,10 +2519,9 @@ def anthropic_prompt_cache_policy(
     # (True, True) above this exclusion.
     # Docs: https://platform.minimax.io/docs/api-reference/text-prompt-caching
     is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
-    is_minimax_host = (
-        base_url_host_matches(eff_base_url, "api.minimax.io")
-        or base_url_host_matches(eff_base_url, "api.minimaxi.com")
-    )
+    is_minimax_host = base_url_host_matches(
+        eff_base_url, "api.minimax.io"
+    ) or base_url_host_matches(eff_base_url, "api.minimaxi.com")
     is_minimax_route = is_minimax_provider or is_minimax_host
     if is_anthropic_wire and is_minimax_route:
         from agent.model_metadata import _model_name_suggests_minimax_m3
@@ -2499,10 +2629,12 @@ def anthropic_prompt_cache_policy(
     return False, False
 
 
-
-def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+def create_openai_client(
+    agent, client_kwargs: dict, *, reason: str, shared: bool
+) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
+
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
     # copies of it) in; any in-place mutation leaks back into the stored dict and is
     # reused on subsequent requests. #10933 hit this by injecting an httpx.Client
@@ -2522,13 +2654,18 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # re-wires the reference relay, see #53802).
     if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
         from agent.moa_loop import build_moa_facade
+
         return build_moa_facade(agent, getattr(agent, "model", None) or "default")
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
-    httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
+    httpx_verify = resolve_httpx_verify(
+        ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg
+    )
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+    if agent.provider == "copilot-acp" or str(
+        client_kwargs.get("base_url", "")
+    ).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
@@ -2540,17 +2677,23 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         )
         return client
     if agent.provider == "gemini":
-        from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+        from agent.gemini_native_adapter import (
+            GeminiNativeClient,
+            is_native_gemini_base_url,
+        )
 
         base_url = str(client_kwargs.get("base_url", "") or "")
         if is_native_gemini_base_url(base_url):
             safe_kwargs = {
-                k: v for k, v in client_kwargs.items()
-                if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+                k: v
+                for k, v in client_kwargs.items()
+                if k
+                in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
             }
             if "http_client" not in safe_kwargs:
                 keepalive_http = agent._build_keepalive_http_client(
-                    base_url, verify=httpx_verify,
+                    base_url,
+                    verify=httpx_verify,
                 )
                 if keepalive_http is not None:
                     safe_kwargs["http_client"] = keepalive_http
@@ -2581,7 +2724,8 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
     if "http_client" not in client_kwargs:
         keepalive_http = agent._build_keepalive_http_client(
-            client_kwargs.get("base_url", ""), verify=httpx_verify,
+            client_kwargs.get("base_url", ""),
+            verify=httpx_verify,
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
@@ -2609,8 +2753,11 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # missing Copilot headers here closes the whole class. We only ADD missing
     # keys — never override headers a caller deliberately set.
     try:
-        if base_url_host_matches(str(client_kwargs.get("base_url", "")), "githubcopilot.com"):
+        if base_url_host_matches(
+            str(client_kwargs.get("base_url", "")), "githubcopilot.com"
+        ):
             from hermes_cli.models import copilot_default_headers
+
             existing = dict(client_kwargs.get("default_headers") or {})
             existing_lower = {k.lower() for k in existing}
             for hk, hv in copilot_default_headers().items():
@@ -2631,7 +2778,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(agent, new_model, new_provider, api_key="", base_url="", api_mode=""):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2778,12 +2925,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._credential_pool_entry_id = None
             try:
                 from agent.credential_pool import load_pool
+
                 agent._credential_pool = load_pool(new_provider)
             except Exception as _pool_exc:  # noqa: BLE001
                 logger.warning(
                     "switch_model: credential pool reload failed for %s (%s); "
                     "continuing without pool rotation this turn",
-                    new_provider, _pool_exc,
+                    new_provider,
+                    _pool_exc,
                 )
         # ── Build new client ──
         if (new_provider or "").strip().lower() == "moa":
@@ -2811,21 +2960,32 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 resolve_anthropic_token,
                 _is_oauth_token,
             )
+
             # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
             # API key — falling back would send Anthropic credentials to third-party endpoints.
             _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or agent.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or agent.api_key or "")
+            effective_key = (
+                (api_key or agent.api_key or resolve_anthropic_token() or "")
+                if _is_native_anthropic
+                else (api_key or agent.api_key or "")
+            )
 
             # MiniMax OAuth: swap static string for a per-request callable token
             # provider so the rebuilt client survives 15-min token expiry. See
             # the matching block in agent_init.py for the full rationale.
-            if new_provider == "minimax-oauth" and isinstance(effective_key, str) and effective_key:
+            if (
+                new_provider == "minimax-oauth"
+                and isinstance(effective_key, str)
+                and effective_key
+            ):
                 try:
                     from hermes_cli.auth import build_minimax_oauth_token_provider
+
                     effective_key = build_minimax_oauth_token_provider()
                 except Exception as _mm_exc:  # noqa: BLE001
                     import logging as _logging
+
                     _logging.getLogger(__name__).warning(
                         "MiniMax OAuth: failed to install per-request token provider "
                         "on switch (%s); using static bearer.",
@@ -2834,12 +2994,19 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
-            agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
+            agent._anthropic_base_url = base_url or getattr(
+                agent, "_anthropic_base_url", None
+            )
             agent._anthropic_client = build_anthropic_client(
-                effective_key, agent._anthropic_base_url,
+                effective_key,
+                agent._anthropic_base_url,
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
-            agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
+            agent._is_anthropic_oauth = (
+                _is_oauth_token(effective_key)
+                if (_is_native_anthropic and isinstance(effective_key, str))
+                else False
+            )
             agent.client = None
             agent._client_kwargs = {}
         else:
@@ -2866,7 +3033,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                     get_compatible_custom_providers(load_config_readonly()),
                 )
             except Exception:
-                logger.debug("custom-provider TLS resolution skipped on switch_model", exc_info=True)
+                logger.debug(
+                    "custom-provider TLS resolution skipped on switch_model",
+                    exc_info=True,
+                )
             _sm_timeout = get_provider_request_timeout(agent.provider, agent.model)
             if _sm_timeout is not None:
                 agent._client_kwargs["timeout"] = _sm_timeout
@@ -2944,9 +3114,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         from agent.model_metadata import get_model_context_length
+
         if _sm_custom_providers is None:
             try:
-                from hermes_cli.config import get_compatible_custom_providers, load_config
+                from hermes_cli.config import (
+                    get_compatible_custom_providers,
+                    load_config,
+                )
+
                 _sm_custom_providers = get_compatible_custom_providers(load_config())
             except Exception:
                 _sm_custom_providers = None
@@ -2986,10 +3161,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s",
-            agent.model, agent.reasoning_config,
+            agent.model,
+            agent.reasoning_config,
         )
     except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+        logger.debug(
+            "switch_model: could not re-resolve reasoning_config: %s", _reasoning_err
+        )
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
@@ -3000,10 +3178,15 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # selected (healthy) provider would keep short-circuiting before any
     # stream is even attempted.
     from agent.chat_completion_helpers import _reset_stale_streak
+
     _reset_stale_streak(agent)
 
     # ── Update _primary_runtime so the change persists across turns ──
-    _cc = agent.context_compressor if hasattr(agent, "context_compressor") and agent.context_compressor else None
+    _cc = (
+        agent.context_compressor
+        if hasattr(agent, "context_compressor") and agent.context_compressor
+        else None
+    )
     agent._primary_runtime = {
         "model": agent.model,
         "provider": agent.provider,
@@ -3014,13 +3197,21 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
-        "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
+        "reasoning_config": dict(agent.reasoning_config)
+        if getattr(agent, "reasoning_config", None)
+        else None,
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
-        "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
+        "compressor_base_url": getattr(_cc, "base_url", agent.base_url)
+        if _cc
+        else agent.base_url,
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
-        "compressor_provider": getattr(_cc, "provider", agent.provider) if _cc else agent.provider,
+        "compressor_provider": getattr(_cc, "provider", agent.provider)
+        if _cc
+        else agent.provider,
         "compressor_context_length": _cc.context_length if _cc else 0,
-        "compressor_api_mode": getattr(_cc, "api_mode", agent.api_mode) if _cc else agent.api_mode,
+        "compressor_api_mode": getattr(_cc, "api_mode", agent.api_mode)
+        if _cc
+        else agent.api_mode,
         "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
     }
     if api_mode == "anthropic_messages":
@@ -3046,7 +3237,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
     if old_norm and new_norm and old_norm != new_norm:
         fallback_chain = [
-            entry for entry in fallback_chain
+            entry
+            for entry in fallback_chain
             if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}
         ]
     agent._fallback_chain = fallback_chain
@@ -3054,7 +3246,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
-        old_model, old_provider, new_model, new_provider,
+        old_model,
+        old_provider,
+        new_model,
+        new_provider,
     )
 
     # ── Persist billing route to session DB ──
@@ -3080,12 +3275,18 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
 
-def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
-                 tool_call_id: Optional[str] = None, messages: list = None,
-                 pre_tool_block_checked: bool = False,
-                 skip_tool_request_middleware: bool = False,
-                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
-                 skip_tool_execution_middleware: bool = False) -> str:
+def invoke_tool(
+    agent,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    tool_call_id: Optional[str] = None,
+    messages: list = None,
+    pre_tool_block_checked: bool = False,
+    skip_tool_request_middleware: bool = False,
+    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    skip_tool_execution_middleware: bool = False,
+) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -3119,8 +3320,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not pre_tool_block_checked:
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+
             block_message, modified_args = _dispatch_pre_tool_call_hooks(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 tool_call_id=tool_call_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
@@ -3135,6 +3339,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:
             from model_tools import _emit_post_tool_call_hook
+
             _emit_post_tool_call_hook(
                 function_name=function_name,
                 function_args=function_args,
@@ -3159,6 +3364,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         hook_args = observed_args if isinstance(observed_args, dict) else function_args
         try:
             from model_tools import _emit_post_tool_call_hook
+
             _emit_post_tool_call_hook(
                 function_name=function_name,
                 function_args=hook_args,
@@ -3176,8 +3382,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         return result
 
     if function_name == "todo":
+
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
+
             return _finish_agent_tool(
                 _todo_tool(
                     todos=next_args.get("todos"),
@@ -3186,13 +3394,23 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+
     elif function_name == "session_search":
+
         def _execute(next_args: dict) -> Any:
             session_db = agent._get_session_db_for_recall()
             if not session_db:
                 from hermes_state import format_session_db_unavailable
-                return _finish_agent_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}), next_args)
+
+                return _finish_agent_tool(
+                    json.dumps({
+                        "success": False,
+                        "error": format_session_db_unavailable(),
+                    }),
+                    next_args,
+                )
             from tools.session_search_tool import session_search as _session_search
+
             return _finish_agent_tool(
                 _session_search(
                     query=next_args.get("query", ""),
@@ -3208,11 +3426,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+
     elif function_name == "memory":
+
         def _execute(next_args: dict) -> Any:
             target = next_args.get("target", "memory")
             operations = next_args.get("operations")
             from tools.memory_tool import memory_tool as _memory_tool
+
             result = _memory_tool(
                 action=next_args.get("action"),
                 target=target,
@@ -3234,12 +3455,20 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
+
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
+
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            return _finish_agent_tool(
+                agent._memory_manager.handle_tool_call(function_name, next_args),
+                next_args,
+            )
+
     elif function_name == "clarify":
+
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool
+
             return _finish_agent_tool(
                 _clarify_tool(
                     question=next_args.get("question", ""),
@@ -3249,9 +3478,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+
     elif function_name == "read_terminal":
+
         def _execute(next_args: dict) -> Any:
-            from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
+            from tools.read_terminal_tool import (
+                read_terminal_tool as _read_terminal_tool,
+            )
+
             return _finish_agent_tool(
                 _read_terminal_tool(
                     start_line=next_args.get("start_line"),
@@ -3260,9 +3494,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+
     elif function_name == "read_preview":
+
         def _execute(next_args: dict) -> Any:
             from tools.read_preview_tool import read_preview_tool as _read_preview_tool
+
             return _finish_agent_tool(
                 _read_preview_tool(
                     start=next_args.get("start"),
@@ -3271,18 +3508,26 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+
     elif function_name == "read_window_below":
+
         def _execute(next_args: dict) -> Any:
-            from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
+            from tools.read_window_tool import (
+                read_window_below_tool as _read_window_below_tool,
+            )
+
             return _finish_agent_tool(
                 _read_window_below_tool(
                     callback=getattr(agent, "read_window_below_callback", None),
                 ),
                 next_args,
             )
+
     elif function_name == "setup_mcp":
+
         def _execute(next_args: dict) -> Any:
             from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool
+
             return _finish_agent_tool(
                 _setup_mcp_tool(
                     server=next_args.get("server", ""),
@@ -3292,15 +3537,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+
     elif function_name == "delegate_task":
+
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+            return _finish_agent_tool(
+                agent._dispatch_delegate_task(next_args), next_args
+            )
+
     elif function_name == "compact_context":
         # Agent-driven context compaction (#1568 SelfCompact). The model
         # decides when to compact (not just the threshold trigger) and may
         # pass a focus topic the summariser should prioritise.
         def _execute(next_args: dict) -> Any:
             from tools.compact_context_tool import compact_context_tool as _cc
+
             return _finish_agent_tool(
                 _cc(
                     focus_topic=next_args.get("focus_topic", ""),
@@ -3309,7 +3560,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+
     else:
+
         def _execute(next_args: dict) -> Any:
             # #2237 (Slice B) — replay-or-fork: before executing a non-atomic
             # tool, check whether this exact semantic intent already succeeded
@@ -3328,6 +3581,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             # Guarded by is_non_atomic() because record() raises for atomic tools.
             try:
                 from tools.tool_call_log import get_default_log, is_non_atomic
+
                 if is_non_atomic(function_name):
                     get_default_log().record(function_name, next_args)
             except Exception:
@@ -3337,7 +3591,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                enabled_tools=list(agent.valid_tool_names)
+                if agent.valid_tool_names
+                else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
@@ -3361,7 +3617,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        lambda next_args: _execute(
+            next_args if isinstance(next_args, dict) else function_args
+        ),
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
@@ -3369,7 +3627,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
     )
-
 
 
 def repair_tool_call(agent, tool_name: str) -> str | None:
@@ -3466,7 +3723,6 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     return None
 
 
-
 # Placeholder substituted for an empty non-final message that would otherwise
 # make the provider reject the whole request. Kept identical to the stub-
 # creation placeholder in chat_completion_helpers so a healed transcript reads
@@ -3503,7 +3759,10 @@ def _msg_has_payload(msg: Dict[str, Any]) -> bool:
     # Structural payloads that make an "empty-content" message still valid.
     if msg.get("tool_calls"):
         return True
-    if isinstance(msg.get("reasoning_content"), str) and msg["reasoning_content"].strip():
+    if (
+        isinstance(msg.get("reasoning_content"), str)
+        and msg["reasoning_content"].strip()
+    ):
         return True
     if msg.get("reasoning") or msg.get("reasoning_details"):
         return True
@@ -3680,7 +3939,11 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         for tc in tcs:
             if isinstance(tc, dict):
                 fn = tc.get("function")
-                name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+                name = (
+                    fn.get("name")
+                    if isinstance(fn, dict)
+                    else getattr(fn, "name", None)
+                )
             else:
                 fn = getattr(tc, "function", None)
                 name = getattr(fn, "name", None) if fn else None
@@ -3721,8 +3984,12 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     orphaned_results = result_call_ids - surviving_call_ids
     if orphaned_results:
         messages = [
-            m for m in messages
-            if not (m.get("role") == "tool" and (m.get("tool_call_id") or "").strip() in orphaned_results)
+            m
+            for m in messages
+            if not (
+                m.get("role") == "tool"
+                and (m.get("tool_call_id") or "").strip() in orphaned_results
+            )
         ]
         _ra().logger.debug(
             "Pre-call sanitizer: removed %d orphaned tool result(s)",
@@ -3799,7 +4066,6 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return messages
 
 
-
 def looks_like_codex_intermediate_ack(
     agent,
     user_message: Any,
@@ -3830,7 +4096,10 @@ def looks_like_codex_intermediate_ack(
         return False
 
     has_future_ack = bool(
-        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+        re.search(
+            r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b",
+            assistant_text,
+        )
     )
     if not has_future_ack:
         return False
@@ -3872,7 +4141,9 @@ def looks_like_codex_intermediate_ack(
         "path",
     )
 
-    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
+    assistant_mentions_action = any(
+        marker in assistant_text for marker in action_markers
+    )
     if not assistant_mentions_action:
         return False
 
@@ -3919,13 +4190,21 @@ def intent_ack_continuation_mode(agent) -> str:
     """
     mode = getattr(agent, "_intent_ack_continuation", "auto")
 
-    if mode is True or (isinstance(mode, str) and mode.lower() in {"true", "always", "yes", "on"}):
+    if mode is True or (
+        isinstance(mode, str) and mode.lower() in {"true", "always", "yes", "on"}
+    ):
         return "all"
-    if mode is False or (isinstance(mode, str) and mode.lower() in {"false", "never", "no", "off"}):
+    if mode is False or (
+        isinstance(mode, str) and mode.lower() in {"false", "never", "no", "off"}
+    ):
         return "off"
     if isinstance(mode, list):
         model_lower = (agent.model or "").lower()
-        return "all" if any(p.lower() in model_lower for p in mode if isinstance(p, str)) else "off"
+        return (
+            "all"
+            if any(p.lower() in model_lower for p in mode if isinstance(p, str))
+            else "off"
+        )
     # "auto" or any unrecognised value — historical codex-only behavior.
     return "codex_only" if agent.api_mode == "codex_responses" else "off"
 
@@ -3940,8 +4219,6 @@ def intent_ack_continuation_enabled(agent) -> bool:
     directly (``"codex_only"`` ⇒ require_workspace=True, ``"all"`` ⇒ False).
     """
     return intent_ack_continuation_mode(agent) != "off"
-
-
 
 
 def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:
@@ -3989,9 +4266,7 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     """
     from agent.message_sanitization import reapply_reasoning_echo
 
-    return reapply_reasoning_echo(
-        api_messages, agent._needs_thinking_reasoning_pad()
-    )
+    return reapply_reasoning_echo(api_messages, agent._needs_thinking_reasoning_pad())
 
 
 def _iter_httpx_pool_objects(http_client: Any):
@@ -4099,9 +4374,8 @@ def _iter_pool_sockets(client: Any):
                 connections.append(conn)
         for conn in connections:
             for candidate in _connection_candidates(conn):
-                stream = (
-                    getattr(candidate, "_network_stream", None)
-                    or getattr(candidate, "_stream", None)
+                stream = getattr(candidate, "_network_stream", None) or getattr(
+                    candidate, "_stream", None
                 )
                 if stream is None:
                     continue
@@ -4125,6 +4399,7 @@ def _iter_pool_sockets(client: Any):
                     if callable(extra):
                         try:
                             from anyio.abc import SocketAttribute
+
                             sock = extra(SocketAttribute.raw_socket)
                         except Exception:
                             sock = None
@@ -4154,6 +4429,7 @@ def cleanup_dead_connections(agent) -> bool:
         for sock in _iter_pool_sockets(client):
             # Probe socket health with a non-blocking recv peek
             import socket as _socket
+
             try:
                 sock.setblocking(False)
                 data = sock.recv(1, _socket.MSG_PEEK | _socket.MSG_DONTWAIT)
@@ -4178,7 +4454,6 @@ def cleanup_dead_connections(agent) -> bool:
     except Exception as exc:
         _ra().logger.debug("Dead connection check error: %s", exc)
     return False
-
 
 
 def extract_api_error_context(error: Exception) -> Dict[str, Any]:
@@ -4233,10 +4508,14 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     if "reset_at" not in context:
         message = context.get("message") or ""
         if isinstance(message, str):
-            delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
+            delay_match = re.search(
+                r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE
+            )
             if delay_match:
                 value = float(delay_match.group(1))
-                seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
+                seconds = (
+                    value / 1000.0 if delay_match.group(2).lower() == "ms" else value
+                )
                 context["reset_at"] = time.time() + seconds
             else:
                 resets_in_match = re.search(
@@ -4251,7 +4530,9 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                     hours = float(resets_in_match.group(1) or 0)
                     minutes = float(resets_in_match.group(2) or 0)
                     seconds = float(resets_in_match.group(3) or 0)
-                    context["reset_at"] = time.time() + (hours * 3600) + (minutes * 60) + seconds
+                    context["reset_at"] = (
+                        time.time() + (hours * 3600) + (minutes * 60) + seconds
+                    )
                 else:
                     sec_match = re.search(
                         r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
@@ -4264,8 +4545,9 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     return context
 
 
-
-def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
+def apply_pending_steer_to_tool_results(
+    agent, messages: list, num_tool_msgs: int
+) -> None:
     """Append any pending /steer text to the last tool result in this turn.
 
     Called at the end of a tool-call batch, before the next API call.
@@ -4306,7 +4588,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
                     agent._pending_steer = steer_text
         else:
             existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+            agent._pending_steer = (
+                (existing + "\n" + steer_text) if existing else steer_text
+            )
         return
     marker = format_steer_marker(steer_text)
     existing_content = messages[target_idx].get("content", "")
@@ -4327,7 +4611,6 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
-
 
 
 def force_close_tcp_sockets(client: Any) -> int:
@@ -4391,7 +4674,6 @@ def force_close_tcp_sockets(client: Any) -> int:
     except Exception as exc:
         _ra().logger.debug("Force-close TCP sockets sweep error: %s", exc)
     return shutdown_count
-
 
 
 __all__ = [
