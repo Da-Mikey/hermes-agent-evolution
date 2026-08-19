@@ -6715,14 +6715,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if structured is not None or meta is not None:
                 payload: Dict[str, Any] = {}
                 if text_result:
-                    return json.dumps(
-                        {
-                            "result": text_result,
-                            "structuredContent": structured,
-                        },
-                        ensure_ascii=False,
-                    )
-                return json.dumps({"result": structured}, ensure_ascii=False)
+                    payload["result"] = text_result
+                if structured is not None:
+                    if text_result:
+                        payload["structuredContent"] = structured
+                    else:
+                        payload["result"] = structured
+                if meta is not None:
+                    payload["_meta"] = meta
+                if "result" not in payload:
+                    payload["result"] = text_result
+                try:
+                    return json.dumps(payload, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    # Non-serializable metadata: drop the extras rather than
+                    # failing the whole tool call.
+                    return json.dumps({"result": text_result}, ensure_ascii=False)
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():

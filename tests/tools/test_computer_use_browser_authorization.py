@@ -239,10 +239,14 @@ def test_dispatch_does_not_forward_removed_approval_token():
     assert kwargs["profile_mode"] == "existing_profile"
 
 
-def test_schema_does_not_expose_approval_token():
+def test_schema_exposes_approval_token():
+    """Fork: approval_token IS in the public schema — the browser-approve
+    flow (`hermes computer-use browser-approve`) mints a five-minute
+    single-use token the model passes here to attach to a browser; upstream
+    moved it out-of-band, the fork keeps the explicit in-band boundary."""
     from tools.computer_use.schema import COMPUTER_USE_SCHEMA
 
-    assert "approval_token" not in COMPUTER_USE_SCHEMA["parameters"]["properties"]
+    assert "approval_token" in COMPUTER_USE_SCHEMA["parameters"]["properties"]
 
 
 # ── bounded embedded daemon ─────────────────────────────────────────────
