@@ -149,6 +149,10 @@ platforms:
         - sensor.cpu_usage
         - sensor.memory_usage
       cooldown_seconds: 30
+      # Suppress repeat toggles of the same entity to the same state within
+      # this window (dedupes presence/location-tracker flaps before they
+      # reach the LLM; `0` disables). Default: 60.
+      flap_suppression_seconds: 60
 ```
 
 | Setting | Default | Description |
@@ -158,6 +162,7 @@ platforms:
 | `watch_all` | `false` | Set to `true` to receive **all** state changes (not recommended for most setups) |
 | `ignore_entities` | *(none)* | Always ignore these entities (applied before domain/entity filters) |
 | `cooldown_seconds` | `30` | Minimum seconds between events for the same entity |
+| `flap_suppression_seconds` | `60` | Suppress repeat toggles of the same entity to the same state within this window before they reach the LLM (`0` disables; unparseable values fall back to `60`) |
 
 :::tip
 Start with a focused set of domains — `climate`, `binary_sensor`, and `alarm_control_panel` cover the most useful automations. Add more as needed. Use `ignore_entities` to suppress noisy sensors like CPU temperature or uptime counters.
