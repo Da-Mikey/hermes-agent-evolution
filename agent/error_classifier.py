@@ -12,7 +12,10 @@ that the main retry loop in run_agent.py consults for every API failure.
 from __future__ import annotations
 
 import enum
+import errno
 import logging
+import re
+import socket
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -598,6 +601,43 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APITimeoutError",
 })
 
+# Environmental network-failure fail-fast set (#74) — TYPED errno matching.
+#
+# DNS / routing / reachability failures are environmental, not
+# provider-side: retrying the identical payload N times cannot succeed while
+# the environment is broken, and only amplifies a transient outage into a
+# retry storm that burns tokens, delays scheduled jobs, and floods the
+# error-capture store. Match on the ``.errno`` ATTRIBUTE (set by the
+# OS/socket layer), never on bare "errno -2" substring text — a tool error
+# like ``OSError("tool reported errno -2 from its own syscall...")`` carries
+# no errno attribute and must stay retryable.
+_ENV_NETWORK_FAILFAST_ERRNOS = frozenset(
+    {
+        socket.EAI_NONAME,  # -2  Name or service not known — definitive DNS miss
+        socket.EAI_FAIL,  # -4  Non-recoverable failure in name resolution
+        errno.EHOSTUNREACH,  # 113 No route to host — routing failure
+        errno.ENETUNREACH,  # 101 Network is unreachable
+    }
+)
+# EAI_AGAIN (-3, "temporary failure in name resolution") is deliberately
+# EXCLUDED: it is transient by definition and a 1-2s retry usually succeeds.
+
+# Anchored message-pattern fallback for SDK-wrapped shapes that lost the
+# typed errno — e.g. openai.APIConnectionError whose __cause__ chain holds an
+# httpx.ConnectError stringified from the socket error, or a Node bridge's
+# "getaddrinfo ENOTFOUND <host>". Word-boundary-bounded tokens / full
+# phrases only — never bare "errno N" substring scans, which misclassify
+# unrelated errors that merely quote errno text.
+_ENV_NETWORK_FAILFAST_MESSAGE_PATTERNS = (
+    re.compile(r"\bname or service not known\b"),
+    re.compile(r"\bgetaddrinfo\s+failed\b"),
+    re.compile(r"\bENOTFOUND\b"),
+    re.compile(r"\bno route to host\b"),
+    re.compile(r"\bnetwork is unreachable\b"),
+    re.compile(r"\bEHOSTUNREACH\b"),
+    re.compile(r"\bENETUNREACH\b"),
+)
+
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
 # transient transport hiccup OR server-side context overflow rejection
@@ -670,6 +710,72 @@ _SSL_TRANSIENT_PATTERNS = [
     # Python ssl module prefix, e.g. "[SSL: BAD_RECORD_MAC]"
     "[ssl:",
 ]
+
+
+# ── Environmental network-failure detection (#74) ───────────────────────
+
+
+def _iter_exception_chain(error: BaseException):
+    """Yield ``error`` and every exception reachable via ``__cause__`` /
+    ``__context__`` links, deduplicated.
+
+    SDKs wrap the underlying transport failure: openai.APIConnectionError
+    carries the httpx.ConnectError as its ``__cause__``, which in turn
+    carries the originating ``socket.gaierror``. The classifier must look
+    through those wrappers to find the typed error — ``str()`` of the
+    top-level wrapper is just "Connection error.".
+    """
+    seen = set()
+    stack: list[Optional[BaseException]] = [error]
+    while stack:
+        exc = stack.pop()
+        if exc is None or id(exc) in seen:
+            continue
+        seen.add(id(exc))
+        yield exc
+        stack.append(exc.__cause__)
+        stack.append(exc.__context__)
+
+
+def _is_environmental_network_failure(error: BaseException, error_msg: str) -> bool:
+    """True when the failure is environmental (DNS / routing / reachability).
+
+    Matching is TYPED — never a bare substring scan of "errno -2" /
+    "errno -3" / "errno 113" text, which misclassifies unrelated errors
+    (e.g. ``OSError("tool reported errno -2 from its own syscall...")``)
+    as environmental network failures.
+
+    1. Any exception in the cause/context chain that is OSError-family
+       (``socket.gaierror`` subclasses ``OSError``) whose ``.errno`` is one
+       of the environmental codes fails fast. ``errno`` attributes are set
+       by the OS/socket layer and cannot be spoofed by message text.
+    2. Anchored message patterns as a fallback ONLY for non-OSError SDK
+       transport wrappers (e.g. openai.APIConnectionError) whose chain
+       carries the DNS/route text without a typed errno — e.g. an
+       ``httpx.ConnectError`` whose message is "[Errno -2] Name or service
+       not known" but whose underlying socket error object was consumed, or
+       a Node bridge's "getaddrinfo ENOTFOUND <host>". Plain OSErrors are
+       deliberately excluded from the message fallback: a real OS failure
+       always sets ``.errno``, and message-only OSErrors (including tool
+       errors that quote errno text) stay retryable.
+
+    EAI_AGAIN ("temporary failure in name resolution", errno -3) is
+    deliberately NOT in the fail-fast set — it is transient by definition
+    and a short retry usually succeeds, so it must stay retryable.
+    """
+    chain = list(_iter_exception_chain(error))
+    for exc in chain:
+        if isinstance(exc, OSError) and exc.errno in _ENV_NETWORK_FAILFAST_ERRNOS:
+            return True
+    if isinstance(error, OSError):
+        return False
+    parts = [error_msg]
+    for exc in chain:
+        text = str(exc).lower()
+        if text and text not in parts:
+            parts.append(text)
+    haystack = " ".join(parts)
+    return any(p.search(haystack) for p in _ENV_NETWORK_FAILFAST_MESSAGE_PATTERNS)
 
 
 # ── Classification pipeline ─────────────────────────────────────────────
@@ -1087,6 +1193,26 @@ def classify_api_error(
         and "consecutive stale attempts" in error_msg
         and "aborting this call" in error_msg
     ):
+        return _result(
+            FailoverReason.timeout,
+            retryable=False,
+            should_fallback=True,
+        )
+
+    # ── 7c. Environmental network failures → fail fast (#74) ────────
+    # DNS resolution / routing / reachability failures are environmental,
+    # not provider-side: the identical request cannot succeed while the
+    # environment is broken, so the full fixed retry count only amplifies a
+    # transient outage into a retry storm (and, for scheduled jobs, a wall of
+    # failure records + request snapshots). Fail fast with a fallback to the
+    # next provider — if the environment is truly down the fallback also
+    # fails fast, and the loop surfaces a clear reason instead of silently
+    # burning the budget. Checked BEFORE §8 so an SDK-wrapped DNS failure
+    # (e.g. openai.APIConnectionError) does not fall through to the
+    # retryable transport bucket.
+    if (
+        isinstance(error, OSError) or error_type in _TRANSPORT_ERROR_TYPES
+    ) and _is_environmental_network_failure(error, error_msg):
         return _result(
             FailoverReason.timeout,
             retryable=False,
