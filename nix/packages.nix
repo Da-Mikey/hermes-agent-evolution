@@ -54,8 +54,6 @@
           }).node-gyp;
         default = full;
 
-        inherit sandbox;
-
         inherit minimal;
 
         # Ships discord.py + python-telegram-bot + slack-sdk so a plain
@@ -70,6 +68,14 @@
         desktop = full.hermesDesktop;
 
         update-npm-lockfile = full.hermesNpmLib.updateNpmLockfile;
-      };
+      }
+      # The dev sandbox is Linux-only: it pulls bubblewrap/slirp4netns (and
+      # the X11 electron runtime) unconditionally, and nixpkgs refuses to
+      # evaluate those on darwin. Gate the package to Linux so
+      # `nix flake check` on macOS stops failing with "Refusing to evaluate
+      # package 'bubblewrap-0.11.2' ... not available on the requested
+      # hostPlatform" (#79). The `let`-bound `sandbox` stays lazy, so it is
+      # never forced on darwin.
+      // lib.optionalAttrs pkgs.stdenv.isLinux { inherit sandbox; };
     };
 }

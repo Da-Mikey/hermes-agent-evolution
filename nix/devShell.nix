@@ -27,7 +27,6 @@
             mkdir -p $out/bin
             install -Dm755 ${../hermes} $out/bin/hermes
           '')
-          self'.packages.sandbox
           uv
         ]
         # The Wayland E2E capture stack is Linux-only — `cage` and `grim` carry
@@ -37,6 +36,9 @@
         # workflows/nix.yml, ubuntu + macos), and upstream has no such job.
         # nix/hermes-agent.nix already guards its own `cage` the same way.
         ++ lib.optionals stdenv.isLinux [
+          # The dev sandbox (bubblewrap/slirp4netns) is Linux-only — see
+          # nix/packages.nix. Keep it out of the darwin devShell evaluation.
+          self'.packages.sandbox
           # Headless Wayland compositor for E2E tests (test:e2e:visual).
           # cage renders a single client with no window management, so
           # the Electron window opens at a fixed size without tiling.
