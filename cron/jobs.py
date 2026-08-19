@@ -964,6 +964,97 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     return None
 
 
+def _failure_backoff_config() -> Dict[str, Any]:
+    """Return the ``cron`` config section for failure-backoff tuning (#70).
+
+    Read-only: uses ``load_config_readonly`` so the hot path (every job run)
+    does not pay the defensive deepcopy. A missing config yields an empty
+    dict so all call sites fall back to their built-in defaults.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+        return cron_cfg if isinstance(cron_cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+# #70: last_status values recording a SYNTHETIC failure — scheduler restart
+# / forced release — rather than a real agent failure. These must never feed
+# the failure-streak circuit breaker: a restart mid-run (or a stale in-flight
+# claim force-released by the scheduler) is not evidence the job is
+# deterministically broken, and counting it would let scheduler restarts
+# false-positive auto-pause a healthy job.
+_SYNTHETIC_FAILURE_STATUSES = frozenset({"interrupted", "released"})
+
+
+def _failure_backoff_max_skips() -> int:
+    """Resolve ``cron.failure_backoff_max_skips`` (default 16).
+
+    A non-int value in config.yaml degrades to the default instead of
+    crashing the failure path of ``_mark_job_run_locked`` (#70).
+    """
+    try:
+        return int(_failure_backoff_config().get("failure_backoff_max_skips", 16))
+    except (TypeError, ValueError):
+        return 16
+
+
+def _failure_auto_pause_threshold() -> int:
+    """Resolve ``cron.failure_auto_pause_threshold`` (default 10).
+
+    A non-int value in config.yaml degrades to the default instead of
+    crashing the failure path of ``_mark_job_run_locked`` (#70).
+    """
+    try:
+        return int(_failure_backoff_config().get("failure_auto_pause_threshold", 10))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _advance_schedule_by_steps(
+    schedule: Dict[str, Any],
+    from_iso: str,
+    n_steps: int,
+) -> Optional[str]:
+    """Advance ``from_iso`` forward by ``n_steps`` schedule slots.
+
+    Used by #70 to skip scheduled runs after identical consecutive failures:
+    instead of running on the very next slot, the job is pushed out by
+    ``failure_backoff_skips`` slots. Returns ``from_iso`` unchanged when the
+    schedule kind is unsupported or the step count is non-positive.
+    """
+    if n_steps <= 0:
+        return from_iso
+    if not isinstance(schedule, dict):
+        return from_iso
+    kind = schedule.get("kind")
+    try:
+        base = _ensure_aware(datetime.fromisoformat(from_iso))
+    except Exception:
+        base = _hermes_now()
+
+    if kind == "interval":
+        minutes = schedule.get("minutes")
+        if minutes is None:
+            return from_iso
+        return (base + timedelta(minutes=minutes * n_steps)).isoformat()
+
+    if kind == "cron":
+        expr = schedule.get("expr")
+        if not expr or not _ensure_croniter():
+            return from_iso
+        cron = croniter(expr, base)
+        result = base
+        for _ in range(n_steps):
+            result = cron.get_next(datetime)
+        return result.isoformat()
+
+    return from_iso
+
+
 # =============================================================================
 # Ticker heartbeat (liveness signal for `hermes cron status`)
 # =============================================================================
@@ -2081,6 +2172,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            # #70: an update that transitions the job into an enabled,
+            # scheduled state is an operator re-enable — clear the failure
+            # streak so the auto-pause circuit breaker doesn't re-trip on a
+            # stale deterministic-failure chain (e.g. a dashboard/API update
+            # flipping enabled back on). Updates that leave the job disabled
+            # or paused, or that merely edit an already-live job, keep the
+            # streak intact.
+            if (
+                updated.get("enabled", True)
+                and updated.get("state") != "paused"
+                and (not job.get("enabled") or job.get("state") == "paused")
+            ):
+                updated["failure_streak"] = 0
+                updated.pop("failure_backoff_skips", None)
+
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -2123,6 +2229,11 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            # #70: a manual resume is an explicit "try again" — clear the
+            # failure streak so a single immediate failure doesn't re-trip the
+            # auto-pause circuit breaker on a stale streak.
+            "failure_streak": 0,
+            "failure_backoff_skips": None,
             "next_run_at": next_run_at,
         },
     )
@@ -2140,6 +2251,11 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            # #70: a manual trigger is an explicit re-enable — clear the
+            # failure streak so a single immediate failure doesn't re-trip
+            # the auto-pause circuit breaker on a stale streak.
+            "failure_streak": 0,
+            "failure_backoff_skips": None,
             "next_run_at": _hermes_now().isoformat(),
         },
     )
@@ -2320,6 +2436,7 @@ def _mark_job_run_locked(
                         )
                         return False
                 now = _hermes_now().isoformat()
+                _prev_err = job.get("last_error")
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
@@ -2334,6 +2451,33 @@ def _mark_job_run_locked(
                     job.pop("drift_alerted", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # #70: per-job failure accounting (exponential backoff + circuit
+                # breaker). An error byte-identical to the previous run is
+                # deterministic: the fixed schedule re-running it only burns
+                # tokens/disk and floods the failure store. Backoff skips
+                # 2**(streak-1)-1 scheduled slots (capped, see
+                # failure_backoff_max_skips); a changed error or a success
+                # resets the streak. Synthetic failures (interruption / forced
+                # release — status in _SYNTHETIC_FAILURE_STATUSES) never touch
+                # the streak: a scheduler restart mid-run is not evidence the
+                # job is deterministically broken, and counting it would let
+                # restarts false-positive auto-pause a healthy job.
+                if success:
+                    job["failure_streak"] = 0
+                    job.pop("failure_backoff_skips", None)
+                elif status in _SYNTHETIC_FAILURE_STATUSES:
+                    # Recorded (last_status/last_error) but excluded from the
+                    # failure-streak circuit breaker (#70 review).
+                    pass
+                else:
+                    _same = bool(_prev_err) and error == _prev_err
+                    job["failure_streak"] = (
+                        int(job.get("failure_streak") or 0) + 1 if _same else 1
+                    )
+                    _streak = int(job["failure_streak"])
+                    job["failure_backoff_skips"] = min(
+                        2 ** (_streak - 1) - 1, _failure_backoff_max_skips()
+                    )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -2412,6 +2556,34 @@ def _mark_job_run_locked(
                         job["state"] = "completed"
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
+
+                # #70: apply failure backoff (skip scheduled slots) and, past
+                # the auto-pause threshold, pause the job for operator review
+                # instead of retrying a deterministic failure indefinitely.
+                # Placed AFTER the next_run_at computation so a pause cleanly
+                # clears the schedule rather than tripping the missing-croniter
+                # error branch above. Synthetic failures (interruption /
+                # forced release) never advance the streak, so they must not
+                # trigger the backoff/pause either.
+                if not success and status not in _SYNTHETIC_FAILURE_STATUSES:
+                    _skips = int(job.get("failure_backoff_skips") or 0)
+                    if _skips > 0 and job["next_run_at"] is not None:
+                        job["next_run_at"] = _advance_schedule_by_steps(
+                            job["schedule"], job["next_run_at"], _skips
+                        )
+                    if (
+                        int(job.get("failure_streak") or 0)
+                        >= _failure_auto_pause_threshold()
+                    ):
+                        job["enabled"] = False
+                        job["state"] = "paused"
+                        job["paused_at"] = now
+                        job["paused_reason"] = (
+                            "auto-paused after %d identical consecutive "
+                            "failures (last error: %.200s) — resume to retry"
+                            % (int(job["failure_streak"]), error or "")
+                        )
+                        job["next_run_at"] = None
 
                 save_jobs(jobs)
                 return True
@@ -2729,6 +2901,11 @@ def _claim_job_for_fire_locked(
                 job["state"] = "scheduled"
                 job["paused_at"] = None
                 job["paused_reason"] = None
+                # #70: a forced fire is an explicit operator re-enable —
+                # clear the failure streak so the circuit breaker doesn't
+                # re-trip on a stale deterministic-failure chain.
+                job["failure_streak"] = 0
+                job.pop("failure_backoff_skips", None)
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
