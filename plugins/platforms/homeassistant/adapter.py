@@ -19,7 +19,7 @@ import os
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 try:
     import aiohttp
@@ -61,6 +61,97 @@ def _get_scoped_secret(name, default=None):
 
 
 logger = logging.getLogger(__name__)
+
+# Default flap-suppression window: an identical (entity, toggled-to state)
+# event arriving within this many seconds of the last forwarded one is
+# dropped before it costs an LLM round-trip.  See FlapSuppressor.
+_DEFAULT_FLAP_SUPPRESSION_SECONDS = 60.0
+
+
+def _parse_window_seconds(
+    value: Any, default: float = _DEFAULT_FLAP_SUPPRESSION_SECONDS
+) -> float:
+    """Coerce a config flap-suppression window to seconds.
+
+    Accepts int/float or numeric strings; anything unparseable (including
+    ``bool``, which is an ``int`` subclass and would otherwise read as
+    1/0) falls back to ``default``.  Values <= 0 disable suppression, so
+    ``flap_suppression_seconds: 0`` is an explicit config-driven off
+    switch.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return default
+    return parsed
+
+
+class FlapSuppressor:
+    """Deduplicate repeated (entity, state) toggles within a window.
+
+    Home Assistant presence / location trackers and binary sensors
+    oscillate: a device flaps A -> B -> A -> B with a period longer than
+    the per-entity ``cooldown_seconds``, and every toggle currently costs
+    a full LLM round-trip that answers "known flap -- no action".  This
+    suppressor keys on ``(entity_id, toggled-to state)`` so an identical
+    toggle arriving within ``window_seconds`` of the last *forwarded* one
+    is dropped, while a genuine state change (a different target state)
+    always passes through.  Re-notification resumes once the window since
+    the last forwarded occurrence expires, and entities are fully
+    independent (each has its own ``(entity, state)`` key).
+
+    The window anchors on the last forwarded occurrence: suppressed
+    events do not extend it, so a continuously flapping device re-notifies
+    at most once per window instead of never.
+
+    A window <= 0 disables suppression entirely.
+    """
+
+    def __init__(self, window_seconds: float) -> None:
+        self.window_seconds = max(0.0, float(window_seconds))
+        self._last_seen: Dict[Tuple[str, str], float] = {}
+
+    def should_suppress(
+        self, entity_id: str, new_state: str, now: Optional[float] = None
+    ) -> bool:
+        """Return True when this (entity, state) toggle is a known flap.
+
+        Records the occurrence timestamp only when the event is NOT
+        suppressed (i.e. when it will be forwarded to the LLM).  Expired
+        keys are pruned opportunistically so memory stays bounded for a
+        long-running gateway.
+        """
+        if self.window_seconds <= 0:
+            return False
+        now = time.time() if now is None else now
+        key = (entity_id, new_state)
+        last = self._last_seen.get(key)
+        if last is not None and (now - last) < self.window_seconds:
+            return True
+        self._last_seen[key] = now
+        self._prune(now)
+        return False
+
+    def _prune(self, now: float) -> None:
+        """Drop keys whose window has fully expired.
+
+        An expired key would let the event through anyway, so pruning is
+        semantics-preserving and keeps the tracker bounded.
+        """
+        if self.window_seconds <= 0:
+            self._last_seen.clear()
+            return
+        expired = [
+            key
+            for key, ts in self._last_seen.items()
+            if (now - ts) >= self.window_seconds
+        ]
+        for key in expired:
+            del self._last_seen[key]
 
 
 def check_ha_requirements() -> bool:
@@ -111,6 +202,14 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._ignore_entities: Set[str] = set(extra.get("ignore_entities", []))
         self._watch_all: bool = bool(extra.get("watch_all", False))
         self._cooldown_seconds: int = int(extra.get("cooldown_seconds", 30))
+
+        # Flap suppression: repeat (entity, toggled-to state) events within
+        # this window are dropped before they reach the LLM.  Config-driven
+        # via ``extra.flap_suppression_seconds`` (default 60s; 0 disables;
+        # unparseable values fall back to the default).
+        self._flap_suppressor = FlapSuppressor(
+            _parse_window_seconds(extra.get("flap_suppression_seconds"))
+        )
 
         # Cooldown tracking: entity_id -> last_event_timestamp
         self._last_event_time: Dict[str, float] = {}
@@ -322,6 +421,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         message = self._format_state_change(entity_id, old_state, new_state)
 
         if not message:
+            return
+
+        # Flap suppression: drop repeat (entity, toggled-to state) events
+        # within the window BEFORE the message reaches the LLM.  Only
+        # genuine state changes (old != new, which is what produced a
+        # message) are consulted, so no-op events never extend the window.
+        new_val = new_state.get("state", "unknown") if new_state else "unknown"
+        if self._flap_suppressor.should_suppress(entity_id, new_val):
+            logger.debug(
+                "[%s] suppressing known flap for %s -> %s (within window)",
+                self.name,
+                entity_id,
+                new_val,
+            )
             return
 
         # Build MessageEvent and forward to handler

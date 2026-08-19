@@ -2686,6 +2686,19 @@ DEFAULT_CONFIG = {
         "backup_count": 3,     # Number of rotated backup files to keep
     },
 
+    # Debug request dumps (request_dump_*.json, written when
+    # HERMES_DUMP_REQUESTS is set; see conversation_loop preflight + the
+    # API-error path in agent_runtime_helpers.dump_api_request_debug).
+    # Dedup suppresses re-dumping an identical request payload within
+    # ``dedup_window_seconds`` (e.g. the same preflight body on every retry),
+    # and ``max_dumps_per_session`` caps how many *preflight* dumps are
+    # written per session (0 disables the cap). The error path is never
+    # capped — post-mortem debugging always gets its dump. #73
+    "request_dump": {
+        "dedup_window_seconds": 60,
+        "max_dumps_per_session": 8,
+    },
+
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
     # curated model lists for OpenRouter and Nous Portal from this URL,
     # falling back to the in-repo snapshot on network failure.  Lets us

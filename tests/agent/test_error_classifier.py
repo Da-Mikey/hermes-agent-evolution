@@ -1,5 +1,9 @@
 """Tests for agent.error_classifier — structured API error classification."""
 
+import errno
+import socket
+
+import httpx
 import pytest
 from agent.error_classifier import (
     ClassifiedError,
@@ -42,6 +46,13 @@ class RemoteProtocolError(MockTransportError):
 
 class ServerDisconnectedError(MockTransportError):
     pass
+
+
+class APIConnectionError(MockTransportError):
+    """Simulates openai.APIConnectionError — the SDK transport wrapper whose
+    __cause__/__context__ chain carries the underlying httpx/socket error.
+    Named to match the real class so the type-name-based transport gate in
+    the classifier treats it identically."""
 
 
 # ── Test: FailoverReason enum ──────────────────────────────────────────
@@ -349,6 +360,8 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
+
+
     def test_404_requires_available_credits_is_billing(self):
         e = MockAPIError(
             "Not Found",
@@ -536,6 +549,12 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
 
+    def test_502_plain_bad_gateway_still_retryable(self):
+        """A genuine 502 with no request-validation signal stays retryable."""
+        e = MockAPIError("Bad Gateway", status_code=502)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
 
     def test_non_json_stream_validation_error_is_non_retryable(self):
         e = MockAPIError(
@@ -1554,6 +1573,43 @@ class TestClassifyApiError:
             "Malformed message array 400" in r.getMessage() for r in caplog.records
         ), "Expected a distinct warning identifying the malformed-body 400"
 
+    def test_400_empty_tool_calls_array_is_non_retryable_format_error(self):
+        """Empty ``tool_calls: []`` rejection → non-retryable format_error (#33).
+
+        DeepSeek v4 rejects an assistant message carrying ``"tool_calls": []``
+        with HTTP 400 "Invalid 'messages[N].tool_calls': empty array.
+        Expected an array with minimum length 1...". This is a deterministic
+        request-shape rejection — the pre-API sanitizer strips [] at the
+        chokepoint, but if it ever reaches the classifier it must be a
+        non-retryable format_error, not a retry loop on the identical payload.
+        """
+        e = MockAPIError(
+            "Invalid 'messages[2].tool_calls': empty array. Expected an array "
+            "with minimum length 1, but got an empty array instead.",
+            status_code=400,
+        )
+        result = classify_api_error(
+            e,
+            provider="deepseek",
+            model="deepseek-v4",
+            approx_tokens=5000,
+            context_length=200000,
+            num_messages=12,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+
+    def test_400_empty_tool_calls_array_non_apostrophe_variant(self):
+        """Same rejection without the field-path apostrophe → format_error."""
+        e = MockAPIError(
+            "Invalid messages[2].tool_calls: empty array. Expected an array "
+            "with minimum length 1.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="moonshot", model="kimi")
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+
 
 # ── Test: Adversarial / edge cases (from live testing) ─────────────────
 
@@ -2372,70 +2428,171 @@ class Test408RequestTimeout:
         assert result.should_compress is False
 
 
-# ── Test: connection/DNS failure message patterns on generic exception types ──
-# Port of anomalyco/opencode#40707 (expand retryable error patterns): errors
-# whose TYPE is generic (RuntimeError/Exception from local shims, MCP bridges,
-# re-raising SDKs) but whose MESSAGE carries a connection-establishment or DNS
-# failure must classify as retryable transport, not FailoverReason.unknown.
+# ── Environmental network failure → fail fast (#74) ─────────────────────
 
-class TestConnectionMessagePatterns:
-    """Generic-typed connect/DNS failures route to the transport bucket."""
 
-    @pytest.mark.parametrize("message", [
-        "connect ECONNREFUSED 127.0.0.1:11434",
-        "Connection refused by proxy",
-        "getaddrinfo failed",
-        "getaddrinfo ENOTFOUND api.example.com",
-        "[Errno -3] Temporary failure in name resolution",
-        "[Errno 8] nodename nor servname provided, or not known",
-        "getaddrinfo EAI_AGAIN openrouter.ai",
-        "Name or service not known",
-        "No route to host",
-        "[Errno 101] Network is unreachable",
-        "fetch failed",
-        "TypeError: Failed to fetch",
-        "upstream connect error or disconnect/reset before headers",
-    ])
-    def test_generic_exception_with_connect_failure_message_is_timeout(self, message):
-        # RuntimeError — NOT in _TRANSPORT_ERROR_TYPES, not a ConnectionError
-        # subclass, no status code. Without message matching this falls to
-        # FailoverReason.unknown and misses the eager transport fallback.
-        result = classify_api_error(RuntimeError(message))
-        assert result.reason == FailoverReason.timeout, message
-        assert result.retryable is True
-        assert result.should_compress is False
+class TestEnvironmentalNetworkFailFast:
+    """DNS / routing / reachability failures are environmental, not
+    provider-side — retrying the identical payload cannot succeed while the
+    environment is broken. They must fail fast (non-retryable + fallback)
+    instead of exhausting the retry budget against an unreachable host.
 
-    def test_connect_failure_never_routes_to_compression_on_large_session(self):
-        # A connection that was never established is not an overflow signal,
-        # even when the session is huge (the disconnect+large-session
-        # heuristic must not apply to connect-phase failures).
-        result = classify_api_error(
-            RuntimeError("connect ECONNREFUSED 10.0.0.5:443"),
-            approx_tokens=180000, context_length=200000, num_messages=400,
-        )
+    Matching is TYPED (errno attributes / anchored patterns), never a bare
+    "errno -2" substring scan, and EAI_AGAIN ("temporary failure in name
+    resolution") is transient by definition and stays retryable.
+    """
+
+    # ── Typed errno matching: fail-fast shapes ──────────────────────
+
+    def test_gaierror_eai_noname_fails_fast(self):
+        # Definitive DNS miss ("Name or service not known") — retrying the
+        # identical hostname cannot succeed while the environment is broken.
+        e = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
         assert result.reason == FailoverReason.timeout
-        assert result.should_compress is False
+        assert result.retryable is False
+        assert result.should_fallback is True
 
-    def test_midstream_disconnect_patterns_still_use_disconnect_path(self):
-        # "connection reset by peer" is deliberately NOT in the connect-phase
-        # list — it stays on the _SERVER_DISCONNECT_PATTERNS path, which
-        # routes large sessions to context-overflow compression.
-        result = classify_api_error(
-            RuntimeError("Connection reset by peer"),
-            approx_tokens=180000, context_length=200000, num_messages=400,
+    def test_gaierror_eai_fail_fails_fast(self):
+        # EAI_FAIL is "Non-recoverable failure in name resolution" — by
+        # definition not transient.
+        e = socket.gaierror(
+            socket.EAI_FAIL, "Non-recoverable failure in name resolution"
         )
-        assert result.reason == FailoverReason.context_overflow
-        assert result.should_compress is True
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
 
-    def test_plain_unknown_error_still_unknown(self):
-        # Guard against over-matching: an unrelated message stays unknown.
-        result = classify_api_error(RuntimeError("something exploded"))
-        assert result.reason == FailoverReason.unknown
+    def test_host_unreachable_errno_fails_fast(self):
+        # EHOSTUNREACH (113) — routing failure, environmental.
+        e = OSError(errno.EHOSTUNREACH, "No route to host")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_network_unreachable_errno_fails_fast(self):
+        # ENETUNREACH (101) — no network path, environmental.
+        e = OSError(errno.ENETUNREACH, "Network is unreachable")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    # ── EAI_AGAIN stays retryable (transient by definition) ─────────
+
+    def test_gaierror_eai_again_stays_retryable(self):
+        # "Temporary failure in name resolution" (errno -3) is transient by
+        # definition — a 1-2s retry usually succeeds. MUST stay retryable.
+        e = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_message_only_temporary_dns_failure_stays_retryable(self):
+        # Message-only OSError (no errno attribute) quoting the EAI_AGAIN
+        # text — conservative: a real OS failure always sets .errno.
+        e = OSError("Temporary failure in name resolution")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    # ── SDK-wrapped shapes (openai.APIConnectionError) ──────────────
+
+    def test_sdk_connection_error_with_gaierror_cause_fails_fast(self):
+        # openai.APIConnectionError str()s to "Connection error." — the
+        # underlying DNS failure lives in the __cause__ chain.
+        e = APIConnectionError("Connection error.")
+        e.__cause__ = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_sdk_connection_error_with_full_httpx_chain_fails_fast(self):
+        # The realistic openai SDK chain: APIConnectionError → httpx
+        # ConnectError("[Errno -2] Name or service not known") → gaierror.
+        req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        gaierr = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        transport_err = httpx.ConnectError(str(gaierr), request=req)
+        transport_err.__cause__ = gaierr
+        e = APIConnectionError("Connection error.")
+        e.__cause__ = transport_err
+        result = classify_api_error(e, provider="openai", model="gpt-5.5")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_sdk_connection_error_with_stringified_transport_cause_fails_fast(self):
+        # Shape where the socket error object was consumed and only the
+        # stringified message survives in the chain (some SDK/async paths):
+        # the anchored message fallback must catch it via the chain text.
+        req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        e = APIConnectionError("Connection error.")
+        e.__cause__ = httpx.ConnectError(
+            "[Errno -2] Name or service not known", request=req
+        )
+        result = classify_api_error(e, provider="openai", model="gpt-5.5")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_sdk_connection_error_with_eai_again_cause_stays_retryable(self):
+        # Even SDK-wrapped, EAI_AGAIN stays retryable.
+        e = APIConnectionError("Connection error.")
+        e.__cause__ = socket.gaierror(
+            socket.EAI_AGAIN, "Temporary failure in name resolution"
+        )
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_sdk_connection_error_without_env_signal_still_retries(self):
+        # A bare APIConnectionError ("Connection error.") with no env signal
+        # in the chain is a transient transport hiccup — must NOT fail fast.
+        e = APIConnectionError("Connection error.")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    # ── Message-text spoofing must NOT fail fast ────────────────────
+
+    def test_errno_text_in_unrelated_oserror_message_stays_retryable(self):
+        # Regression guard from the rework brief: a tool error whose message
+        # QUOTES errno text carries no errno attribute and must not be
+        # misclassified as an environmental network failure. Bare substring
+        # scans of "errno -2" / "errno -3" / "errno 113" would misfire here;
+        # note the quoted "getaddrinfo failed" is also ignored because the
+        # message fallback only applies to non-OSError SDK wrappers.
+        for msg in (
+            "tool reported errno -2 from its own syscall: getaddrinfo failed inside the tool",
+            "tool reported errno -3 from its own syscall: temporary failure inside the tool",
+            "tool reported errno 113 from its own syscall: route lookup inside the tool",
+        ):
+            e = OSError(msg)
+            result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+            assert result.reason == FailoverReason.timeout
+            assert result.retryable is True, msg
+
+    def test_transient_timeout_without_env_signal_still_retries(self):
+        # A plain timeout (no environmental signal) must keep retrying as a
+        # transient transport hiccup — the fail-fast branch is narrow.
+        e = TimeoutError("timed out")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_connection_reset_without_env_signal_still_retries(self):
+        # Connection reset is a provider-side transport hiccup, not an
+        # environmental DNS/route failure — must NOT fail fast.
+        e = ConnectionError("Connection reset by peer")
+        result = classify_api_error(e, provider="deepseek", model="deepseek-chat")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
 
 
-# ── Test: throttle vs overflow disambiguation + new overflow shapes ─────
-# Port of anomalyco/opencode#37848 (expand context overflow patterns +
-# rate-limit exclusion guard).
+# ── HTTP 504 gateway timeout ───────────────────────────────────────────
 
 
 class Test504GatewayTimeout:
@@ -2497,5 +2654,6 @@ class Test504GatewayTimeout:
         assert r_overload.reason == FailoverReason.overloaded
         assert r_timeout.reason == FailoverReason.timeout
         assert r_overload.reason != r_timeout.reason
+
 
 

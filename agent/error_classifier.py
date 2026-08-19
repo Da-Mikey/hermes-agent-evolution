@@ -12,7 +12,10 @@ that the main retry loop in run_agent.py consults for every API failure.
 from __future__ import annotations
 
 import enum
+import errno
 import logging
+import re
+import socket
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -432,6 +435,17 @@ _INVALID_MESSAGE_BODY_PATTERNS = [
     "text content blocks must be non-empty",
     "content field is required",
     "messages: at least one message is required",
+    # Empty tool_calls arrays (#33): strict OpenAI-compatible providers
+    # (DeepSeek v4, Moonshot/Kimi) reject ``"tool_calls": []`` with HTTP 400
+    # "Invalid 'messages[N].tool_calls': empty array. Expected an array with
+    # minimum length 1, but got an empty array instead." The pre-API
+    # sanitizer (agent_runtime_helpers.py) strips the empty array at the
+    # chokepoint, but a transport that bypasses it would otherwise retry the
+    # byte-identical payload into the same deterministic 400 — classify as a
+    # non-retryable format_error safety net instead of looping.
+    "tool_calls': empty array",
+    "tool_calls: empty array",
+    "expected an array with minimum length 1",
     # Qwen / vLLM chat templates raise this when the request has no surviving
     # non-empty user turn (oversized session truncation, compression that
     # dropped the only user message, or a resumed lineage that opens with
@@ -577,43 +591,6 @@ _TIMEOUT_MESSAGE_PATTERNS = [
     "upstream timed out",
 ]
 
-# Connection-establishment / DNS failure message patterns.  These surface
-# when the exception TYPE is generic (RuntimeError/Exception from a local
-# shim, MCP bridge, subprocess wrapper, or an SDK that re-raises without
-# chaining) so the _TRANSPORT_ERROR_TYPES check never fires, and the error
-# carries no HTTP status.  Without message-level matching they fall through
-# to FailoverReason.unknown, which misses the transport eager-fallback path
-# in the retry loop (unknown retries the same dead endpoint for the full
-# budget before fallback).  Ported from anomalyco/opencode#40707, which hit
-# the same bug shape: serialized midstream errors matched by type only.
-#
-# Deliberately EXCLUDES mid-stream disconnect strings ("connection reset by
-# peer", "peer closed connection", "unexpected eof", "socket hang up") —
-# those belong to _SERVER_DISCONNECT_PATTERNS, whose classification step
-# runs later and routes large sessions to context-overflow compression.
-# A connection that was never established cannot be a server-side overflow
-# rejection, so these are safe to classify as plain retryable transport.
-_CONNECTION_MESSAGE_PATTERNS = [
-    # TCP connect failures
-    "connection refused",
-    "econnrefused",
-    "no route to host",
-    "network is unreachable",
-    "network unreachable",
-    # DNS resolution failures (Python, glibc, macOS, Node bridge phrasings)
-    "name or service not known",
-    "temporary failure in name resolution",
-    "nodename nor servname provided",
-    "getaddrinfo failed",
-    "getaddrinfo enotfound",
-    "eai_again",
-    # Node/undici bridge generic network failure (MCP servers, local shims)
-    "fetch failed",
-    "failed to fetch",
-    # Envoy/proxy upstream connect failure (cloud gateways)
-    "upstream connect error",
-]
-
 # Transport error type names
 _TRANSPORT_ERROR_TYPES = frozenset({
     "ReadTimeout", "ConnectTimeout", "PoolTimeout",
@@ -634,6 +611,43 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APIConnectionError",
     "APITimeoutError",
 })
+
+# Environmental network-failure fail-fast set (#74) — TYPED errno matching.
+#
+# DNS / routing / reachability failures are environmental, not
+# provider-side: retrying the identical payload N times cannot succeed while
+# the environment is broken, and only amplifies a transient outage into a
+# retry storm that burns tokens, delays scheduled jobs, and floods the
+# error-capture store. Match on the ``.errno`` ATTRIBUTE (set by the
+# OS/socket layer), never on bare "errno -2" substring text — a tool error
+# like ``OSError("tool reported errno -2 from its own syscall...")`` carries
+# no errno attribute and must stay retryable.
+_ENV_NETWORK_FAILFAST_ERRNOS = frozenset(
+    {
+        socket.EAI_NONAME,  # -2  Name or service not known — definitive DNS miss
+        socket.EAI_FAIL,  # -4  Non-recoverable failure in name resolution
+        errno.EHOSTUNREACH,  # 113 No route to host — routing failure
+        errno.ENETUNREACH,  # 101 Network is unreachable
+    }
+)
+# EAI_AGAIN (-3, "temporary failure in name resolution") is deliberately
+# EXCLUDED: it is transient by definition and a 1-2s retry usually succeeds.
+
+# Anchored message-pattern fallback for SDK-wrapped shapes that lost the
+# typed errno — e.g. openai.APIConnectionError whose __cause__ chain holds an
+# httpx.ConnectError stringified from the socket error, or a Node bridge's
+# "getaddrinfo ENOTFOUND <host>". Word-boundary-bounded tokens / full
+# phrases only — never bare "errno N" substring scans, which misclassify
+# unrelated errors that merely quote errno text.
+_ENV_NETWORK_FAILFAST_MESSAGE_PATTERNS = (
+    re.compile(r"\bname or service not known\b"),
+    re.compile(r"\bgetaddrinfo\s+failed\b"),
+    re.compile(r"\bENOTFOUND\b"),
+    re.compile(r"\bno route to host\b"),
+    re.compile(r"\bnetwork is unreachable\b"),
+    re.compile(r"\bEHOSTUNREACH\b"),
+    re.compile(r"\bENETUNREACH\b"),
+)
 
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
@@ -707,6 +721,72 @@ _SSL_TRANSIENT_PATTERNS = [
     # Python ssl module prefix, e.g. "[SSL: BAD_RECORD_MAC]"
     "[ssl:",
 ]
+
+
+# ── Environmental network-failure detection (#74) ───────────────────────
+
+
+def _iter_exception_chain(error: BaseException):
+    """Yield ``error`` and every exception reachable via ``__cause__`` /
+    ``__context__`` links, deduplicated.
+
+    SDKs wrap the underlying transport failure: openai.APIConnectionError
+    carries the httpx.ConnectError as its ``__cause__``, which in turn
+    carries the originating ``socket.gaierror``. The classifier must look
+    through those wrappers to find the typed error — ``str()`` of the
+    top-level wrapper is just "Connection error.".
+    """
+    seen = set()
+    stack: list[Optional[BaseException]] = [error]
+    while stack:
+        exc = stack.pop()
+        if exc is None or id(exc) in seen:
+            continue
+        seen.add(id(exc))
+        yield exc
+        stack.append(exc.__cause__)
+        stack.append(exc.__context__)
+
+
+def _is_environmental_network_failure(error: BaseException, error_msg: str) -> bool:
+    """True when the failure is environmental (DNS / routing / reachability).
+
+    Matching is TYPED — never a bare substring scan of "errno -2" /
+    "errno -3" / "errno 113" text, which misclassifies unrelated errors
+    (e.g. ``OSError("tool reported errno -2 from its own syscall...")``)
+    as environmental network failures.
+
+    1. Any exception in the cause/context chain that is OSError-family
+       (``socket.gaierror`` subclasses ``OSError``) whose ``.errno`` is one
+       of the environmental codes fails fast. ``errno`` attributes are set
+       by the OS/socket layer and cannot be spoofed by message text.
+    2. Anchored message patterns as a fallback ONLY for non-OSError SDK
+       transport wrappers (e.g. openai.APIConnectionError) whose chain
+       carries the DNS/route text without a typed errno — e.g. an
+       ``httpx.ConnectError`` whose message is "[Errno -2] Name or service
+       not known" but whose underlying socket error object was consumed, or
+       a Node bridge's "getaddrinfo ENOTFOUND <host>". Plain OSErrors are
+       deliberately excluded from the message fallback: a real OS failure
+       always sets ``.errno``, and message-only OSErrors (including tool
+       errors that quote errno text) stay retryable.
+
+    EAI_AGAIN ("temporary failure in name resolution", errno -3) is
+    deliberately NOT in the fail-fast set — it is transient by definition
+    and a short retry usually succeeds, so it must stay retryable.
+    """
+    chain = list(_iter_exception_chain(error))
+    for exc in chain:
+        if isinstance(exc, OSError) and exc.errno in _ENV_NETWORK_FAILFAST_ERRNOS:
+            return True
+    if isinstance(error, OSError):
+        return False
+    parts = [error_msg]
+    for exc in chain:
+        text = str(exc).lower()
+        if text and text not in parts:
+            parts.append(text)
+    haystack = " ".join(parts)
+    return any(p.search(haystack) for p in _ENV_NETWORK_FAILFAST_MESSAGE_PATTERNS)
 
 
 # ── Classification pipeline ─────────────────────────────────────────────
@@ -1029,22 +1109,6 @@ def classify_api_error(
         if classified is not None:
             return classified
 
-    # ── 4. SSL certificate verification failures → fail fast ────────
-    # A broken certificate chain (TLS-inspecting proxy, missing custom CA,
-    # expired/self-signed cert) is deterministic for the host — every retry
-    # reproduces the identical handshake failure. Fail immediately with
-    # actionable guidance instead of burning the retry budget first.
-    # Checked BEFORE message-pattern matching: cert-verify messages also
-    # carry generic transport phrases ("fetch failed", "[ssl:") that would
-    # otherwise classify them as transient/timeout first.
-    # Inspired by Claude Code v2.1.199 (July 2026).
-    if any(p in error_msg for p in _SSL_CERT_VERIFY_PATTERNS):
-        return _result(
-            FailoverReason.ssl_cert_verification,
-            retryable=False,
-            should_fallback=False,
-        )
-
     # ── 4. Message pattern matching (no status code) ────────────────
 
     classified = _classify_by_message(
@@ -1055,6 +1119,21 @@ def classify_api_error(
     )
     if classified is not None:
         return classified
+
+    # ── 5. SSL certificate verification failures → fail fast ────────
+    # A broken certificate chain (TLS-inspecting proxy, missing custom CA,
+    # expired/self-signed cert) is deterministic for the host — every retry
+    # reproduces the identical handshake failure. Fail immediately with
+    # actionable guidance instead of burning the retry budget first.
+    # Checked BEFORE the transient-SSL patterns: cert-verify messages also
+    # contain "[ssl:" which would otherwise match the transient list.
+    # Inspired by Claude Code v2.1.199 (July 2026).
+    if any(p in error_msg for p in _SSL_CERT_VERIFY_PATTERNS):
+        return _result(
+            FailoverReason.ssl_cert_verification,
+            retryable=False,
+            should_fallback=False,
+        )
 
     # ── 5b. SSL/TLS transient errors → retry as timeout (not compression) ──
     # SSL alerts mid-stream are transport hiccups, not server-side context
@@ -1125,6 +1204,26 @@ def classify_api_error(
         and "consecutive stale attempts" in error_msg
         and "aborting this call" in error_msg
     ):
+        return _result(
+            FailoverReason.timeout,
+            retryable=False,
+            should_fallback=True,
+        )
+
+    # ── 7c. Environmental network failures → fail fast (#74) ────────
+    # DNS resolution / routing / reachability failures are environmental,
+    # not provider-side: the identical request cannot succeed while the
+    # environment is broken, so the full fixed retry count only amplifies a
+    # transient outage into a retry storm (and, for scheduled jobs, a wall of
+    # failure records + request snapshots). Fail fast with a fallback to the
+    # next provider — if the environment is truly down the fallback also
+    # fails fast, and the loop surfaces a clear reason instead of silently
+    # burning the budget. Checked BEFORE §8 so an SDK-wrapped DNS failure
+    # (e.g. openai.APIConnectionError) does not fall through to the
+    # retryable transport bucket.
+    if (
+        isinstance(error, OSError) or error_type in _TRANSPORT_ERROR_TYPES
+    ) and _is_environmental_network_failure(error, error_msg):
         return _result(
             FailoverReason.timeout,
             retryable=False,
@@ -1838,16 +1937,6 @@ def _classify_by_message(
     # loop rebuilds the client instead of treating the turn as an empty
     # model response.
     if any(p in error_msg for p in _TIMEOUT_MESSAGE_PATTERNS):
-        return result_fn(FailoverReason.timeout, retryable=True)
-
-    # Connection-establishment / DNS failure message patterns — same shim
-    # problem as the timeout patterns above: the wrapping exception type is
-    # generic, so _TRANSPORT_ERROR_TYPES never matches and the error would
-    # fall through to FailoverReason.unknown. Classified as timeout (the
-    # transport bucket) so the retry loop's eager transport fallback and
-    # client rebuild apply. Never routes to compression: a connection that
-    # was never established is not a context-overflow signal.
-    if any(p in error_msg for p in _CONNECTION_MESSAGE_PATTERNS):
         return result_fn(FailoverReason.timeout, retryable=True)
 
     return None

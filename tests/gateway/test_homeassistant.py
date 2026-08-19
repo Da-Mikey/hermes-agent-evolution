@@ -15,7 +15,9 @@ from gateway.config import (
     PlatformConfig,
 )
 from plugins.platforms.homeassistant.adapter import (
+    FlapSuppressor,
     HomeAssistantAdapter,
+    _parse_window_seconds,
     check_ha_requirements,
     validate_ha_config,
 )
@@ -226,6 +228,243 @@ class TestCooldown:
                              new_attrs={"friendly_name": "Temp"})
         await adapter._handle_ha_event(event2)
         assert adapter.handle_message.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Flap suppression (issue #71): dedup repeated (entity, state) toggles
+# before they cost an LLM round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestFlapSuppression:
+    """Known-flap events are suppressed at the integration layer; novel
+    state changes always pass through."""
+
+    @staticmethod
+    def _clock(monkeypatch, start=1000.0):
+        """Freeze ``time.time`` in the adapter module on a controllable clock."""
+        state = {"now": start}
+        monkeypatch.setattr(
+            "plugins.platforms.homeassistant.adapter.time.time",
+            lambda: state["now"],
+        )
+        return state
+
+    @staticmethod
+    def _adapter(**extra) -> HomeAssistantAdapter:
+        # cooldown_seconds=0 so only the flap suppressor gates the event.
+        return _make_adapter(watch_all=True, cooldown_seconds=0, **extra)
+
+    @pytest.mark.asyncio
+    async def test_identical_flap_within_window_suppressed(self, monkeypatch):
+        clock = self._clock(monkeypatch)
+        adapter = self._adapter(flap_suppression_seconds=60)
+        event = _make_event(
+            "device_tracker.person",
+            "home",
+            "away",
+            new_attrs={"friendly_name": "Person"},
+        )
+
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 1
+
+        # Same entity toggling to the same state again inside the window.
+        clock["now"] += 10
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_state_change_within_window_passes_through(self, monkeypatch):
+        clock = self._clock(monkeypatch)
+        adapter = self._adapter(flap_suppression_seconds=60)
+        away_event = _make_event(
+            "device_tracker.person",
+            "home",
+            "away",
+            new_attrs={"friendly_name": "Person"},
+        )
+        home_event = _make_event(
+            "device_tracker.person",
+            "away",
+            "home",
+            new_attrs={"friendly_name": "Person"},
+        )
+
+        await adapter._handle_ha_event(away_event)
+        assert adapter.handle_message.call_count == 1
+
+        # A genuine toggle back is a different target state: must pass.
+        clock["now"] += 5
+        await adapter._handle_ha_event(home_event)
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_window_expiry_allows_re_notification(self, monkeypatch):
+        clock = self._clock(monkeypatch)
+        adapter = self._adapter(flap_suppression_seconds=60)
+        event = _make_event(
+            "device_tracker.person",
+            "home",
+            "away",
+            new_attrs={"friendly_name": "Person"},
+        )
+
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 1
+
+        # After the window expires the identical flap is novel again.
+        clock["now"] += 61
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_different_entities_independent(self, monkeypatch):
+        clock = self._clock(monkeypatch)
+        adapter = self._adapter(flap_suppression_seconds=60)
+
+        await adapter._handle_ha_event(
+            _make_event(
+                "device_tracker.person_a",
+                "home",
+                "away",
+                new_attrs={"friendly_name": "Person A"},
+            )
+        )
+        assert adapter.handle_message.call_count == 1
+
+        # Same state, different entity: independent key, must pass.
+        clock["now"] += 5
+        await adapter._handle_ha_event(
+            _make_event(
+                "device_tracker.person_b",
+                "home",
+                "away",
+                new_attrs={"friendly_name": "Person B"},
+            )
+        )
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_config_driven_window(self, monkeypatch):
+        clock = self._clock(monkeypatch)
+        adapter = self._adapter(flap_suppression_seconds=30)
+        assert adapter._flap_suppressor.window_seconds == 30.0
+        event = _make_event(
+            "binary_sensor.motion",
+            "off",
+            "on",
+            new_attrs={"friendly_name": "Motion"},
+        )
+
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 1
+
+        # Inside the configured 30s window: suppressed.
+        clock["now"] += 20
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 1
+
+        # Past the configured window: re-notified.
+        clock["now"] += 11
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_int_window_falls_back_to_default(self, monkeypatch):
+        clock = self._clock(monkeypatch)
+        adapter = self._adapter(flap_suppression_seconds="not-a-number")
+        # Unparseable config falls back to the 60s default...
+        assert adapter._flap_suppressor.window_seconds == 60.0
+
+        event = _make_event(
+            "binary_sensor.motion",
+            "off",
+            "on",
+            new_attrs={"friendly_name": "Motion"},
+        )
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 1
+
+        # ...so a repeat inside 60s is still suppressed.
+        clock["now"] += 10
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_zero_window_disables_suppression(self, monkeypatch):
+        clock = self._clock(monkeypatch)
+        adapter = self._adapter(flap_suppression_seconds=0)
+        event = _make_event(
+            "binary_sensor.motion",
+            "off",
+            "on",
+            new_attrs={"friendly_name": "Motion"},
+        )
+
+        await adapter._handle_ha_event(event)
+        clock["now"] += 1
+        await adapter._handle_ha_event(event)
+        assert adapter.handle_message.call_count == 2
+
+
+class TestFlapSuppressorUnit:
+    """Direct unit tests for the FlapSuppressor tracker (explicit ``now``)."""
+
+    def test_should_suppress_keyed_on_entity_and_state(self):
+        suppressor = FlapSuppressor(window_seconds=60)
+        assert suppressor.should_suppress("sensor.a", "on", now=1000.0) is False
+        # Same (entity, state) inside the window.
+        assert suppressor.should_suppress("sensor.a", "on", now=1010.0) is True
+        # Same entity, different state: novel.
+        assert suppressor.should_suppress("sensor.a", "off", now=1010.0) is False
+        # Same state, different entity: novel.
+        assert suppressor.should_suppress("sensor.b", "on", now=1010.0) is False
+        # Window expiry: identical flap is novel again.
+        assert suppressor.should_suppress("sensor.a", "on", now=1070.0) is False
+
+    def test_suppressed_events_do_not_extend_window(self):
+        suppressor = FlapSuppressor(window_seconds=60)
+        assert suppressor.should_suppress("sensor.a", "on", now=1000.0) is False
+        assert suppressor.should_suppress("sensor.a", "on", now=1010.0) is True
+        assert suppressor.should_suppress("sensor.a", "on", now=1020.0) is True
+        # Still anchored on the forwarded occurrence at t=1000.
+        assert suppressor.should_suppress("sensor.a", "on", now=1061.0) is False
+
+    def test_zero_window_never_suppresses(self):
+        suppressor = FlapSuppressor(window_seconds=0)
+        assert suppressor.should_suppress("sensor.a", "on", now=1.0) is False
+        assert suppressor.should_suppress("sensor.a", "on", now=1.0) is False
+
+    def test_prune_keeps_tracker_bounded(self):
+        suppressor = FlapSuppressor(window_seconds=60)
+        for i in range(100):
+            suppressor.should_suppress(f"sensor.e{i}", "on", now=1000.0 + i * 0.1)
+        # Advance far past the window: everything expires on the next call.
+        suppressor.should_suppress("sensor.fresh", "on", now=2000.0)
+        assert all(ts >= 2000.0 - 60.0 for ts in suppressor._last_seen.values())
+
+
+class TestParseWindowSeconds:
+    def test_accepts_int_float_and_numeric_string(self):
+        assert _parse_window_seconds(30) == 30.0
+        assert _parse_window_seconds(30.5) == 30.5
+        assert _parse_window_seconds("45") == 45.0
+
+    def test_unparseable_falls_back_to_default(self):
+        assert _parse_window_seconds("nope") == 60.0
+        assert _parse_window_seconds(None) == 60.0
+        assert _parse_window_seconds([]) == 60.0
+        # bool is an int subclass; a YAML `true` must not read as 1s.
+        assert _parse_window_seconds(True) == 60.0
+        assert _parse_window_seconds(False) == 60.0
+        assert _parse_window_seconds(float("inf")) == 60.0
+
+    def test_zero_and_negative_disable(self):
+        assert _parse_window_seconds(0) == 0.0
+        assert _parse_window_seconds(-5) == -5.0
+        suppressor = FlapSuppressor(_parse_window_seconds(0))
+        assert suppressor.window_seconds == 0.0
 
 
 # ---------------------------------------------------------------------------

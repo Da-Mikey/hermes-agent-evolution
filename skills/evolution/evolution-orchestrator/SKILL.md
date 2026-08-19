@@ -75,6 +75,31 @@ candidates yourself and you do NOT loop — see *Scope boundary* below.
    It prints `{"tasks": [...], "dropped": N}`. The `tasks` array is ready to pass
    straight to `delegate_task`.
 
+   2a. **Shared retrieval memo (issue #65) — consult BEFORE the fan-out.** Pass
+   `--memo ~/.hermes/evolution/shared-memo.json` to `build` (or `draft`). The
+   helper then consults the shared memo and embeds every already-summarized URL
+   from your sub-task/angles into each worker's context as a "DO NOT fetch — use
+   the summary" hit, so parallel workers stop redundantly scraping the same
+   pages. Maintain the memo between cycles with the `memo` subcommand:
+
+   ```bash
+   # after a worker fetched a page, record its one-line summary for the next fan-out
+   python scripts/evolution_orchestrator.py memo record "https://arxiv.org/abs/2608.10424" \
+       "parallel branches redundantly fetch the same pages; shared memory cut redundancy 46%->7.8%" \
+       --memo ~/.hermes/evolution/shared-memo.json
+   # before a fan-out, check whether a URL is already summarized (skip the fetch if so)
+   python scripts/evolution_orchestrator.py memo lookup "https://arxiv.org/abs/2608.10424" \
+       --memo ~/.hermes/evolution/shared-memo.json
+   # mark an edit attempt that failed so the draft fan-out skips re-attempting it
+   python scripts/evolution_orchestrator.py memo failing "Implement the shared memo" \
+       "tried twice — held-out gate blocks adoption" \
+       --memo ~/.hermes/evolution/shared-memo.json
+   python scripts/evolution_orchestrator.py memo status --memo ~/.hermes/evolution/shared-memo.json
+   ```
+
+   A goal recorded via `memo failing` makes `draft` return zero tasks with
+   `memo_skip: true` — the known-failing edit is not re-attempted this cycle.
+
 3. **Fan out with `delegate_task` (batch mode).** Pass the `tasks` array as the
    `delegate_task` `tasks=[...]` argument. All workers run in parallel; each is a
    `role="leaf"` worker with `web`+`file` toolsets and its own isolated context.
