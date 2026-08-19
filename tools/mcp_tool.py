@@ -6604,8 +6604,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             {"error": _sanitize_error(err_msg)}, ensure_ascii=False
                         )
 
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP CallToolResult has .content (list of content blocks) and
+            # an error flag spelled isError (1.x) / is_error (2.x) — read it
+            # through mcp_field so EITHER SDK generation (or a fork-shaped
+            # object) resolves correctly instead of silently inverting.
+            if mcp_field(result, "is_error", "isError", default=False):
                 error_text = ""
                 for block in result.content or []:
                     if getattr(block, "text", None):

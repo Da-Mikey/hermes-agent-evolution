@@ -235,7 +235,10 @@ def test_dispatch_does_not_forward_removed_approval_token():
     )
 
     kwargs = backend.typed_browser_prepare.call_args.kwargs
-    assert "approval_token" not in kwargs
+    # Fork: the kwarg IS forwarded (in-band browser-approve boundary) but
+    # carries None when the caller supplied no token — existing-profile
+    # attach then fails at the driver without a valid single-use token.
+    assert kwargs["approval_token"] is None
     assert kwargs["profile_mode"] == "existing_profile"
 
 
