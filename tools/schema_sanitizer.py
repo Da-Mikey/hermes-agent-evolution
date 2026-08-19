@@ -398,6 +398,24 @@ def collapse_const_unions(schema: Any) -> Any:
     return out
 
 
+# Array-specific JSON Schema keywords that only have meaning on a node whose
+# declared ``type`` is ``array``. When a multi-type ``type`` list (e.g.
+# ``["string", "array"]``) is normalized into an ``anyOf`` below, these must be
+# hoisted INTO the ``array`` branch of the union — emitting them as siblings of
+# ``anyOf`` is malformed and is rejected by Gemini with HTTP 400 INVALID_ARGUMENT.
+_ARRAY_KEYWORDS = frozenset({
+    "items",
+    "prefixItems",
+    "contains",
+    "unevaluatedItems",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minContains",
+    "maxContains",
+})
+
+
 def _sanitize_node(node: Any, path: str) -> Any:
     """Recursively sanitize a JSON-Schema fragment.
 
@@ -446,7 +464,30 @@ def _sanitize_node(node: Any, path: str) -> Any:
         prop_renames = _rename_property_keys(node["properties"], f"{path}.properties")
 
     out: dict = {}
+    # When ``type`` is a multi-type list that will be normalized into ``anyOf``
+    # below, any array-specific keywords sitting as siblings of ``type``
+    # (``items``, ``minItems``, ...) must move INTO the ``array`` branch of the
+    # generated union. Leaving them at the top level produces a malformed shape
+    # Gemini rejects with two distinct 400s:
+    #   * ``properties[x].items: field predicate failed`` (``items`` is not
+    #     valid on a node whose type is a union), and
+    #   * ``properties[x].any_of[1].items: missing field`` (the array branch
+    #     lost its ``items``).
+    # This is the root cause of the ``read_file`` ``path`` schema failure that
+    # killed Gemini sessions (issue: read_file path schema).
+    array_keywords: dict[str, Any] = {}
+    if isinstance(node.get("type"), list) and "array" in node["type"]:
+        non_null = [
+            t for t in node["type"] if isinstance(t, str) and t != "null"
+        ]
+        if len(non_null) >= 2:
+            array_keywords = {k: node[k] for k in _ARRAY_KEYWORDS if k in node}
+
     for key, value in node.items():
+        # Array keywords already captured for hoisting are re-attached to the
+        # ``array`` branch when the ``type`` list is normalized below.
+        if key in array_keywords:
+            continue
         # JSON Schema ``type`` arrays (e.g. ``["number", "string"]``, common
         # in MCP tool schemas) are rejected by several tool-call backends:
         #   * llama.cpp's grammar generator only accepts a singular string type.
@@ -472,8 +513,21 @@ def _sanitize_node(node: Any, path: str) -> Any:
                     out.setdefault("nullable", True)
                 continue
             if len(non_null) >= 2:
-                # Preserve all branches as a union instead of dropping them.
-                out["anyOf"] = [{"type": t} for t in non_null]
+                # Preserve all branches as a union instead of dropping them,
+                # and attach hoisted array keywords to the ``array`` branch so
+                # it remains a complete, self-describing array schema.
+                branches: list[dict] = []
+                for t in non_null:
+                    branch: dict = {"type": t}
+                    if t == "array" and array_keywords:
+                        for ak, av in array_keywords.items():
+                            branch[ak] = (
+                                _sanitize_node(av, f"{path}.{ak}")
+                                if isinstance(av, (dict, list))
+                                else av
+                            )
+                    branches.append(branch)
+                out["anyOf"] = branches
                 if has_null:
                     out.setdefault("nullable", True)
                 continue
