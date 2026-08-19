@@ -4059,11 +4059,8 @@ class MCPServerTask:
             # http_client is provided, so we wrap in async-with.
             try:
                 async with httpx.AsyncClient(**client_kwargs) as http_client:
-                    async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream,
-                        write_stream,
-                        _get_session_id,
-                    ):
+                    async with streamable_http_client(url, http_client=http_client) as _streams:
+                        read_stream, write_stream = _streams[0], _streams[1]
                         async with ClientSession(
                             read_stream, write_stream, **sampling_kwargs
                         ) as session:

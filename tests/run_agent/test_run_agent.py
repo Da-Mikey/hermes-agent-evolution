@@ -3472,7 +3472,6 @@ class TestConcurrentToolExecution:
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
-    @pytest.mark.parametrize("quiet_mode", [True, False])
     def test_sequential_browser_type_callbacks_redact_api_key(self, agent):
         secret = "sk-proj-ABCD1234567890EFGH"
         tool_call = _mock_tool_call(
