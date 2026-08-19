@@ -28,18 +28,28 @@ Scorecard schema (both graders produce the same shape):
     "total_max": 52,
     "overall_percentage": float,
     "flags": [str],
+
+    # N-run reliability measurement (#50) — attached by the CLI runner:
+    "n_runs": int,           # evaluations per cycle (1 = legacy single run)
+    "mean_score": float,     # mean overall_percentage across the runs
+    "stddev": float,         # population stddev of overall_percentage
+    "pass_at_k": float,      # chance of >= k successful runs out of n_runs
+    "unreliable": bool,      # True when stddev exceeded the variance threshold
+    "run_scores": [float],   # per-run overall_percentage values
   }
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+import math
 import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1431,6 +1441,264 @@ def format_summary(summary: Dict[str, Any]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# N-run reliability measurement (#50) — mean / stddev / pass@k per cycle
+# ──────────────────────────────────────────────────────────────────────
+# A single rubric score cannot distinguish a consistently good cycle from
+# a lucky one. Evaluating each cycle n_runs times (temperature > 0 for
+# LLM-backed graders) and reporting mean / stddev / pass@k exposes that.
+# The shipped StrictRubricJudgeGrader is deterministic, so repeated runs
+# are identical and stddev is 0.0 — the reliability fields then attest
+# consistency (no sampling luck), which is the correct baseline.
+#
+# Cost bound: total cost = n_runs * single-run cost. n_runs is validated
+# into [1, RUBRIC_RELIABILITY_MAX_RUNS], so the worst case is a bounded
+# 10x single-run spend per cycle.
+
+RUBRIC_RELIABILITY_DEFAULTS: Dict[str, Any] = {
+    "n_runs": 3,  # evaluations per cycle (1 = legacy single-run, 2-10 = N-run)
+    "temperature": 0.7,  # sampling temperature (> 0) for run diversity
+    "variance_threshold": 10.0,  # stddev of overall_percentage that flags unreliable
+    "pass_at_k": 1,  # k for pass@k: chance of >= k successful runs out of n_runs
+    "success_threshold": 50.0,  # a run succeeds when overall_percentage >= this
+}
+
+RUBRIC_RELIABILITY_MIN_RUNS = 1  # 1 preserves pre-#50 single-run behavior
+RUBRIC_RELIABILITY_MAX_RUNS = 10  # cost bound: total = n_runs * single-run cost
+
+
+def _parse_n_runs(
+    value: Any, default: int = RUBRIC_RELIABILITY_DEFAULTS["n_runs"]
+) -> int:
+    """Validate n_runs: an int in [1, 10], else fall back to ``default``.
+
+    ``n_runs=1`` is the documented legacy single-run mode; 2-10 enable
+    N-run reliability measurement. Bools, floats with fractional parts,
+    non-numeric values, and out-of-range ints are rejected (default used)
+    so a config typo can never crash the cron job.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if isinstance(value, float) and n != value:
+        return default  # a fractional run count is meaningless
+    if not (RUBRIC_RELIABILITY_MIN_RUNS <= n <= RUBRIC_RELIABILITY_MAX_RUNS):
+        return default
+    return n
+
+
+def _parse_positive_float(value: Any, default: float) -> float:
+    """Validate a strictly-positive float config knob; fall back on garbage."""
+    if isinstance(value, bool):
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if f > 0 else default
+
+
+def load_rubric_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load the rubric judge's ``reliability:`` config from cron YAML.
+
+    Resolution order: explicit ``config_path`` (CLI ``--config``) → the
+    shipped ``cron/evolution/rubric-judge.yaml`` next to the repo root →
+    built-in defaults. Every knob is validated; invalid values fall back
+    to the default. Missing YAML (standalone script deployment) yields
+    the defaults, preserving pre-#50 behavior.
+    """
+    config: Dict[str, Any] = dict(RUBRIC_RELIABILITY_DEFAULTS)
+    path = config_path
+    if path is None:
+        path = (
+            Path(__file__).resolve().parent.parent
+            / "cron"
+            / "evolution"
+            / "rubric-judge.yaml"
+        )
+    if path is None or not Path(path).is_file():
+        return config
+    try:
+        import yaml
+    except ImportError:
+        return config  # standalone deployment without pyyaml — defaults
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return config
+    rel = data.get("reliability") if isinstance(data, dict) else None
+    if not isinstance(rel, dict):
+        return config
+    config["n_runs"] = _parse_n_runs(rel.get("n_runs"))
+    config["temperature"] = _parse_positive_float(
+        rel.get("temperature"), RUBRIC_RELIABILITY_DEFAULTS["temperature"]
+    )
+    config["variance_threshold"] = _parse_positive_float(
+        rel.get("variance_threshold"),
+        RUBRIC_RELIABILITY_DEFAULTS["variance_threshold"],
+    )
+    config["success_threshold"] = _parse_positive_float(
+        rel.get("success_threshold"),
+        RUBRIC_RELIABILITY_DEFAULTS["success_threshold"],
+    )
+    config["pass_at_k"] = _parse_n_runs(
+        rel.get("pass_at_k"), RUBRIC_RELIABILITY_DEFAULTS["pass_at_k"]
+    )
+    return config
+
+
+def compute_reliability(
+    scores: Sequence[float],
+    *,
+    pass_at_k: int = 1,
+    success_threshold: float = 50.0,
+    variance_threshold: float = 10.0,
+) -> Dict[str, Any]:
+    """Aggregate per-run scores into reliability statistics (#50).
+
+    ``mean_score`` / ``stddev`` are the arithmetic mean and the population
+    standard deviation of the per-run ``overall_percentage`` values
+    (population: divide by n — we observe ALL runs, not a sample).
+    ``pass_at_k`` is the chance that at least ``k`` of the ``n_runs``
+    succeed, where a run succeeds when its percentage is >=
+    ``success_threshold``: the observed success rate p = successes / n is
+    plugged into the binomial tail P(X >= k), X ~ Binomial(n, p).
+    ``unreliable`` is True when stddev exceeds ``variance_threshold``.
+    A single run (n == 1) has stddev 0.0 and can never be unreliable.
+    """
+    n = len(scores)
+    if n == 0:
+        return {
+            "n_runs": 0,
+            "mean_score": 0.0,
+            "stddev": 0.0,
+            "pass_at_k": 0.0,
+            "unreliable": False,
+        }
+    mean = sum(scores) / n
+    stddev = math.sqrt(sum((s - mean) ** 2 for s in scores) / n) if n > 1 else 0.0
+    successes = sum(1 for s in scores if s >= success_threshold)
+    p = successes / n
+    if pass_at_k <= 0:
+        pass_prob = 1.0  # "at least 0 successes" is certain
+    elif pass_at_k > n:
+        pass_prob = 0.0
+    else:
+        pass_prob = sum(
+            math.comb(n, j) * (p**j) * ((1.0 - p) ** (n - j))
+            for j in range(pass_at_k, n + 1)
+        )
+    return {
+        "n_runs": n,
+        "mean_score": round(mean, 1),
+        "stddev": round(stddev, 1),
+        "pass_at_k": round(pass_prob, 3),
+        "unreliable": stddev > variance_threshold,
+    }
+
+
+def _score_with_temperature(
+    grader: Any,
+    date: str,
+    evolution_dir: Path,
+    temperature: Optional[float],
+) -> Dict[str, Any]:
+    """Run one evaluation, passing ``temperature`` when the grader accepts it.
+
+    The shipped StrictRubricJudgeGrader is deterministic and takes no
+    temperature kwarg — repeated runs are identical by design. LLM-backed
+    graders that accept ``temperature`` in ``score()`` get it so repeated
+    runs sample diverse outputs.
+    """
+    if temperature is None:
+        return grader.score(date, evolution_dir)
+    try:
+        accepts = "temperature" in inspect.signature(grader.score).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    if accepts:
+        return grader.score(date, evolution_dir, temperature=temperature)
+    return grader.score(date, evolution_dir)
+
+
+def run_scored_evaluations(
+    grader: Any,
+    date: str,
+    evolution_dir: Path,
+    n_runs: int,
+    temperature: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Evaluate a cycle ``n_runs`` times; returns the per-run scorecards.
+
+    Cost bound (#50): total cost = n_runs * single-run cost. n_runs is
+    validated into [1, 10] by the config layer, so the worst case is a
+    bounded 10x single-run spend.
+    """
+    return [
+        _score_with_temperature(grader, date, evolution_dir, temperature)
+        for _ in range(n_runs)
+    ]
+
+
+def aggregate_scorecards(
+    scorecards: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge per-run scorecards into one reliability-augmented record.
+
+    Run 0 is the base (dimensions, claims, flags, rubric_forge, ...);
+    when more than one run happened the headline numbers become the mean
+    and the reliability fields are attached. ``n_runs=1`` keeps every
+    pre-#50 field's exact value (plus inert reliability fields), so
+    existing single-run callers stay backward compatible.
+    """
+    base = dict(scorecards[0])
+    pcts = [float(s.get("overall_percentage", 0.0)) for s in scorecards]
+    rel = compute_reliability(
+        pcts,
+        pass_at_k=int(
+            config.get("pass_at_k", RUBRIC_RELIABILITY_DEFAULTS["pass_at_k"])
+        ),
+        success_threshold=float(
+            config.get(
+                "success_threshold", RUBRIC_RELIABILITY_DEFAULTS["success_threshold"]
+            )
+        ),
+        variance_threshold=float(
+            config.get(
+                "variance_threshold", RUBRIC_RELIABILITY_DEFAULTS["variance_threshold"]
+            )
+        ),
+    )
+    if rel["n_runs"] > 1:
+        base["overall_percentage"] = rel["mean_score"]
+        total_max = base.get("total_max") or 0
+        if total_max > 0:
+            base["total_score"] = round(total_max * rel["mean_score"] / 100.0, 1)
+    base["n_runs"] = rel["n_runs"]
+    base["mean_score"] = rel["mean_score"]
+    base["stddev"] = rel["stddev"]
+    base["pass_at_k"] = rel["pass_at_k"]
+    base["unreliable"] = rel["unreliable"]
+    base["run_scores"] = pcts
+    if rel["unreliable"]:
+        flags = list(base.get("flags") or [])
+        flags.append(
+            "UNRELIABLE: stddev {} exceeds threshold {}".format(
+                rel["stddev"],
+                config.get(
+                    "variance_threshold",
+                    RUBRIC_RELIABILITY_DEFAULTS["variance_threshold"],
+                ),
+            )
+        )
+        base["flags"] = flags
+    return base
+
+
+# ──────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────
 
@@ -1457,6 +1725,9 @@ def main(argv: List[str]) -> int:
             "  --summary       Summarize recent strict scorecards\n"
             "  --last N        Window for summary (default: 7)\n"
             "  --grader TYPE   'strict' (default) or 'agent'\n"
+            "  --config PATH   rubric judge cron YAML with the reliability: section\n"
+            "                  (default: cron/evolution/rubric-judge.yaml next to\n"
+            "                  this script; n_runs/temperature/variance_threshold/...)\n"
         )
         return 0
 
@@ -1500,7 +1771,24 @@ def main(argv: List[str]) -> int:
     else:
         grader = StrictRubricJudgeGrader()  # AgentGrader needs LLM — fall back
 
-    scorecard = grader.score(date, evolution_dir)
+    # N-run reliability (#50): load the reliability: config (n_runs,
+    # temperature, variance_threshold, pass_at_k, success_threshold) and
+    # evaluate the cycle n_runs times. Cost bound: n_runs * single-run
+    # cost, with n_runs validated into [1, 10].
+    config_path: Optional[Path] = None
+    if "--config" in args:
+        i = args.index("--config")
+        if i + 1 < len(args):
+            config_path = Path(args[i + 1])
+    config = load_rubric_config(config_path)
+    scorecards = run_scored_evaluations(
+        grader,
+        date,
+        evolution_dir,
+        config["n_runs"],
+        temperature=config.get("temperature"),
+    )
+    scorecard = aggregate_scorecards(scorecards, config)
 
     # Persist
     append_scorecard(evolution_dir / "rubric-scorecard.jsonl", scorecard)
@@ -1522,9 +1810,14 @@ def main(argv: List[str]) -> int:
     # Compact oneline for cron log (no_agent job)
     pct = scorecard["overall_percentage"]
     flags = " | ".join(scorecard["flags"][:2]) if scorecard["flags"] else "ok"
+    reliability = (
+        f"n_runs={scorecard['n_runs']} mean={scorecard['mean_score']} "
+        f"stddev={scorecard['stddev']} pass@k={scorecard['pass_at_k']}"
+        + (" UNRELIABLE" if scorecard["unreliable"] else "")
+    )
     print(
         f"[rubric-judge] {date}: {pct}% ({scorecard['total_score']}/"
-        f"{scorecard['total_max']}) | {flags}"
+        f"{scorecard['total_max']}) | {flags} | {reliability}"
     )
     return 0
 
