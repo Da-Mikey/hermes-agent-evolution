@@ -3874,7 +3874,7 @@ class MCPServerTask:
         # missing its required `params._meta` envelope keys. The header has to
         # agree with what the body actually speaks.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
-            headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
+            headers["mcp-protocol-version"] = LATEST_HANDSHAKE_VERSION
         # Pin a brotli-free Accept-Encoding (#724). httpx negotiates ``br``
         # whenever brotlicffi is importable; some MCP servers' streamed JSON
         # then trips a brotlicffi decoder bug ("decoder process called with
