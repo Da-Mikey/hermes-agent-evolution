@@ -3189,6 +3189,8 @@ def cmd_chat(args):
     _qfile = getattr(args, "query_file", None)
     if _qfile:
         if args.query:
+            # argparse's mutually-exclusive group catches the normal CLI path;
+            # this guards programmatic callers that fill the namespace directly.
             print("Error: -q/--query and --query-file are mutually exclusive", file=sys.stderr)
             sys.exit(2)
         try:
