@@ -2694,7 +2694,10 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     seen_content: set = set()
     loaded_paths: list[Path] = []
     for directory in _agents_md_directory_chain(cwd_resolved):
-        for name in ["AGENTS.override.md", "AGENTS.md", "agents.md"]:
+        # AGENTS.md / agents.md only — the override file is collected by its
+        # own loop below so BOTH can coexist in one directory (override
+        # appended after, highest precedence).
+        for name in _AGENTS_MD_NAMES:
             candidate = directory / name
             if not candidate.exists():
                 continue

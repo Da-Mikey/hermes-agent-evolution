@@ -778,13 +778,18 @@ class TestBuildContextFilesPrompt:
 
     # --- AGENTS.override.md personal override (port of pi#7681) ---
 
-    def test_agents_override_md_wins_over_agents_md(self, tmp_path):
+    def test_agents_override_md_appended_after_agents_md(self, tmp_path):
+        """Fork semantics: BOTH load — the override is appended after the
+        base AGENTS.md content, giving it the final word (upstream v2
+        replaces the base file entirely; the fork keeps both so shared team
+        rules stay visible alongside personal overrides)."""
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
         (tmp_path / "AGENTS.override.md").write_text("Use Black instead.")
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Use Black instead" in result
-        assert "Ruff for linting" not in result
+        assert "Ruff for linting" in result
         assert "AGENTS.override.md" in result
+        assert result.index("Ruff for linting") < result.index("Use Black instead")
 
     def test_agents_override_md_loads_alone(self, tmp_path):
         (tmp_path / "AGENTS.override.md").write_text("Override-only context.")
