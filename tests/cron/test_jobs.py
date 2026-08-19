@@ -25,6 +25,8 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
     _hermes_now,
+    _advance_schedule_by_steps,
+    _failure_backoff_config,
 )
 
 
@@ -515,6 +517,88 @@ class TestMarkJobRun:
         assert updated["next_run_at"] is None
         assert updated["last_error"]
         assert "croniter" in updated["last_error"].lower()
+
+
+class TestFailureBackoff:
+    """#70: per-job exponential backoff + circuit breaker for deterministically
+    failing jobs. An error byte-identical to the previous run is deterministic
+    — the fixed schedule re-running it only burns tokens/disk. Backoff skips
+    2**(streak-1)-1 slots (capped); past the threshold the job auto-pauses."""
+
+    def test_single_failure_sets_streak_one_no_backoff(self, tmp_cron_dir):
+        job = create_job(prompt="Fail", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        updated = get_job(job["id"])
+        assert updated["failure_streak"] == 1
+        assert updated["failure_backoff_skips"] == 0
+        assert updated["enabled"] is True
+        assert updated["state"] == "scheduled"
+
+    def test_identical_failures_increment_streak_and_backoff(self, tmp_cron_dir):
+        job = create_job(prompt="Fail", schedule="every 10m")
+        mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        updated = get_job(job["id"])
+        assert updated["failure_streak"] == 2
+        assert updated["failure_backoff_skips"] == 1  # 2**(2-1)-1
+
+    def test_changed_error_resets_streak(self, tmp_cron_dir):
+        job = create_job(prompt="Fail", schedule="every 10m")
+        mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        mark_job_run(job["id"], success=False, error="TypeError: bad op")
+        updated = get_job(job["id"])
+        assert updated["failure_streak"] == 1
+
+    def test_success_resets_streak_and_skips(self, tmp_cron_dir):
+        job = create_job(prompt="Fail", schedule="every 10m")
+        mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        mark_job_run(job["id"], success=True)
+        updated = get_job(job["id"])
+        assert updated["failure_streak"] == 0
+        assert updated.get("failure_backoff_skips") in (None, 0)
+
+    def test_auto_pause_after_threshold_identical_failures(self, tmp_cron_dir):
+        job = create_job(prompt="Fail", schedule="every 1h")
+        for _ in range(10):
+            mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        updated = get_job(job["id"])
+        assert updated["failure_streak"] == 10
+        assert updated["enabled"] is False
+        assert updated["state"] == "paused"
+        assert updated["next_run_at"] is None
+        assert "auto-paused" in (updated.get("paused_reason") or "")
+
+    def test_resume_clears_streak(self, tmp_cron_dir):
+        job = create_job(prompt="Fail", schedule="every 1h")
+        for _ in range(10):
+            mark_job_run(job["id"], success=False, error="KeyError: 'foo'")
+        resume_job(job["id"])
+        updated = get_job(job["id"])
+        assert updated["enabled"] is True
+        assert updated["failure_streak"] == 0
+
+    def test_advance_schedule_by_steps_interval(self):
+        from datetime import datetime, timedelta, timezone
+        base = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc).isoformat()
+        advanced = _advance_schedule_by_steps(
+            {"kind": "interval", "minutes": 10}, base, 3
+        )
+        dt = datetime.fromisoformat(advanced)
+        assert dt == datetime(2026, 8, 18, 12, 30, tzinfo=timezone.utc)
+
+    def test_advance_schedule_by_steps_zero_is_identity(self):
+        base = "2026-08-18T12:00:00+00:00"
+        assert _advance_schedule_by_steps(
+            {"kind": "interval", "minutes": 10}, base, 0
+        ) == base
+
+    def test_failure_backoff_config_returns_dict_with_defaults(self, tmp_cron_dir):
+        # Even with no explicit tuning, the config section is a dict and the
+        # call sites fall back to their built-in defaults.
+        cfg = _failure_backoff_config()
+        assert isinstance(cfg, dict)
+        assert cfg.get("failure_backoff_max_skips", 16) == 16
 
 
 class TestAdvanceNextRun:
