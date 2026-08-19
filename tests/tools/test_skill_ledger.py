@@ -16,12 +16,15 @@ import pytest
 
 VALID_SKILL_CONTENT = """---
 name: my-skill
-description: test skill
+description: ledger round-trip test skill for audit and rollback
 ---
 
 # My Skill
 
-Original body.
+Original body. The ledger tests only care that create/patch/rollback round-trip
+through the audit ledger, so the body is deliberately plain — but it must clear
+the auto-created-skill structural gate (>= 80 body chars), which this sentence
+padding exists to satisfy.
 """
 
 

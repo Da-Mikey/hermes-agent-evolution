@@ -31,20 +31,24 @@ def _invoke(monkeypatch: pytest.MonkeyPatch, *args: str) -> int:
     return 0
 
 
-def test_computer_use_help_omits_browser_approve() -> None:
+def test_computer_use_help_lists_browser_approve() -> None:
+    """Fork: browser-approve is a SHIPPED subcommand (the explicit human
+    boundary for attaching to an existing signed-in browser profile);
+    upstream removed it, the fork keeps it in-band."""
     result = _run("--help")
 
     assert result.returncode == 0
-    assert "browser-approve" not in result.stdout
+    assert "browser-approve" in result.stdout
     assert "doctor" in result.stdout
     assert "permissions" in result.stdout
 
 
-def test_computer_use_rejects_removed_browser_approve_command() -> None:
-    result = _run("browser-approve", "--pid", "123")
+def test_computer_use_browser_approve_rejects_missing_pid() -> None:
+    result = _run("browser-approve")
 
+    # argparse rejects the missing --pid with usage text, exit 2.
     assert result.returncode == 2
-    assert "invalid choice: 'browser-approve'" in result.stderr
+    assert "--pid" in result.stderr
 
 
 def test_computer_use_status_returns_zero_for_compatible_driver(
