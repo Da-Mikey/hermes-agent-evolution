@@ -432,6 +432,17 @@ _INVALID_MESSAGE_BODY_PATTERNS = [
     "text content blocks must be non-empty",
     "content field is required",
     "messages: at least one message is required",
+    # Empty tool_calls arrays (#33): strict OpenAI-compatible providers
+    # (DeepSeek v4, Moonshot/Kimi) reject ``"tool_calls": []`` with HTTP 400
+    # "Invalid 'messages[N].tool_calls': empty array. Expected an array with
+    # minimum length 1, but got an empty array instead." The pre-API
+    # sanitizer (agent_runtime_helpers.py) strips the empty array at the
+    # chokepoint, but a transport that bypasses it would otherwise retry the
+    # byte-identical payload into the same deterministic 400 — classify as a
+    # non-retryable format_error safety net instead of looping.
+    "tool_calls': empty array",
+    "tool_calls: empty array",
+    "expected an array with minimum length 1",
     # Qwen / vLLM chat templates raise this when the request has no surviving
     # non-empty user turn (oversized session truncation, compression that
     # dropped the only user message, or a resumed lineage that opens with
