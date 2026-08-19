@@ -897,6 +897,7 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
                 f"Stale in-flight claim force-released after {age / 60:.1f}m "
                 f"(allowance {allowance / 60:.1f}m); previous run never released "
                 f"the scheduler in-flight guard",
+                status="released",
             )
         except Exception as e:
             logger.warning("Could not record forced release for job %s: %s", job_id, e)
@@ -981,6 +982,7 @@ def mark_running_jobs_interrupted(
                     job_id,
                     False,
                     reason,
+                    status="interrupted",
                     expected_fire_owner=fire_owner,
                 ):
                     marked.append(job_id)
@@ -6293,6 +6295,7 @@ def _run_one_job_body(
                     job["id"],
                     False,
                     "Interrupted by shutdown before terminal completion.",
+                    status="interrupted",
                     expected_fire_owner=fire_owner,
                 )
                 finish_execution(
@@ -6456,6 +6459,7 @@ def _run_one_job_body(
                     job["id"],
                     False,
                     "Interrupted by shutdown before terminal completion.",
+                    status="interrupted",
                     expected_fire_owner=fire_owner,
                 )
                 finish_execution(
