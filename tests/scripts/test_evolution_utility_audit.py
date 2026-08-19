@@ -158,3 +158,104 @@ class TestCli:
     def test_help_exits_zero(self, capsys):
         assert main(["--help"]) == 0
         assert "usage" in capsys.readouterr().out
+
+
+class TestNonStationaryAuditBar:
+    """Wiring of the non-stationary audit bar (issue #63) into the daily
+    utility audit run — the real call site."""
+
+    def _sidecar(self, tmp_path, usage):
+        sidecar = tmp_path / "skills" / ".usage.json"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps(usage), encoding="utf-8")
+        return sidecar
+
+    def test_first_run_accepts_baseline_then_carries_traps(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._sidecar(
+            tmp_path,
+            {
+                "main": _rec(use=100, last=_now()),
+                "tiny": _rec(use=1, last=_now(), description="unrelated topic"),
+            },
+        )
+        assert main([]) == 0
+        out1 = capsys.readouterr().out
+        assert "[utility-audit][bar]" in out1
+        assert "first run" in out1
+        state_file = tmp_path / "evolution" / "audit-bar-state.json"
+        assert state_file.exists()
+        saved = json.loads(state_file.read_text(encoding="utf-8"))
+        assert len(saved["accepted_observations"]) == 2
+        assert saved["miss_threshold"] == 2
+
+        # Second run: the accepted observations are carried forward as
+        # calibration traps.
+        assert main([]) == 0
+        out2 = capsys.readouterr().out
+        assert "calibration traps carried forward" in out2
+        assert "known/accepted" in out2
+
+    def test_drift_against_accepted_baseline_is_reported(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._sidecar(
+            tmp_path,
+            {
+                "main": _rec(use=100, last=_now()),
+                "tiny": _rec(use=1, last=_now(), description="unrelated topic"),
+            },
+        )
+        assert main([]) == 0
+        capsys.readouterr().out
+
+        # "main" collapses to inert (keep -> remove): drift. "tiny" vanishes:
+        # disappearance drift. "giant" appears: new drift until accepted.
+        self._sidecar(
+            tmp_path,
+            {"main": _rec(), "giant": _rec(use=1000, last=_now())},
+        )
+        assert main([]) == 0
+        out = capsys.readouterr().out
+        assert "NEW DRIFT: main" in out
+        assert "disappeared" in out
+        assert "NEW DRIFT: giant" in out
+
+    def test_bar_prompt_prints_rubric_and_traps(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._sidecar(tmp_path, {"main": _rec(use=100, last=_now())})
+        assert main([]) == 0
+        capsys.readouterr().out
+        assert main(["--bar-prompt"]) == 0
+        out = capsys.readouterr().out
+        assert "NON-STATIONARY AUDIT BAR" in out
+        assert "ACTIVE AUDIT RUBRIC" in out
+        assert "CALIBRATION TRAPS" in out
+        assert "KNOWN/ACCEPTED: skill:main" in out
+        assert "never report" in out
+
+    def test_json_includes_audit_bar_state(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._sidecar(tmp_path, {"main": _rec(use=100, last=_now())})
+        assert main(["--json"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["audit_bar"] is not None
+        assert data["audit_bar"]["rubric_variant"] == 0
+        assert data["audit_bar"]["miss_threshold"] == 2
+        assert data["audit_bar"]["calibration_traps"] == 1
+
+    def test_miss_threshold_flag_is_configurable(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._sidecar(tmp_path, {"main": _rec(use=100, last=_now())})
+        assert main(["--json", "--miss-threshold", "3"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["audit_bar"]["miss_threshold"] == 3
+        saved = json.loads(
+            (tmp_path / "evolution" / "audit-bar-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert saved["miss_threshold"] == 3
