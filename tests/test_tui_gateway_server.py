@@ -150,7 +150,6 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-@pytest.fixture(autouse=True)
 def _reap_leaked_notification_pollers():
     """Stop and join notification pollers leaked by each test.
 
