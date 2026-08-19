@@ -2209,24 +2209,24 @@ def _build_child_agent(
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:
         effective_api_mode = getattr(parent_agent, "api_mode", None)
-    # Defensive: validate trusted delegation.command exists on PATH before
-    # honoring it. An explicitly pinned transport that cannot run must fail
-    # the spawn loudly (#80450) — silently falling back to the default
-    # transport would run the child somewhere the user explicitly routed it
-    # away from. Normally unreachable via delegate_task, which pre-validates
-    # the command in _resolve_delegation_credentials.
+    # Defensive: models occasionally hallucinate acp_command="copilot" /
+    # "claude" in delegate_task calls despite the schema. Forcing the child
+    # onto the copilot-acp transport then crashes the gateway when the
+    # binary is missing (headless container deploys — 3 retries then the
+    # asyncio teardown takes the process down). A MODEL-supplied override is
+    # not trusted intent: silently clear it and fall back to the parent's
+    # transport. USER-pinned commands (delegation.command in config.yaml)
+    # are pre-validated loudly in _resolve_delegation_credentials (#80450)
+    # and never reach this clearing path.
+    effective_acp_command = override_acp_command or getattr(
+        parent_agent, "acp_command", None
+    )
     if override_acp_command:
         import shutil as _shutil
 
         if not _shutil.which(override_acp_command):
-            raise ValueError(
-                f"Pinned delegation command '{override_acp_command}' was not "
-                f"found on PATH. Install it or remove delegation.command from "
-                f"config.yaml."
-            )
-    effective_acp_command = override_acp_command or getattr(
-        parent_agent, "acp_command", None
-    )
+            effective_acp_command = None
+            override_acp_args = None
     effective_acp_args = list(
         override_acp_args
         if override_acp_args is not None
@@ -2241,9 +2241,11 @@ def _build_child_agent(
         effective_acp_command = None
         effective_acp_args = []
 
-    if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
+    if override_acp_command and effective_acp_command:
+        # If an ACP transport override SURVIVED the binary check above, the
+        # provider MUST be copilot-acp so run_agent.py initializes the
+        # CopilotACPClient. When the check cleared a hallucinated command,
+        # fall through to the parent's provider instead.
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
