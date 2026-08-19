@@ -11,6 +11,17 @@ mode: PRIVATE
 # utility audit, and (with --apply) stamps trust_state=demoted on demote
 # verdicts so the audit has consequence. See scripts/evolution_utility_audit.py
 # (issue #2286, SkillProx).
+#
+# Non-stationary audit bar (issue #63): the audit standard is not frozen.
+# The previous audit's accepted observations are carried forward as
+# calibration traps (KNOWN/ACCEPTED — flagged as known, never re-reported as
+# new drift); NEW drift beyond them is reported each run; consecutive audits
+# with drift-but-no-report rotate the audit rubric (variant of the checklist)
+# and reset the counter. State lives in
+# <evolution-dir>/audit-bar-state.json (miss threshold defaults to 2; tune
+# via `--miss-threshold N` or the state file's miss_threshold field). Run
+# `python3 scripts/evolution_utility_audit.py --bar-prompt` to see the active
+# audit prompt (rubric variant + calibration traps).
 no_agent: true
 script: evolution_utility_audit.py
 
@@ -22,4 +33,7 @@ prompt: |
   Deterministic leave-one-out utility audit (no LLM). Reads the curator
   sidecar, scores each skill's recency-weighted utility, and stamps
   trust_state=demoted on low-utility non-redundant skills. See
-  scripts/evolution_utility_audit.py (issue #2286).
+  scripts/evolution_utility_audit.py (issue #2286). The non-stationary
+  audit bar (issue #63) carries the previous audit's accepted observations
+  forward as calibration traps and rotates the audit rubric when missed
+  drift crosses the threshold — the bar rises with the system.
