@@ -37,6 +37,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from tools.delegation_attribution import (
+    attribution_prompt_block,
+    build_attribution_stamp,
+)
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -1417,6 +1421,7 @@ def _build_child_system_prompt(
     max_spawn_depth: int = 2,
     child_depth: int = 1,
     denied_toolsets: Optional[List[str]] = None,
+    attribution: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -1440,12 +1445,23 @@ def _build_child_system_prompt(
     the prompt, rather than fixed by relaxing the parent-toolset
     intersection: that intersection is a security boundary (no privilege
     escalation via delegation), not a bug.
+
+    ``attribution`` (#67, slice 1): an optional canonical attribution
+    marker line (see :mod:`tools.delegation_attribution`). When present,
+    the child is told its run identity and instructed to stamp the
+    marker on every artifact it produces (file headers, commit bodies,
+    PR titles), making parallel-agent work traceable to the exact run.
+    Built at the spawn site, where the subagent identity is known.
     """
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
     ]
+    if attribution and str(attribution).strip():
+        parts.append(
+            f"\nATTRIBUTION:\n{attribution_prompt_block(str(attribution).strip())}"
+        )
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -2115,6 +2131,16 @@ def _build_child_agent(
                 _seen_denied.add(t)
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    # Attribution (#67, slice 1): stamp this child run with its identity so
+    # every artifact it produces can be traced back to this exact delegation.
+    # parent_subagent_id is non-None exactly when the parent is itself a
+    # subagent (nested orchestrator -> worker chains), which is the attribution
+    # chain the red-team research calls out as untraceable.
+    _attribution_stamp = build_attribution_stamp(
+        subagent_id=subagent_id,
+        parent_subagent_id=parent_subagent_id,
+        task_index=task_index,
+    )
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -2123,6 +2149,7 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
         denied_toolsets=denied_toolsets,
+        attribution=_attribution_stamp,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
