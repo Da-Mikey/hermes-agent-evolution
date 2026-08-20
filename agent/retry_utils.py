@@ -304,6 +304,27 @@ def overload_retry_ceiling(short_attempts: int = _OVERLOAD_SHORT_ATTEMPTS) -> in
     return short_attempts + len(_OVERLOAD_LONG_BACKOFF) + 1
 
 
+def resolve_retry_ceiling(
+    *,
+    platform: Optional[str],
+    interactive_max: int,
+    cron_max: int = 15,
+) -> int:
+    """Resolve the effective API retry ceiling for a run context (#2376).
+
+    Cron/unattended contexts (``platform == "cron"``) get a higher ceiling
+    (default 15 vs the interactive default 3) so transient 429/overload spikes
+    don't kill the pipeline stage. The cron ceiling is only ever *raised*
+    above the interactive default — it never lowers an interactive session's
+    own ``api_max_retries``.
+
+    Returns the effective ``max_retries`` for the retry loop.
+    """
+    if platform == "cron":
+        return max(interactive_max, cron_max)
+    return interactive_max
+
+
 # Connection/read timeouts classify as ``FailoverReason.timeout``.  They mean
 # the provider accepted the request but did not respond within the deadline —
 # usually provider-side slowness or a hung upstream, not a fast-failing network

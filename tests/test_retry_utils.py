@@ -5,37 +5,40 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+)
 
 
 def test_backoff_is_exponential():
     """Base delay should double each attempt (before jitter)."""
     for attempt in (1, 2, 3, 4):
-        delays = [jittered_backoff(attempt, base_delay=5.0, max_delay=120.0, jitter_ratio=0.0) for _ in range(100)]
+        delays = [
+            jittered_backoff(attempt, base_delay=5.0, max_delay=120.0, jitter_ratio=0.0)
+            for _ in range(100)
+        ]
         expected = min(5.0 * (2 ** (attempt - 1)), 120.0)
         mean = sum(delays) / len(delays)
-        assert abs(mean - expected) < 0.01, f"attempt {attempt}: expected {expected}, got {mean}"
+        assert abs(mean - expected) < 0.01, (
+            f"attempt {attempt}: expected {expected}, got {mean}"
+        )
 
 
 def test_backoff_respects_max_delay():
     """Even with high attempt numbers, delay should not exceed max_delay."""
     for attempt in (10, 20, 100):
-        delay = jittered_backoff(attempt, base_delay=5.0, max_delay=60.0, jitter_ratio=0.0)
+        delay = jittered_backoff(
+            attempt, base_delay=5.0, max_delay=60.0, jitter_ratio=0.0
+        )
         assert delay <= 60.0, f"attempt {attempt}: delay {delay} exceeds max 60s"
-
-
 
 
 def test_backoff_attempt_1_is_base():
     """First attempt delay should equal base_delay (with no jitter)."""
     delay = jittered_backoff(1, base_delay=3.0, max_delay=120.0, jitter_ratio=0.0)
     assert delay == 3.0
-
-
-
-
-
-
 
 
 def test_backoff_thread_safety():
@@ -45,7 +48,9 @@ def test_backoff_thread_safety():
 
     def _call_backoff():
         barrier.wait()
-        results.append(jittered_backoff(1, base_delay=10.0, max_delay=120.0, jitter_ratio=0.5))
+        results.append(
+            jittered_backoff(1, base_delay=10.0, max_delay=120.0, jitter_ratio=0.5)
+        )
 
     threads = [threading.Thread(target=_call_backoff) for _ in range(8)]
     for t in threads:
@@ -113,14 +118,6 @@ def _zai_overload_error():
     )
 
 
-
-
-
-
-
-
-
-
 def test_zai_overload_retry_ceiling_exceeds_short_attempts():
     """Invariant: the ceiling must sit above the short-retry threshold, or the
     long-backoff tier is unreachable and the whole schedule is dead code
@@ -139,14 +136,18 @@ def test_zai_overload_retry_ceiling_exceeds_short_attempts():
     # i.e. the largest attempt the loop still computes backoff for
     # (ceiling - 1) must reach the final long-tier index.
     last_attempt_with_backoff = ceiling - 1
-    assert last_attempt_with_backoff - short_attempts >= len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF)
+    assert last_attempt_with_backoff - short_attempts >= len(
+        _ZAI_CODING_OVERLOAD_LONG_BACKOFF
+    )
 
 
 def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     """End-to-end over the attempt range the retry loop actually walks: with the
     extended ceiling, at least one attempt reaches the long-backoff tier and the
     full 30/60/90/120s schedule is exercised."""
-    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    monkeypatch.setattr(
+        retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"]
+    )
     from agent.retry_utils import zai_coding_overload_retry_ceiling
 
     err = _zai_overload_error()
@@ -170,6 +171,41 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# resolve_retry_ceiling — cron-context extended retry ceiling (#2376)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_retry_ceiling_cron_raises_ceiling():
+    """Cron context gets the higher cron ceiling (default 15 vs interactive 3)."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cron", interactive_max=3) == 15
+
+
+def test_resolve_retry_ceiling_cron_honors_override():
+    """A configured cron ceiling propagates through the resolver."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cron", interactive_max=3, cron_max=20) == 20
+
+
+def test_resolve_retry_ceiling_cron_never_lowers_interactive():
+    """A cron ceiling below the interactive default must not reduce max_retries."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cron", interactive_max=5, cron_max=2) == 5
+
+
+def test_resolve_retry_ceiling_interactive_keeps_default():
+    """Non-cron contexts keep the standard interactive ceiling unchanged."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cli", interactive_max=3) == 3
+    assert resolve_retry_ceiling(platform="gateway", interactive_max=3) == 3
+    assert resolve_retry_ceiling(platform=None, interactive_max=3) == 3
+
+
+# ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------
 
@@ -177,14 +213,15 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
 class TestParseRetryAfterSeconds:
     def test_numeric_string(self):
         from agent.retry_utils import parse_retry_after_seconds
+
         assert parse_retry_after_seconds("120") == 120.0
         assert parse_retry_after_seconds(" 4.5 ") == 4.5
 
     def test_numeric_value(self):
         from agent.retry_utils import parse_retry_after_seconds
+
         assert parse_retry_after_seconds(45) == 45.0
         assert parse_retry_after_seconds(3.25) == 3.25
-
 
     def test_http_date(self):
         from datetime import datetime, timedelta, timezone
@@ -197,8 +234,6 @@ class TestParseRetryAfterSeconds:
 
         past = datetime.now(timezone.utc) - timedelta(seconds=90)
         assert parse_retry_after_seconds(format_datetime(past, usegmt=True)) == 0.0
-
-
 
     def test_headers_get_raises(self):
         from agent.retry_utils import parse_retry_after_seconds

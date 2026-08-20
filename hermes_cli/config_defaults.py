@@ -123,6 +123,11 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Issue #2376: in cron/unattended contexts there is no human waiting,
+        # so transient 429/overload spikes should tolerate more retries before
+        # giving up. This raises the ceiling for platform=="cron" only;
+        # interactive sessions keep the standard api_max_retries.
+        "cron_api_max_retries": 15,
         # Empty-response retry guard (NS-503).  The empty-retry loop
         # re-sends the full conversation input at full price on every
         # attempt; these settings stop it from re-billing *deterministic*
@@ -321,7 +326,6 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
-
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.
         # Takes precedence over agent.reasoning_effort when the current model
@@ -329,7 +333,6 @@ DEFAULT_CONFIG = {
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
     },
-
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
@@ -408,9 +411,9 @@ DEFAULT_CONFIG = {
         "vercel_runtime": "node24",
         # Container resource limits (docker, singularity, modal, daytona, vercel_sandbox — ignored for local/ssh)
         "container_cpu": 1,
-        "container_memory": 5120,       # MB (default 5GB)
-        "container_disk": 51200,        # MB (default 50GB)
-        "container_persistent": True,   # Persist filesystem across sessions
+        "container_memory": 5120,  # MB (default 5GB)
+        "container_disk": 51200,  # MB (default 50GB)
+        "container_persistent": True,  # Persist filesystem across sessions
         # Docker volume mounts — share host directories with the container.
         # Each entry is "host_path:container_path" (standard Docker -v syntax).
         # Example:
@@ -425,7 +428,7 @@ DEFAULT_CONFIG = {
         # Opt-in egress lockdown for Docker terminal sessions. When false,
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,
-        "docker_extra_args": [],        # Extra flags passed verbatim to docker run
+        "docker_extra_args": [],  # Extra flags passed verbatim to docker run
         # /dev/shm size for the Docker sandbox. Docker's 64 MB default silently
         # breaks Chromium/Playwright and PyTorch DataLoader workers; tmpfs is
         # lazily allocated so the higher ceiling costs nothing until used.
@@ -448,15 +451,13 @@ DEFAULT_CONFIG = {
         # via TERMINAL_LOCAL_PERSISTENT env var.
         "persistent_shell": True,
     },
-
     "web": {
-        "backend": "",           # shared fallback — applies to both search and extract
-        "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
-        "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        "backend": "",  # shared fallback — applies to both search and extract
+        "search_backend": "",  # per-capability override for web_search (e.g. "searxng")
+        "extract_backend": "",  # per-capability override for web_extract (e.g. "native")
         "search_backend_fallback_chain": "",
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
     },
-
     "browser": {
         # Browser tool implementation.
         # ""            — DEFAULT: Browser Use mode when the browser-use CLI
@@ -509,7 +510,6 @@ DEFAULT_CONFIG = {
             "loopback_host_alias": "host.docker.internal",
         },
     },
-
     # Filesystem checkpoints — automatic snapshots before destructive file ops.
     # When enabled, the agent takes a snapshot of the working directory once
     # per conversation turn (on first write_file/patch call).  Use /rollback
@@ -555,7 +555,6 @@ DEFAULT_CONFIG = {
         "retention_days": 7,
         "min_interval_hours": 24,
     },
-
     # Hard cap (chars) for a single automatic context file such as SOUL.md,
     # AGENTS.md, CLAUDE.md, .hermes.md, or .cursorrules before Hermes applies
     # head/tail truncation. ``null`` (the default) lets the cap scale with the
@@ -563,12 +562,10 @@ DEFAULT_CONFIG = {
     # rarely truncate a project doc. Set a positive integer to pin a fixed cap
     # and override the dynamic behavior. Separate from read_file tool limits.
     "context_file_max_chars": None,
-
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
     "file_read_max_chars": 100_000,
-
     # Seconds to wait at agent-build time for in-flight MCP server discovery
     # to finish before the agent snapshots its tool list.  MCP discovery runs
     # in a background thread so a slow/dead server can't freeze startup; this
@@ -583,7 +580,6 @@ DEFAULT_CONFIG = {
     # (see agent/turn_context.py), so correctness never depends on it.  Keep it
     # small so a slow/dead server adds little to first-response latency.
     "mcp_discovery_timeout": 1.5,
-
     # Single-query (``hermes -q/-z "..."``) variant of mcp_discovery_timeout.
     # In one-shot mode there is only ONE turn, so the between-turns late-binding
     # refresh never runs: a server that misses the small interactive bound is
@@ -593,7 +589,6 @@ DEFAULT_CONFIG = {
     # completes, so reachable servers only wait for their real handshake time
     # while unavailable servers remain bounded.
     "mcp_single_query_discovery_timeout": 15.0,
-
     # MCP runtime behavior (distinct from the per-server definitions in
     # mcp_servers: and from the auxiliary.mcp side-LLM task settings).
     "mcp": {
@@ -607,7 +602,6 @@ DEFAULT_CONFIG = {
         # guidance to apply it deliberately via /reload-mcp.
         "auto_reload_on_config_change": True,
     },
-
     # Tool-output truncation thresholds. When terminal output or a
     # single read_file page exceeds these limits, Hermes truncates the
     # payload sent to the model (keeping head + tail for terminal,
@@ -627,7 +621,6 @@ DEFAULT_CONFIG = {
         "max_lines": 2000,
         "max_line_length": 2000,
     },
-
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
     # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
@@ -653,227 +646,225 @@ DEFAULT_CONFIG = {
         # searches or spawning dozens of subagents is already pathological, so
         # the defaults are low. Set either to 0 to disable that cap (unlimited).
         "loop_caps": {
-            "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
-            "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            "max_web_searches": 50,  # max web_search calls per turn (0 = unlimited)
+            "max_subagents": 50,  # max subagents spawned per turn (0 = unlimited)
         },
     },
-
     "compression": {
         "enabled": True,
-        "progress_notices": False,    # opt-in (#52995): when True, routine compression
-                                      # progress statuses (compacting/preflight/pre-API/
-                                      # idle/retry) are delivered to chat gateway
-                                      # platforms instead of being suppressed by the
-                                      # gateway noise filter. Default False keeps
-                                      # routine compression silent-by-design on chat
-                                      # surfaces (server-side logging only). Failure
-                                      # notices and manual /compress feedback are
-                                      # always visible regardless of this setting.
-        "threshold": 0.50,            # compress when context usage exceeds this ratio.
-                                      # Models with context windows below 512K are
-                                      # floored at 0.75 (raise-only) so compaction
-                                      # doesn't fire with half the window still free;
-                                      # set this above 0.75 to override the floor.
-        "threshold_tokens": None,     # absolute token cap — when set, compression
-                                      # triggers at the lower of the ratio-based
-                                      # threshold and this token count. Clamped to
-                                      # the model's context length at apply-time.
-        "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
-        "tail_mode": "legacy",        # tail retention policy (#87326):
-                                      #   "legacy" — 0.20×window verbatim tail (default)
-                                      #   "lean"   — clamped 2.5%-of-window tail
-                                      #              (10K floor / 25K cap) plus chunked
-                                      #              digests, a mechanical anchor index,
-                                      #              verbatim user messages, and
-                                      #              session_search recovery pointers in
-                                      #              the summary. ~3x fewer retained
-                                      #              tokens after compaction; costs a few
-                                      #              extra summarizer calls at the
-                                      #              compaction boundary.
-        "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        "progress_notices": False,  # opt-in (#52995): when True, routine compression
+        # progress statuses (compacting/preflight/pre-API/
+        # idle/retry) are delivered to chat gateway
+        # platforms instead of being suppressed by the
+        # gateway noise filter. Default False keeps
+        # routine compression silent-by-design on chat
+        # surfaces (server-side logging only). Failure
+        # notices and manual /compress feedback are
+        # always visible regardless of this setting.
+        "threshold": 0.50,  # compress when context usage exceeds this ratio.
+        # Models with context windows below 512K are
+        # floored at 0.75 (raise-only) so compaction
+        # doesn't fire with half the window still free;
+        # set this above 0.75 to override the floor.
+        "threshold_tokens": None,  # absolute token cap — when set, compression
+        # triggers at the lower of the ratio-based
+        # threshold and this token count. Clamped to
+        # the model's context length at apply-time.
+        "target_ratio": 0.20,  # fraction of threshold to preserve as recent tail
+        "tail_mode": "legacy",  # tail retention policy (#87326):
+        #   "legacy" — 0.20×window verbatim tail (default)
+        #   "lean"   — clamped 2.5%-of-window tail
+        #              (10K floor / 25K cap) plus chunked
+        #              digests, a mechanical anchor index,
+        #              verbatim user messages, and
+        #              session_search recovery pointers in
+        #              the summary. ~3x fewer retained
+        #              tokens after compaction; costs a few
+        #              extra summarizer calls at the
+        #              compaction boundary.
+        "protect_last_n": 20,  # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
-                                      # survive in the uncompressed tail. 1 = existing
-                                      # single last-user anchor (default, behavior-
-                                      # preserving); raise to e.g. 3 to keep the last
-                                      # 3 real user turns verbatim when bulky tool
-                                      # outputs fill the tail token budget.
-        "max_attempts": 3,            # compression retry rounds before a turn gives up
-                                      # with "max compression attempts reached". Raise
-                                      # (e.g. 6) for tool-schema-heavy sessions where 3
-                                      # rounds cannot clear the request estimate.
-                                      # Validated >= 1, hard-capped at 10.
+        # survive in the uncompressed tail. 1 = existing
+        # single last-user anchor (default, behavior-
+        # preserving); raise to e.g. 3 to keep the last
+        # 3 real user turns verbatim when bulky tool
+        # outputs fill the tail token budget.
+        "max_attempts": 3,  # compression retry rounds before a turn gives up
+        # with "max compression attempts reached". Raise
+        # (e.g. 6) for tool-schema-heavy sessions where 3
+        # rounds cannot clear the request estimate.
+        # Validated >= 1, hard-capped at 10.
         "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
-                                      # no-LLM tool-result prune, run independently of
-                                      # `threshold` above. On large-window models
-                                      # `threshold` (≈50% of the window) rarely fires,
-                                      # so old tool output otherwise rides in history
-                                      # and is re-sent every turn; a low value like
-                                      # 48000 reclaims it early. 0 = off. Recent tail
-                                      # protected by `protect_last_n`. Built-in
-                                      # compressor only (other engines inherit a no-op).
-                                      # NOTE: each committed prune rewrites already-sent
-                                      # history, breaking the provider prompt-cache
-                                      # prefix — the min_reclaim gate below keeps those
-                                      # breaks episodic rather than per-turn.
+        # no-LLM tool-result prune, run independently of
+        # `threshold` above. On large-window models
+        # `threshold` (≈50% of the window) rarely fires,
+        # so old tool output otherwise rides in history
+        # and is re-sent every turn; a low value like
+        # 48000 reclaims it early. 0 = off. Recent tail
+        # protected by `protect_last_n`. Built-in
+        # compressor only (other engines inherit a no-op).
+        # NOTE: each committed prune rewrites already-sent
+        # history, breaking the provider prompt-cache
+        # prefix — the min_reclaim gate below keeps those
+        # breaks episodic rather than per-turn.
         "proactive_prune_min_result_chars": 8000,  # the prune's summarize pass only
-                                      # touches tool results larger than this (chars);
-                                      # clamped to >= 200 so a generated summary can't
-                                      # itself be re-summarized.
+        # touches tool results larger than this (chars);
+        # clamped to >= 200 so a generated summary can't
+        # itself be re-summarized.
         "proactive_prune_min_reclaim_tokens": 4096,  # a proactive prune only commits
-                                      # when it reclaims at least this many tokens
-                                      # (measured on the pruned output), then waits
-                                      # for a full trigger-sized token runway to
-                                      # regrow before rearming. Keeps prompt-cache
-                                      # breaks episodic. 0 = no minimum-savings gate.
-        "micro_compact": False,       # opt-in: after each completed turn, fold the
-                                      # oldest un-absorbed exchange into a rolling
-                                      # summary, amortizing compression cost instead
-                                      # of paying it in one batch stall. Default False
-                                      # because a pass rewrites already-sent history
-                                      # and so breaks the provider prompt-cache prefix
-                                      # EVERY turn — the per-turn cache break that
-                                      # `proactive_prune_min_reclaim_tokens` above
-                                      # exists to avoid. Enable only when you have
-                                      # measured that the amortized stall is worth
-                                      # more to you than the cached-prefix discount.
-                                      # See docs/micro-compaction.md.
+        # when it reclaims at least this many tokens
+        # (measured on the pruned output), then waits
+        # for a full trigger-sized token runway to
+        # regrow before rearming. Keeps prompt-cache
+        # breaks episodic. 0 = no minimum-savings gate.
+        "micro_compact": False,  # opt-in: after each completed turn, fold the
+        # oldest un-absorbed exchange into a rolling
+        # summary, amortizing compression cost instead
+        # of paying it in one batch stall. Default False
+        # because a pass rewrites already-sent history
+        # and so breaks the provider prompt-cache prefix
+        # EVERY turn — the per-turn cache break that
+        # `proactive_prune_min_reclaim_tokens` above
+        # exists to avoid. Enable only when you have
+        # measured that the amortized stall is worth
+        # more to you than the cached-prefix discount.
+        # See docs/micro-compaction.md.
         "micro_compact_every_n_turns": 1,  # cadence: run a pass every Nth completed
-                                      # turn. Since each pass costs one prompt-cache
-                                      # break, this is the dial for how often that
-                                      # cost is paid — 1 reclaims most aggressively
-                                      # at one break per turn, 5 trades reclaim rate
-                                      # for a fifth of the breaks. Clamped to >= 1.
-                                      # Ignored unless `micro_compact` is true.
+        # turn. Since each pass costs one prompt-cache
+        # break, this is the dial for how often that
+        # cost is paid — 1 reclaims most aggressively
+        # at one break per turn, 5 trades reclaim rate
+        # for a fifth of the breaks. Clamped to >= 1.
+        # Ignored unless `micro_compact` is true.
         "micro_compact_defrag_threshold_tokens": 2000,  # once the rolling summary
-                                      # exceeds this many tokens, the next pass
-                                      # re-summarizes the summary itself instead of
-                                      # letting it grow without bound.
+        # exceeds this many tokens, the next pass
+        # re-summarizes the summary itself instead of
+        # letting it grow without bound.
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
-                                      # WITHOUT forward progress. The summary call streams, so
-                                      # this is an inactivity budget: a slow model still
-                                      # producing tokens keeps extending the wait; only a
-                                      # silent/hung call is cut off.
+        # WITHOUT forward progress. The summary call streams, so
+        # this is an inactivity budget: a slow model still
+        # producing tokens keeps extending the wait; only a
+        # silent/hung call is cut off.
         "hygiene_total_ceiling_seconds": 600,  # absolute cap on the hygiene compression wait even
-                                      # while tokens are still moving — bounds a degenerate
-                                      # trickle stream. Clamped to >= hygiene_timeout_seconds.
+        # while tokens are still moving — bounds a degenerate
+        # trickle stream. Clamped to >= hygiene_timeout_seconds.
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
         "context_timeout_seconds": 120,  # inactivity budget for in-agent compress_context
-                                      # (conversation loop, /compress, preflight, etc.).
-                                      # Same progress-aware semantics as hygiene_timeout_seconds:
-                                      # streamed summary tokens extend the wait; only a silent
-                                      # worker is cut off. 0 = disable the owned wrapper
-                                      # (callers that already pass commit_fence, e.g. gateway
-                                      # hygiene, never use this path).
+        # (conversation loop, /compress, preflight, etc.).
+        # Same progress-aware semantics as hygiene_timeout_seconds:
+        # streamed summary tokens extend the wait; only a silent
+        # worker is cut off. 0 = disable the owned wrapper
+        # (callers that already pass commit_fence, e.g. gateway
+        # hygiene, never use this path).
         "context_total_ceiling_seconds": 600,  # absolute cap on the *pre-commit*
-                                      # in-agent compress_context wait (summary /
-                                      # stream phase) even while tokens are still
-                                      # moving. Clamped to >= context_timeout_seconds
-                                      # when the idle budget is > 0. Guarantee:
-                                      # the summary phase is bounded by this
-                                      # ceiling; an already-started SessionDB
-                                      # commit is never abandoned mid-flight —
-                                      # if the commit itself runs past the
-                                      # ceiling it is logged (WARNING, then
-                                      # ERROR) and surfaced to the user via the
-                                      # warning channel while the host keeps
-                                      # waiting in bounded increments for the
-                                      # commit to finish.
-        "protect_first_n": 3,         # non-system head messages always preserved
-                                      # verbatim, in ADDITION to the system prompt
-                                      # (which is always implicitly protected). Set to
-                                      # 0 for long-running rolling-compaction sessions
-                                      # where you want nothing pinned except the
-                                      # system prompt + rolling summary + recent tail.
+        # in-agent compress_context wait (summary /
+        # stream phase) even while tokens are still
+        # moving. Clamped to >= context_timeout_seconds
+        # when the idle budget is > 0. Guarantee:
+        # the summary phase is bounded by this
+        # ceiling; an already-started SessionDB
+        # commit is never abandoned mid-flight —
+        # if the commit itself runs past the
+        # ceiling it is logged (WARNING, then
+        # ERROR) and surfaced to the user via the
+        # warning channel while the host keeps
+        # waiting in bounded increments for the
+        # commit to finish.
+        "protect_first_n": 3,  # non-system head messages always preserved
+        # verbatim, in ADDITION to the system prompt
+        # (which is always implicitly protected). Set to
+        # 0 for long-running rolling-compaction sessions
+        # where you want nothing pinned except the
+        # system prompt + rolling summary + recent tail.
         "abort_on_summary_failure": False,  # When True, auto-compression that fails
-                                      # to generate a summary (aux LLM errored / returned
-                                      # non-JSON / timed out) aborts entirely instead of
-                                      # dropping the middle window with a static
-                                      # "summary unavailable" placeholder.  Messages are
-                                      # preserved unchanged and the session "freezes" at
-                                      # its current size until the user runs /compress
-                                      # (which bypasses the failure cooldown) or /new.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
-                                      # context turns when your aux model is flaky.
+        # to generate a summary (aux LLM errored / returned
+        # non-JSON / timed out) aborts entirely instead of
+        # dropping the middle window with a static
+        # "summary unavailable" placeholder.  Messages are
+        # preserved unchanged and the session "freezes" at
+        # its current size until the user runs /compress
+        # (which bypasses the failure cooldown) or /new.
+        # Default False matches historical behavior; set to
+        # True if you'd rather pause than silently lose
+        # context turns when your aux model is flaky.
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
-                                      # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
-                                      # ChatGPT Codex OAuth route raise their compaction
-                                      # trigger to 85% (vs the global `threshold` above).
-                                      # Codex hard-caps these families at a 272K window, so
-                                      # the default 50% would compact at ~136K and waste half
-                                      # the usable context. Set to False to opt back down to
-                                      # the global threshold (e.g. 0.50) for those Codex
-                                      # sessions. Only this exact route is affected —
-                                      # gpt-5.4 / 5.5 / 5.6 on OpenAI's direct API,
-                                      # OpenRouter, and Copilot keep the global threshold
-                                      # regardless.
+        # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
+        # ChatGPT Codex OAuth route raise their compaction
+        # trigger to 85% (vs the global `threshold` above).
+        # Codex hard-caps these families at a 272K window, so
+        # the default 50% would compact at ~136K and waste half
+        # the usable context. Set to False to opt back down to
+        # the global threshold (e.g. 0.50) for those Codex
+        # sessions. Only this exact route is affected —
+        # gpt-5.4 / 5.5 / 5.6 on OpenAI's direct API,
+        # OpenRouter, and Copilot keep the global threshold
+        # regardless.
         "codex_gpt55_autoraise_notice": True,  # Display the one-time Codex gpt-5.4/5.5/5.6
-                                      # autoraise banner. Set False to keep the
-                                      # 85% threshold autoraise but suppress the
-                                      # user-facing notice in CLI/gateway output.
+        # autoraise banner. Set False to keep the
+        # 85% threshold autoraise but suppress the
+        # user-facing notice in CLI/gateway output.
         "codex_app_server_auto": "native",  # Codex app-server (codex CLI runtime) thread
-                                      # compaction mode. The codex agent owns the real
-                                      # thread context, so Hermes' summarizer cannot
-                                      # shrink it (#36801). native = codex decides when
-                                      # to compact its own thread (default); hermes =
-                                      # Hermes' compression threshold triggers
-                                      # thread/compact/start; off = never auto-trigger
-                                      # (codex may still compact natively).
+        # compaction mode. The codex agent owns the real
+        # thread context, so Hermes' summarizer cannot
+        # shrink it (#36801). native = codex decides when
+        # to compact its own thread (default); hermes =
+        # Hermes' compression threshold triggers
+        # thread/compact/start; off = never auto-trigger
+        # (codex may still compact natively).
         "codex_responses_native": False,  # Opt in to OpenAI's server-side compaction
-                                      # on the Responses API. Engages ONLY for
-                                      # gpt-5.6-family models on api.openai.com or
-                                      # the ChatGPT Codex backend; every other
-                                      # route/model is unaffected. Hermes' local
-                                      # compression stays armed as the fallback.
+        # on the Responses API. Engages ONLY for
+        # gpt-5.6-family models on api.openai.com or
+        # the ChatGPT Codex backend; every other
+        # route/model is unaffected. Hermes' local
+        # compression stays armed as the fallback.
         "codex_responses_compact_threshold": 200000,  # Server-side compaction trigger
-                                      # (input tokens). Clamped below the local
-                                      # compression threshold at request time so
-                                      # the server compacts before Hermes does.
-        "in_place": True,             # When True, compaction rewrites the message
-                                      # list and rebuilds the system prompt WITHOUT
-                                      # rotating the session id — the conversation
-                                      # keeps one durable id for its whole life
-                                      # (no parent_session_id chain, no `name #N`
-                                      # renumbering). Eliminates the session-rotation
-                                      # bug cluster (#33618 /goal loss, #14238 lost
-                                      # response, #33907 orphans, #45117 search gaps,
-                                      # #42228 null cwd) — see #38763. Non-destructive:
-                                      # the live context is compacted (lossy for what
-                                      # the model reloads), but the pre-compaction
-                                      # turns are soft-archived under the same id
-                                      # (active=0, compacted=1) — still searchable via
-                                      # session_search and recoverable, not deleted.
-                                      # Default True since 2107b86024; set False to
-                                      # restore the legacy rotating-compaction path.
-        "model_thresholds": {},       # Per-model threshold overrides. Keys are
-                                      # substring-matched against the model name
-                                      # (longest match wins); values replace the
-                                      # global `threshold` for that model, e.g.
-                                      #   model_thresholds:
-                                      #     "glm-5.2": 0.40
-                                      #     "claude-sonnet": 0.35
-                                      # The small-context floor (0.75 for <512K
-                                      # models) still applies on top of overrides
-                                      # (raise-only: an override above the floor
-                                      # wins; one below it is raised to the floor).
+        # (input tokens). Clamped below the local
+        # compression threshold at request time so
+        # the server compacts before Hermes does.
+        "in_place": True,  # When True, compaction rewrites the message
+        # list and rebuilds the system prompt WITHOUT
+        # rotating the session id — the conversation
+        # keeps one durable id for its whole life
+        # (no parent_session_id chain, no `name #N`
+        # renumbering). Eliminates the session-rotation
+        # bug cluster (#33618 /goal loss, #14238 lost
+        # response, #33907 orphans, #45117 search gaps,
+        # #42228 null cwd) — see #38763. Non-destructive:
+        # the live context is compacted (lossy for what
+        # the model reloads), but the pre-compaction
+        # turns are soft-archived under the same id
+        # (active=0, compacted=1) — still searchable via
+        # session_search and recoverable, not deleted.
+        # Default True since 2107b86024; set False to
+        # restore the legacy rotating-compaction path.
+        "model_thresholds": {},  # Per-model threshold overrides. Keys are
+        # substring-matched against the model name
+        # (longest match wins); values replace the
+        # global `threshold` for that model, e.g.
+        #   model_thresholds:
+        #     "glm-5.2": 0.40
+        #     "claude-sonnet": 0.35
+        # The small-context floor (0.75 for <512K
+        # models) still applies on top of overrides
+        # (raise-only: an override above the floor
+        # wins; one below it is raised to the floor).
         "idle_compact_after_seconds": 0,  # Opt-in idle compaction (0 = disabled).
-                                      # When > 0, a session that resumes after at
-                                      # least this many seconds of inactivity
-                                      # compacts its accumulated history up front,
-                                      # before the first reply — so a long-lived
-                                      # thread resumed hours later doesn't re-read
-                                      # its full stale context on every turn.
-                                      # Time-based; complements (does not replace)
-                                      # the size-based `threshold` above. Skipped
-                                      # when the context is already at/below the
-                                      # post-compression target (threshold ×
-                                      # target_ratio) and it honors the same
-                                      # failure-cooldown / anti-thrash / per-session
-                                      # lock guards as every automatic compaction.
-                                      # Example: 1800 = compact after 30 min idle.
+        # When > 0, a session that resumes after at
+        # least this many seconds of inactivity
+        # compacts its accumulated history up front,
+        # before the first reply — so a long-lived
+        # thread resumed hours later doesn't re-read
+        # its full stale context on every turn.
+        # Time-based; complements (does not replace)
+        # the size-based `threshold` above. Skipped
+        # when the context is already at/below the
+        # post-compression target (threshold ×
+        # target_ratio) and it honors the same
+        # failure-cooldown / anti-thrash / per-session
+        # lock guards as every automatic compaction.
+        # Example: 1800 = compact after 30 min idle.
     },
-
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl: "5m" or "1h" (Anthropic-supported tiers). Other non-falsy
     # values are silently ignored. Falsy values (false, null, "off",
@@ -881,7 +872,6 @@ DEFAULT_CONFIG = {
     "prompt_caching": {
         "cache_ttl": "5m",
     },
-
     # OpenRouter-specific settings.
     # response_cache: enable OpenRouter response caching (X-OpenRouter-Cache header).
     #   When enabled, identical requests return cached responses for free (zero billing).
@@ -902,14 +892,13 @@ DEFAULT_CONFIG = {
         "response_cache_ttl": 300,
         "min_coding_score": 0.65,
     },
-
     # AWS Bedrock provider configuration.
     # Only used when model.provider is "bedrock".
     "bedrock": {
         "region": "",  # AWS region for Bedrock API calls (empty = AWS_REGION env var → us-east-1)
         "discovery": {
-            "enabled": True,           # Auto-discover models via ListFoundationModels
-            "provider_filter": [],     # Only show models from these providers (e.g. ["anthropic", "amazon"])
+            "enabled": True,  # Auto-discover models via ListFoundationModels
+            "provider_filter": [],  # Only show models from these providers (e.g. ["anthropic", "amazon"])
             "refresh_interval": 3600,  # Cache discovery results for this many seconds
         },
         "guardrail": {
@@ -917,12 +906,11 @@ DEFAULT_CONFIG = {
             # Create a guardrail in the Bedrock console, then set the ID and version here.
             # See: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html
             "guardrail_identifier": "",  # e.g. "abc123def456"
-            "guardrail_version": "",     # e.g. "1" or "DRAFT"
+            "guardrail_version": "",  # e.g. "1" or "DRAFT"
             "stream_processing_mode": "async",  # "sync" or "async"
-            "trace": "disabled",         # "enabled", "disabled", or "enabled_full"
+            "trace": "disabled",  # "enabled", "disabled", or "enabled_full"
         },
     },
-
     # Auxiliary model config — provider:model for each side task.
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.
@@ -979,12 +967,12 @@ DEFAULT_CONFIG = {
         # copilot.tencent.com is always treated as stream-only.
         "stream_only_base_urls": [],
         "vision": {
-            "provider": "auto",    # auto | openrouter | nous | codex | custom
-            "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
-            "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
-            "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
-            "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
-            "extra_body": {},      # OpenAI-compatible provider-specific request fields
+            "provider": "auto",  # auto | openrouter | nous | codex | custom
+            "model": "",  # e.g. "google/gemini-2.5-flash", "gpt-4o"
+            "base_url": "",  # direct OpenAI-compatible endpoint (takes precedence over provider)
+            "api_key": "",  # API key for base_url (falls back to OPENAI_API_KEY)
+            "timeout": 120,  # seconds — LLM API call timeout; vision payloads need generous timeout
+            "extra_body": {},  # OpenAI-compatible provider-specific request fields
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
@@ -993,7 +981,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
+            "timeout": 360,  # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
@@ -1002,7 +990,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "timeout": 120,  # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
@@ -1021,7 +1009,7 @@ DEFAULT_CONFIG = {
         },
         "approval": {
             "provider": "auto",
-            "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
+            "model": "",  # fast/cheap model recommended (e.g. gemini-flash, haiku)
             "base_url": "",
             "api_key": "",
             "timeout": 30,
@@ -1193,7 +1181,6 @@ DEFAULT_CONFIG = {
             # NOTE: no reasoning_effort here by design — see moa_reference above.
         },
     },
-    
     "display": {
         "compact": False,
         "personality": "",
@@ -1201,10 +1188,10 @@ DEFAULT_CONFIG = {
         # Recap tuning for /resume and startup resume. The defaults match the
         # historical hardcoded values; expose them as config so power users can
         # widen or tighten the snapshot to taste.
-        "resume_exchanges": 10,            # max user+assistant pairs to show
-        "resume_max_user_chars": 300,      # truncate user message text
-        "resume_max_assistant_chars": 200, # truncate non-last assistant text
-        "resume_max_assistant_lines": 3,   # truncate non-last assistant lines
+        "resume_exchanges": 10,  # max user+assistant pairs to show
+        "resume_max_user_chars": 300,  # truncate user message text
+        "resume_max_assistant_chars": 200,  # truncate non-last assistant text
+        "resume_max_assistant_lines": 3,  # truncate non-last assistant lines
         # When True (default), assistant entries that are *only* tool calls
         # (no visible text) are skipped in the recap. This prevents the recap
         # from being dominated by `[2 tool calls: terminal, read_file]` lines
@@ -1265,7 +1252,7 @@ DEFAULT_CONFIG = {
         #   "off"     — no watcher messages at all
         "background_process_notifications": "concise",
         "streaming": False,
-        "timestamps": False,      # Show message timestamps (CLI labels, TUI rows, desktop transcript)
+        "timestamps": False,  # Show message timestamps (CLI labels, TUI rows, desktop transcript)
         "timestamp_format": "%H:%M",  # strftime format for timestamps (e.g. "%b-%d %H:%M")
         "final_response_markdown": "strip",  # render | strip | raw
         # Preserve recent classic CLI output across Ctrl+L, /redraw, and
@@ -1283,7 +1270,7 @@ DEFAULT_CONFIG = {
         # clarify) into scrollback so the question and decision survive the
         # panel repaint. Set false to keep scrollback untouched.
         "persist_prompts": True,
-        "inline_diffs": True,     # Show inline diff previews for write actions (write_file, patch, skill_manage)
+        "inline_diffs": True,  # Show inline diff previews for write actions (write_file, patch, skill_manage)
         # File-mutation verifier footer.  When true (default), the agent
         # appends a one-line advisory to its final response whenever a
         # write_file / patch call failed during the turn and was never
@@ -1304,7 +1291,7 @@ DEFAULT_CONFIG = {
         # iteration/budget limit.  Replaces the bare "(empty)" sentinel so the
         # failure isn't silent from the UI's perspective.  Set false to suppress.
         "turn_completion_explainer": True,
-        "show_cost": False,       # Show $ cost in the status bar (off by default)
+        "show_cost": False,  # Show $ cost in the status bar (off by default)
         # Show a color-coded battery read-out as the first status-bar element in
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,
@@ -1451,7 +1438,6 @@ DEFAULT_CONFIG = {
             "unicode_cols": 0,
         },
     },
-
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
@@ -1558,12 +1544,10 @@ DEFAULT_CONFIG = {
         # the login flow.
         "public_url": "",
     },
-
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
     },
-
     # Text-to-speech configuration
     # Each provider supports an optional `max_text_length:` override for the
     # per-request input-character cap. Omit it to use the provider's documented
@@ -1624,7 +1608,7 @@ DEFAULT_CONFIG = {
         },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
-            "ref_text": "",   # Path to reference voice transcript (empty = bundled default)
+            "ref_text": "",  # Path to reference voice transcript (empty = bundled default)
             "model": "neuphonic/neutts-air-q4-gguf",  # HuggingFace model repo
             "device": "cpu",  # cpu, cuda, or mps
         },
@@ -1647,7 +1631,6 @@ DEFAULT_CONFIG = {
             # "base_url": "",  # override DEEPINFRA_BASE_URL for TTS only
         },
     },
-
     "stt": {
         "enabled": True,
         # When true, gateway voice messages are transcribed for the agent and
@@ -1707,18 +1690,17 @@ DEFAULT_CONFIG = {
             # "base_url": "",  # override DEEPINFRA_BASE_URL for STT only
         },
     },
-
     "voice": {
         "record_key": "ctrl+b",
-        "submit_mode": "direct",       # TUI: direct submits immediately; draft leaves an editable transcript
+        "submit_mode": "direct",  # TUI: direct submits immediately; draft leaves an editable transcript
         "max_recording_seconds": 120,
         "auto_tts": False,
-        "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
-        "beep_volume": 0.3,           # Beep amplitude multiplier (0.0-1.0, default keeps prior hardcoded value)
-        "thinking_sound": True,       # Calm ambient bubble sound while the agent works in voice chat (volume follows beep_volume)
-        "silence_threshold": 200,     # RMS below this = silence (0-32767)
-        "silence_duration": 3.0,      # Seconds of silence before auto-stop
-        "barge_in": True,             # Interrupt the agent / stop TTS when the user starts talking
+        "beep_enabled": True,  # Play record start/stop beeps in CLI voice mode
+        "beep_volume": 0.3,  # Beep amplitude multiplier (0.0-1.0, default keeps prior hardcoded value)
+        "thinking_sound": True,  # Calm ambient bubble sound while the agent works in voice chat (volume follows beep_volume)
+        "silence_threshold": 200,  # RMS below this = silence (0-32767)
+        "silence_duration": 3.0,  # Seconds of silence before auto-stop
+        "barge_in": True,  # Interrupt the agent / stop TTS when the user starts talking
         "barge_in_grace_seconds": 0.5,  # Trip suppression right after TTS playback starts (onset transient); the mic itself is live for the whole turn
         "barge_in_threshold_multiplier": 3.0,  # Speech trigger = quiet-room floor x this (floor is calibrated BEFORE playback, never against speaker bleed)
         # Saying EXACTLY one of these phrases (and nothing else) ends the
@@ -1726,21 +1708,20 @@ DEFAULT_CONFIG = {
         # surrounding punctuation ignored. Set [] to disable.
         "stop_phrases": ["stop"],
     },
-
     # "Hey Hermes" hands-free wake word. Always-on, on-device hotword
     # detection that starts a fresh voice session — the "Hey Siri" pattern.
     # Off by default; toggle with /wake or `wake_word.enabled: true`.
     "wake_word": {
         "enabled": False,
-        "surface": "auto",            # eligible surface: "auto" (first claimant) | "cli" | "tui" | "gui"
-        "input_device": None,          # PortAudio input device index/name; null uses the process default
-        "capture": "auto",            # auto | local | client — where PCM is captured (client = desktop streams mic via wake.feed)
-        "provider": "openwakeword",   # "openwakeword" (free, local) | "sherpa" (free, ANY phrase, no training) | "porcupine" (premium; needs PORCUPINE_ACCESS_KEY)
-        "phrase": "hey hermes",       # for "sherpa" this IS the detected phrase (any text works); for other engines it's a cosmetic label — detection is keyed by the model/keyword below
-        "sensitivity": 0.6,           # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)
-        "confirmation_frames": 3,     # openWakeWord only: consecutive over-threshold frames required to fire (higher = fewer false triggers on ambient speech, slightly more latency; 1 = old single-frame behavior)
-        "start_new_session": True,    # start a fresh session on wake vs. continue the current one
-        "profile_routing": True,      # sherpa only: also listen for every wake-enabled profile's phrase and route the wake to the matching profile
+        "surface": "auto",  # eligible surface: "auto" (first claimant) | "cli" | "tui" | "gui"
+        "input_device": None,  # PortAudio input device index/name; null uses the process default
+        "capture": "auto",  # auto | local | client — where PCM is captured (client = desktop streams mic via wake.feed)
+        "provider": "openwakeword",  # "openwakeword" (free, local) | "sherpa" (free, ANY phrase, no training) | "porcupine" (premium; needs PORCUPINE_ACCESS_KEY)
+        "phrase": "hey hermes",  # for "sherpa" this IS the detected phrase (any text works); for other engines it's a cosmetic label — detection is keyed by the model/keyword below
+        "sensitivity": 0.6,  # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)
+        "confirmation_frames": 3,  # openWakeWord only: consecutive over-threshold frames required to fire (higher = fewer false triggers on ambient speech, slightly more latency; 1 = old single-frame behavior)
+        "start_new_session": True,  # start a fresh session on wake vs. continue the current one
+        "profile_routing": True,  # sherpa only: also listen for every wake-enabled profile's phrase and route the wake to the matching profile
         "openwakeword": {
             # "hey_hermes" (the bundled, works-out-of-the-box default) OR a
             # built-in openWakeWord name ("hey_jarvis", "alexa", "hey_mycroft",
@@ -1764,13 +1745,11 @@ DEFAULT_CONFIG = {
             "keyword": "jarvis",
         },
     },
-    
     "human_delay": {
         "mode": "off",
         "min_ms": 800,
         "max_ms": 2500,
     },
-    
     # Context engine -- controls how the context window is managed when
     # approaching the model's token limit.
     # "compressor" = built-in lossy summarization (default).
@@ -1792,7 +1771,6 @@ DEFAULT_CONFIG = {
             "info_log_min_delta_mb": 0.0,
         },
     },
-
     # Persistent memory -- bounded curated memory injected into system prompt
     "memory": {
         "memory_enabled": True,
@@ -1810,28 +1788,27 @@ DEFAULT_CONFIG = {
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
         "write_approval": False,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "memory_char_limit": 2200,  # ~800 tokens at 2.75 chars/token
+        "user_char_limit": 1375,  # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
     },
-
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
     "delegation": {
-        "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
-        "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
-        "base_url": "",    # direct OpenAI-compatible endpoint for subagents
-        "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
-        "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
-                           # "codex_responses", or "anthropic_messages". Empty = auto-detect
-                           # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
-                           # explicitly for non-standard endpoints the heuristic can't detect.
+        "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
+        "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        "base_url": "",  # direct OpenAI-compatible endpoint for subagents
+        "api_key": "",  # API key for delegation.base_url (falls back to OPENAI_API_KEY)
+        "api_mode": "",  # wire protocol for delegation.base_url: "chat_completions",
+        # "codex_responses", or "anthropic_messages". Empty = auto-detect
+        # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
+        # explicitly for non-standard endpoints the heuristic can't detect.
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
@@ -1839,7 +1816,7 @@ DEFAULT_CONFIG = {
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
-                               # independent of the parent's max_iterations)
+        # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
         # the parent's context window and trigger a compression/429 death
@@ -1855,23 +1832,22 @@ DEFAULT_CONFIG = {
         # instruction). 0 disables the hard ceiling; the dynamic headroom
         # budget still applies.
         "max_summary_chars": 24000,
-
         "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
-                                     # = no timeout: children fail only from real errors
-                                     # (API, tools, iteration budget), never a delegation
-                                     # stopwatch. Set a positive number of seconds
-                                     # (floor 30s) to enforce a hard cap.
+        # = no timeout: children fail only from real errors
+        # (API, tools, iteration budget), never a delegation
+        # stopwatch. Set a positive number of seconds
+        # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
-                                 # "medium", "low", "minimal", "none" (empty = inherit)
+        # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch
-                                       # AND max concurrent background (background=true)
-                                       # delegation units. New async dispatches beyond the cap
-                                       # fall back to synchronous execution. Floor of 1, no ceiling.
-                                       # (Replaces the deprecated max_async_children.)
+        # AND max concurrent background (background=true)
+        # delegation units. New async dispatches beyond the cap
+        # fall back to synchronous execution. Floor of 1, no ceiling.
+        # (Replaces the deprecated max_async_children.)
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
-        "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
+        "max_spawn_depth": 1,  # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
@@ -1883,12 +1859,10 @@ DEFAULT_CONFIG = {
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
     },
-
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
     "prefill_messages_file": "",
-
     # Goals — persistent cross-turn goals (Ralph-style loop).
     # After every turn, a lightweight judge call asks the auxiliary model
     # whether the active /goal is satisfied by the assistant's last
@@ -1904,8 +1878,6 @@ DEFAULT_CONFIG = {
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
     },
-
-
     # Loops — /loop recurring in-session wakeups (Claude Code parity).
     # A loop re-runs a prompt (or slash command) on a cadence inside the
     # live session. Fixed-interval mode fires on the user's clock;
@@ -1922,7 +1894,6 @@ DEFAULT_CONFIG = {
         "self_paced_floor_seconds": 60,
         "self_paced_ceiling_seconds": 900,
     },
-
     # Mixture of Agents — named presets used by /moa. A preset is an execution
     # mode around the main model, not a provider/model itself: references +
     # aggregator synthesize private guidance before each main-model iteration.
@@ -1953,18 +1924,20 @@ DEFAULT_CONFIG = {
                     {"provider": "openai-codex", "model": "gpt-5.5"},
                     {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},
                 ],
-                "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                },
                 "max_tokens": 4096,
                 "enabled": True,
             }
         },
     },
-
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
     "skills": {
-        "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "external_dirs": [],  # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``
         # are sourced as the highest-precedence skill tier — but ONLY when the
@@ -2021,7 +1994,6 @@ DEFAULT_CONFIG = {
         # Telemetry, never a gate: ledger failures cannot block a mutation.
         "ledger": True,
     },
-
     # Curator — background skill maintenance.
     #
     # Periodically reviews AGENT-CREATED skills (never bundled or
@@ -2076,21 +2048,18 @@ DEFAULT_CONFIG = {
             "keep": 5,  # retain last N regular snapshots
         },
     },
-
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for hermes-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
     "honcho": {},
-
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").
     # Empty string means use server-local time.
     "timezone": "",
-
     # Slack platform settings (gateway mode)
     "slack": {
-        "require_mention": True,       # Require @mention to respond in channels
+        "require_mention": True,  # Require @mention to respond in channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
-        "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
+        "allowed_channels": "",  # If set, bot ONLY responds in these channel IDs (whitelist)
         # Channel IDs where @mention is ALWAYS required, even when
         # require_mention is false globally (per-channel force-mention override).
         "require_mention_channels": "",
@@ -2100,27 +2069,26 @@ DEFAULT_CONFIG = {
         "ignore_other_user_mentions": False,
         # If True, require @mention in Slack thread replies too.
         "thread_require_mention": False,
-        "channel_prompts": {},         # Per-channel ephemeral system prompts
+        "channel_prompts": {},  # Per-channel ephemeral system prompts
     },
-
     # Discord platform settings (gateway mode)
     "discord": {
-        "require_mention": True,       # Require @mention to respond in server channels
+        "require_mention": True,  # Require @mention to respond in server channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
-        "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
-        "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
+        "allowed_channels": "",  # If set, bot ONLY responds in these channel IDs (whitelist)
+        "auto_thread": True,  # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
-        "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
-        "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
+        "history_backfill": True,  # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
+        "history_backfill_limit": 50,  # Max number of recent messages to scan when assembling the backfill block
         "missed_message_backfill": {
-            "enabled": False,             # Replay missed Discord messages after reconnect/startup
-            "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels
-            "window_seconds": 21600,      # Only inspect messages from the last 6 hours
-            "limit": 100,                 # Global cap on messages scanned per reconnect
-            "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
+            "enabled": False,  # Replay missed Discord messages after reconnect/startup
+            "channels": "",  # Comma-separated channel IDs; empty uses free_response_channels
+            "window_seconds": 21600,  # Only inspect messages from the last 6 hours
+            "limit": 100,  # Global cap on messages scanned per reconnect
+            "max_dispatches": 10,  # Cap on recovered messages dispatched per reconnect
         },
-        "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
+        "reactions": True,  # Add 👀/✅/❌ reactions to messages during processing
         # Discord Gateway transport health. These settings inspect the active
         # WebSocket's ready/open/heartbeat state; they never use Discord REST as
         # proof that Gateway events are still arriving. Set any value to 0 to
@@ -2129,7 +2097,7 @@ DEFAULT_CONFIG = {
         "websocket_liveness_failure_threshold": 2,
         "websocket_heartbeat_ack_max_age_seconds": 60,
         "websocket_max_latency_seconds": 30,
-        "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
+        "channel_prompts": {},  # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require
         # DISCORD_ALLOWED_USERS. Set dm_role_auth_guild to a guild ID to also
@@ -2174,14 +2142,14 @@ DEFAULT_CONFIG = {
         # stop-and-swap — the Grok-voice-mode feel. discord.py ships no mixer;
         # this is implemented in plugins/platforms/discord/voice_mixer.py.
         "voice_fx": {
-            "enabled": False,         # master switch for the mixer subsystem
+            "enabled": False,  # master switch for the mixer subsystem
             "ambient_enabled": True,  # play the idle "thinking" bed while tools run
-            "ambient_path": "",       # custom loop audio file; "" = synthesised pad
-            "ambient_gain": 0.18,     # idle bed loudness, 0.0–1.0
-            "duck_gain": 0.06,        # ambient loudness while speech plays
-            "speech_gain": 1.0,       # TTS / ack loudness, 0.0–1.0
-            "ack_enabled": True,      # speak a short phrase before the first tool call
-            "ack_phrases": [          # picked at random; set [] to disable phrases
+            "ambient_path": "",  # custom loop audio file; "" = synthesised pad
+            "ambient_gain": 0.18,  # idle bed loudness, 0.0–1.0
+            "duck_gain": 0.06,  # ambient loudness while speech plays
+            "speech_gain": 1.0,  # TTS / ack loudness, 0.0–1.0
+            "ack_enabled": True,  # speak a short phrase before the first tool call
+            "ack_phrases": [  # picked at random; set [] to disable phrases
                 "Let me look into that.",
                 "One moment.",
                 "Checking on that now.",
@@ -2190,7 +2158,6 @@ DEFAULT_CONFIG = {
             ],
         },
     },
-
     # WhatsApp platform settings (gateway mode)
     "whatsapp": {
         # Reply prefix prepended to every outgoing WhatsApp message.
@@ -2198,33 +2165,29 @@ DEFAULT_CONFIG = {
         # Set to "" (empty string) to disable the header entirely.
         # Supports \n for newlines, e.g. "🤖 *My Bot*\n──────\n"
     },
-
     # Telegram platform settings (gateway mode)
     "telegram": {
-        "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
-        "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
-        "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
+        "reactions": False,  # Add 👀/✅/❌ reactions to messages during processing
+        "channel_prompts": {},  # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
+        "allowed_chats": "",  # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
         "extra": {
-            "rich_messages": False,     # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set True to opt in. Default stays legacy MarkdownV2 because rich messages can be hard to copy as plain text in Telegram clients.
-            "rich_drafts": False,       # Experimental Bot API 10.1 rich draft previews during Telegram DM streaming. Default off because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws.
+            "rich_messages": False,  # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set True to opt in. Default stays legacy MarkdownV2 because rich messages can be hard to copy as plain text in Telegram clients.
+            "rich_drafts": False,  # Experimental Bot API 10.1 rich draft previews during Telegram DM streaming. Default off because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws.
         },
     },
-
     # Mattermost platform settings (gateway mode)
     "mattermost": {
-        "require_mention": True,       # Require @mention to respond in channels
+        "require_mention": True,  # Require @mention to respond in channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
-        "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
-        "channel_prompts": {},         # Per-channel ephemeral system prompts
+        "allowed_channels": "",  # If set, bot ONLY responds in these channel IDs (whitelist)
+        "channel_prompts": {},  # Per-channel ephemeral system prompts
     },
-
     # Matrix platform settings (gateway mode)
     "matrix": {
-        "require_mention": True,       # Require @mention to respond in rooms
-        "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
-        "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
+        "require_mention": True,  # Require @mention to respond in rooms
+        "free_response_rooms": "",  # Comma-separated room IDs where bot responds without mention
+        "allowed_rooms": "",  # If set, bot ONLY responds in these room IDs (whitelist)
     },
-
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
@@ -2297,12 +2260,10 @@ DEFAULT_CONFIG = {
         # the configured value.
         "destructive_slash_confirm": True,
     },
-
     # Permanently allowed dangerous command patterns (added via "always" approval)
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
-
     # Per-platform system-prompt hint overrides. Lets an admin append to or
     # replace Hermes' built-in platform hint for a single messaging platform
     # (WhatsApp, Slack, Telegram, ...) without affecting other platforms.
@@ -2318,7 +2279,6 @@ DEFAULT_CONFIG = {
     #         When tabular output would be useful, invoke the
     #         table_formatting skill instead of emitting a Markdown table.
     "platform_hints": {},
-
     # Shell-script hooks — declarative bridge that invokes shell scripts
     # on plugin-hook events (pre_tool_call, post_tool_call, pre_llm_call,
     # subagent_stop, etc.).  Each entry maps an event name to a list of
@@ -2327,7 +2287,6 @@ DEFAULT_CONFIG = {
     # stored approval from ~/.hermes/shell-hooks-allowlist.json.
     # See `website/docs/user-guide/features/hooks.md` for schema + examples.
     "hooks": {},
-
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
     # Gateway / cron / non-interactive runs need this (or one of the other
@@ -2337,7 +2296,6 @@ DEFAULT_CONFIG = {
     # Supports string format: {"name": "system prompt"}
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
     "personalities": {},
-
     # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
@@ -2387,7 +2345,6 @@ DEFAULT_CONFIG = {
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
     },
-
     "cron": {
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
@@ -2513,7 +2470,6 @@ DEFAULT_CONFIG = {
         # precedence). 0 = unlimited (no inactivity watchdog).
         "inactivity_timeout_seconds": 900,
     },
-
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 60), reclaims stale claims, promotes dependency-satisfied
@@ -2613,7 +2569,6 @@ DEFAULT_CONFIG = {
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
     },
-
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:
@@ -2627,7 +2582,6 @@ DEFAULT_CONFIG = {
         # tool whitelist apply identically in both modes.
         "mode": "project",
     },
-
     # Tool Search (progressive disclosure for large tool surfaces).
     # When the model is connected to many MCP servers or non-core plugin
     # tools, their JSON schemas can consume a substantial fraction of the
@@ -2677,15 +2631,13 @@ DEFAULT_CONFIG = {
             "listing_max_tokens": 4000,
         },
     },
-
     # Logging — controls file logging to ~/.hermes/logs/.
     # agent.log captures INFO+ (all agent activity); errors.log captures WARNING+.
     "logging": {
-        "level": "INFO",       # Minimum level for agent.log: DEBUG, INFO, WARNING
-        "max_size_mb": 5,      # Max size per log file before rotation
-        "backup_count": 3,     # Number of rotated backup files to keep
+        "level": "INFO",  # Minimum level for agent.log: DEBUG, INFO, WARNING
+        "max_size_mb": 5,  # Max size per log file before rotation
+        "backup_count": 3,  # Number of rotated backup files to keep
     },
-
     # Debug request dumps (request_dump_*.json, written when
     # HERMES_DUMP_REQUESTS is set; see conversation_loop preflight + the
     # API-error path in agent_runtime_helpers.dump_api_request_debug).
@@ -2698,7 +2650,6 @@ DEFAULT_CONFIG = {
         "dedup_window_seconds": 60,
         "max_dumps_per_session": 8,
     },
-
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
     # curated model lists for OpenRouter and Nous Portal from this URL,
     # falling back to the in-repo snapshot on network failure.  Lets us
@@ -2719,7 +2670,6 @@ DEFAULT_CONFIG = {
         #       url: https://example.com/my-curation.json
         "providers": {},
     },
-
     # Per-model metadata overrides — manually declare context_window,
     # max_output_tokens, capabilities, or model family for any
     # provider+model. Recognized fields: context_window,
@@ -2765,7 +2715,6 @@ DEFAULT_CONFIG = {
     #     _default:            # fill-gap only: models not in the catalog
     #       context_window: 128000
     "model_overrides": {},
-
     # models.dev registry — provider/model metadata (context windows,
     # capabilities, pricing, modalities).  The agent fetches this on startup
     # and serves from cache; a background daemon refreshes stale data.
@@ -2775,7 +2724,6 @@ DEFAULT_CONFIG = {
     "models_dev": {
         "url": "",  # empty = default https://models.dev/api.json
     },
-
     # Network settings — workarounds for connectivity issues.
     "network": {
         # Force IPv4 connections.  On servers with broken or unreachable IPv6,
@@ -2783,7 +2731,6 @@ DEFAULT_CONFIG = {
         # before falling back to IPv4.  Set to true to skip IPv6 entirely.
         "force_ipv4": False,
     },
-
     # Gateway monitoring — Service Health Monitoring plus redacted Operational
     # Diagnostics for the gateway daemon, exported over OTLP to an
     # operator-configured endpoint (OTEL Collector, DataDog, ...). Content-free
@@ -2821,14 +2768,12 @@ DEFAULT_CONFIG = {
             },
         },
     },
-
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
-
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
@@ -2837,7 +2782,6 @@ DEFAULT_CONFIG = {
         # at-least-once). Disable to lose in-flight final responses on
         # crash/restart, as before.
         "delivery_ledger": True,
-
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
         # can blow past the old fixed 30s when an account has many slash
@@ -2848,21 +2792,18 @@ DEFAULT_CONFIG = {
         # internal HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT env var, which still
         # works as a manual override and wins if set explicitly.
         "platform_connect_timeout": 30,
-
         # In-process event-loop liveness watchdog (#69089). A daemon OS thread
         # probes the gateway asyncio loop; after consecutive missed probes it
         # dumps all-thread stacks and hard-exits with the service-restart exit
         # code so the supervisor (systemd/launchd) revives the process instead
         # of leaving a wedged-but-alive zombie. Set to false to disable.
         "loop_watchdog": True,
-
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
         # gateway_routing table). Default True for backward compatibility with
         # external tooling and downgrade safety; set to false to stop
         # producing ~/.hermes/sessions/sessions.json entirely.
         "write_sessions_json": True,
-
         # Scale-to-zero idle detection (Phase 0). The gateway watches for idle
         # and, when an instance is opted in via the NAS "Labs" toggle (carried as
         # the HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent
@@ -2874,7 +2815,6 @@ DEFAULT_CONFIG = {
         "scale_to_zero": {
             "idle_timeout_minutes": 5,
         },
-
         # Auto-resume restart-loop breaker (#30719, defense-3). When the
         # gateway is killed mid-turn (SIGTERM) and revived by a supervisor
         # (launchd KeepAlive / systemd Restart=), it auto-resumes the
@@ -2901,7 +2841,6 @@ DEFAULT_CONFIG = {
             "window_seconds": 60,
             "max_gap_seconds": 300,
         },
-
         # Portable respawn-storm circuit breaker (complements
         # ``restart_loop_guard`` above). Counts gateway (re)starts in a sliding
         # window and, when too many land, sleeps an exponential backoff before
@@ -2914,7 +2853,6 @@ DEFAULT_CONFIG = {
             "max_starts": 5,
             "window_seconds": 120,
         },
-
         # Inject a human-readable timestamp prefix (e.g.
         # "[Tue 2026-04-28 13:40:53 CEST]") onto user messages IN THE MODEL'S
         # CONTEXT so the agent has temporal awareness of when each message was
@@ -2925,7 +2863,6 @@ DEFAULT_CONFIG = {
         "message_timestamps": {
             "enabled": False,
         },
-
         # Maximum bytes for an inbound image / audio / video payload the
         # gateway will buffer into memory and cache to disk. Inbound media is
         # read fully into RAM before being written, so an unbounded upload
@@ -2935,7 +2872,6 @@ DEFAULT_CONFIG = {
         # (gateway/platforms/base.py), so the cap holds across every platform
         # adapter. ``0`` disables the cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
-
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
         # system-path denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,
@@ -2973,7 +2909,6 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
-
         # OpenAI-compatible API server platform
         # (gateway/platforms/api_server.py).
         "api_server": {
@@ -2986,7 +2921,6 @@ DEFAULT_CONFIG = {
             "max_concurrent_runs": 10,
         },
     },
-
     # Real-time token streaming to messaging platforms (Telegram, Discord,
     # Slack, etc.). Read at the top level by the gateway; absent this block the
     # gateway falls back to these same defaults, so adding it here only makes
@@ -3025,7 +2959,6 @@ DEFAULT_CONFIG = {
         # completion time. Telegram only; other platforms ignore it.
         "fresh_final_after_seconds": 0.0,
     },
-
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.
     # state.db accumulates every session, message, tool call, and FTS5 index
     # entry forever.  Without auto-pruning, a heavy user (gateway + cron)
@@ -3117,7 +3050,6 @@ DEFAULT_CONFIG = {
         # per session, so full-DB backups of many small sessions still work.
         "max_export_messages": 20000,
     },
-
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
     # Each hint is shown once per install and then latched here so it
     # never fires again.  Users can wipe the section to re-see all hints.
@@ -3130,7 +3062,6 @@ DEFAULT_CONFIG = {
         # The offer fires at most once (latched under onboarding.seen).
         "profile_build": "ask",
     },
-
     # Privacy-safe aggregate metrics written only to this profile's local
     # telemetry directory. Collection is opt-in and no remote sink exists.
     "telemetry": {
@@ -3138,14 +3069,12 @@ DEFAULT_CONFIG = {
             "enabled": False,
         },
     },
-
     # ``hermes doctor`` behaviour.
     "doctor": {
         # Per-probe timeout (seconds) for the opt-in `hermes doctor --live`
         # real-call backend probes (Firecrawl/FAL/browser/MCP/TTS/STT).
         "live_probe_timeout": 10,
     },
-
     # ``hermes update`` behaviour.
     "updates": {
         # Pre-update safety backup — ONE consolidated mechanism, three modes:
@@ -3194,7 +3123,6 @@ DEFAULT_CONFIG = {
         # on non-admin accounts where `/Applications` is not writable.
         "refresh_cua_driver": True,
     },
-
     # Language Server Protocol — semantic diagnostics from real
     # language servers (pyright, gopls, rust-analyzer, etc.) wired
     # into the post-write lint check used by ``write_file`` and
@@ -3211,21 +3139,18 @@ DEFAULT_CONFIG = {
         # subsystem — no servers spawn, no background event loop, no
         # cost.
         "enabled": True,
-
         # Diagnostic-wait mode for the post-write check.
         # ``"document"`` waits up to ``wait_timeout`` seconds for the
         # current file's diagnostics; ``"full"`` additionally requests
         # workspace-wide diagnostics (slower).
         "wait_mode": "document",
         "wait_timeout": 5.0,
-
         # How to handle missing server binaries.
         # ``"auto"`` — try to install via npm/go/pip into
         #              ``<HERMES_HOME>/lsp/bin/`` on first use.
         # ``"manual"`` — only use binaries already on PATH.
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
-
         # Idle language servers are shut down automatically after this
         # many seconds with no file activity, then respawned on demand.
         # Prevents long-running gateway/CLI processes from accumulating
@@ -3233,7 +3158,6 @@ DEFAULT_CONFIG = {
         # plus pipe FDs) as the agent moves across worktrees.  Set to 0
         # to disable idle reaping and keep servers for process lifetime.
         "idle_timeout": 600.0,
-
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:
@@ -3249,8 +3173,6 @@ DEFAULT_CONFIG = {
         # setups.
         "servers": {},
     },
-
-
     # X (Twitter) Search via xAI's built-in x_search Responses tool.
     # The tool registers when xAI credentials are available (SuperGrok
     # OAuth or XAI_API_KEY) AND the x_search toolset is enabled in
@@ -3270,7 +3192,6 @@ DEFAULT_CONFIG = {
         # Each retry backs off (1.5x attempt seconds, capped at 5s).
         "retries": 2,
     },
-
     # =========================================================================
     # External secret sources
     # =========================================================================
@@ -3356,7 +3277,6 @@ DEFAULT_CONFIG = {
             "override_existing": True,
         },
     },
-
     # Paste collapse thresholds (TUI + CLI).
     #
     # paste_collapse_threshold (default 5)
@@ -3377,7 +3297,6 @@ DEFAULT_CONFIG = {
     "paste_collapse_threshold": 5,
     "paste_collapse_threshold_fallback": 5,
     "paste_collapse_char_threshold": 2000,
-
     # Computer Use (cua-driver) toolset settings.
     "computer_use": {
         # cua-driver ships with anonymous usage telemetry (PostHog) ENABLED
@@ -3430,7 +3349,6 @@ DEFAULT_CONFIG = {
         # isolated driver-owned profiles work either way.
         "grant_existing_profile": False,
     },
-
     # =========================================================================
     # Egress credential-injection proxy (iron-proxy)
     # =========================================================================
@@ -3490,7 +3408,6 @@ DEFAULT_CONFIG = {
         # Together, DeepSeek, Nous).  Wildcards (`*.foo.com`) are supported.
         "extra_allowed_hosts": [],
     },
-
     # Hermes Desktop (Electron app) launch options. These only affect
     # `hermes desktop`; they do not touch the CLI/gateway.
     "desktop": {
@@ -3544,8 +3461,6 @@ DEFAULT_CONFIG = {
             "max_attempts": 2,
         },
     },
-
-
     # Google Vertex AI provider (Gemini via the OpenAI-compatible endpoint).
     # Auth is OAuth2 (short-lived access tokens minted from a service-account
     # JSON or Application Default Credentials) — NOT a static API key. The
@@ -3563,7 +3478,6 @@ DEFAULT_CONFIG = {
         # (e.g. "us-central1") only if your models are pinned to a region.
         "region": "global",
     },
-
     # Patch tool self-correction settings (issue #996).
     # Controls how many consecutive patch failures on the same file are
     # allowed before the error is classified as "permanent" and the model
@@ -3573,7 +3487,6 @@ DEFAULT_CONFIG = {
         "self_correction_retries": 3,
         "lint_after_patch": True,
     },
-
     # Config schema version - bump this when adding new required fields
     "_config_version": 38,
 }
@@ -3624,10 +3537,10 @@ OPTIONAL_ENV_VARS = {
     },
     "VERTEX_CREDENTIALS_PATH": {
         "description": "Path to a Google Cloud service account JSON for Vertex AI (Gemini). "
-                       "Vertex uses OAuth2, not a static API key — this points at the "
-                       "credentials Hermes mints short-lived tokens from. Falls back to "
-                       "GOOGLE_APPLICATION_CREDENTIALS, then to ADC (gcloud auth "
-                       "application-default login). Set project/region under vertex: in config.yaml.",
+        "Vertex uses OAuth2, not a static API key — this points at the "
+        "credentials Hermes mints short-lived tokens from. Falls back to "
+        "GOOGLE_APPLICATION_CREDENTIALS, then to ADC (gcloud auth "
+        "application-default login). Set project/region under vertex: in config.yaml.",
         "prompt": "Vertex service account JSON path (leave empty to use ADC / GOOGLE_APPLICATION_CREDENTIALS)",
         "url": "https://cloud.google.com/iam/docs/keys-create-delete",
         "password": False,
@@ -4135,7 +4048,12 @@ OPTIONAL_ENV_VARS = {
         "description": "Browser engine for local mode: auto (default Chrome), lightpanda (faster, no screenshots), chrome",
         "prompt": "Browser engine (auto/lightpanda/chrome)",
         "url": "https://github.com/vercel-labs/agent-browser",
-        "tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_vision"],
+        "tools": [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_vision",
+        ],
         "password": False,
         "category": "tool",
         "advanced": True,
@@ -4210,7 +4128,6 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
-
     # ── Bundled skills (opt-in: only needed if the user uses that skill) ──
     # These use category="skill" (distinct from "tool") so the sandbox
     # env blocklist in tools/environments/local.py does NOT rewrite them —
@@ -4248,7 +4165,6 @@ OPTIONAL_ENV_VARS = {
         "category": "skill",
         "advanced": True,
     },
-
     # ── Honcho ──
     "HONCHO_API_KEY": {
         "description": "Honcho API key for AI-native persistent memory",
@@ -4263,7 +4179,6 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Honcho base URL (e.g. http://localhost:8000)",
         "category": "tool",
     },
-
     # ── Hindsight ──
     "HINDSIGHT_API_KEY": {
         "description": "Hindsight API key for graph-aware persistent memory",
@@ -4279,7 +4194,6 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
-
     # ── Supermemory ──
     "SUPERMEMORY_API_KEY": {
         "description": "Supermemory API key for conversation-scoped persistent memory",
@@ -4289,7 +4203,6 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
-
     # ── Mem0 ──
     "MEM0_API_KEY": {
         "description": "Mem0 Platform API key for semantic persistent memory",
@@ -4299,7 +4212,6 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
-
     # ── RetainDB ──
     "RETAINDB_API_KEY": {
         "description": "RetainDB API key for persistent memory",
@@ -4315,7 +4227,6 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
-
     # ── ByteRover ──
     "BRV_API_KEY": {
         "description": "ByteRover API key (optional, for cloud sync — local-first by default)",
@@ -4325,7 +4236,6 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
-
     # ── OpenViking ──
     "OPENVIKING_API_KEY": {
         "description": "OpenViking API key (leave blank for local dev mode)",
@@ -4340,7 +4250,6 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
-
     # ── Langfuse observability ──
     "HERMES_LANGFUSE_PUBLIC_KEY": {
         "description": "Langfuse project public key (pk-lf-...)",
@@ -4364,7 +4273,6 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
-
     # ── Messaging platforms ──
     "TELEGRAM_BOT_TOKEN": {
         "description": "Complete Telegram bot token created by @BotFather (numeric bot ID followed by a colon and secret)",
@@ -4409,8 +4317,8 @@ OPTIONAL_ENV_VARS = {
     },
     "SLACK_BOT_TOKEN": {
         "description": "Slack bot token (xoxb-). Get from OAuth & Permissions after installing your app. "
-                       "Required scopes: chat:write, app_mentions:read, channels:history, groups:history, "
-                       "im:history, im:read, im:write, mpim:history, mpim:read, users:read, files:read, files:write",
+        "Required scopes: chat:write, app_mentions:read, channels:history, groups:history, "
+        "im:history, im:read, im:write, mpim:history, mpim:read, users:read, files:read, files:write",
         "prompt": "Slack Bot Token (xoxb-...)",
         "help": "In your Slack app, add the required bot scopes, install the app to the workspace, then copy OAuth & Permissions > Bot User OAuth Token.",
         "url": "https://api.slack.com/apps",
@@ -4419,8 +4327,8 @@ OPTIONAL_ENV_VARS = {
     },
     "SLACK_APP_TOKEN": {
         "description": "Slack app-level token (xapp-) for Socket Mode. Get from Basic Information → "
-                       "App-Level Tokens. Also ensure Event Subscriptions include: message.im, "
-                       "message.channels, message.groups, message.mpim, app_mention",
+        "App-Level Tokens. Also ensure Event Subscriptions include: message.im, "
+        "message.channels, message.groups, message.mpim, app_mention",
         "prompt": "Slack App Token (xapp-...)",
         "help": "In your Slack app, enable Socket Mode, then create Basic Information > App-Level Tokens with the connections:write scope.",
         "url": "https://api.slack.com/apps",
@@ -4736,7 +4644,6 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "messaging",
     },
-
     # ── Agent settings ──
     # NOTE: MESSAGING_CWD was removed here — use terminal.cwd in config.yaml
     # instead.  The gateway reads TERMINAL_CWD (bridged from terminal.cwd).
