@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "description": "Immutable Cerberus/household constraints for forge rewrites (skill/prompt/harness edits). A rewrite that violates any hard rule is filtered at zero-fitness BEFORE it reaches the judge, so a candidate that breaks the 'cannot violate' floor is never evaluated or applied. Rules are data so they can be reviewed, versioned, and extended without touching code.",
+  "rules": [
+    {
+      "id": "human-gating-floor",
+      "severity": "hard",
+      "description": "A rewrite must never weaken human gating: auto_apply stays falsy and requires_human_review stays truthy. The forge proposes; only a human disposes.",
+      "check": "human_gating"
+    },
+    {
+      "id": "no-critical-auth-path-rewrite",
+      "severity": "hard",
+      "description": "A rewrite must not target token/credential handling or the critical auth/auto-update paths (setup-hermes.sh, install_auto_update.sh, cron/jobs.py, any token/credential/secret surface). These require manual confirmation, never an unattended forge edit.",
+      "check": "forbidden_paths",
+      "path_fields": ["path", "file", "target", "target_file", "files"],
+      "forbidden_fragments": [
+        "setup-hermes.sh",
+        "install_auto_update.sh",
+        "cron/jobs.py",
+        "token",
+        "credential",
+        "secret",
+        ".env",
+        "gh-auth"
+      ]
+    },
+    {
+      "id": "no-outbound-telemetry",
+      "severity": "hard",
+      "description": "A rewrite must not add outbound telemetry, analytics, usage attribution, or exfiltration without an opt-in gate. Removal/suppression of telemetry is explicitly allowed.",
+      "check": "forbidden_patterns",
+      "text_fields": ["delta", "text", "rationale", "title", "body", "content", "summary"],
+      "patterns": [
+        "exfiltrat",
+        "add\\s+(?:un)?gated\\s+telemetry",
+        "add\\s+telemetry",
+        "enable\\s+telemetry",
+        "introduce\\s+telemetry",
+        "add\\s+analytics",
+        "enable\\s+analytics",
+        "attribution\\s+tag",
+        "send\\s+.*\\s+data\\s+to\\s+.*\\s+server"
+      ]
+    },
+    {
+      "id": "no-safety-gate-disable",
+      "severity": "hard",
+      "description": "A rewrite must not disable, bypass, skip, or remove an existing safety gate or scan. A mitigation that destroys the feature it secures is the wrong mitigation.",
+      "check": "forbidden_patterns",
+      "text_fields": ["delta", "text", "rationale", "title", "body", "content", "summary"],
+      "patterns": [
+        "disable\\s+.*safety",
+        "bypass\\s+.*(?:safety|gate)",
+        "skip\\s+.*safety",
+        "remove\\s+.*safety\\s+.*gate"
+      ]
+    }
+  ]
+}
