@@ -34,6 +34,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_importance import EpisodicMemoryStore, MemoryEvent, score_importance
+from agent.memory_contradiction import ContradictionFlag, detect_contradictions
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
@@ -901,6 +902,13 @@ class MemoryManager:
             tags=[session_id] if session_id else [],
             metadata={"session_id": session_id} if session_id else {},
         )
+        # Contradiction handling (#37): before persisting this turn, check it
+        # against the recent episodic store for negation-flip conflicts (new
+        # observation says X, a stored event says not-X, or vice versa).
+        # Non-fatal and bounded: flags are logged with both timestamps, never
+        # silently overwriting or deleting the stored event.
+        if user_content and user_content.strip():
+            self.check_contradictions(user_content)
         self.episodic_store.add(event)
         logger.debug(
             "score_memories: recorded turn (importance=%.3f, signals=%s)",
@@ -908,6 +916,47 @@ class MemoryManager:
             signals,
         )
         return event
+
+    def check_contradictions(
+        self,
+        observation: str,
+        *,
+        limit: int = 200,
+        min_importance: float = 0.0,
+    ) -> List[ContradictionFlag]:
+        """Surface contradictions between *observation* and episodic memory.
+
+        Runs :func:`agent.memory_contradiction.detect_contradictions` over the
+        most-recent events in :attr:`episodic_store` and logs a warning per
+        flag — both sides verbatim with their timestamps, so a conflict is
+        surfaced instead of silently overwritten (#37). Non-fatal by design:
+        memory sync must never fail a turn because of a flagged conflict.
+
+        Called from :meth:`score_memories` on the per-turn write path and
+        available to any caller that wants to probe a candidate observation
+        before persisting it.
+
+        Returns the flags (empty when nothing conflicts).
+        """
+        if not observation or not observation.strip():
+            return []
+        flags = detect_contradictions(
+            self.episodic_store.events.values(),
+            observation,
+            limit=limit,
+            min_importance=min_importance,
+        )
+        for flag in flags:
+            logger.warning(
+                "memory contradiction (conf=%.2f): %s — stored %s (%s) vs new "
+                "observation %r",
+                flag.confidence,
+                flag.reason,
+                flag.stored_text[:200],
+                flag.stored_when,
+                observation[:200],
+            )
+        return flags
 
     def sync_all(
         self,
