@@ -17,6 +17,19 @@ Slices shipped here:
     rewrite dict against it. Wired into ``evolution_harness_gate.run_gate`` and
     ``run_cron_pass`` so a violating harness proposal is rejected with
     ``zero_fitness`` before the sandbox/regression gate ever runs.
+  * **Slice 3** (staged rollout) — ``classify_stakes`` buckets a proposal into
+    low/medium/high from its explicit ``stakes`` field (else its target path).
+    Each rule may declare an ``enforce_at`` floor; below that floor a finding is
+    demoted to ADVISORY instead of blocking. A rule with no ``enforce_at``
+    defaults to high and blocks everything (unchanged behavior), so a new strict
+    rule can be rolled out staged — advisory on high-stakes targets first,
+    blocking on low-stakes ones — with zero behavior change for existing rules.
+  * **Slice 4** (pinned safe-fallback set) — ``load_safe_fallbacks`` /
+    ``resolve_pinned_fallback`` expose a versioned ``safe_fallbacks`` set of
+    human-vetted, pinned alternative targets. When a proposal is blocked on a
+    forbidden path that has a pinned fallback, the filter attaches
+    ``safe_fallback`` to the result so the rejection is actionable, not a dead
+    end. Additive: a rules file that predates slice 4 simply yields no fallbacks.
 
 The filter is deliberately CONSERVATIVE: it catches only unambiguous
 violations (low false-positive floor), and it checks only top-level scalar
@@ -51,6 +64,22 @@ _RULES_FILENAME = "evolution_invariant_rules.json"
 # Check types the rules file may declare. Anything outside this vocabulary is
 # ignored (never a crash) so a malformed/older rules file degrades safely.
 _CHECKS = ("human_gating", "forbidden_paths", "forbidden_patterns")
+
+# Stakes ladder (slice 3 — staged rollout). A proposal's ``stakes`` (explicit
+# field, else inferred from its target path) selects how aggressively the
+# immutable floor is applied. Rules declare ``enforce_at`` — the minimum stakes
+# at which the rule BLOCKS. A violation of a rule whose threshold is above the
+# proposal's stakes is demoted to an ADVISORY (non-blocking) finding, so a new
+# strict rule can be rolled out staged (advisory on high-stakes targets first,
+# blocking on low-stakes ones) without an abrupt all-or-nothing flip.
+_STAKES_ORDER = ("low", "medium", "high")
+_DEFAULT_STAKES = "high"  # fail safe: an unclassifiable proposal is high-stakes
+# Backward-compatible default for a rule's ``enforce_at`` floor: a rule with no
+# ``enforce_at`` always blocks (threshold = low — the easiest to meet). This
+# preserves the pre-slice-3 behavior where every hard rule blocked every
+# proposal. Staged rollout is OPT-IN: a rule that wants advisory-on-high-stakes
+# explicitly declares ``enforce_at: high`` (or ``medium``).
+_DEFAULT_ENFORCE_AT = "low"
 
 # Default text fields scanned by ``forbidden_patterns`` when a rule does not
 # declare its own ``text_fields``.
@@ -93,7 +122,13 @@ def load_invariant_rules(path: Optional[Path] = None) -> Dict[str, Any]:
     rules = data.get("rules")
     if not isinstance(rules, list) or not rules:
         raise ValueError(f"invariant rules {p} has no 'rules' list")
-    return {"version": version, "rules": rules}
+    loaded: Dict[str, Any] = {"version": version, "rules": rules}
+    # Slice 4: carry the versioned safe-fallback set forward verbatim (if the
+    # rules file declares one) so downstream consumers can resolve pinned
+    # alternatives. Absent in older files -> the key is simply omitted.
+    if "safe_fallbacks" in data:
+        loaded["safe_fallbacks"] = data["safe_fallbacks"]
+    return loaded
 
 
 def _as_text(value: Any) -> str:
@@ -125,6 +160,135 @@ def _walk_paths(obj: Any, fields: Tuple[str, ...]) -> List[str]:
         elif isinstance(value, list):
             out.extend(_as_text(x) for x in value)
     return out
+
+
+# -- Slice 3: stakes classification (staged rollout) --------------------------
+
+
+def _stakes_rank(stakes: Any) -> int:
+    """Rank a stakes label on the ``low < medium < high`` ladder.
+
+    Unknown values are coerced to the safe default (high). Returns an index
+    into ``_STAKES_ORDER`` so callers can compare with ``>=``.
+    """
+    label = str(stakes or "").strip().lower()
+    if label in _STAKES_ORDER:
+        return _STAKES_ORDER.index(label)
+    return _STAKES_ORDER.index(_DEFAULT_STAKES)
+
+
+def classify_stakes(obj: Any) -> Tuple[str, str]:
+    """Classify a proposal's stakes as ``(label, source)``.
+
+    ``label`` is one of ``low``/``medium``/``high``. ``source`` is ``"explicit"``
+    (the proposal carried its own ``stakes`` field), ``"inferred"`` (from its
+    target path), or ``"default"`` (fail-safe high for a pathless/unclassifiable
+    proposal). Pure + deterministic — no IO, no clock.
+    """
+    if isinstance(obj, dict) and isinstance(obj.get("stakes"), str):
+        label = obj["stakes"].strip().lower()
+        if label in _STAKES_ORDER:
+            return label, "explicit"
+        # An explicit but unknown label is not silently trusted — fail safe.
+        return _DEFAULT_STAKES, "default"
+    if isinstance(obj, dict):
+        # Infer from the target path. Distinguish an inferred-HIGH (a path hit
+        # the high-risk fragments) from a fail-safe default-HIGH (no path at
+        # all): both return "high", but only the former is source="inferred".
+        paths = _walk_paths(obj, _DEFAULT_PATH_FIELDS)
+        if not paths:
+            return _DEFAULT_STAKES, "default"
+        high_fragments = (
+            "evolution_merge_gate",
+            "evolution_harness_gate",
+            "register_evolution_cron",
+            "evolution_orchestrator",
+            "tools/approval",
+            "evolution_*_gate.py",
+        )
+        for p in paths:
+            pl = p.lower()
+            if any(frag in pl for frag in high_fragments):
+                return "high", "inferred"
+        return "medium", "inferred"
+    return _DEFAULT_STAKES, "default"
+
+
+def _rule_enforces_at(rule: Dict[str, Any], stakes_rank: int) -> bool:
+    """True if a rule's ``enforce_at`` threshold is met at the given stakes.
+
+    A rule with no ``enforce_at`` defaults to ``_DEFAULT_ENFORCE_AT`` (low) —
+    i.e. it blocks every proposal, backwards compatible with the pre-slice-3
+    behavior where every hard rule always blocked. A rule that explicitly
+    declares a higher floor (e.g. ``enforce_at: high``) is rolled out staged:
+    below that floor a finding becomes advisory instead of blocking.
+    """
+    threshold = str(rule.get("enforce_at") or _DEFAULT_ENFORCE_AT).strip().lower()
+    return stakes_rank >= _stakes_rank(threshold)
+
+
+# -- Slice 4: pinned safe-fallback set ----------------------------------------
+
+
+def load_safe_fallbacks(rules: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract the versioned ``safe_fallbacks`` set from a loaded rules dict.
+
+    Each entry is ``{"id", "target", "replacement"}``: a pinned, human-vetted
+    alternative for a high-stakes target path that the forge must never rewrite
+    unattended. When a proposal violates ``no-critical-auth-path-rewrite`` (or
+    any rule with ``safe_fallback_key``), the filter can offer the matching
+    fallback as the allowed path instead of a flat rejection — so the blocker
+    becomes actionable, not a dead end. Returns ``[]`` for a rules file that
+    predates slice 4 (safe fallback is additive).
+    """
+    if not isinstance(rules, dict):
+        return []
+    data = rules.get("safe_fallbacks")
+    if not isinstance(data, list):
+        return []
+    out = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("id") and entry.get("replacement"):
+            out.append(
+                {
+                    "id": str(entry["id"]),
+                    "target": str(entry.get("target") or ""),
+                    "replacement": str(entry["replacement"]),
+                    "description": str(entry.get("description") or ""),
+                }
+            )
+    return out
+
+
+def resolve_pinned_fallback(
+    proposal: Any,
+    rules: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a pinned safe fallback for a proposal that hit a forbidden path.
+
+    Scans the versioned ``safe_fallbacks`` set for an entry whose ``target`` is
+    a fragment of a path the proposal rewrites. Returns ``None`` when the
+    proposal does not target a pinned path (or no fallback is pinned) — the
+    caller then treats the violation as an un-cachable hard block. Pure +
+    deterministic. When ``rules`` is omitted it is loaded from disk.
+    """
+    if rules is None:
+        try:
+            rules = load_invariant_rules()
+        except ValueError:
+            return None
+    if not isinstance(proposal, dict):
+        return None
+    paths = _walk_paths(proposal, _DEFAULT_PATH_FIELDS)
+    if not paths:
+        return None
+    for entry in load_safe_fallbacks(rules):
+        target = entry["target"].lower()
+        if target and any(target in p.lower() for p in paths):
+            return entry
+    return None
 
 
 def _check_human_gating(
@@ -206,17 +370,47 @@ def check_proposal(
     if not isinstance(proposal, dict):
         return {"ok": True, "violations": []}
 
-    violations: List[Dict[str, Any]] = []
+    # Slice 3: classify stakes once for this proposal (explicit > inferred >
+    # fail-safe default) and use each rule's ``enforce_at`` floor to decide
+    # whether a finding BLOCKS or is merely advisory. Backwards compatible:
+    # a rule with no ``enforce_at`` blocks every proposal, exactly as before.
+    stakes, stakes_source = classify_stakes(proposal)
+    stakes_rank = _stakes_rank(stakes)
+
+    blocking: List[Dict[str, Any]] = []
+    advisory: List[Dict[str, Any]] = []
     for rule in rules.get("rules", []):
         check = rule.get("check")
         if check == "human_gating":
-            violations.extend(_check_human_gating(proposal, rule))
+            found = _check_human_gating(proposal, rule)
         elif check == "forbidden_paths":
-            violations.extend(_check_forbidden_paths(proposal, rule))
+            found = _check_forbidden_paths(proposal, rule)
         elif check == "forbidden_patterns":
-            violations.extend(_check_forbidden_patterns(proposal, rule))
-        # unknown check type -> ignored (never crash)
-    return {"ok": not violations, "violations": violations}
+            found = _check_forbidden_patterns(proposal, rule)
+        else:  # unknown check type -> ignored (never crash)
+            continue
+        if not found:
+            continue
+        if _rule_enforces_at(rule, stakes_rank):
+            blocking.extend(found)
+        else:
+            advisory.extend(found)
+
+    result: Dict[str, Any] = {
+        "ok": not blocking,
+        "violations": blocking,
+        "advisory": advisory,
+        "stakes": stakes,
+        "stakes_source": stakes_source,
+    }
+
+    # Slice 4: for a forbidden-path block with a pinned safe fallback, surface
+    # the allowed alternative so the rejection is actionable, not a dead end.
+    if blocking:
+        fallback = resolve_pinned_fallback(proposal, rules=rules)
+        if fallback is not None:
+            result["safe_fallback"] = fallback
+    return result
 
 
 def filter_proposals(

@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "Immutable Cerberus/household constraints for forge rewrites (skill/prompt/harness edits). A rewrite that violates any hard rule is filtered at zero-fitness BEFORE it reaches the judge, so a candidate that breaks the 'cannot violate' floor is never evaluated or applied. Rules are data so they can be reviewed, versioned, and extended without touching code.",
+  "version": 2,
+  "description": "Immutable Cerberus/household constraints for forge rewrites (skill/prompt/harness edits). A rewrite that violates any hard rule is filtered at zero-fitness BEFORE it reaches the judge, so a candidate that breaks the 'cannot violate' floor is never evaluated or applied. Rules are data so they can be reviewed, versioned, and extended without touching code. v2 adds the versioned 'safe_fallbacks' set (slice 4): a pinned, human-vetted alternative target for a high-stakes path that must never be rewritten unattended, surfaced on a forbidden-path block so the rejection stays actionable.",
   "rules": [
     {
       "id": "human-gating-floor",
@@ -55,6 +55,20 @@
         "skip\\s+.*safety",
         "remove\\s+.*safety\\s+.*gate"
       ]
+    }
+  ],
+  "safe_fallbacks": [
+    {
+      "id": "cron-jobs-config-surface",
+      "target": "cron/jobs.py",
+      "replacement": "cron/config/*.json",
+      "description": "The cron registrar's job definitions carry the safety instructions; never rewrite cron/jobs.py unattended. Change job cadence/parameters via the per-job JSON config surface instead."
+    },
+    {
+      "id": "setup-hermes-config-surface",
+      "target": "setup-hermes.sh",
+      "replacement": "config/hermes.yaml",
+      "description": "The bootstrap installer must not be rewritten unattended. Adjust runtime behavior via the YAML config file, which the installer reads at run time."
     }
   ]
 }
