@@ -3470,9 +3470,7 @@ class TestConcurrentToolExecution:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert starts == [("c1", "web_search", {"query": "hello"})]
-        assert completes == [
-            ("c1", "web_search", {"query": "hello"}, '{"success": true}')
-        ]
+        assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
     def test_sequential_browser_type_callbacks_redact_api_key(self, agent):
         secret = "sk-proj-ABCD1234567890EFGH"
@@ -5579,6 +5577,77 @@ class TestRunConversation:
         assert "No reply:" in result["final_response"]
         assert result["api_calls"] == 4  # 1 original + 3 retries
 
+    def test_deterministic_empty_stops_retries_early(self, agent):
+        """NS-503: consecutive zero-output-token empties with identical
+        model/provider/finish_reason are deterministic (unsignaled refusal)
+        — the loop must stop re-billing the full input after the second
+        attempt instead of burning the whole retry budget."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        zero_usage = {
+            "prompt_tokens": 25_900,
+            "completion_tokens": 0,
+            "total_tokens": 25_900,
+        }
+        empty_resp = _mock_response(
+            content=None, finish_reason="stop", usage=zero_usage
+        )
+        # Provide plenty of responses; guard should stop consuming early.
+        agent.client.chat.completions.create.side_effect = [empty_resp] * 6
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is True
+        assert result["final_response"] != "(empty)"
+        # 1 original + 1 retry: the second identical zero-output empty
+        # proves determinism, remaining retries are skipped.
+        assert result["api_calls"] == 2
+
+    def test_guard_disabled_via_config_restores_legacy_retries(self, agent):
+        """NS-503: agent.empty_response_guard.enabled: false in config.yaml
+        (resolved to _empty_guard_enabled at init) restores the legacy
+        fixed 3-retry behaviour even for deterministic empties."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent._empty_guard_enabled = False  # as set by agent_init from config
+        zero_usage = {
+            "prompt_tokens": 25_900,
+            "completion_tokens": 0,
+            "total_tokens": 25_900,
+        }
+        empty_resp = _mock_response(
+            content=None, finish_reason="stop", usage=zero_usage
+        )
+        agent.client.chat.completions.create.side_effect = [empty_resp] * 6
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is True
+        assert result["api_calls"] == 4  # legacy: 1 original + 3 retries
+
+    def test_empty_without_usage_keeps_full_retry_budget(self, agent):
+        """NS-503 fail-open: no usage data means no evidence of a
+        deterministic empty — legacy 3-retry behaviour must be preserved
+        (this is the flaky-provider case retries exist for)."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [empty_resp] * 4
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is True
+        assert result["api_calls"] == 4  # unchanged: 1 original + 3 retries
+
     def test_truly_empty_response_succeeds_on_nudge(self, agent):
         """Model produces content after being nudged for empty response."""
         self._setup_agent(agent)
@@ -7414,7 +7483,11 @@ class TestRunConversation:
             if calls == 1:
                 agent._fire_reasoning_delta("Following the original approach.")
                 entered.set()
-                deadline = time.time() + 2
+                # Generous window (flake policy >= 2s): on a loaded runner the
+                # redirect() below must land BEFORE this expires, or the
+                # InterruptedError fires un-redirected and the test observes
+                # the wrong path.
+                deadline = time.time() + 5
                 while not agent._interrupt_requested and time.time() < deadline:
                     time.sleep(0.01)
                 raise InterruptedError("request cancelled by redirect")
@@ -8023,7 +8096,12 @@ class TestNousCredentialRefresh:
         closed = {"value": False}
         retired = {"value": False}
         rebuilt = {"kwargs": None}
-        captured = {}
+        # Append-only call log: a leaked background refresher from an earlier
+        # test may ALSO hit the patched resolve mid-test (order-dependent,
+        # observed 3x on CI runners). A single dict got clobbered by that
+        # extra force_refresh=False call; a log lets the assertions target
+        # OUR call without assuming a quiet runner.
+        resolve_calls: list = []
 
         class _ExistingClient:
             def close(self):
@@ -8033,7 +8111,7 @@ class TestNousCredentialRefresh:
             pass
 
         def _fake_resolve(**kwargs):
-            captured.update(kwargs)
+            resolve_calls.append(kwargs)
             return {
                 "api_key": "new-nous-key",
                 "base_url": "https://inference-api.nousresearch.com/v1",
@@ -8069,7 +8147,9 @@ class TestNousCredentialRefresh:
         # TLS-FD→SQLite corruption vector.
         assert retired["value"] is True
         assert closed["value"] is False
-        assert captured["force_refresh"] is True
+        assert any(
+            c.get("force_refresh") is True for c in resolve_calls
+        ), f"our force=True call missing from {resolve_calls!r}"
         assert rebuilt["kwargs"]["api_key"] == "new-nous-key"
         assert (
             rebuilt["kwargs"]["base_url"] == "https://inference-api.nousresearch.com/v1"

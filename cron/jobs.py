@@ -871,35 +871,164 @@ def _recoverable_oneshot_run_at(
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
-    Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
-    while frequent jobs (every 5-10 min) still fast-forward quickly.
+    Uses half the schedule period (via ``_schedule_cadence_seconds``, the
+    single cadence-measurement implementation), clamped between 120 seconds
+    and 2 hours.  This ensures daily jobs can catch up if missed by up to
+    2 hours, while frequent jobs (every 5-10 min) still fast-forward quickly.
     """
     MIN_GRACE = 120
     MAX_GRACE = 7200  # 2 hours
 
+    period_seconds = _schedule_cadence_seconds(schedule)
+    if not period_seconds:
+        return MIN_GRACE
+    grace = int(period_seconds) // 2
+    return max(MIN_GRACE, min(grace, MAX_GRACE))
+
+
+# Durable (persisted-state) recovery counter for a recurring job wedged in a
+# stale ``last_status == "error"`` state with ``next_run_at`` parked in the
+# future.  This is the restart-surviving half of the recurring-cron wedge
+# (t_20e23f84 / t_8b5480b3): the in-memory stale-claim sweep in scheduler.py
+# heals a leaked ``_running_job_ids`` claim in-process, but a job whose
+# persisted ``next_run_at`` was re-armed into the future (the normal
+# post-error re-arm by ``mark_job_run``) is invisible to that sweep — it is
+# not in the running set, so nothing force-releases it, and it is not due, so
+# ``get_due_jobs`` never returns it.  It just sits.  This recovery re-arms
+# ``next_run_at`` to now so the next tick re-dispatches it, exactly like the
+# operator's force-run / mech_red_guard's ``cron resume`` but built-in.
+_persisted_error_recoveries: int = 0
+_PERSISTED_ERROR_RECOVERY_HISTORY = 20
+_persisted_error_recoveries_recent: list = []
+
+
+def _job_is_stale_error_recurring(
+    job: Dict[str, Any],
+    schedule: Dict[str, Any],
+    now: datetime,
+) -> bool:
+    """True when a recurring job is wedged in a stale persisted error state.
+
+    Condition (all must hold):
+      * it is a recurring (cron/interval) job (checked by caller);
+      * its persisted ``last_status == "error"`` (a prior fire errored and the
+        job never recovered);
+      * it has NOT successfully re-fired within its natural cadence — its
+        ``last_run_at`` is older than ``cadence + grace``, so this is not a
+        normal transient-error retry that will fire on its own soon, it is a
+        job that has been sitting errored for a full period with no recovery;
+      * it is not currently running in this process (a live run must never be
+        re-armed underneath itself, #62002-style).
+
+    ``last_run_at`` being older than one cadence is the key discriminator: a
+    job that errors and is retried on its normal schedule keeps ``last_run_at``
+    fresh (mark_job_run stamps it on every fire, success or failure), so the
+    stale check does not fire for a job that is merely erroring-and-retrying.
+    """
+    if job.get("last_status") != "error":
+        return False
+    if _job_running_in_this_process(str(job.get("id") or "")):
+        return False
+    last_run = job.get("last_run_at")
+    if not last_run:
+        return False
+    try:
+        last_run_dt = _ensure_aware(datetime.fromisoformat(last_run))
+    except (ValueError, TypeError):
+        return False
+    age_seconds = (now - last_run_dt).total_seconds()
+    if age_seconds < 0:
+        return False
+    cadence_seconds = _schedule_cadence_seconds(schedule)
+    if cadence_seconds is None:
+        # Unknown cadence (croniter unavailable / malformed expr): fall back to
+        # the grace window so a badly-parked job is still recovered, but never
+        # re-arm anything younger than the 2h grace cap.
+        cadence_seconds = _compute_grace_seconds(schedule)
+    return age_seconds > (cadence_seconds + _compute_grace_seconds(schedule))
+
+
+def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
+    """Approximate the natural period of a schedule, in seconds, or None.
+
+    Interval jobs use ``minutes * 60``.  Cron jobs measure the gap between the
+    next two fire times with croniter (falling back to None when croniter is
+    missing or the expr is malformed).  Cron results are cached per expr —
+    this runs inside ``_jobs_lock`` on every tick for every stale-errored
+    job, and two croniter evaluations per call add up (the same reason
+    ``scheduler.py`` caches ``_cron_interval_minutes``).  The measured gap
+    can vary with the base time for irregular exprs; the cache trades that
+    precision for not re-evaluating croniter under the lock, which is fine
+    for a staleness *threshold*.
+    """
+    if not isinstance(schedule, dict):
+        return None
     kind = schedule.get("kind")
-
     if kind == "interval":
-        period_seconds = schedule.get("minutes", 1) * 60
-        grace = period_seconds // 2
-        return max(MIN_GRACE, min(grace, MAX_GRACE))
-
-    if kind == "cron" and _ensure_croniter():
+        minutes = schedule.get("minutes")
+        try:
+            return float(minutes) * 60.0 if minutes else None
+        except (TypeError, ValueError):
+            return None
+    if kind == "cron":
+        if not _ensure_croniter():
+            return None
         expr = schedule.get("expr")
-        if expr:
-            try:
-                now = _hermes_now()
-                cron = croniter(expr, now)
-                first = cron.get_next(datetime)
-                second = cron.get_next(datetime)
-                period_seconds = int((second - first).total_seconds())
-                grace = period_seconds // 2
-                return max(MIN_GRACE, min(grace, MAX_GRACE))
-            except Exception:
-                pass
+        if not expr:
+            return None
+        if expr in _cron_cadence_cache:
+            return _cron_cadence_cache[expr]
+        try:
+            base = _hermes_now()
+            it = croniter(expr, base)
+            first = it.get_next(datetime)
+            second = it.get_next(datetime)
+            gap = (second - first).total_seconds()
+            result = gap if gap > 0 else None
+        except Exception:
+            result = None
+        # Hard bound so deleted/edited exprs can never grow the cache
+        # unboundedly in a long-lived gateway; a rare full clear costs two
+        # croniter evaluations per live expr to rebuild.
+        if len(_cron_cadence_cache) >= 256:
+            _cron_cadence_cache.clear()
+        _cron_cadence_cache[expr] = result
+        return result
+    return None
 
-    return MIN_GRACE
+
+# Per-expr cache for _schedule_cadence_seconds' croniter measurements.
+_cron_cadence_cache: Dict[str, Optional[float]] = {}
+
+
+def _record_persisted_error_recovery(job: Dict[str, Any], previous_next_run: str) -> None:
+    """Persist a countable, probe-visible signal for one stale-error re-arm."""
+    global _persisted_error_recoveries
+    now = _hermes_now()
+    entry = {
+        "job_id": job.get("id"),
+        "name": job.get("name") or job.get("id"),
+        "previous_next_run_at": previous_next_run,
+        "rearmed_at": now.isoformat(),
+    }
+    _persisted_error_recoveries += 1
+    _persisted_error_recoveries_recent.append(entry)
+    del _persisted_error_recoveries_recent[:-_PERSISTED_ERROR_RECOVERY_HISTORY]
+    try:
+        path = _current_cron_store().cron_dir / "persisted_error_recoveries.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception as exc:  # never let telemetry break a tick
+        logger.debug("Could not append persisted-error-recovery record: %s", exc)
+
+
+def get_persisted_error_recovery_stats() -> Dict[str, Any]:
+    """Probe-visible snapshot of persisted-error recoveries."""
+    return {
+        "persisted_error_recoveries": _persisted_error_recoveries,
+        "recent": list(_persisted_error_recoveries_recent),
+    }
 
 
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
@@ -962,6 +1091,97 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         return next_run.isoformat()
 
     return None
+
+
+def _failure_backoff_config() -> Dict[str, Any]:
+    """Return the ``cron`` config section for failure-backoff tuning (#70).
+
+    Read-only: uses ``load_config_readonly`` so the hot path (every job run)
+    does not pay the defensive deepcopy. A missing config yields an empty
+    dict so all call sites fall back to their built-in defaults.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+        return cron_cfg if isinstance(cron_cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+# #70: last_status values recording a SYNTHETIC failure — scheduler restart
+# / forced release — rather than a real agent failure. These must never feed
+# the failure-streak circuit breaker: a restart mid-run (or a stale in-flight
+# claim force-released by the scheduler) is not evidence the job is
+# deterministically broken, and counting it would let scheduler restarts
+# false-positive auto-pause a healthy job.
+_SYNTHETIC_FAILURE_STATUSES = frozenset({"interrupted", "released"})
+
+
+def _failure_backoff_max_skips() -> int:
+    """Resolve ``cron.failure_backoff_max_skips`` (default 16).
+
+    A non-int value in config.yaml degrades to the default instead of
+    crashing the failure path of ``_mark_job_run_locked`` (#70).
+    """
+    try:
+        return int(_failure_backoff_config().get("failure_backoff_max_skips", 16))
+    except (TypeError, ValueError):
+        return 16
+
+
+def _failure_auto_pause_threshold() -> int:
+    """Resolve ``cron.failure_auto_pause_threshold`` (default 10).
+
+    A non-int value in config.yaml degrades to the default instead of
+    crashing the failure path of ``_mark_job_run_locked`` (#70).
+    """
+    try:
+        return int(_failure_backoff_config().get("failure_auto_pause_threshold", 10))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _advance_schedule_by_steps(
+    schedule: Dict[str, Any],
+    from_iso: str,
+    n_steps: int,
+) -> Optional[str]:
+    """Advance ``from_iso`` forward by ``n_steps`` schedule slots.
+
+    Used by #70 to skip scheduled runs after identical consecutive failures:
+    instead of running on the very next slot, the job is pushed out by
+    ``failure_backoff_skips`` slots. Returns ``from_iso`` unchanged when the
+    schedule kind is unsupported or the step count is non-positive.
+    """
+    if n_steps <= 0:
+        return from_iso
+    if not isinstance(schedule, dict):
+        return from_iso
+    kind = schedule.get("kind")
+    try:
+        base = _ensure_aware(datetime.fromisoformat(from_iso))
+    except Exception:
+        base = _hermes_now()
+
+    if kind == "interval":
+        minutes = schedule.get("minutes")
+        if minutes is None:
+            return from_iso
+        return (base + timedelta(minutes=minutes * n_steps)).isoformat()
+
+    if kind == "cron":
+        expr = schedule.get("expr")
+        if not expr or not _ensure_croniter():
+            return from_iso
+        cron = croniter(expr, base)
+        result = base
+        for _ in range(n_steps):
+            result = cron.get_next(datetime)
+        return result.isoformat()
+
+    return from_iso
 
 
 # =============================================================================
@@ -1862,6 +2082,7 @@ def create_job(
         "last_error": None,
         "last_tool_calls": None,
         "last_delivery_error": None,
+        "failure_streak": 0,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -2081,6 +2302,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            # #70: an update that transitions the job into an enabled,
+            # scheduled state is an operator re-enable — clear the failure
+            # streak so the auto-pause circuit breaker doesn't re-trip on a
+            # stale deterministic-failure chain (e.g. a dashboard/API update
+            # flipping enabled back on). Updates that leave the job disabled
+            # or paused, or that merely edit an already-live job, keep the
+            # streak intact.
+            if (
+                updated.get("enabled", True)
+                and updated.get("state") != "paused"
+                and (not job.get("enabled") or job.get("state") == "paused")
+            ):
+                updated["failure_streak"] = 0
+                updated.pop("failure_backoff_skips", None)
+
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -2123,6 +2359,11 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            # #70: a manual resume is an explicit "try again" — clear the
+            # failure streak so a single immediate failure doesn't re-trip the
+            # auto-pause circuit breaker on a stale streak.
+            "failure_streak": 0,
+            "failure_backoff_skips": None,
             "next_run_at": next_run_at,
         },
     )
@@ -2140,6 +2381,11 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            # #70: a manual trigger is an explicit re-enable — clear the
+            # failure streak so a single immediate failure doesn't re-trip
+            # the auto-pause circuit breaker on a stale streak.
+            "failure_streak": 0,
+            "failure_backoff_skips": None,
             "next_run_at": _hermes_now().isoformat(),
         },
     )
@@ -2281,6 +2527,40 @@ def mark_job_run(
         )
 
 
+
+
+def note_fire_forward_failure(job_id: str, detail: str) -> bool:
+    """Durably record that a scheduled fire could not be handed to the runner.
+
+    Written by the dashboard fire webhook when the loopback forward to the
+    gateway api_server fails (gateway unreachable / listener not bound) —
+    the shape behind "job runs manually but never auto-fires". Without this
+    stamp the miss is invisible outside gui.log: no execution row is created
+    (the claim never happens) and ``last_status``/``last_error`` only cover
+    runs that actually started.
+
+    Stored as ``last_fire_error`` (``{"at": iso, "detail": str}``) on the job
+    record so `cronjob list`, the CLI, and the dashboard all surface it.
+    Cleared by the next successful run (``mark_job_run``). Repeated failures
+    overwrite in place — latest miss wins; per-fire history lives in the
+    scheduler's own logs.
+
+    Returns True when a job record was found and stamped.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                job["last_fire_error"] = {
+                    "at": _hermes_now().isoformat(),
+                    "detail": str(detail or "")[:500],
+                }
+                jobs[i] = job
+                save_jobs(jobs)
+                return True
+    return False
+
+
 def _mark_job_run_locked(
     job_id: str,
     success: bool,
@@ -2320,6 +2600,7 @@ def _mark_job_run_locked(
                         )
                         return False
                 now = _hermes_now().isoformat()
+                _prev_err = job.get("last_error")
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
@@ -2332,8 +2613,40 @@ def _mark_job_run_locked(
                 if success:
                     job.pop("preflight_alerted", None)
                     job.pop("drift_alerted", None)
+                    # The fire hand-off demonstrably works again — clear the
+                    # forward-failure stamp so it only ever describes the
+                    # CURRENT auto-fire health, not a healed past incident.
+                    job.pop("last_fire_error", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # #70 + Poke-nudge UNIFIED streak: ONE increment per failed
+                # run (the pre-merge code had two independent if/else blocks
+                # each incrementing failure_streak, double-counting). Any
+                # successful run resets it and the backoff skips; delivery
+                # failures alone do NOT count (the agent did its job).
+                # Synthetic failures (interruption / forced release — status
+                # in _SYNTHETIC_FAILURE_STATUSES) never touch the streak: a
+                # scheduler restart mid-run is not evidence the job is
+                # deterministically broken, and counting it would let
+                # restarts false-positive auto-pause a healthy job. The
+                # scheduler's delivery path reads the same field for its
+                # review nudge (cron/scheduler._failure_streak_nudge).
+                if success:
+                    job["failure_streak"] = 0
+                    job.pop("failure_backoff_skips", None)
+                elif status in _SYNTHETIC_FAILURE_STATUSES:
+                    # Recorded (last_status/last_error) but excluded from the
+                    # failure-streak circuit breaker (#70 review).
+                    pass
+                else:
+                    _same = bool(_prev_err) and error == _prev_err
+                    job["failure_streak"] = (
+                        int(job.get("failure_streak") or 0) + 1 if _same else 1
+                    )
+                    _streak = int(job["failure_streak"])
+                    job["failure_backoff_skips"] = min(
+                        2 ** (_streak - 1) - 1, _failure_backoff_max_skips()
+                    )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -2412,6 +2725,34 @@ def _mark_job_run_locked(
                         job["state"] = "completed"
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
+
+                # #70: apply failure backoff (skip scheduled slots) and, past
+                # the auto-pause threshold, pause the job for operator review
+                # instead of retrying a deterministic failure indefinitely.
+                # Placed AFTER the next_run_at computation so a pause cleanly
+                # clears the schedule rather than tripping the missing-croniter
+                # error branch above. Synthetic failures (interruption /
+                # forced release) never advance the streak, so they must not
+                # trigger the backoff/pause either.
+                if not success and status not in _SYNTHETIC_FAILURE_STATUSES:
+                    _skips = int(job.get("failure_backoff_skips") or 0)
+                    if _skips > 0 and job["next_run_at"] is not None:
+                        job["next_run_at"] = _advance_schedule_by_steps(
+                            job["schedule"], job["next_run_at"], _skips
+                        )
+                    if (
+                        int(job.get("failure_streak") or 0)
+                        >= _failure_auto_pause_threshold()
+                    ):
+                        job["enabled"] = False
+                        job["state"] = "paused"
+                        job["paused_at"] = now
+                        job["paused_reason"] = (
+                            "auto-paused after %d identical consecutive "
+                            "failures (last error: %.200s) — resume to retry"
+                            % (int(job["failure_streak"]), error or "")
+                        )
+                        job["next_run_at"] = None
 
                 save_jobs(jobs)
                 return True
@@ -2578,6 +2919,34 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def clear_run_claim(job_id: str) -> bool:
+    """Clear a one-shot job's ``run_claim`` when its dispatch fails.
+
+    ``get_due_jobs`` stamps a ``run_claim`` before returning a one-shot as
+    due (#59229).  ``mark_job_run`` clears it on *successful* completion.
+    When dispatch itself fails (interpreter shutdown, executor submit error,
+    execution-creation error) the job never reaches ``mark_job_run`` and the
+    stale claim blocks re-dispatch until the TTL expires (default 30 min).
+
+    Calling this on every early-exit path restores the "the job stays due
+    and will fire on the next healthy tick" invariant that the scheduler
+    comment promises (#86522).
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            if job.get("run_claim") is not None:
+                job["run_claim"] = None
+                save_jobs(jobs)
+                return True
+            return False  # already cleared
+    return False
+
+
 def advance_next_runs(job_ids) -> int:
     """Batch form of :func:`advance_next_run` for the due-dispatch loop.
 
@@ -2729,6 +3098,11 @@ def _claim_job_for_fire_locked(
                 job["state"] = "scheduled"
                 job["paused_at"] = None
                 job["paused_reason"] = None
+                # #70: a forced fire is an explicit operator re-enable —
+                # clear the failure streak so the circuit breaker doesn't
+                # re-trip on a stale deterministic-failure chain.
+                job["failure_streak"] = 0
+                job.pop("failure_backoff_skips", None)
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
@@ -3135,6 +3509,61 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             needs_save = True
                             break
                     continue
+
+            # Persisted-state stale-error recovery (t_8b5480b3): a recurring
+            # job whose persisted state shows last_status=error and whose
+            # last_run_at is older than a full cadence has been sitting wedged
+            # (errored once, next_run_at re-armed into the future by
+            # mark_job_run, but never re-dispatched — the restart-surviving
+            # half of the 2026-08-14 incident, invisible to the in-memory
+            # in-flight sweep). Re-arm so the job re-dispatches WITHOUT
+            # force-run/resume:
+            #   * interval jobs re-arm to now — interval schedules have no
+            #     excluded times, so an immediate catch-up retry is always a
+            #     legal fire (the 2026-08-14 incident jobs were intervals);
+            #   * cron jobs re-arm to the next LEGAL occurrence from now —
+            #     re-arming to now would fire at times the expression
+            #     explicitly excludes (e.g. a weekday-only 9am job whose
+            #     Friday run errored must fire Monday 9am, not Saturday).
+            #     This still repairs values parked beyond the next legal
+            #     occurrence; a correctly-parked cron value is left as-is.
+            if (
+                kind in ("cron", "interval")
+                and next_run_dt > now
+                and _job_is_stale_error_recurring(job, schedule, now)
+            ):
+                jid = job.get("id")
+                if kind == "interval":
+                    recovered_next = now.isoformat()
+                    recovered_next_dt = now
+                else:
+                    recovered_next = compute_next_run(schedule, now.isoformat())
+                    try:
+                        recovered_next_dt = (
+                            _ensure_aware(datetime.fromisoformat(recovered_next))
+                            if recovered_next
+                            else None
+                        )
+                    except (ValueError, TypeError):
+                        recovered_next_dt = None
+                if recovered_next and recovered_next_dt is not None and recovered_next_dt < next_run_dt:
+                    logger.warning(
+                        "cron.persisted_error.recovered job='%s' id=%s — recurring "
+                        "job wedged in stale last_status=error without re-firing for "
+                        "a full cadence; re-arming next_run_at to %s so it "
+                        "re-dispatches without force-run/resume",
+                        job.get("name", jid),
+                        jid,
+                        recovered_next,
+                    )
+                    _record_persisted_error_recovery(job, next_run)
+                    job["next_run_at"] = recovered_next
+                    next_run_dt = recovered_next_dt
+                    for rj in raw_jobs:
+                        if rj["id"] == jid:
+                            rj["next_run_at"] = recovered_next
+                            needs_save = True
+                            break
 
             if next_run_dt <= now:
 

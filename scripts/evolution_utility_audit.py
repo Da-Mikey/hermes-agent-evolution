@@ -28,11 +28,48 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 HALF_LIFE_DAYS = 30.0
 KEEP_FRACTION = 0.10
 REDUNDANT_OVERLAP = 0.35
+
+# Non-stationary audit bar (issue #63): the audit standard rises with the
+# system instead of freezing.  The bar carries the previous audit's accepted
+# observations forward as calibration traps, tracks missed drift, and rotates
+# the audit rubric when the miss threshold is crossed.  Wired in below; the
+# engine lives in evolution/lib/audit_bar.py.
+DEFAULT_MISS_THRESHOLD = 2
+
+
+def _import_audit_bar():
+    """Import the non-stationary bar engine, resolving the repo root when the
+    script runs from scripts/ (the cron runner) without the repo on sys.path.
+
+    Returns the module, or None in a standalone deployment (HERMES_HOME/scripts
+    without the repo tree) — the bar then no-ops instead of crashing the
+    audit, mirroring resolve_active_rubric's fallback in
+    evolution_rubric_judge.py.
+    """
+    try:
+        from evolution.lib import audit_bar
+
+        return audit_bar
+    except ImportError:
+        pass
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    try:
+        from evolution.lib import audit_bar
+
+        return audit_bar
+    except ImportError:
+        return None
+
+
+audit_bar = _import_audit_bar()
+BAR_AVAILABLE = audit_bar is not None
 
 _STOPWORDS = frozenset(
     "the and for are but not you all any can had her was one our out has have "
@@ -196,12 +233,137 @@ def apply_demotions(
 
 def _usage() -> str:
     return (
-        "usage: evolution_utility_audit.py [--apply] [--json]\n"
+        "usage: evolution_utility_audit.py [--apply] [--json] [--bar-prompt] "
+        "[--miss-threshold N]\n"
         "  Runs the leave-one-out utility audit over the curator sidecar.\n"
-        "  --apply   stamp trust_state=demoted on demote verdicts (default: report only)\n"
-        "  --json    emit machine-readable JSON to stdout\n"
+        "  --apply            stamp trust_state=demoted on demote verdicts (default: report only)\n"
+        "  --json             emit machine-readable JSON to stdout\n"
+        "  --bar-prompt       print the non-stationary audit prompt (active rubric\n"
+        "                     variant + calibration traps) and exit\n"
+        "  --miss-threshold N rotation threshold for the non-stationary audit bar\n"
+        "                     (default 2; persisted in audit-bar-state.json)\n"
         "  Exit 0 ok, 2 bad input.\n"
     )
+
+
+def _evolution_dir() -> Path:
+    """Canonical evolution state dir: $EVOLUTION_PROFILE_DIR or
+    <hermes-home>/evolution (mirrors evolution_watchdog.py)."""
+    hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    return Path(os.environ.get("EVOLUTION_PROFILE_DIR", str(hermes_home / "evolution")))
+
+
+def _bar_observations(audits: List[SkillAudit]) -> List[Dict[str, Any]]:
+    """The audit's observations as the bar's trap pool entries."""
+    return [
+        {
+            "kind": "skill",
+            "name": a.name,
+            "verdict": a.verdict,
+            "utility": round(a.utility, 3),
+            "share": round(a.share, 4),
+            "activity": a.activity,
+        }
+        for a in audits
+    ]
+
+
+def _run_audit_bar(
+    audits: List[SkillAudit],
+    evolution_dir: Path,
+    *,
+    miss_threshold: int = DEFAULT_MISS_THRESHOLD,
+    silent: bool = False,
+) -> Tuple[Optional[Any], List[str], List[str]]:
+    """Wire the non-stationary audit bar (issue #63) into the daily run.
+
+    Loads the persisted bar state, detects NEW drift against the previous
+    audit's accepted observations (calibration traps), reports drift findings,
+    applies the miss-count / rubric-rotation state machine, and persists the
+    updated state.  Returns ``(new_state, events, report_lines)``;
+    ``(None, [], [])`` when the bar engine is unavailable (standalone
+    deployment).  ``report_lines`` are the ``[utility-audit][bar]`` lines;
+    they are printed unless ``silent`` (JSON / --bar-prompt mode keeps
+    stdout clean for the caller's own document).
+    """
+    if not BAR_AVAILABLE:
+        return None, [], []
+    assert audit_bar is not None  # BAR_AVAILABLE guard above
+    observations = _bar_observations(audits)
+    path = audit_bar.state_file_path(evolution_dir)
+    state = audit_bar.load_state(path)
+
+    # First run — no accepted baseline yet: everything observed becomes a
+    # calibration trap, nothing has drifted FROM anything yet.
+    if not state.accepted_observations:
+        new_state, events = audit_bar.update_bar_state(
+            state,
+            drift_occurred=False,
+            drift_reported=False,
+            observations=observations,
+            miss_threshold=miss_threshold,
+        )
+        audit_bar.save_state(path, new_state)
+        report = [
+            f"[utility-audit][bar] first run — no accepted baseline; "
+            f"{len(observations)} observation(s) accepted as calibration traps "
+            f"(rubric variant {new_state.rubric_variant + 1}/"
+            f"{len(audit_bar.AUDIT_RUBRIC_VARIANTS)})"
+        ]
+        if not silent:
+            for line in report:
+                print(line)
+        return new_state, events, report
+
+    drift = audit_bar.find_new_drift(observations, state.accepted_observations)
+    missing = audit_bar.find_missing(observations, state.accepted_observations)
+    drift_occurred = bool(drift) or bool(missing)
+    # Deterministic audit: every detected drift IS reported in this output
+    # (the miss machinery guards the LLM-auditor case and is exercised by the
+    # engine's tests; a silent miss here would mean a crashed report path).
+    drift_reported = drift_occurred
+
+    new_state, events = audit_bar.update_bar_state(
+        state,
+        drift_occurred=drift_occurred,
+        drift_reported=drift_reported,
+        observations=observations,
+        miss_threshold=miss_threshold,
+    )
+    audit_bar.save_state(path, new_state)
+
+    report = [
+        f"[utility-audit][bar] rubric variant "
+        f"{new_state.rubric_variant + 1}/{len(audit_bar.AUDIT_RUBRIC_VARIANTS)}; "
+        f"miss count {new_state.miss_count}/{new_state.miss_threshold}",
+        f"[utility-audit][bar] calibration traps carried forward: "
+        f"{len(new_state.accepted_observations)} known/accepted — flagged as "
+        "known, never re-reported as new drift",
+    ]
+    for obs in drift:
+        prev = next(
+            (
+                p
+                for p in state.accepted_observations
+                if audit_bar.observation_id(p) == audit_bar.observation_id(obs)
+            ),
+            None,
+        )
+        prev_verdict = prev.get("verdict") if prev else "?"
+        report.append(
+            f"[utility-audit][bar] NEW DRIFT: {obs.get('name')} "
+            f"(verdict {prev_verdict} -> {obs.get('verdict')})"
+        )
+    for obs in missing:
+        report.append(
+            f"[utility-audit][bar] NEW DRIFT: {obs.get('name')} disappeared "
+            f"from the corpus (was {obs.get('verdict')})"
+        )
+    report.extend(f"[utility-audit][bar] {event}" for event in events)
+    if not silent:
+        for line in report:
+            print(line)
+    return new_state, events, report
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -212,11 +374,59 @@ def main(argv: Optional[List[str]] = None) -> int:
     apply = "--apply" in args
     as_json = "--json" in args
 
+    miss_threshold = DEFAULT_MISS_THRESHOLD
+    if "--miss-threshold" in args:
+        try:
+            miss_threshold = max(1, int(args[args.index("--miss-threshold") + 1]))
+        except (ValueError, IndexError):
+            print(
+                "evolution_utility_audit: --miss-threshold needs an integer >= 1",
+                file=sys.stderr,
+            )
+            return 2
+
     usage = _load_usage()
     audits = audit_corpus(usage)
     demoted = apply_demotions(audits, usage) if apply else []
+    evolution_dir = _evolution_dir()
+
+    bar_state, _, _ = _run_audit_bar(
+        audits,
+        evolution_dir,
+        miss_threshold=miss_threshold,
+        silent=(as_json or "--bar-prompt" in args),
+    )
+
+    if "--bar-prompt" in args:
+        if bar_state is not None:
+            print(
+                audit_bar.build_audit_prompt(
+                    audit_bar.AUDIT_RUBRIC_VARIANTS,
+                    bar_state.rubric_variant,
+                    bar_state.accepted_observations,
+                    bar_state.miss_threshold,
+                )
+            )
+        else:
+            print(
+                "evolution_utility_audit: non-stationary bar unavailable "
+                "(evolution lib not importable)",
+                file=sys.stderr,
+            )
+            return 2
+        return 0
 
     if as_json:
+        bar_payload = None
+        if bar_state is not None:
+            bar_payload = {
+                "rubric_variant": bar_state.rubric_variant,
+                "rubric_variants": len(audit_bar.AUDIT_RUBRIC_VARIANTS),
+                "miss_count": bar_state.miss_count,
+                "miss_threshold": bar_state.miss_threshold,
+                "calibration_traps": len(bar_state.accepted_observations),
+                "rotations": len(bar_state.rotations),
+            }
         print(
             json.dumps(
                 {
@@ -226,6 +436,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         for v in ("keep", "consolidate", "demote", "remove")
                     },
                     "demoted": demoted,
+                    "audit_bar": bar_payload,
                 },
                 indent=2,
                 sort_keys=True,

@@ -13,6 +13,19 @@ mode: PRIVATE
 no_agent: true
 script: evolution_rubric_judge.py
 
+# N-run reliability measurement (#50): the strict grader is deterministic, so
+# per-cycle reliability (mean / stddev / pass@k across n_runs evaluations)
+# attests consistency, and with an LLM-backed grader sampled at temperature >
+# 0 it separates consistently good cycles from lucky ones. Total cost stays
+# bounded: n_runs * single-run cost (n_runs capped at 10; 1 = legacy
+# single-run behavior).
+reliability:
+  n_runs: 3                 # evaluations per cycle (1 = legacy single run, 2-10 = N-run)
+  temperature: 0.7          # sampling temperature (> 0) for run diversity (LLM graders)
+  variance_threshold: 10.0  # stddev of overall_percentage above which a cycle is flagged unreliable
+  pass_at_k: 1              # pass@k: chance of >= k successful runs out of n_runs
+  success_threshold: 50.0   # a run is successful when overall_percentage >= this
+
 # Keep on disk alongside metrics.jsonl; nothing delivered to channels (a
 # quality score is an observation, not an alert — unless it flags CRITICAL).
 deliver: local
@@ -20,5 +33,7 @@ deliver: local
 prompt: |
   Deterministic per-cycle rubric quality scores (no LLM). Appends one JSON
   line to evolution/rubric-scorecard.jsonl scoring the previous cycle's
-  output quality across 6 dimensions using the StrictRubricJudgeGrader.
+  output quality across 6 dimensions using the StrictRubricJudgeGrader,
+  including N-run reliability fields (n_runs, mean_score, stddev, pass_at_k,
+  unreliable) per the reliability: config section.
   See scripts/evolution_rubric_judge.py.

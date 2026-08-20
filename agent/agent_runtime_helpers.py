@@ -1944,15 +1944,83 @@ def dump_api_request_debug(
 
             dump_payload["error"] = error_info
 
+        # ── #73: request-dump dedup window + per-session cap ──────────────
+        # The preflight call site (conversation_loop.py) fires on EVERY API
+        # call while HERMES_DUMP_REQUESTS is set, so a burst of identical
+        # attempts would otherwise write one full multi-hundred-KB snapshot
+        # per call. Content-hash the request body and skip re-dumps of an
+        # identical payload within the window; additionally cap the number of
+        # preflight dumps per session so a long-lived session cannot flood
+        # logs_dir. Both knobs live under ``request_dump`` in config.yaml:
+        # ``dedup_window_seconds`` (default 60) and
+        # ``max_dumps_per_session`` (default 8; 0 disables the cap).
+        # The error path below keeps its finer-grained failure-category dedup
+        # and is deliberately NOT capped — post-mortem debugging must always
+        # get its dump.
+        import hashlib
+
+        _body_for_hash = json.dumps(body, sort_keys=True, default=str)
+        _body_hash = hashlib.sha256(_body_for_hash.encode("utf-8")).hexdigest()[:32]
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _dump_cfg = (load_config_readonly() or {}).get("request_dump") or {}
+        except Exception:
+            _dump_cfg = {}
+        try:
+            _dedup_window = int(_dump_cfg.get("dedup_window_seconds", 60))
+        except (TypeError, ValueError):
+            _dedup_window = 60
+        try:
+            _cap = int(_dump_cfg.get("max_dumps_per_session", 8))
+        except (TypeError, ValueError):
+            _cap = 8
+
+        if error is None:
+            # Preflight dumps (no error) previously bypassed dedup entirely.
+            # Dedup by (session, reason, body hash) within the window, then
+            # enforce the per-session cap. The cap counts dumps actually
+            # written, NOT attempts: a suppressed duplicate must not burn the
+            # budget, otherwise a burst of identical preflight attempts would
+            # exhaust the cap and silence genuinely new dumps for the rest of
+            # the session (issue #73).
+            _dump_cache_key = (agent.session_id, reason, _body_hash)
+            _dump_cache = getattr(agent, "_request_dump_cache", None)
+            if _dump_cache is None:
+                _dump_cache = {}
+                agent._request_dump_cache = _dump_cache
+            _now = time.time()
+            _last_dump_time = _dump_cache.get(_dump_cache_key)
+            if _last_dump_time is not None and (_now - _last_dump_time) < _dedup_window:
+                _ra().logger.info(
+                    "Suppressing duplicate request dump for session %s (%s, %s) within %ss",
+                    agent.session_id,
+                    reason,
+                    _body_hash,
+                    _dedup_window,
+                )
+                return None
+            _dump_cache[_dump_cache_key] = _now
+            if _cap > 0 and int(getattr(agent, "_request_dump_count", 0)) >= _cap:
+                _ra().logger.info(
+                    "Suppressing request dump for session %s: cap %d reached",
+                    agent.session_id,
+                    _cap,
+                )
+                return None
+
+        if error is not None:
             # ── Suppress duplicate dumps of identical failing payloads ─────
             # Re-dumping the same ~1 MB request on every retry against a
             # dead endpoint wastes disk I/O and can leak identical secrets
             # repeatedly.  Cache the last dump per (session, failure category,
             # request body hash) tuple and skip if the same dump was written
-            # within 60 seconds.
-            import hashlib
-            _body_for_hash = json.dumps(body, sort_keys=True, default=str)
-            _body_hash = hashlib.sha256(_body_for_hash.encode("utf-8")).hexdigest()[:32]
+            # within the dedup window (configurable via
+            # ``request_dump.dedup_window_seconds``; ``_body_hash`` and
+            # ``_dedup_window`` are computed above, before the error branch).
+            # Unlike the preflight path, this path is NOT subject to
+            # ``request_dump.max_dumps_per_session`` — post-mortem debugging
+            # must always get its dump.
             _failure_category = error_info.get("failure_category", "unknown")
             _dump_cache_key = (agent.session_id, _failure_category, _body_hash)
             _dump_cache = getattr(agent, "_request_dump_cache", None)
@@ -1961,12 +2029,13 @@ def dump_api_request_debug(
                 agent._request_dump_cache = _dump_cache
             _now = time.time()
             _last_dump_time = _dump_cache.get(_dump_cache_key)
-            if _last_dump_time is not None and (_now - _last_dump_time) < 60:
+            if _last_dump_time is not None and (_now - _last_dump_time) < _dedup_window:
                 _ra().logger.info(
-                    "Suppressing duplicate request dump for session %s (%s, %s) within 60s",
+                    "Suppressing duplicate request dump for session %s (%s, %s) within %ss",
                     agent.session_id,
                     _failure_category,
                     _body_hash,
+                    _dedup_window,
                 )
                 return None
             _dump_cache[_dump_cache_key] = _now
@@ -1989,6 +2058,14 @@ def dump_api_request_debug(
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
+
+        # Count only dumps actually written, and only on the capped preflight
+        # path: a suppressed duplicate must not burn the per-session budget,
+        # and error dumps stay uncapped for post-mortem debugging (#73).
+        if error is None:
+            agent._request_dump_count = (
+                int(getattr(agent, "_request_dump_count", 0)) + 1
+            )
 
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
 
@@ -3758,9 +3835,21 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # tool result. This is the final pre-API chokepoint, so dedup defensively
     # here even though repair_message_sequence also consumes matched ids.
     #   (a) collapse duplicate tool_calls WITHIN an assistant message
-    #   (b) drop later tool result messages reusing an already-seen id
+    #   (b) drop tool results that answer no OUTSTANDING tool call
+    #
+    # (b) tracks outstanding calls rather than every id ever seen, because
+    # ``tool_call_id`` is NOT globally unique in practice: llama.cpp emits a
+    # single constant id for every tool call it ever returns (verified: three
+    # separate completions from one server all carry the same id). A
+    # seen-once-drop-forever rule reads the SECOND legitimate tool result of
+    # such a session as a duplicate and deletes it, so from the second tool
+    # call onward the model never sees any result — it announces its next
+    # action and the turn dies with the work unfinished. Outstanding-call
+    # semantics keep both protections intact: a re-emitted result still
+    # answers no pending call and is still dropped, while a genuine new call
+    # that reuses the id re-arms that id first.
     seen_assistant_call_ids: set = set()
-    seen_result_call_ids: set = set()
+    outstanding_call_ids: set = set()
     deduped: List[Dict[str, Any]] = []
     removed_dupes = 0
     for msg in messages:
@@ -3774,6 +3863,7 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     continue
                 if cid:
                     seen_assistant_call_ids.add(cid)
+                    outstanding_call_ids.add(cid)
                 kept_tcs.append(tc)
             if kept_tcs:
                 msg = {**msg, "tool_calls": kept_tcs}
@@ -3782,11 +3872,15 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             deduped.append(msg)
         elif role == "tool":
             cid = (msg.get("tool_call_id") or "").strip()
-            if cid and cid in seen_result_call_ids:
+            if cid and cid not in outstanding_call_ids:
                 removed_dupes += 1
                 continue
             if cid:
-                seen_result_call_ids.add(cid)
+                # Answered: this id is no longer outstanding, so a second
+                # result replaying it is still caught above.
+                outstanding_call_ids.discard(cid)
+                # A reused id must be re-armable by the next assistant call.
+                seen_assistant_call_ids.discard(cid)
             deduped.append(msg)
         else:
             deduped.append(msg)

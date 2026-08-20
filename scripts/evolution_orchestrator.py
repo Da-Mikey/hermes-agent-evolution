@@ -53,6 +53,7 @@ and exits 0 (2 on bad input). The candidates payload is accepted as-is by
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -83,6 +84,13 @@ DEFAULT_WORKER_TOOLSETS: Tuple[str, ...] = ("web", "file")
 # else (timeout, error, interrupted, max_iterations) is a failed candidate that
 # must NOT be scored as if it were a real answer.
 _OK_STATUSES = frozenset({"completed", "success", "ok"})
+
+# Shared retrieval/failure memo (issue #65): parallel research workers
+# redundantly fetch the same pages. ``build`` consults the memo BEFORE the
+# fan-out and embeds already-summarized URLs into every worker's context so
+# the worker skips the duplicate fetch; the ``memo`` subcommand gives the
+# skill a direct consult/record/failing CLI between fan-outs.
+_URL_PATTERN = re.compile(r"https?://[^\s\"'\)\]]+")
 
 
 def _clean_str(value: Any) -> str:
@@ -153,6 +161,7 @@ def build_worker_tasks(
     max_workers: int = DEFAULT_MAX_WORKERS,
     toolsets: Optional[List[str]] = None,
     complexity: Optional[str] = None,
+    memo_path: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Decompose a sub-task into a capped batch of leaf-worker task dicts.
 
@@ -161,16 +170,79 @@ def build_worker_tasks(
     angles were discarded for exceeding ``max_workers``. Blank/whitespace angles
     are skipped (they would spawn an empty worker) and do NOT count as dropped.
     Order is preserved so a candidate's ``task_index`` maps back to its angle.
+
+    When ``memo_path`` is given (shared retrieval memo, issue #65), the memo is
+    consulted BEFORE the fan-out: every URL named in the sub-task/angles that
+    already has a recorded summary is embedded into each worker's context as a
+    "DO NOT fetch — use the summary" hit, and each task carries the
+    ``memo_hits`` list for inspection. Sibling workers that already fetched a
+    page write their one-line summary there, so later workers skip the fetch.
     """
     max_workers = max(1, int(max_workers))
     kept_angles = [a for a in angles if _clean_str(a)]
     dropped = max(0, len(kept_angles) - max_workers)
     kept_angles = kept_angles[:max_workers]
+    memo_hits = _memo_hits_for(subtask, kept_angles, memo_path)
+    memo_block = _memo_context_block(memo_hits, memo_path)
     tasks = [
         build_worker_task(subtask, angle, toolsets=toolsets, complexity=complexity)
         for angle in kept_angles
     ]
+    if memo_block:
+        for task in tasks:
+            task["context"] = f"{task['context']}\n\n{memo_block}"
+            task["memo_hits"] = [url for url, _summary in memo_hits]
     return tasks, dropped
+
+
+def _memo_hits_for(
+    subtask: str, angles: List[str], memo_path: Optional[str]
+) -> List[Tuple[str, str]]:
+    """URLs in the sub-task/angles that the shared memo already summarizes.
+
+    Consult-before-fetch (issue #65): an empty list means the memo has nothing
+    for these URLs (workers fetch normally); a hit means the fetch is
+    redundant and the worker must use the recorded summary instead.
+    """
+    if not memo_path:
+        return []
+    try:
+        from evolution_shared_memo import load_memo
+    except ImportError:
+        return []
+    memo = load_memo(Path(memo_path))
+    hits: List[Tuple[str, str]] = []
+    seen: set = set()
+    for text in (subtask, *angles):
+        for url in _URL_PATTERN.findall(text or ""):
+            if url in seen:
+                continue
+            seen.add(url)
+            summary = memo.lookup_summary(url)
+            if summary is not None:
+                hits.append((url, summary))
+    return hits
+
+
+def _memo_context_block(
+    memo_hits: List[Tuple[str, str]], memo_path: Optional[str]
+) -> str:
+    """Worker-facing memo instructions appended to every task's context."""
+    if not memo_hits:
+        return ""
+    lines = [
+        "SHARED RETRIEVAL MEMO (consult BEFORE fetching — issue #65):",
+        "Sibling workers share one memo file. Before fetching any URL, check it.",
+        "URLs ALREADY summarized by a sibling worker — DO NOT fetch these, use the summary:",
+    ]
+    lines += [f"- {url}: {summary}" for url, summary in memo_hits]
+    if memo_path:
+        lines.append(
+            f"After fetching a URL NOT listed above, record a one-line summary in "
+            f'the memo ({memo_path}, under "retrievals") so sibling workers '
+            f"skip the duplicate fetch."
+        )
+    return "\n".join(lines)
 
 
 def collect_candidates(
@@ -268,6 +340,7 @@ def _cmd_build(argv: List[str]) -> int:
     max_workers = DEFAULT_MAX_WORKERS
     toolsets: Optional[List[str]] = None
     complexity: Optional[str] = None
+    memo_path: Optional[str] = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -318,6 +391,12 @@ def _cmd_build(argv: List[str]) -> int:
                 return 2
             complexity = argv[i + 1]
             i += 2
+        elif arg == "--memo":
+            if i + 1 >= len(argv):
+                print("[evolution-orchestrator] --memo needs a value", file=sys.stderr)
+                return 2
+            memo_path = argv[i + 1]
+            i += 2
         else:
             print(f"[evolution-orchestrator] unknown flag: {arg}", file=sys.stderr)
             return 2
@@ -335,8 +414,17 @@ def _cmd_build(argv: List[str]) -> int:
         max_workers=max_workers,
         toolsets=toolsets,
         complexity=complexity,
+        memo_path=memo_path,
     )
-    print(json.dumps({"tasks": tasks, "dropped": dropped}, ensure_ascii=False))
+    payload: Dict[str, Any] = {"tasks": tasks, "dropped": dropped}
+    if memo_path:
+        try:
+            from evolution_shared_memo import load_memo
+
+            payload["memo"] = load_memo(Path(memo_path)).stats()
+        except ImportError:
+            payload["memo"] = None
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
@@ -394,11 +482,17 @@ def _cmd_draft(argv: List[str]) -> int:
     fan-out helper.  The skill calls this from its terminal toolset, collects
     the JSON output, dispatches it via ``delegate_task`` batch mode, then
     pipes the results back through ``_cmd_draft_select``.
+
+    With ``--memo PATH`` the shared failure memo (issue #65) is consulted
+    BEFORE the fan-out: a known-failing goal yields zero tasks with
+    ``dropped == n_drafters`` and ``memo_skip: true`` — the edit is not
+    re-attempted this cycle.
     """
     goal = ""
     n_drafters = 3  # DEFAULT_MAX_DRAFTERS from the draft selector
     context = ""
     toolsets: Optional[List[str]] = None
+    memo_path: Optional[str] = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -439,6 +533,12 @@ def _cmd_draft(argv: List[str]) -> int:
                 return 2
             toolsets = [t.strip() for t in argv[i + 1].split(",") if t.strip()]
             i += 2
+        elif arg == "--memo":
+            if i + 1 >= len(argv):
+                print("[evolution-orchestrator] --memo needs a value", file=sys.stderr)
+                return 2
+            memo_path = argv[i + 1]
+            i += 2
         else:
             print(f"[evolution-orchestrator] unknown flag: {arg}", file=sys.stderr)
             return 2
@@ -446,9 +546,16 @@ def _cmd_draft(argv: List[str]) -> int:
         print("[evolution-orchestrator] --goal is required", file=sys.stderr)
         return 2
     tasks, dropped = build_draft_tasks(
-        goal, n_drafters, context=context, toolsets=toolsets
+        goal,
+        n_drafters,
+        context=context,
+        toolsets=toolsets,
+        memo_path=memo_path,
     )
-    print(json.dumps({"tasks": tasks, "dropped": dropped}, ensure_ascii=False))
+    payload: Dict[str, Any] = {"tasks": tasks, "dropped": dropped}
+    if memo_path:
+        payload["memo_skip"] = not tasks and dropped == n_drafters
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
@@ -514,15 +621,37 @@ def _cmd_route(argv: List[str]) -> int:
     return 0
 
 
+def _cmd_memo(argv: List[str]) -> int:
+    """Shared memo CLI (issue #65): lookup / record / failing / status.
+
+    Real call site for ``evolution_shared_memo``: the research stage runs
+    with terminal, so it consults the shared memo BEFORE a fan-out
+    (``lookup``), records what a worker fetched (``record``), and marks an
+    edit attempt that failed (``failing``) so later cycles skip re-attempting
+    it. All subcommands accept ``--memo PATH`` (default: the evolution dir's
+    ``shared-memo.json``).
+    """
+    try:
+        from evolution_shared_memo import main as memo_main
+    except ImportError:
+        print(
+            "[evolution-orchestrator] evolution_shared_memo unavailable",
+            file=sys.stderr,
+        )
+        return 2
+    return memo_main(["evolution_shared_memo.py"] + argv)
+
+
 def main(argv: List[str]) -> int:
     if len(argv) < 2 or argv[1] in ("-h", "--help"):
         print(
-            "usage: evolution_orchestrator.py {build,collect,draft,draft-select,route} ...\n"
-            '  build         --subtask S --angle A [--angle A ...] [--max-workers N] [--toolsets a,b] [--complexity "task desc"]\n'
+            "usage: evolution_orchestrator.py {build,collect,draft,draft-select,route,memo} ...\n"
+            "  build         --subtask S --angle A [--angle A ...] [--max-workers N] [--toolsets a,b] [--complexity C] [--memo PATH]\n"
             "  collect       [results.json] [--angles angles.json]   (reads stdin if no path)\n"
-            "  draft         --goal G [--drafters N] [--context C] [--toolsets a,b]\n"
+            "  draft         --goal G [--drafters N] [--context C] [--toolsets a,b] [--memo PATH]\n"
             "  draft-select  [results.json]   (reads stdin if no path)\n"
-            '  route         --complexity "task desc"',
+            '  route         --complexity "task desc"\n'
+            "  memo          lookup <url> | record <url> <summary...> | failing <key> <note...> | status [--memo PATH]",
             file=sys.stderr,
         )
         return 2
@@ -537,6 +666,8 @@ def main(argv: List[str]) -> int:
         return _cmd_draft_select(argv[2:])
     if cmd == "route":
         return _cmd_route(argv[2:])
+    if cmd == "memo":
+        return _cmd_memo(argv[2:])
     print(f"[evolution-orchestrator] unknown command: {cmd}", file=sys.stderr)
     return 2
 
