@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from evolution_harness_proposer import generate_proposals, load_weaknesses
+from evolution_invariant_filter import check_proposal
 from evolution_harness_sandbox import INVALID, VALIDATED, validate_code_diff
 
 EXIT_VALIDATED = 0
@@ -36,7 +37,24 @@ GATE_SIDECAR = "harness-gate-latest.json"
 
 
 def run_gate(proposal: Dict[str, Any], *, gate_runner=None) -> Dict[str, Any]:
-    """Sandboxed apply + regression gate for a proposal; never auto-applies."""
+    """Sandboxed apply + regression gate for a proposal; never auto-applies.
+
+    Slice 2 wiring (#68): screen the proposal against the immutable invariant
+    rules FIRST. A violating proposal is short-circuited (``zero_fitness``)
+    before the sandbox/regression gate ever runs — a candidate that breaks the
+    "cannot violate" floor never reaches the judge."""
+    invariant = check_proposal(proposal)
+    if not invariant["ok"]:
+        return {
+            "status": INVALID,
+            "applied": None,
+            "gate": {"passed": False, "exit_code": None, "output": ""},
+            "reason": "invariant violation",
+            "zero_fitness": True,
+            "violations": invariant["violations"],
+            "requires_human_review": True,
+            "auto_apply": False,
+        }
     return validate_code_diff(proposal, gate_runner=gate_runner)
 
 
@@ -62,7 +80,25 @@ def run_cron_pass(
     proposals = generate_proposals(load_weaknesses(weaknesses_payload), surface=surface)
     verdicts: List[Dict[str, Any]] = []
     skipped = 0
+    invariant_rejected = 0
     for p in proposals:
+        # Slice 2 wiring (#68): screen the FULL proposal (title/delta/auto_apply)
+        # against the immutable invariant rules before it reaches the gate.
+        invariant = check_proposal(p)
+        if not invariant["ok"]:
+            invariant_rejected += 1
+            verdicts.append({
+                "status": INVALID,
+                "applied": None,
+                "gate": {"passed": False, "exit_code": None, "output": ""},
+                "reason": "invariant violation",
+                "zero_fitness": True,
+                "violations": invariant["violations"],
+                "proposal_title": p.get("title", ""),
+                "requires_human_review": True,
+                "auto_apply": False,
+            })
+            continue
         diff = p.get("code_diff")
         if not isinstance(diff, dict):
             skipped += 1  # gate only judges diffs it can sandbox-apply
@@ -74,7 +110,8 @@ def run_cron_pass(
         "mode": "cron-report-only",
         "auto_apply": False,
         "proposals": len(proposals),
-        "gated": len(verdicts),
+        "gated": len(verdicts) - invariant_rejected,
+        "invariant_rejected": invariant_rejected,
         "skipped_no_code_diff": skipped,
         "validated": sum(1 for v in verdicts if v.get("status") == VALIDATED),
         "verdicts": verdicts,
