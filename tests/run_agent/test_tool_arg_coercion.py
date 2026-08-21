@@ -302,6 +302,21 @@ class TestCoerceToolArgs:
         result = coerce_tool_args("read_file", args)
         assert result["path"] == "src/main.py"
 
+    def test_real_read_file_scalar_path_no_misleading_warning(self, caplog):
+        """Regression for #3026 — a scalar path on read_file's
+        ``["string", "array"]`` union is valid as-is, so it must NOT emit the
+        misleading ``failed to parse string as JSON for expected type list``
+        WARNING (previously logged 126+ times/day for reads that succeeded)."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="model_tools"):
+            args = {"path": "/root/.hermes/evolution/.hydra-dispatch-ledger.json"}
+            result = coerce_tool_args("read_file", args)
+        assert result["path"] == "/root/.hermes/evolution/.hydra-dispatch-ledger.json"
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "failed to parse string as JSON for expected type list" not in joined
+        assert "read_file.path" not in joined
+
     def test_real_read_file_single_element_json_array_parses_to_list(self):
         """A single-element JSON array string should parse to a
         single-element list (the model intended a batch read)."""

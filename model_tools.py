@@ -1082,20 +1082,32 @@ def _coerce_value(
     expected_type,
     schema: dict | None = None,
     context: str = "",
+    quiet: bool = False,
 ):
     """Attempt to coerce a string *value* to *expected_type*.
 
     Returns the original string when coercion is not applicable or fails.
     ``context`` (e.g. ``"tool_name.param"``) is forwarded into parse-failure
-    warnings so the agent gets a deterministic recovery hint.
+    warnings so the agent gets a deterministic recovery hint.  ``quiet``
+    suppresses parse-failure warnings for unions that also accept ``string``
+    (the value is already valid, so a failed JSON parse is expected, not an
+    error — see the read_file.path ``["string","array"]`` noise).
     """
     if _schema_allows_null(schema) and value.strip().lower() == "null":
         return None
 
     if isinstance(expected_type, list):
-        # Union type — try each in order, return first successful coercion
+        # Union type — try each in order, return first successful coercion.
+        # If the union also accepts ``string`` and the value is already a
+        # string, the value is valid as-is: silence the parse-failure WARNING
+        # from later non-string members (array/object) so a legitimate scalar
+        # (e.g. read_file.path on ["string","array"]) does not log a
+        # misleading "failed to parse string as JSON for expected type list".
+        quiet = quiet or ("string" in expected_type and isinstance(value, str))
         for t in expected_type:
-            result = _coerce_value(value, t, schema=schema, context=context)
+            result = _coerce_value(
+                value, t, schema=schema, context=context, quiet=quiet
+            )
             if result is not value:
                 return result
         return value
@@ -1105,9 +1117,9 @@ def _coerce_value(
     if expected_type == "boolean":
         return _coerce_boolean(value)
     if expected_type == "array":
-        return _coerce_json(value, list, context=context)
+        return _coerce_json(value, list, context=context, quiet=quiet)
     if expected_type == "object":
-        return _coerce_json(value, dict, context=context)
+        return _coerce_json(value, dict, context=context, quiet=quiet)
     if expected_type == "null" and value.strip().lower() == "null":
         return None
     return value
@@ -1253,11 +1265,16 @@ def _split_path_list(value: str) -> Optional[List[str]]:
     return None
 
 
-def _coerce_json(value: str, expected_python_type: type, context: str = ""):
+def _coerce_json(
+    value: str, expected_python_type: type, context: str = "", quiet: bool = False
+):
     """Parse *value* as JSON when the schema expects an array or object.
 
     ``context`` (e.g. ``"tool_name.param"``) is included in the parse-failure
     WARNING so the agent gets a deterministic recovery hint (issue #2953).
+    ``quiet`` suppresses that WARNING when the value is already valid for a
+    sibling union member (e.g. a scalar string on ``["string","array"]``),
+    where a failed JSON parse is expected rather than an error.
     """
     if not value or not value.strip():
         if expected_python_type is list:
@@ -1278,15 +1295,16 @@ def _coerce_json(value: str, expected_python_type: type, context: str = ""):
                     items,
                 )
                 return items
-        ctx = f"{context} " if context else ""
-        logger.warning(
-            "coerce_tool_args: %sfailed to parse string as JSON for expected type %s "
-            "(value %.80r): %s",
-            ctx,
-            expected_python_type.__name__,
-            value,
-            exc,
-        )
+        if not quiet:
+            ctx = f"{context} " if context else ""
+            logger.warning(
+                "coerce_tool_args: %sfailed to parse string as JSON for expected type %s "
+                "(value %.80r): %s",
+                ctx,
+                expected_python_type.__name__,
+                value,
+                exc,
+            )
         return value
     if isinstance(parsed, expected_python_type):
         logger.debug(
