@@ -50,6 +50,7 @@ __all__ = [
     "GateDecision",
     "decide",
     "record_decision",
+    "record_review_critic_verdict",
     "load_decisions",
     "compute_gate_rates",
     "gate_flags",
@@ -208,6 +209,51 @@ def record_decision(ledger_file: Path, decision: GateDecision) -> None:
         ledger_file.parent.mkdir(parents=True, exist_ok=True)
         with open(ledger_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(decision.to_dict(), sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def record_review_critic_verdict(
+    ledger_file: Path,
+    *,
+    verdict: str,
+    reviewer_ok: bool,
+    dissent: bool,
+    grounded: bool,
+    failure_mode: str = "",
+    agreement_reason: str = "",
+) -> None:
+    """Append one adversarial reviewer-to-critic verdict to the stage-gate ledger.
+
+    Distinct from :func:`record_decision` (which logs the accept/refine/restart
+    branch): this records the outcome of the reviewer-to-critic adversarial gate
+    (#92) so disagreement verdicts are inspectable in the SAME append-only
+    ledger. Records carry a ``kind`` discriminator so :func:`load_decisions`
+    (which filters on ``branch``) skips them rather than confusing critic
+    verdicts with branch decisions. Never raises — instrumentation must not
+    take a pipeline boundary down with it.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(ledger_file, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "kind": "review_critic",
+                        "verdict": verdict,
+                        "reviewer_ok": bool(reviewer_ok),
+                        "dissent": bool(dissent),
+                        "grounded": bool(grounded),
+                        "failure_mode": failure_mode,
+                        "agreement_reason": agreement_reason,
+                        "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
     except OSError:
         pass
 
