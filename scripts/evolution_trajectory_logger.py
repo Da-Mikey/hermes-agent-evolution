@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 __all__ = [
     "TrajectoryEntry",
+    "CoordinationEdge",
     "TrajectoryLog",
     "redact_args",
     "summarize_result",
@@ -80,6 +81,52 @@ def summarize_result(result: Any) -> str:
         if len(text) > _MAX_RESULT_SUMMARY_LEN
         else text
     )
+
+
+class CoordinationEdge:
+    """A timestamped, typed edge in a multi-agent coordination network (#2996).
+
+    Models one message / file-write / file-read interaction between two actors
+    (agents, stages, or a subagent and a shared artifact) with its cost, so
+    delegation overhead is measurable and comparable across topologies. This is
+    the smallest coherent slice of the "coordination measurement pass" — pure
+    logging on the existing TrajectoryLog; no behavior change.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        target: str,
+        edge_type: str,
+        cost_tokens: Optional[int] = None,
+        timestamp: str = "",
+    ) -> None:
+        self.source = source
+        self.target = target
+        self.edge_type = edge_type
+        self.cost_tokens = cost_tokens
+        self.timestamp = timestamp or datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "timestamp": self.timestamp,
+            "source": self.source,
+            "target": self.target,
+            "type": self.edge_type,
+        }
+        if self.cost_tokens is not None:
+            d["cost_tokens"] = self.cost_tokens
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CoordinationEdge":
+        return cls(
+            source=str(d.get("source", "")),
+            target=str(d.get("target", "")),
+            edge_type=str(d.get("type", "message")),
+            cost_tokens=d.get("cost_tokens"),
+            timestamp=str(d.get("timestamp", "")),
+        )
 
 
 @dataclass
@@ -149,9 +196,29 @@ class TrajectoryLog:
         # is user prose and must not enter the pipeline's store.
         self.completed = completed
         self.task_key = task_key
+        # Coordination network edges (#2996). Optional, append-only; empty by
+        # default so existing callers are unaffected and the serialized shape
+        # of a trajectory with no edges is byte-identical to before.
+        self.edges: List[CoordinationEdge] = []
 
     def add(self, entry: TrajectoryEntry) -> None:
         self.entries.append(entry)
+
+    def add_coordination_edge(
+        self,
+        source: str,
+        target: str,
+        edge_type: str = "message",
+        cost_tokens: Optional[int] = None,
+    ) -> None:
+        """Record one message / file-write / file-read edge (#2996).
+
+        Pure logging: measures delegation overhead (who talked to whom, via
+        which channel, at what token cost) without changing behavior.
+        """
+        self.edges.append(
+            CoordinationEdge(source, target, edge_type, cost_tokens)
+        )
 
     def add_tool_call(
         self,
@@ -178,6 +245,8 @@ class TrajectoryLog:
             out["completed"] = bool(self.completed)
         if self.task_key:
             out["task_key"] = self.task_key
+        if self.edges:
+            out["edges"] = [e.to_dict() for e in self.edges]
         return out
 
     def to_json(self) -> str:
@@ -273,6 +342,9 @@ def load_trajectory(path: Path) -> Optional[TrajectoryLog]:
                     duration_ms=ed.get("duration_ms"),
                 )
             )
+    for ed in data.get("edges", []):
+        if isinstance(ed, dict):
+            log.edges.append(CoordinationEdge.from_dict(ed))
     return log
 
 
