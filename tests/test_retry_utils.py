@@ -170,6 +170,41 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# resolve_retry_ceiling — cron-context extended retry ceiling (#2376)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_retry_ceiling_cron_raises_ceiling():
+    """Cron context gets the higher cron ceiling (default 15 vs interactive 3)."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cron", interactive_max=3) == 15
+
+
+def test_resolve_retry_ceiling_cron_honors_override():
+    """A configured cron ceiling propagates through the resolver."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cron", interactive_max=3, cron_max=20) == 20
+
+
+def test_resolve_retry_ceiling_cron_never_lowers_interactive():
+    """A cron ceiling below the interactive default must not reduce max_retries."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cron", interactive_max=5, cron_max=2) == 5
+
+
+def test_resolve_retry_ceiling_interactive_keeps_default():
+    """Non-cron contexts keep the standard interactive ceiling unchanged."""
+    from agent.retry_utils import resolve_retry_ceiling
+
+    assert resolve_retry_ceiling(platform="cli", interactive_max=3) == 3
+    assert resolve_retry_ceiling(platform="gateway", interactive_max=3) == 3
+    assert resolve_retry_ceiling(platform=None, interactive_max=3) == 3
+
+
+# ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------
 

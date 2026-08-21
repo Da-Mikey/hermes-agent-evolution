@@ -123,6 +123,11 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Issue #2376: in cron/unattended contexts there is no human waiting,
+        # so transient 429/overload spikes should tolerate more retries before
+        # giving up. This raises the ceiling for platform=="cron" only;
+        # interactive sessions keep the standard api_max_retries.
+        "cron_api_max_retries": 15,
         # Empty-response retry guard (NS-503).  The empty-retry loop
         # re-sends the full conversation input at full price on every
         # attempt; these settings stop it from re-billing *deterministic*
