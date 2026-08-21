@@ -1369,6 +1369,28 @@ def _tool_result_observer_fields(
     return "ok", None, None
 
 
+def _derive_provenance_source_id(
+    function_name: str,
+    function_args: Dict[str, Any],
+) -> str:
+    """Derive a bounded provenance source id for a completed tool call.
+
+    Used by the background-review source chain (#2994) so a skill promoted
+    from a fork can attribute its evidence to the concrete source that
+    produced it.  Prefers a URL / path / host when one is present in the
+    args (that is what a provenance gate can taint-flag); falls back to the
+    tool name alone.  Bounded to keep the chain compact and to avoid
+    embedding large payloads in the usage record.
+    """
+    if not isinstance(function_args, dict):
+        return function_name
+    for key in ("url", "path", "command", "query", "session_id"):
+        val = function_args.get(key)
+        if isinstance(val, str) and val.strip():
+            return f"{function_name}:{val.strip()[:200]}"
+    return function_name
+
+
 def _emit_post_tool_call_hook(
     *,
     function_name: str,
@@ -1865,6 +1887,24 @@ def handle_function_call(
             duration_ms=duration_ms,
             middleware_trace=list(_tool_middleware_trace),
         )
+
+        # ── Provenance recording (#2994, CoSnitch-class defense) ──────────
+        # Record this tool call into the background-review source chain so
+        # ``provenance_ok()`` at skill-admission time has real entries to
+        # evaluate.  ``add_provenance_entry`` is a no-op outside a
+        # background-review fork with an initialized chain, so this is cheap
+        # on the foreground path.  Without this wiring the source chain is
+        # always empty, the provenance gate trivially passes, and a
+        # content-ingestion poisoning vector (CoSnitch) goes undefended.
+        try:
+            from tools.skill_provenance import add_provenance_entry
+
+            add_provenance_entry(
+                function_name,
+                _derive_provenance_source_id(function_name, function_args),
+            )
+        except Exception:
+            pass  # fail-open: provenance must never block a tool call
 
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
