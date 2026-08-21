@@ -7,7 +7,11 @@ import json
 
 import pytest
 
-from evolution.lib.mutation_guard import FailureCauseSummary, MutatingFailureCounter
+from evolution.lib.mutation_guard import (
+    FailureCauseSummary,
+    FileSnapshot,
+    MutatingFailureCounter,
+)
 
 
 class TestMutatingFailureCounter:
@@ -70,3 +74,75 @@ class TestFailureCauseSummary:
         assert d["failed_runs"] == 4
         assert d["mutating_share"] == 0.25
         json.dumps(d)  # must not raise
+
+
+class TestFileSnapshot:
+    def test_snapshot_and_restore_modified_file(self, tmp_path):
+        f = tmp_path / "foo.txt"
+        f.write_text("initial content", encoding="utf-8")
+        snapshot = FileSnapshot([f])
+        assert not snapshot.has_changed()
+
+        # Mutate
+        f.write_text("corrupted content", encoding="utf-8")
+        assert snapshot.has_changed()
+
+        # Restore
+        restored = snapshot.restore()
+        assert restored == 1
+        assert f.read_text(encoding="utf-8") == "initial content"
+        assert not snapshot.has_changed()
+
+    def test_snapshot_and_restore_deleted_file(self, tmp_path):
+        f = tmp_path / "bar.txt"
+        f.write_text("must survive", encoding="utf-8")
+        snapshot = FileSnapshot([f])
+
+        # Delete
+        f.unlink()
+        assert snapshot.has_changed()
+
+        # Restore
+        restored = snapshot.restore()
+        assert restored == 1
+        assert f.exists()
+        assert f.read_text(encoding="utf-8") == "must survive"
+
+    def test_snapshot_and_restore_created_file(self, tmp_path):
+        f = tmp_path / "new_file.txt"
+        assert not f.exists()
+        snapshot = FileSnapshot([f])
+        assert not snapshot.has_changed()
+
+        # Create
+        f.write_text("newly created", encoding="utf-8")
+        assert snapshot.has_changed()
+
+        # Restore (should remove newly created file)
+        restored = snapshot.restore()
+        assert restored == 1
+        assert not f.exists()
+        assert not snapshot.has_changed()
+
+    def test_context_manager_rollback_on_exception(self, tmp_path):
+        f = tmp_path / "target.txt"
+        f.write_text("original", encoding="utf-8")
+
+        with pytest.raises(RuntimeError):
+            with FileSnapshot([f]):
+                f.write_text("bad mutation", encoding="utf-8")
+                raise RuntimeError("mutation failed!")
+
+        # Should be auto-reverted by context manager
+        assert f.read_text(encoding="utf-8") == "original"
+
+    def test_context_manager_no_rollback_on_success(self, tmp_path):
+        f = tmp_path / "target.txt"
+        f.write_text("original", encoding="utf-8")
+
+        with FileSnapshot([f]):
+            f.write_text("successful mutation", encoding="utf-8")
+
+        # Kept because no exception was raised
+        assert f.read_text(encoding="utf-8") == "successful mutation"
+

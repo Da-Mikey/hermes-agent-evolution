@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Failure-cause mutating counter — SLICE A of issue #3014.
+"""Mutating-step safety: snapshot-before-destructive primitive + failure-cause counter (#3014, #2995).
 
-Implements the mutating-step failure-cause counter from #2995 (SABER / Do-over
-mutating-step safety). The snapshot-before-destructive primitive (the other
-piece of #3014) is deferred to a next increment; this module ships the
-measurement half only: record how often a failed run's root cause was a
-mutating step and surface the share for realized-impact metrics. Pure, no
-side effects on import, standard library only, thread-safe.
+Implements the SABER / Do-over mutating-step safety pattern:
+1. FileSnapshot: snapshot target files before executing a destructive or
+   mutating command, with automatic or explicit rollback capabilities.
+2. MutatingFailureCounter: record how often a failed run's root cause was a
+   mutating step and surface the share for realized-impact metrics.
+
+Pure standard library only, thread-safe, no side effects on import.
 """
 
 from __future__ import annotations
@@ -16,9 +17,9 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 @dataclass
@@ -60,7 +61,7 @@ class MutatingFailureCounter:
     recorded.
     """
 
-    def __init__(self, ledger_file: Optional[os.PathLike] = None) -> None:
+    def __init__(self, ledger_file: Optional[Union[os.PathLike, str]] = None) -> None:
         """Initialize with an optional ledger path."""
         if ledger_file is None:
             base = Path(
@@ -82,7 +83,7 @@ class MutatingFailureCounter:
         if cause_category not in ("mutating", "other"):
             raise ValueError("cause_category must be 'mutating' or 'other'")
         if not recorded_at:
-            from datetime import date, datetime, timezone
+            from datetime import datetime, timezone
 
             recorded_at = datetime.now(timezone.utc).date().isoformat()
         rec = {
@@ -121,3 +122,75 @@ class MutatingFailureCounter:
             other_cause=total - mutating,
             mutating_share=share,
         )
+
+
+class FileSnapshot:
+    """Snapshot-before-destructive-command primitive (SABER / Do-over pattern).
+
+    Captures file states before a mutating command runs, enabling reliable
+    rollback on failure. Supports both explicit rollback via :meth:`restore`
+    and context-manager rollback on unhandled exceptions.
+    """
+
+    def __init__(self, paths: Sequence[Union[os.PathLike, str]]) -> None:
+        """Snapshot the given paths (files that exist or might be created)."""
+        self._snapshots: Dict[Path, Optional[bytes]] = {}
+        for p in paths:
+            path = Path(p).resolve()
+            if path.is_file():
+                self._snapshots[path] = path.read_bytes()
+            else:
+                self._snapshots[path] = None
+
+    @property
+    def paths(self) -> List[Path]:
+        """List of snapshotted file paths."""
+        return list(self._snapshots.keys())
+
+    def has_changed(self) -> bool:
+        """Check if any snapshotted path has diverged from snapshot time."""
+        for path, orig_content in self._snapshots.items():
+            if orig_content is None:
+                if path.exists():
+                    return True
+            else:
+                if not path.is_file() or path.read_bytes() != orig_content:
+                    return True
+        return False
+
+    def restore(self) -> int:
+        """Restore all snapshotted files to their state at snapshot time.
+
+        - If the file existed originally, restores original bytes.
+        - If the file was created after snapshot time, deletes it.
+
+        Returns the number of files modified or deleted during restoration.
+        """
+        restored_count = 0
+        for path, orig_content in self._snapshots.items():
+            if orig_content is None:
+                if path.exists():
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                        restored_count += 1
+            else:
+                current = path.read_bytes() if path.is_file() else None
+                if current != orig_content:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(orig_content)
+                    restored_count += 1
+        return restored_count
+
+    def __enter__(self) -> "FileSnapshot":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[Any],
+    ) -> bool:
+        if exc_type is not None:
+            self.restore()
+        return False  # Do not suppress the exception
+
