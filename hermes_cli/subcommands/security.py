@@ -59,4 +59,33 @@ def build_security_parser(subparsers, *, cmd_security: Callable) -> None:
         help="Skip scanning pinned MCP servers in config.yaml",
     )
     audit_parser.set_defaults(func=cmd_security)
+
+    lint_parser = security_subparsers.add_parser(
+        "lint",
+        help="Lint instruction/config files for prompt-injection patterns",
+        description=(
+            "Scan AGENTS.md / CLAUDE.md / .cursorrules, skills (SKILL.md), and "
+            "hooks for prompt-injection and exfiltration patterns. Audit-only: "
+            "reports findings with file and line, never modifies or deletes."
+        ),
+    )
+    lint_parser.add_argument(
+        "--roots",
+        nargs="+",
+        metavar="PATH",
+        help="Directories to scan (default: project root + HERMES_HOME)",
+    )
+    lint_parser.add_argument(
+        "--scope",
+        default="context",
+        choices=["all", "context", "strict"],
+        help="Pattern scope: all (narrow), context (default), strict (broad)",
+    )
+    lint_parser.add_argument(
+        "--no-fail",
+        action="store_true",
+        help="Always exit 0, even when findings are present",
+    )
+    lint_parser.set_defaults(func=cmd_security)
+
     security_parser.set_defaults(func=cmd_security)

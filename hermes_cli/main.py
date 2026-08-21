@@ -5579,6 +5579,11 @@ def cmd_security(args):
         # Default subcommand is `audit` when no subcmd is given.
         code = cmd_security_audit(args)
         sys.exit(int(code or 0))
+    if sub == "lint":
+        from hermes_cli.config_lint import cmd_config_lint
+
+        code = cmd_config_lint(args)
+        sys.exit(int(code or 0))
     print(f"unknown security subcommand: {sub}", file=sys.stderr)
     sys.exit(2)
 
