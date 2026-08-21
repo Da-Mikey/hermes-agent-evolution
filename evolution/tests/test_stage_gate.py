@@ -159,6 +159,43 @@ class TestDecisionLedger:
         record_decision(target / "nested" / "ledger.jsonl", decide(_result(90)))
 
 
+class TestReviewCriticLedger:
+    """Adversarial reviewer-to-critic verdicts share the stage-gate ledger (#92)."""
+
+    def test_record_and_load_are_distinct_streams(self, tmp_path):
+        from evolution.lib.stage_gate import (
+            load_decisions,
+            record_decision,
+            record_review_critic_verdict,
+        )
+
+        ledger = tmp_path / "stage_gate.jsonl"
+        record_decision(ledger, decide(_result(90, ["a.json"])))
+        record_review_critic_verdict(
+            ledger,
+            verdict="rework",
+            reviewer_ok=True,
+            dissent=True,
+            grounded=True,
+            failure_mode="unbounded retry",
+        )
+        # branch decisions are unaffected by critic records, and vice versa
+        assert [r["branch"] for r in load_decisions(ledger)] == [ACCEPT]
+
+    def test_record_critic_verdict_never_raises(self, tmp_path):
+        from evolution.lib.stage_gate import record_review_critic_verdict
+
+        target = tmp_path / "file"
+        target.write_text("x", encoding="utf-8")
+        record_review_critic_verdict(
+            target / "nested" / "ledger.jsonl",
+            verdict="proceed",
+            reviewer_ok=True,
+            dissent=False,
+            grounded=False,
+        )
+
+
 class TestGateRates:
     @staticmethod
     def _recs(*branches, stage="local_triage"):
