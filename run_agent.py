@@ -646,6 +646,106 @@ class AIAgent:
             logger.debug("SessionDB unavailable for %s", reason, exc_info=True)
             return None
 
+    def _ensure_session_db_usable(self) -> bool:
+        """Guarantee a usable SessionDB handle (or a live connection) before writes.
+
+        Two failure shapes were observed in the wild (evolution
+        session-db-conn-guard, 2026-08-18/19): (a) ``self._session_db`` is
+        ``None`` because an entrypoint never opened the handle — previously
+        this made ``_flush_messages_to_session_db_unlocked`` silently drop
+        the turn's messages; (b) the handle EXISTS but its SQLite connection
+        was closed/reaped underneath it, so ``append_messages_batch`` failed
+        with ``'NoneType' object has no attribute 'execute'`` (6 of 8
+        observed failures). Both are repaired here: open the canonical DB
+        lazily (same path as recall) or force a fresh connection, so the
+        flush below has a real connection to write to.
+
+        Returns False only when the store genuinely cannot be opened — the
+        caller then falls back to the JSONL spool instead of writing nothing.
+        """
+        if getattr(self, "_persist_disabled", False):
+            return False
+        db = self._session_db
+        if db is None:
+            # No handle yet: open the canonical DB lazily (same path recall
+            # uses) so writes have a real connection. Fall through to the
+            # re-open below.
+            pass
+        elif not hasattr(db, "_conn"):
+            # Not a real SessionDB (test stand-in, proxy, or duck-typed
+            # wrapper): there is no ``_conn`` to introspect, so this is not a
+            # reaped connection — trust it as usable.
+            return True
+        elif db._conn is not None:
+            return True
+        else:
+            # Real SessionDB whose SQLite connection was closed/reaped
+            # underneath it (previously surfaced as "'NoneType' object has no
+            # attribute 'execute'"). Release the dead handle (close() is
+            # idempotent) and re-open below.
+            try:
+                db.close()
+            except Exception:
+                logger.debug(
+                    "close of stale SessionDB handle failed", exc_info=True
+                )
+            self._session_db = None
+        try:
+            from hermes_state import SessionDB
+
+            self._session_db = SessionDB()
+            self._owns_session_db = True
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Session DB unavailable for flush (re-init failed): %s", exc
+            )
+            return False
+
+    def _spool_unpersisted_messages_to_jsonl(
+        self, messages: List[Dict]
+    ) -> None:
+        """Best-effort JSONL spool of un-persisted messages after DB failure.
+
+        Runs on the flush failure path only: writes every message that never
+        received the ``_DB_PERSISTED_MARKER`` to
+        ``HERMES_HOME/sessions/spool-<session_id>.jsonl`` (append-only), so
+        a storage outage degrades to a recoverable on-disk trace instead of
+        silent message loss. Never raises — the flush failure path must stay
+        non-fatal.
+        """
+        if not messages:
+            return
+        try:
+            pending = [
+                m for m in messages
+                if not m.get(_DB_PERSISTED_MARKER)
+            ]
+            if not pending:
+                return
+            from hermes_constants import get_hermes_home
+
+            sessions_dir = get_hermes_home() / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            spool_path = sessions_dir / f"spool-{self.session_id}.jsonl"
+            import json as _json
+
+            with open(spool_path, "a", encoding="utf-8") as fh:
+                for m in pending:
+                    fh.write(
+                        _json.dumps(m, ensure_ascii=False, default=str) + "\n"
+                    )
+            logger.warning(
+                "Session DB flush failed; spooled %d un-persisted message(s) "
+                "to %s",
+                len(pending),
+                spool_path,
+            )
+        except Exception:
+            logger.debug(
+                "JSONL session spool failed", exc_info=True
+            )
+
     def _ensure_db_session(self) -> None:
         """Create session DB row on first use. Disables _session_db on failure."""
         if getattr(self, "_persist_disabled", False):
@@ -2239,7 +2339,14 @@ class AIAgent:
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
             return None
-        if not self._session_db:
+        # Guarantee a live connection before writing (evolution
+        # session-db-conn-guard): a nil handle OR a handle whose SQLite
+        # connection was closed underneath it previously dropped this turn's
+        # messages silently ('NoneType' object has no attribute 'execute').
+        # Re-open lazily here; only a genuinely unopenable store falls
+        # through to the JSONL spool in the failure path below.
+        if not self._ensure_session_db_usable():
+            self._spool_unpersisted_messages_to_jsonl(messages)
             return None
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
