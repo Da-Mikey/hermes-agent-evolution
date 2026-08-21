@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import importlib.util
 import json
 import re
 import sys
@@ -533,6 +534,62 @@ def _render_json(findings: list[Finding], total_components: int) -> str:
     return json.dumps(payload, indent=2)
 
 
+# ─── MCP secret audit (issue #91) ────────────────────────────────────────────
+
+
+def _load_mcp_secret_audit_module():
+    """Load ``scripts/mcp_secret_audit.py`` as a module (issue #91).
+
+    The script lives outside the package (``scripts/`` is not a package), so
+    we load it by file location — the same idiom used for other standalone
+    scripts in this codebase (see ``hermes_cli/claw.py``). Returns ``None``
+    when the script is missing, so the audit degrades gracefully.
+    """
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "mcp_secret_audit.py"
+    if not script_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("mcp_secret_audit", script_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # noqa: S102 - loading a first-party repo script
+    return mod
+
+
+def _run_mcp_secret_audit(hermes_home: Path) -> tuple[list[dict], int]:
+    """Run the MCP plaintext-secret / injection audit against ``hermes_home``.
+
+    Returns ``(findings, servers_scanned)``. Findings are redacted hints only
+    (never the secret material). A missing script or config yields no findings
+    rather than an error — the OSV supply-chain audit is the primary surface.
+    """
+    mod = _load_mcp_secret_audit_module()
+    if mod is None:
+        return [], 0
+    servers, _source = mod._load_mcp_servers(str(hermes_home / "config.yaml"))  # noqa: SLF001
+    return mod.audit_mcp_servers(servers), len(servers)
+
+
+def _render_mcp_secret_human(findings: list[dict], servers_scanned: int) -> str:
+    """Render the MCP secret-audit block for the human report."""
+    if not findings:
+        return f"MCP secret audit: {servers_scanned} server(s) scanned, no findings"
+    lines = [
+        f"MCP secret audit: {servers_scanned} server(s) scanned, "
+        f"{len(findings)} finding(s):"
+    ]
+    for finding in findings:
+        lines.append(
+            f"  [{finding['kind']}] {finding['server']}.{finding['field']} "
+            f"-> {finding['hint']}"
+        )
+    lines.append(
+        "  Remediation: replace plaintext values with ${ENV_VAR} references; "
+        "review injection-shaped descriptions."
+    )
+    return "\n".join(lines)
+
+
 # ─── CLI entrypoint ───────────────────────────────────────────────────────────
 
 
@@ -552,6 +609,13 @@ def cmd_security_audit(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # MCP plaintext-secret / injection audit (issue #91) — a second, local
+    # surface alongside OSV. Runs even when OSV discovers nothing (a config
+    # with zero pinned components can still hold plaintext credentials).
+    # Redacted hints only; missing script degrades to no findings rather than
+    # failing the audit.
+    mcp_findings, mcp_scanned = _run_mcp_secret_audit(home)
+
     components = _discover_components(
         skip_venv=skip_venv, skip_plugins=skip_plugins, skip_mcp=skip_mcp, hermes_home=home
     )
@@ -559,10 +623,20 @@ def cmd_security_audit(args: argparse.Namespace) -> int:
     if total == 0:
         msg = "No components discovered (everything skipped, or empty environment)."
         if output_json:
-            print(json.dumps({"total_components_scanned": 0, "finding_count": 0, "findings": []}))
+            payload = {
+                "total_components_scanned": 0,
+                "finding_count": 0,
+                "findings": [],
+                "mcp_secret_servers_scanned": mcp_scanned,
+                "mcp_secret_findings": mcp_findings,
+            }
+            print(json.dumps(payload, indent=2))
         else:
             print(msg)
-        return 0
+            if mcp_scanned or mcp_findings:
+                print()
+                print(_render_mcp_secret_human(mcp_findings, mcp_scanned))
+        return 1 if mcp_findings else 0
 
     try:
         findings = run_audit(
@@ -577,13 +651,23 @@ def cmd_security_audit(args: argparse.Namespace) -> int:
         return 2
 
     if output_json:
-        print(_render_json(findings, total))
+        payload = json.loads(_render_json(findings, total))
+        payload["mcp_secret_servers_scanned"] = mcp_scanned
+        payload["mcp_secret_findings"] = mcp_findings
+        print(json.dumps(payload, indent=2))
     else:
         print(_render_human(findings, total))
+        if mcp_scanned or mcp_findings:
+            print()
+            print(_render_mcp_secret_human(mcp_findings, mcp_scanned))
 
-    # Exit code: 1 iff any finding meets or exceeds the --fail-on threshold.
+    # Exit code: 1 iff any finding meets or exceeds the --fail-on threshold,
+    # or the MCP secret audit surfaced a plaintext credential / injection
+    # surface (those have no severity tier — any hit is actionable).
     threshold = SEVERITY_ORDER[fail_on]
     for f in findings:
         if SEVERITY_ORDER.get(f.vuln.severity, 0) >= threshold:
             return 1
+    if mcp_findings:
+        return 1
     return 0

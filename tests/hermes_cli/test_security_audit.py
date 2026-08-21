@@ -214,3 +214,106 @@ class TestExitCodes:
         assert data["finding_count"] == 1
         assert data["findings"][0]["severity"] == "HIGH"
         assert data["findings"][0]["fixed_versions"] == ["1.1"]
+
+
+class TestMCPSecretAuditWiring:
+    """Issue #91 rework: `hermes security audit` must run the MCP secret audit."""
+
+    def _build_args(self, **kwargs):
+        import argparse
+
+        defaults = {
+            "skip_venv": True,
+            "skip_plugins": True,
+            "skip_mcp": True,
+            "json": False,
+            "fail_on": "critical",
+        }
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_mcp_secret_findings_surface_in_human_output(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        """Plaintext-secret findings from the MCP audit appear in the report."""
+        monkeypatch.setattr(sa, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(sa, "_discover_venv", lambda: [])
+        monkeypatch.setattr(sa, "_osv_query_batch", lambda comps: {})
+        fake = [{
+            "server": "graphiti",
+            "field": "env.NEO4J_PASSWORD",
+            "kind": "plaintext-secret",
+            "hint": "<15 chars>",
+        }]
+        monkeypatch.setattr(sa, "_run_mcp_secret_audit", lambda home: (fake, 1))
+
+        code = sa.cmd_security_audit(self._build_args(skip_venv=False))
+        out = capsys.readouterr().out
+        assert "MCP secret audit: 1 server(s) scanned, 1 finding(s)" in out
+        assert "[plaintext-secret] graphiti.env.NEO4J_PASSWORD -> <15 chars>" in out
+        assert code == 1  # any plaintext credential is actionable
+
+    def test_mcp_secret_findings_surface_in_json(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(sa, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(sa, "_discover_venv", lambda: [])
+        monkeypatch.setattr(sa, "_osv_query_batch", lambda comps: {})
+        fake = [{
+            "server": "remote",
+            "field": "headers.Authorization",
+            "kind": "plaintext-secret",
+            "hint": "<18 chars>",
+        }]
+        monkeypatch.setattr(sa, "_run_mcp_secret_audit", lambda home: (fake, 1))
+
+        sa.cmd_security_audit(
+            self._build_args(skip_venv=False, json=True, fail_on="critical")
+        )
+        payload = capsys.readouterr().out
+        lines = payload.splitlines()
+        json_start = next(i for i, l in enumerate(lines) if l.startswith("{"))
+        data = json.loads("\n".join(lines[json_start:]))
+        assert data["mcp_secret_servers_scanned"] == 1
+        assert data["mcp_secret_findings"] == fake
+
+    def test_clean_mcp_audit_keeps_exit_zero(self, tmp_path: Path, monkeypatch, capsys):
+        monkeypatch.setattr(sa, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(sa, "_discover_venv", lambda: [])
+        monkeypatch.setattr(sa, "_osv_query_batch", lambda comps: {})
+        monkeypatch.setattr(sa, "_run_mcp_secret_audit", lambda home: ([], 2))
+
+        code = sa.cmd_security_audit(self._build_args(skip_venv=False))
+        out = capsys.readouterr().out
+        assert "MCP secret audit: 2 server(s) scanned, no findings" in out
+        assert code == 0
+
+    def test_missing_script_degrades_gracefully(self, tmp_path: Path, monkeypatch, capsys):
+        """A missing script must not fail the OSV audit."""
+        monkeypatch.setattr(sa, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.setattr(sa, "_discover_venv", lambda: [])
+        monkeypatch.setattr(sa, "_osv_query_batch", lambda comps: {})
+        monkeypatch.setattr(sa, "_load_mcp_secret_audit_module", lambda: None)
+
+        code = sa.cmd_security_audit(self._build_args(skip_venv=False))
+        capsys.readouterr()
+        assert code == 0
+
+    def test_end_to_end_against_real_script(self, tmp_path: Path):
+        """The real script, loaded through the CLI path, flags a plaintext secret."""
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "mcp_servers:\n"
+            "  graphiti:\n"
+            "    env:\n"
+            "      NEO4J_PASSWORD: graphiti-pass\n",
+            encoding="utf-8",
+        )
+        findings, scanned = sa._run_mcp_secret_audit(tmp_path)
+        assert scanned == 1
+        assert any(
+            f["kind"] == "plaintext-secret" and f["server"] == "graphiti"
+            for f in findings
+        )
+        # The hint must never leak the value itself.
+        assert all("graphiti-pass" not in f["hint"] for f in findings)
