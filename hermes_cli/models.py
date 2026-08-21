@@ -1381,6 +1381,8 @@ _PROVIDER_ALIASES = {
     "zen": "opencode-zen",
     "go": "opencode-go",
     "opencode-go-sub": "opencode-go",
+    "free": "opencode-free",
+    "opencode_free": "opencode-free",
     "aigateway": "ai-gateway",
     "vercel": "ai-gateway",
     "vercel-ai-gateway": "ai-gateway",
@@ -3327,31 +3329,12 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         except Exception:
             pass
 
-    # OpenCode Free: match the exact same logic as opencode CLI.
-    # models.dev has cost+status metadata missing from /zen/v1/models.
-    # Filter: cost.input == 0 (free) AND status != "deprecated".
+    # OpenCode Free: curated keyless list only. models.dev's cost.input==0
+    # filter lags reality (deepseek-v4-flash-free stayed "free" there after
+    # its promo ended and the relay began 401ing keyless requests), so the
+    # curated list — synced against anonymous live probes — is authoritative.
     if normalized == "opencode-free":
-        try:
-            from agent.models_dev import fetch_models_dev
-            data = fetch_models_dev()
-            provider_data = data.get("opencode")
-            if isinstance(provider_data, dict):
-                mdev_models = provider_data.get("models", {})
-                if isinstance(mdev_models, dict):
-                    free_active = [
-                        mid for mid, m in mdev_models.items()
-                        if isinstance(m, dict)
-                        and isinstance(m.get("cost"), dict)
-                        and m["cost"].get("input") == 0
-                        and m.get("status") != "deprecated"
-                    ]
-                    if free_active:
-                        return sorted(free_active)
-        except Exception:
-            pass
-        curated_static = list(_PROVIDER_MODELS.get(normalized, []))
-        if curated_static:
-            return curated_static
+        return list(_PROVIDER_MODELS.get(normalized, []))
 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
     # Handles any provider registered in providers/ with auth_type="api_key".
@@ -4521,17 +4504,132 @@ def azure_foundry_model_api_mode(model_name: Optional[str]) -> Optional[str]:
     return None
 
 
+def opencode_provider_family(provider_id: Optional[str]) -> Optional[str]:
+    """Resolve a provider id to its OpenCode family, or None.
+
+    Returns ``"opencode-zen"`` or ``"opencode-go"`` for the built-in
+    providers AND for custom providers whose name extends a family slug
+    (e.g. ``opencode-go-bridge`` pointing at ``https://opencode.ai/zen/go/v1``,
+    issue #85589). Matching is case-insensitive. Custom family providers
+    need the same per-model api_mode routing and /v1 base-url normalization
+    as the built-ins — this predicate is the single owner of that
+    family-membership question; do not re-implement it inline.
+
+    ``opencode-go`` is checked before ``opencode-zen`` but the two slugs are
+    not prefixes of each other, so order is cosmetic.
+    """
+    raw = str(provider_id or "").strip().lower()
+    if not raw:
+        return None
+    canonical = normalize_provider(provider_id)
+    if canonical in {"opencode-zen", "opencode-go", "opencode-free"}:
+        return canonical
+    if raw.startswith("opencode-free"):
+        return "opencode-free"
+    if raw.startswith("opencode-go"):
+        return "opencode-go"
+    if raw.startswith("opencode-zen"):
+        return "opencode-zen"
+    return None
+
+
 def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[str]) -> str:
     """Normalize OpenCode config IDs to the bare model slug used in API requests."""
-    provider = normalize_provider(provider_id)
+    family = opencode_provider_family(provider_id)
     current = str(model_id or "").strip()
-    if not current or provider not in {"opencode-zen", "opencode-go"}:
+    if not current or family is None:
         return current
 
-    prefix = f"{provider}/"
-    if current.lower().startswith(prefix):
+    prefix = f"{provider_id}/" if provider_id else f"{family}/"
+    if current.lower().startswith(prefix.lower()):
         return current[len(prefix):]
+    fallback_prefix = f"{family}/"
+    if current.lower().startswith(fallback_prefix.lower()):
+        return current[len(fallback_prefix):]
     return current
+
+
+# OpenCode Zen free-tier models (``*-free`` slugs, e.g. x-preview-f-free /
+# "Ox Alpha", plus unsuffixed free models like big-pickle) are served
+# ANONYMOUSLY on the Zen relay: a request with no Authorization header
+# succeeds, while ANY non-empty bearer the relay doesn't recognize is
+# rejected with 401 "Invalid API key" — including our "no-key-required"
+# placeholder and OpenCode GO subscription keys (the Go relay doesn't serve
+# the free tier at all: "Model x is not supported").
+# Verified live 2026-08-21 against POST /zen/v1/chat/completions.
+OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER = "opencode-zen-free-keyless"
+_OPENCODE_ZEN_FREE_BASE_URL = "https://opencode.ai/zen/v1"
+
+# Free-tier models whose slug does NOT carry the ``-free`` suffix.
+# (big-pickle is OpenCode's rotating free stealth slot.)
+_OPENCODE_KEYLESS_EXTRA_SLUGS = frozenset({"big-pickle"})
+
+
+def is_opencode_zen_free_model(model_id: Optional[str]) -> bool:
+    """True when ``model_id`` is an OpenCode Zen free-tier slug.
+
+    Matches the ``*-free`` suffix plus the known unsuffixed free slugs
+    (``big-pickle``). Tolerates provider-prefixed ids
+    (``opencode-zen/x-preview-f-free``). The Go catalog serves no free
+    models (verified 2026-08-21), so this identifies the Zen free tier
+    across the OpenCode family.
+    """
+    bare = str(model_id or "").strip().rsplit("/", 1)[-1].lower()
+    if not bare:
+        return False
+    return bare.endswith("-free") or bare in _OPENCODE_KEYLESS_EXTRA_SLUGS
+
+
+def opencode_zen_free_headers() -> dict:
+    """Client default_headers for anonymous OpenCode Zen free-tier requests.
+
+    ``Authorization: ""`` overrides the OpenAI SDK's ``Bearer <api_key>``
+    header so the placeholder key never reaches the wire — the Zen relay
+    accepts anonymous requests for free models but 401s any unknown bearer.
+    Attribution headers mirror the opencode provider profile.
+    """
+    try:
+        from hermes_cli import __version__ as _v
+    except Exception:
+        _v = "0"
+    return {
+        "Authorization": "",
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+        "User-Agent": f"HermesAgent/{_v}",
+    }
+
+
+def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str]) -> Optional[dict]:
+    """Keyless runtime entry for an OpenCode Zen free-tier model, or None.
+
+    Returns a resolve_runtime_provider-shaped dict pinning the request to the
+    Zen relay with the keyless placeholder whenever:
+
+    - ``provider_id`` is ``opencode-free`` (the dedicated keyless provider —
+      EVERY model on it routes anonymously; that is the provider's contract), or
+    - ``provider_id`` is any other OpenCode-family provider and ``model_id``
+      is a free-tier slug (heals a free-model selection made under
+      opencode-zen/opencode-go, whose keys the free tier rejects).
+    """
+    family = opencode_provider_family(provider_id)
+    if family is None:
+        return None
+    if family != "opencode-free" and not is_opencode_zen_free_model(model_id):
+        return None
+    normalized = normalize_opencode_model_id(provider_id, model_id)
+    api_mode = opencode_model_api_mode("opencode-zen", normalized)
+    base_url = normalize_opencode_base_url(
+        "opencode-zen", api_mode, _OPENCODE_ZEN_FREE_BASE_URL
+    )
+    return {
+        "provider": family,
+        "api_mode": api_mode,
+        "base_url": base_url,
+        "api_key": OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER,
+        "default_headers": opencode_zen_free_headers(),
+        "source": "opencode-zen-free-keyless",
+    }
 
 
 def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str]) -> str:
@@ -4551,12 +4649,16 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
     This follows the published OpenCode docs for Zen and Go endpoints
     (https://opencode.ai/docs/zen/ and https://opencode.ai/docs/go/).
     """
-    provider = normalize_provider(provider_id)
+    family = opencode_provider_family(provider_id)
+    # opencode-free is Zen-hosted (the free tier lives on the Zen relay),
+    # so it shares Zen's per-model endpoint routing.
+    if family == "opencode-free":
+        family = "opencode-zen"
     normalized = normalize_opencode_model_id(provider_id, model_id).lower()
     if not normalized:
         return "chat_completions"
 
-    if provider == "opencode-go":
+    if family == "opencode-go":
         if normalized.startswith("gpt-"):
             # GPT models on Go (gpt-5.6-luna) are served via /v1/responses
             # per the published Go endpoint table, same as GPT on Zen:
