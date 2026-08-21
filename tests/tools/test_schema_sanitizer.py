@@ -200,6 +200,98 @@ def test_items_sanitized_in_array_schema():
     assert items == {"type": "object", "properties": {}}
 
 
+def test_array_keywords_hoisted_into_anyof_array_branch():
+    # The read_file ``path`` schema: ``type: ["string", "array"]`` with a
+    # top-level ``items``. Emitting ``items`` as a sibling of the generated
+    # ``anyOf`` (instead of inside the ``array`` branch) is malformed and 400s
+    # on Gemini with both ``properties[path].items: field predicate failed``
+    # and ``properties[path].any_of[1].items: missing field``. Regression guard
+    # for the "read_file path schema" issue.
+    tools = [_tool("read_file", {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Path or list of paths",
+            },
+        },
+        "required": ["path"],
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["path"]
+    assert "type" not in prop
+    assert "items" not in prop, "top-level items must be hoisted into the array branch"
+    assert prop["anyOf"] == [
+        {"type": "string"},
+        {"type": "array", "items": {"type": "string"}},
+    ]
+    assert prop["description"] == "Path or list of paths"
+
+
+def test_array_keywords_not_hoisted_for_plain_array_type():
+    # A single ``type: "array"`` (not a union) keeps ``items`` at the top
+    # level — that is already a valid JSON Schema shape and must not move.
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "bag": {"type": "array", "items": {"type": "string"}},
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["bag"]
+    assert prop["type"] == "array"
+    assert prop["items"] == {"type": "string"}
+
+
+def test_multiple_array_keywords_hoisted_together():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 10,
+                "uniqueItems": True,
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["path"]
+    assert prop["anyOf"][1] == {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 10,
+        "uniqueItems": True,
+    }
+    for kw in ("items", "minItems", "maxItems", "uniqueItems"):
+        assert kw not in prop, f"{kw} must be hoisted into the array branch"
+
+
+def test_nullable_multitype_array_keeps_nullable_and_hoists_items():
+    # ``type: ["string", "array", "null"]`` — the null branch is lifted into
+    # ``nullable: true`` while ``items`` still lands in the array branch.
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": ["string", "array", "null"],
+                "items": {"type": "string"},
+            },
+        },
+    })]
+    out = sanitize_tool_schemas(tools)
+    prop = out[0]["function"]["parameters"]["properties"]["path"]
+    assert prop["nullable"] is True
+    assert prop["anyOf"] == [
+        {"type": "string"},
+        {"type": "array", "items": {"type": "string"}},
+    ]
+    assert "items" not in prop
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # strip_pattern_and_format — reactive recovery when llama.cpp rejects a
 # schema with an HTTP 400 grammar-parse error. Must be opt-in (only
