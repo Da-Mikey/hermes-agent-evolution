@@ -179,6 +179,32 @@ class TestTrustGateAtCallTime:
         fake_session.call_tool.assert_not_awaited()
         assert "error" in json.loads(raw)
 
+    def test_read_only_tool_on_sensitive_server_is_gated(self, fake_session):
+        """#3040: on `sensitive`, even read-only tools are authorized per call."""
+        _set_trust("srv", "sensitive")
+        _set_read_only("srv", "list_repos", True)
+        handler = mcp_tool._make_tool_handler("srv", "list_repos", 30.0)
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="accept",
+        ) as consent:
+            raw = handler({})
+        consent.assert_called_once()
+        assert json.loads(raw) == {"result": "ok"}
+
+    def test_denied_sensitive_call_blocks_rpc(self, fake_session):
+        """A denied sensitive call never reaches the server."""
+        _set_trust("srv", "sensitive")
+        _set_read_only("srv", "list_repos", True)
+        handler = mcp_tool._make_tool_handler("srv", "list_repos", 30.0)
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ):
+            raw = handler({})
+        fake_session.call_tool.assert_not_awaited()
+        assert "error" in json.loads(raw)
+
 
 class TestTrustNormalization:
     def test_unknown_trust_value_treated_as_untrusted(self):
@@ -191,6 +217,11 @@ class TestTrustNormalization:
         assert mcp_tool._normalize_server_trust("  Full ") == "full"
         # Missing key → default full (backward compatible; documented).
         assert mcp_tool._normalize_server_trust(None) == "full"
+
+    def test_sensitive_tier_recognized(self):
+        """#3040: the sensitive tier normalizes to itself, case-insensitively."""
+        assert mcp_tool._normalize_server_trust("sensitive") == "sensitive"
+        assert mcp_tool._normalize_server_trust("SENSITIVE") == "sensitive"
 
 
 class TestAnnotationCaptureAtDiscovery:

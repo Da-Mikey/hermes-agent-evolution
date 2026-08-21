@@ -5473,14 +5473,21 @@ _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
+_TRUST_SENSITIVE = "sensitive"
 
 
 def _normalize_server_trust(value: Any) -> str:
-    """Normalize a config ``trust`` value to ``full`` or ``untrusted``.
+    """Normalize a config ``trust`` value to ``full``, ``untrusted``, or
+    ``sensitive``.
 
     Missing (None) → ``full`` (backward-compatible default, documented
-    above). Any string other than the two known tiers → ``untrusted``:
+    above). Any string other than the three known tiers → ``untrusted``:
     a misspelled tier must fail closed, never silently disable gating.
+
+    ``sensitive`` (added by #3040, NSA MCP guidance alignment): every tool
+    call — read or write — is gated per call, because the server handles
+    sensitive/regulated data and must be isolated from public-data tools.
+    See ``docs/security/mcp-nsa-guidance.md`` for the full policy.
     """
     if value is None:
         return _TRUST_FULL
@@ -5489,9 +5496,11 @@ def _normalize_server_trust(value: Any) -> str:
         return _TRUST_FULL
     if text == _TRUST_UNTRUSTED:
         return _TRUST_UNTRUSTED
+    if text == _TRUST_SENSITIVE:
+        return _TRUST_SENSITIVE
     logger.warning(
         "MCP trust: unrecognized trust value %r — treating as 'untrusted' "
-        "(valid values: full, untrusted)",
+        "(valid values: full, untrusted, sensitive)",
         value,
     )
     return _TRUST_UNTRUSTED
@@ -5531,17 +5540,43 @@ def _record_tool_trust_metadata(
 
 
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
-    """Consult the approval path for write-capable tools on untrusted servers.
+    """Consult the approval path for calls on untrusted/sensitive servers.
 
     Returns None when the call may proceed, or an error string (already
     formatted via ``tool_error``) when the call is blocked. Fail-closed:
     approval-system errors block the call.
+
+    Tiers (#3040, NSA MCP guidance alignment):
+    - ``full``: no gate.
+    - ``untrusted``: gate write-capable tools (no ``readOnlyHint=true``
+      annotation); read-only tools pass.
+    - ``sensitive``: gate EVERY tool, read or write — the server handles
+      sensitive/regulated data and must be isolated from public-data tools.
     """
     trust = _server_trust_levels.get(server_name, _TRUST_FULL)
-    if trust != _TRUST_UNTRUSTED:
+    if trust == _TRUST_FULL:
         return None
-    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
+    # On `untrusted`, a read-only tool passes without gating.
+    if trust == _TRUST_UNTRUSTED and (
+        _tool_read_only_hints.get(server_name, {}).get(tool_name) is True
+    ):
         return None
+
+    gate_label = (
+        "SENSITIVE server"
+        if trust == _TRUST_SENSITIVE
+        else "UNTRUSTED server"
+    )
+    if trust == _TRUST_SENSITIVE:
+        gate_hint = (
+            "This server handles sensitive/regulated data (trust: sensitive), "
+            "so EVERY tool call — read or write — is authorized per call."
+        )
+    else:
+        gate_hint = (
+            f"Server '{server_name}' is configured 'trust: untrusted'. "
+            f"Approve to run '{tool_name}' once, or deny to block it."
+        )
 
     # Lazy import mirrors the elicitation handler's pattern: tools.approval
     # routes the prompt to whichever surface owns the session (CLI, TUI,
@@ -5551,13 +5586,11 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
 
         answer = request_elicitation_consent(
             (
-                f"MCP tool '{tool_name}' on UNTRUSTED server "
-                f"'{server_name}' wants to run. This tool is write-capable "
-                f"(no readOnlyHint=true annotation) and may modify external "
-                f"state."
+                f"MCP tool '{tool_name}' on {gate_label} '{server_name}' "
+                f"wants to run. {gate_hint}"
             ),
             (
-                f"Server '{server_name}' is configured 'trust: untrusted'. "
+                f"Server '{server_name}' is configured 'trust: {trust}'. "
                 f"Approve to run '{tool_name}' once, or deny to block it."
             ),
             surface=f"mcp-trust/{server_name}",
@@ -5571,7 +5604,7 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
             exc_info=True,
         )
         return tool_error(
-            f"MCP tool '{tool_name}' on untrusted server '{server_name}' "
+            f"MCP tool '{tool_name}' on {trust} server '{server_name}' "
             f"was blocked: the approval system was unavailable "
             f"(fail-closed)."
         )
@@ -5579,15 +5612,16 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     if answer == "accept":
         return None
     logger.info(
-        "MCP trust gate: user %s '%s' on untrusted server '%s'",
+        "MCP trust gate: user %s '%s' on %s server '%s'",
         "cancelled" if answer == "cancel" else "denied",
         tool_name,
+        trust,
         server_name,
     )
     return tool_error(
-        f"The user did not approve running write-capable MCP tool "
-        f"'{tool_name}' on untrusted server '{server_name}'. The command "
-        f"was NOT run. Do not retry without explicit user direction."
+        f"The user did not approve running MCP tool '{tool_name}' on "
+        f"{trust} server '{server_name}'. The command was NOT run. Do not "
+        f"retry without explicit user direction."
     )
 
 
