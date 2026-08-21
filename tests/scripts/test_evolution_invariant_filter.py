@@ -16,8 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from evolution_invariant_filter import (  # noqa: E402
     _rules_path,
     check_proposal,
+    classify_stakes,
     filter_proposals,
     load_invariant_rules,
+    load_safe_fallbacks,
+    resolve_pinned_fallback,
 )
 from evolution_harness_gate import run_cron_pass, run_gate  # noqa: E402
 from evolution_harness_sandbox import INVALID, VALIDATED, GateResult  # noqa: E402
@@ -173,3 +176,111 @@ def test_cron_pass_gates_clean_proposal():
     assert report["invariant_rejected"] == 0
     assert report["gated"] == 1
     assert report["validated"] == 1
+
+
+# -- Slice 3: stakes classification + staged rollout -------------------------
+
+
+def test_classify_stakes_explicit_field():
+    label, source = classify_stakes({**CLEAN, "stakes": "low"})
+    assert label == "low" and source == "explicit"
+
+
+def test_classify_stakes_explicit_unknown_fails_safe_to_high():
+    label, source = classify_stakes({**CLEAN, "stakes": "extreme"})
+    assert label == "high" and source == "default"
+
+
+def test_classify_stakes_infer_medium_from_path():
+    label, source = classify_stakes({**CLEAN, "path": "scripts/evolution_foo.py"})
+    assert label == "medium" and source == "inferred"
+
+
+def test_classify_stakes_infer_high_from_gate_path():
+    label, source = classify_stakes(
+        {**CLEAN, "path": "scripts/evolution_harness_gate.py"}
+    )
+    assert label == "high" and source == "inferred"
+
+
+def test_classify_stakes_defaults_high_for_pathless():
+    label, source = classify_stakes(CLEAN)
+    assert label == "high" and source == "default"
+
+
+def test_backcompat_rule_blocks_at_low_stakes():
+    # A rule with NO enforce_at still blocks a low-stakes proposal (unchanged).
+    result = check_proposal({**CLEAN, "stakes": "low", "auto_apply": True})
+    assert result["ok"] is False
+    assert result["violations"]  # demoted to advisory, not dropped
+    assert result["advisory"] == []
+
+
+def test_staged_rule_advisory_on_high_stakes():
+    # A rule with enforce_at: high does NOT block a high-stakes proposal;
+    # the finding surfaces as advisory so rollout is observable, not silent.
+    staged_rule = {
+        "id": "staged-rule",
+        "severity": "hard",
+        "check": "forbidden_paths",
+        "enforce_at": "high",
+        "forbidden_fragments": ["staging-target.py"],
+    }
+    rules = {
+        "version": 1,
+        "rules": [staged_rule],
+    }
+    result = check_proposal({**CLEAN, "path": "scripts/staging-target.py"}, rules=rules)
+    assert result["ok"] is True
+    assert result["advisory"]
+
+
+def test_staged_rule_blocks_when_threshold_met():
+    # Same staged rule now meets its floor on a LOW-stakes proposal -> blocks.
+    staged_rule = {
+        "id": "staged-rule",
+        "severity": "hard",
+        "check": "forbidden_paths",
+        "enforce_at": "low",
+        "forbidden_fragments": ["staging-target"],
+    }
+    rendered = {"version": 1, "rules": [staged_rule]}
+    result = check_proposal({**CLEAN, "path": "scripts/staging-target.py"}, rules=rendered)
+    assert result["ok"] is False
+    assert any(v["rule"] == "staged-rule" for v in result["violations"])
+
+
+def test_check_proposal_reports_stakes_meta():
+    result = check_proposal(CLEAN)
+    assert result["stakes"] == "high"
+    assert result["stakes_source"] == "default"
+
+
+# -- Slice 4: pinned safe-fallback set ---------------------------------------
+
+
+def test_load_safe_fallbacks_reads_versioned_set():
+    rules = load_invariant_rules()
+    fb = load_safe_fallbacks(rules)
+    assert fb  # the shipped rules file declares a non-empty set
+    assert all(e["id"] and e["replacement"] for e in fb)
+
+
+def test_safe_fallback_attached_on_forbidden_path_block():
+    result = check_proposal({**CLEAN, "path": "cron/jobs.py"})
+    assert result["ok"] is False
+    assert result["safe_fallback"]["target"] == "cron/jobs.py"
+    assert result["safe_fallback"]["replacement"] == "cron/config/*.json"
+
+
+def test_safe_fallback_absent_for_unpinned_block():
+    result = check_proposal({**CLEAN, "path": "scripts/setup-hermes.sh"})
+    assert result["ok"] is False
+    # setup-hermes.sh IS in the forbidden set, and it DOES have a pinned
+    # fallback in the shipped rules -> assert it is surfaced.
+    assert result["safe_fallback"]["replacement"] == "config/hermes.yaml"
+
+
+def test_resolve_pinned_fallback_none_when_no_blocking_path():
+    assert resolve_pinned_fallback(CLEAN) is None
+    assert resolve_pinned_fallback({"path": "scripts/evolution_foo.py"}) is None
