@@ -614,6 +614,19 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
 
+    # Validate sanitized schemas against the structural invariants the
+    # sanitizer enforces, so a malformed tool schema is surfaced (logged) at
+    # registration time instead of surfacing downstream as a cryptic
+    # provider 400 format_error / schema_validation_error. Diagnostic only —
+    # never raises, and a failure is reported rather than fatal.
+    try:
+        from tools.schema_sanitizer import validate_tool_schemas
+        schema_issues = validate_tool_schemas(filtered_tools)
+        for issue in schema_issues:
+            logger.warning("Tool schema validation: %s", issue)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("Tool schema validation skipped: %s", e)
+
     # ── Tool Search (progressive disclosure) ────────────────────────────
     # Conditionally replace MCP + plugin (non-core) tools with three bridge
     # tools (tool_search / tool_describe / tool_call) when the deferrable

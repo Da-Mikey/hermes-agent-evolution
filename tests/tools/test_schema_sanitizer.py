@@ -13,6 +13,7 @@ from tools.schema_sanitizer import (
     sanitize_tool_schemas,
     strip_pattern_and_format,
     strip_slash_enum,
+    validate_tool_schemas,
 )
 
 
@@ -609,3 +610,46 @@ def test_collapse_is_deterministic():
     first = collapse_const_unions(copy.deepcopy(schema))
     second = collapse_const_unions(copy.deepcopy(schema))
     assert first == second == {"type": "string", "enum": ["b", "a"]}
+
+
+class TestValidateToolSchemas:
+    """The validator wired into the sanitizer's public surface (issue #49).
+
+    ``schema_sanitizer.validate_tool_schemas`` is the production call site
+    ``model_tools.get_tool_definitions`` invokes; these tests exercise the
+    Pydantic validator *through that call site*, proving a structurally
+    invalid schema is rejected there (not just in the validator's own unit
+    tests).
+    """
+
+    def test_valid_schema_produces_no_issues(self):
+        tools = [_tool("good", {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+        })]
+        assert validate_tool_schemas(tools) == []
+
+    def test_invalid_root_type_is_reported_with_tool_name(self):
+        # Root must be an object; a bare-string schema node is a real-world
+        # malformed-MCP shape (mirrors the sanitizer's own docstring).
+        tools = [_tool("bad", {"type": "string", "properties": {}})]
+        issues = validate_tool_schemas(tools)
+        assert issues, "expected the invalid schema to be flagged"
+        assert issues[0].startswith("bad: ")
+
+    def test_required_naming_undefined_property_is_reported(self):
+        tools = [_tool("bad", {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q", "missing"],
+        })]
+        issues = validate_tool_schemas(tools)
+        assert issues, "expected the dangling required entry to be flagged"
+        assert any("required" in i for i in issues)
+
+    def test_responses_format_schema_is_validated(self):
+        # Bare Responses-format tool (no OpenAI wrapper) is also accepted.
+        tools = [{"name": "r", "parameters": {"type": "string", "properties": {}}}]
+        issues = validate_tool_schemas(tools)
+        assert issues and issues[0].startswith("r: ")

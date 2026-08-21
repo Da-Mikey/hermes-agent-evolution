@@ -41,6 +41,8 @@ import logging
 import re
 from typing import Any
 
+from tools.schema_validator import validate_tool_schema
+
 logger = logging.getLogger(__name__)
 
 
@@ -739,3 +741,39 @@ def strip_slash_enum(tools: list[dict]) -> tuple[list[dict], int]:
             stripped,
         )
     return tools, stripped
+
+
+def validate_tool_schemas(tools: list[dict]) -> list[str]:
+    """Validate tool schemas and return human-actionable issue strings.
+
+    The runtime sanitizer (this module) repairs known-hostile JSON-Schema
+    shapes; this function is the *diagnostic* half. It runs each tool schema
+    through :func:`tools.schema_validator.validate_tool_schema` — the
+    Pydantic-based structural validator — and returns one message per
+    structural problem found (an empty list means every schema is valid).
+
+    This is wired into :func:`model_tools.get_tool_definitions` so a
+    structurally invalid tool schema is surfaced (logged) at
+    tool-registration time instead of surfacing downstream as a cryptic
+    provider ``400 format_error`` / ``schema_validation_error``.
+
+    Never raises: a malformed schema is reported, not fatal. A tool entry
+    whose name cannot be resolved is labelled ``<unnamed>``.
+    """
+    issues: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        result = validate_tool_schema(tool)
+        if result.ok:
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            name = fn["name"]
+        elif isinstance(tool.get("name"), str):
+            name = tool["name"]
+        else:
+            name = "<unnamed>"
+        for err in result.errors:
+            issues.append(f"{name}: {err}")
+    return issues
