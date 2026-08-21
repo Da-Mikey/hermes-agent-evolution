@@ -924,3 +924,62 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+# =========================================================================
+# Provenance recording on dispatch (#2994)
+# =========================================================================
+
+class TestProvenanceRecordingOnDispatch:
+    """A completed tool call must record its source into the background-review
+    source chain, so the provenance gate at skill-admission time has real
+    entries to evaluate (CoSnitch-class defense)."""
+
+    def test_successful_dispatch_records_provenance(self, monkeypatch):
+        from tools.skill_provenance import (
+            init_source_chain,
+            reset_source_chain,
+            set_current_write_origin,
+            reset_current_write_origin,
+            get_recorded_chain,
+            BACKGROUND_REVIEW,
+        )
+
+        token_origin = set_current_write_origin(BACKGROUND_REVIEW)
+        chain_token = init_source_chain()
+        try:
+            with patch("model_tools.registry.dispatch", return_value='{"ok":true}'):
+                handle_function_call("web_search", {"url": "https://evil.example"})
+            chain = get_recorded_chain()
+            # web_search is untrusted ingestion; it must be recorded and tainted.
+            assert any(
+                e["source_type"] == "web_search"
+                and e["source_id"].startswith("web_search:https://evil.example")
+                and e["trusted"] is False
+                for e in chain
+            ), f"web_search not recorded as untrusted provenance: {chain}"
+        finally:
+            reset_source_chain(chain_token)
+            reset_current_write_origin(token_origin)
+
+    def test_dispatch_outside_fork_is_noop(self, monkeypatch):
+        """No source chain is initialized outside background-review, so the
+        dispatch must not raise and must not record anything."""
+        with (
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
+        ):
+            result = handle_function_call("read_file", {"path": "/tmp/x"})
+        assert result == '{"ok":true}'
+
+    def test_derive_provenance_source_id_prefers_url(self):
+        from model_tools import _derive_provenance_source_id
+
+        assert _derive_provenance_source_id(
+            "web_extract", {"url": "https://a.example"}
+        ) == "web_extract:https://a.example"
+        assert _derive_provenance_source_id(
+            "read_file", {"path": "/etc/passwd"}
+        ) == "read_file:/etc/passwd"
+        assert _derive_provenance_source_id("calc", {}) == "calc"
+        assert _derive_provenance_source_id("calc", None) == "calc"  # type: ignore[arg-type]
+
