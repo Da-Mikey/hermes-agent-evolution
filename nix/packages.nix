@@ -68,6 +68,13 @@
         desktop = full.hermesDesktop;
 
         update-npm-lockfile = full.hermesNpmLib.updateNpmLockfile;
+
+        # CI diagnostic/fix: nix.yml and nix-lockfile-fix.yml call
+        # `nix run .#fix-lockfiles -- --check|--apply`.  Without this
+        # attribute the workflow's hash_check step crashes before emitting
+        # stale=true|false and the "crashed without reporting" gate fires on
+        # every PR (repo-wide red).  The script always reports a status.
+        fix-lockfiles = full.hermesNpmLib.fixLockfiles;
       }
       # The dev sandbox is Linux-only — sandbox.nix pulls bubblewrap, which
       # carries `meta.platforms = [ linux ]` and REFUSES to evaluate on other

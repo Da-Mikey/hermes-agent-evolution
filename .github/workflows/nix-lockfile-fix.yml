@@ -75,10 +75,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Ensure only nix/lib.nix (home of the single npmDepsHash) was
-          # modified — prevents accidental self-triggering if fix-lockfiles
-          # ever touches package files.
-          unexpected="$(git diff --name-only | grep -Ev '^nix/lib\.nix$' || true)"
+          # fix-lockfiles rewrites package-lock.json in place (adds missing
+          # integrity/resolved fields; importNpmLock reads hashes from the
+          # lockfile itself).  Ensure ONLY package-lock.json was modified —
+          # prevents accidental self-triggering if fix-lockfiles ever
+          # touches unexpected files.
+          unexpected="$(git diff --name-only | grep -Ev '^package-lock\.json$' || true)"
           if [ -n "$unexpected" ]; then
             echo "::error::Unexpected modified files: $unexpected"
             exit 1
@@ -90,7 +92,7 @@ jobs:
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add nix/lib.nix
+          git add package-lock.json
           git commit -m "fix(nix): auto-refresh npm lockfile hashes" \
             -m "Source: $GITHUB_SHA" \
             -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
@@ -237,7 +239,7 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add nix/lib.nix
+          git add package-lock.json
           git commit -m "fix(nix): refresh npm lockfile hashes"
           git push
 

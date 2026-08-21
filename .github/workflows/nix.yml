@@ -50,7 +50,19 @@ jobs:
         continue-on-error: true
         env:
           LINK_SHA: ${{ steps.sha.outputs.full }}
-        run: nix run .#fix-lockfiles -- --check
+        run: |
+          # Retry once: infra blips (cache throttle, nix daemon hiccup) are
+          # transient; a flake-eval failure (missing attribute, bad eval) is
+          # not — the retry fails identically and the "crashed without
+          # reporting" gate below still fires.
+          for attempt in 1 2; do
+            if nix run .#fix-lockfiles -- --check; then
+              exit 0
+            fi
+            echo "::warning::fix-lockfiles attempt ${attempt} failed; retrying once"
+            sleep 10
+          done
+          exit 1
 
       # If fix-lockfiles itself crashes (infrastructure blip, cache throttle,
       # etc.) it won't set stale=true/false.  Treat that as a distinct failure
@@ -67,11 +79,11 @@ jobs:
         with:
           header: nix-lockfile-check
           message: |
-            ### ⚠️ npm lockfile hash out of date
+            ### ⚠️ npm lockfile out of date
 
             Checked against commit [`${{ steps.sha.outputs.short }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.sha.outputs.full }}) (PR head at check time).
 
-            The `hash = "sha256-..."` line in these nix files no longer matches the committed `package-lock.json`:
+            `package-lock.json` is missing `integrity`/`resolved` fields that `importNpmLock` needs (hand-edited or stripped lockfile). `nix run .#fix-lockfiles` can repair it:
 
             ${{ steps.hash_check.outputs.report }}
 

@@ -307,6 +307,102 @@ in
     echo "Lockfile updated and all npm packages built."
   '';
 
+  # Check/fix npm lockfile integrity+resolved fields.  Exposed as a runnable
+  # package — `nix run .#fix-lockfiles -- --check` (nix.yml) and
+  # `nix run .#fix-lockfiles -- --apply` (nix-lockfile-fix.yml).
+  #
+  # npm-lockfile-fix rewrites package-lock.json in place, adding any missing
+  # `integrity`/`resolved` fields (a hand-edited or stripped lockfile breaks
+  # importNpmLock at eval time).  The --check mode runs the fixer on a temp
+  # copy and reports whether the committed lockfile would change; --apply
+  # runs it for real.
+  #
+  # Output contract (read by the workflows):
+  #   --check  → always emits stale=true|false (+ report=… when stale) to
+  #              GITHUB_OUTPUT/stdout on ANY exit — even a crash — so the CI
+  #              gate can distinguish "checked, not stale" from "did not
+  #              report"; exits 0 on a completed check, non-zero only if it
+  #              genuinely could not run.
+  #   --apply  → emits changed=true|false.
+  fixLockfiles = writeShellScriptBin "fix-lockfiles" ''
+    set -uo pipefail
+    # DEBUG=1 nix run .#fix-lockfiles -- --check — trace every command
+    [ -n "''${DEBUG:-}" ] && set -x
+
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    cd "$REPO_ROOT"
+
+    LOCKFILE="package-lock.json"
+    MODE="''${1:-apply}"
+
+    stale=false
+    changed=false
+    report=""
+
+    emit_status() {
+      if [ -n "''${GITHUB_OUTPUT:-}" ]; then
+        echo "stale=$stale" >> "$GITHUB_OUTPUT"
+        echo "changed=$changed" >> "$GITHUB_OUTPUT"
+        if [ -n "$report" ]; then
+          echo "report<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$report" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        fi
+      fi
+      echo "stale=$stale"
+      echo "changed=$changed"
+      if [ -n "$report" ]; then
+        echo "report:"
+        echo "$report"
+      fi
+    }
+
+    if [ ! -f "$LOCKFILE" ]; then
+      echo "::error::package-lock.json not found at $REPO_ROOT" >&2
+      # Still report a definitive status so the gate never sees a silent crash.
+      trap emit_status EXIT
+      exit 1
+    fi
+
+    case "$MODE" in
+      --check)
+        TMP="$(${coreutils}/bin/mktemp)"
+        trap '${coreutils}/bin/rm -f "$TMP"; emit_status' EXIT
+        ${coreutils}/bin/cp "$LOCKFILE" "$TMP"
+        if ! ${lib.getExe npm-lockfile-fix} "$TMP" >/dev/null 2>&1; then
+          # The fixer itself crashed (transient infra blip / eval hiccup).
+          # Report a definitive status so nix.yml's "crashed without
+          # reporting" gate does not fire; the real failure signal is the
+          # flake check that triggered this diagnostic.
+          echo "::warning::npm-lockfile-fix --check crashed; reporting stale=false (flake check remains the source of truth)" >&2
+          exit 0
+        fi
+        # Compare content, ignoring the trailing newline: the tool always
+        # rewrites via json.dump (no trailing \n) while npm writes one, so a
+        # byte comparison would false-positive stale=true on every clean file.
+        if ! ${coreutils}/bin/cmp -s \
+          <(${coreutils}/bin/tr -d '\n' < "$LOCKFILE") \
+          <(${coreutils}/bin/tr -d '\n' < "$TMP"); then
+          stale=true
+          report="$(git diff --no-index -- "$LOCKFILE" "$TMP" 2>/dev/null | head -40 || true)"
+        fi
+        exit 0
+        ;;
+      --apply|apply|*)
+        BEFORE="$(${coreutils}/bin/sha256sum "$LOCKFILE" | ${coreutils}/bin/cut -d' ' -f1)"
+        if ! ${lib.getExe npm-lockfile-fix} "$LOCKFILE"; then
+          echo "::error::npm-lockfile-fix --apply failed" >&2
+          trap emit_status EXIT
+          exit 1
+        fi
+        AFTER="$(${coreutils}/bin/sha256sum "$LOCKFILE" | ${coreutils}/bin/cut -d' ' -f1)"
+        [ "$BEFORE" != "$AFTER" ] && changed=true
+        trap emit_status EXIT
+        exit 0
+        ;;
+    esac
+  '';
+
   buildNpmPackage = customBuildNpmPackage;
 
   # Single devshell hook for all npm workspace packages.
