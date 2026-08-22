@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   nix:
+    if: github.repository == 'NousResearch/hermes-agent'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
