@@ -34,6 +34,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
+from datetime import datetime, timezone
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
@@ -4700,6 +4701,78 @@ _TEMPLATE_MARKER_RE = re.compile(
 _MIN_BATCH_GOAL_LEN = 10
 
 
+# Known template markers the cron/orchestrator dispatch path can leave behind
+# unexpanded in a delegate_task goal (issue #95). These are the *mechanically
+# resolvable* ones — timestamps and session identity — that we can substitute
+# with a real value at dispatch time so a delegated stage never silently
+# no-ops on delegate_task's rejection guard. Anything else (e.g. ``<real
+# citation>``) is a genuine incomplete instruction and stays a residual marker
+# for the batch quality gate to reject loudly.
+_MARKER_SEP_RE = re.compile(r"[ _-]+")
+
+# Marker keys (normalized via _marker_token) that resolve to the current UTC
+# timestamp. Only multi-word markers are listed — the marker regex is
+# deliberately narrow and never fires on single-word brackets like <now>.
+_TIMESTAMP_MARKER_KEYS = frozenset(
+    {
+        "now-iso",
+        "generated-timestamp",
+        "current-datetime",
+        "current-date",
+    }
+)
+# Marker keys that resolve to the originating session id.
+_SESSION_MARKER_KEYS = frozenset({"session-id"})
+
+
+def _marker_token(marker: str) -> str:
+    """Normalize a matched marker (e.g. ``<NOW-ISO>``) to a canonical key."""
+    inner = (marker or "").strip()
+    if len(inner) >= 2 and inner[0] in "<{" and inner[-1] in ">}":
+        inner = inner[1:-1]
+    return _MARKER_SEP_RE.sub("-", inner.strip().lower())
+
+
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def expand_template_markers(
+    text: str,
+    *,
+    now_iso: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> "tuple[str, list[str], list[str]]":
+    """Substitute known template markers in *text* with concrete values.
+
+    Returns ``(expanded, substituted, residual)``:
+
+    * ``expanded`` — ``text`` with known markers replaced by real values.
+    * ``substituted`` — the raw marker strings that were replaced.
+    * ``residual`` — the raw marker strings that could not be resolved and
+      remain in ``expanded`` (to be stripped or rejected by the caller).
+    """
+    now_iso = now_iso if now_iso is not None else _now_iso_utc()
+    values: Dict[str, str] = {key: now_iso for key in _TIMESTAMP_MARKER_KEYS}
+    if session_id:
+        values.update({key: session_id for key in _SESSION_MARKER_KEYS})
+
+    substituted: List[str] = []
+    residual: List[str] = []
+
+    def _repl(match: "re.Match[str]") -> str:
+        raw = match.group(0)
+        key = _marker_token(raw)
+        if key in values:
+            substituted.append(raw)
+            return values[key]
+        residual.append(raw)
+        return raw
+
+    expanded = _TEMPLATE_MARKER_RE.sub(_repl, text)
+    return expanded, substituted, residual
+
+
 def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     """Validate a tasks=[...] batch beyond per-task goal presence.
 
@@ -4730,6 +4803,14 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
             )
         marker = _TEMPLATE_MARKER_RE.search(goal)
         if marker:
+            logger.warning(
+                "delegate_task: rejecting task %d goal with unexpanded template "
+                "marker %r — the dispatch layer failed to substitute it; "
+                "surfacing so the caller fixes the goal instead of silently "
+                "skipping the delegated stage (issue #95)",
+                i,
+                marker.group(0),
+            )
             return (
                 f"Task {i} goal contains an unexpanded template marker "
                 f"({marker.group(0)!r}). Substitute the real value before "
@@ -4921,6 +5002,45 @@ def delegate_task(
             return tool_error(f"Task {i} must be an object, got {type(task).__name__}.")
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Issue #95: substitute known template markers (<NOW-ISO>, <session_id>,
+    # <generated-timestamp>) at dispatch time so a cron/orchestrator-dispatched
+    # goal that still carries them never silently no-ops on the batch quality
+    # gate. Residual markers that cannot be mechanically resolved are left for
+    # the gate to reject loudly (see _validate_batch_tasks).
+    _dispatch_now = _now_iso_utc()
+    _dispatch_sid = ""
+    try:
+        from tools.async_delegation import _current_origin_session_id  # noqa: PLC0415
+
+        _dispatch_sid = _current_origin_session_id() or os.environ.get(
+            "HERMES_SESSION_ID", ""
+        )
+    except Exception:
+        _dispatch_sid = os.environ.get("HERMES_SESSION_ID", "")
+    for _i, _task in enumerate(task_list):
+        _goal = _task.get("goal")
+        if not isinstance(_goal, str):
+            continue
+        _expanded, _substituted, _residual = expand_template_markers(
+            _goal, now_iso=_dispatch_now, session_id=_dispatch_sid
+        )
+        if _substituted:
+            logger.warning(
+                "delegate_task: expanded unexpanded template marker(s) %s in "
+                "task %d goal with dispatch-time values (issue #95)",
+                _substituted,
+                _i,
+            )
+        if _residual:
+            logger.warning(
+                "delegate_task: task %d goal still carries unexpanded template "
+                "marker(s) %s that could not be resolved (issue #95)",
+                _i,
+                _residual,
+            )
+        if _expanded != _goal:
+            _task["goal"] = _expanded
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
