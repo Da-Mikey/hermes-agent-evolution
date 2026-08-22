@@ -529,10 +529,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek-v4-pro",
         "deepseek-v4-flash",
         "deepseek-v4-flash-free",
-<<<<<<< HEAD
         "qwen3.7-plus",
-=======
->>>>>>> 624723130b (fix: catalog drift sync — dead free slugs out, live OpenRouter free models in, ox-alpha-free on Go)
         "qwen3.6-plus",
         "qwen3.5-plus",
         "grok-build-0.1",
