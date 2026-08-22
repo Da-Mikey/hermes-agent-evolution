@@ -457,6 +457,7 @@ from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.verify import build_verify_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.audit import build_audit_parser
+from hermes_cli.subcommands.evolution import build_evolution_parser
 from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
@@ -5594,6 +5595,13 @@ def cmd_audit(args):
     from hermes_cli.audit_cmd import cmd_audit as _cmd_audit
 
     return _cmd_audit(args)
+
+
+def cmd_evolution(args):
+    """Dispatch `hermes evolution <subcmd>`."""
+    from hermes_cli.evolution_cmd import cmd_evolution as _cmd_evolution
+
+    return _cmd_evolution(args)
 
 
 def cmd_approvals(args):
@@ -12682,6 +12690,12 @@ def main():
     # (parser built in hermes_cli/subcommands/audit.py)
     # =========================================================================
     build_audit_parser(subparsers, cmd_audit=cmd_audit)
+
+    # =========================================================================
+    # evolution command — AI4AI-Bench recursive self-improvement benchmark
+    # (parser built in hermes_cli/subcommands/evolution.py)
+    # =========================================================================
+    build_evolution_parser(subparsers, cmd_evolution=cmd_evolution)
 
     # =========================================================================
     # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
