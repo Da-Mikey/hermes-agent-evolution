@@ -33,8 +33,8 @@ class TestSandboxEscapeBoundary:
         home = str(Path.home())
 
         denied = file_safety.build_write_denied_paths(home)
-        assert "/etc/passwd" in denied
-        assert "/etc/shadow" in denied
+        assert os.path.realpath("/etc/passwd") in denied
+        assert os.path.realpath("/etc/shadow") in denied
 
         for escape in ("/etc/passwd", "/etc/shadow", "/etc/sudoers"):
             assert file_safety.is_write_denied(escape), escape
