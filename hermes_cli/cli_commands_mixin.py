@@ -2008,7 +2008,7 @@ class CLICommandsMixin:
         from cli import ChatConsole
         # Intercept write-approval review subcommands first (pending/approve/
         # reject/diff/mode); everything else goes to the skills hub.
-        parts = cmd.strip().split()
+        parts = cmd.strip().split(None, 2)
         args = parts[1:] if len(parts) > 1 else []
         if args and args[0].lower() in {"pending", "approve", "apply", "reject",
                                         "deny", "drop", "diff", "approval", "mode"}:
@@ -2021,6 +2021,33 @@ class CLICommandsMixin:
             if out is not None:
                 print(out)
                 return
+
+        # Check if user typed `/skill <name> [instruction]` or `/skills <name> [instruction]`
+        # targeting an installed skill rather than a hub subcommand.
+        _known_subcommands = {
+            "search", "browse", "inspect", "install", "audit", "check",
+            "update", "uninstall", "list", "list-modified", "diff", "opt-in",
+            "opt-out", "publish", "snapshot", "tap", "help", "reset",
+        }
+        if args and args[0].lower() not in _known_subcommands:
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                get_skill_commands,
+                resolve_skill_command_key,
+            )
+            target_key = resolve_skill_command_key(args[0])
+            if target_key:
+                instruction = parts[2] if len(parts) > 2 else ""
+                msg = build_skill_invocation_message(
+                    target_key, instruction, task_id=getattr(self, "session_id", None)
+                )
+                if msg:
+                    skill_name = get_skill_commands().get(target_key, {}).get("name") or args[0]
+                    print(f"\n⚡ Loading skill: {skill_name}")
+                    if hasattr(self, '_pending_input'):
+                        self._pending_input.put(msg)
+                    return
+
         from hermes_cli.skills_hub import handle_skills_slash
         handle_skills_slash(cmd, ChatConsole())
 

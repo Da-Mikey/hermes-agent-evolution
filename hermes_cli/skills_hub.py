@@ -823,6 +823,37 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     except Exception:  # pragma: no cover - blueprint detection is best-effort
         pass
 
+    try:
+        from agent.skill_commands import _SKILL_INVALID_CHARS, _SKILL_MULTI_HYPHEN
+        from hermes_cli.commands import resolve_command
+        from tools.skills_tool import _parse_frontmatter
+
+        # Read actual frontmatter name if available on disk
+        installed_name = bundle.name
+        target_skill_dir = SKILLS_DIR / (f"{category}/{bundle.name}" if category else bundle.name)
+        skill_md_file = target_skill_dir / "SKILL.md"
+        if skill_md_file.exists():
+            try:
+                fm, _ = _parse_frontmatter(skill_md_file.read_text(encoding="utf-8"))
+                if fm.get("name"):
+                    installed_name = fm["name"]
+            except Exception:
+                pass
+
+        cmd_slug = installed_name.lower().replace(" ", "-").replace("_", "-")
+        cmd_slug = _SKILL_INVALID_CHARS.sub("", cmd_slug)
+        cmd_slug = _SKILL_MULTI_HYPHEN.sub("-", cmd_slug).strip("-")
+
+        if cmd_slug and resolve_command(cmd_slug) is not None:
+            c.print(
+                f"[yellow]⚠️ Note:[/] Skill name '[bold]{installed_name}[/]' matches a core Hermes slash command ([bold]/{cmd_slug}[/])."
+            )
+            c.print(
+                f"[dim]To invoke this skill, run [bold]/skill {installed_name}[/] or [bold]/skill-{cmd_slug}[/].[/]\n"
+            )
+    except Exception:
+        pass
+
     if invalidate_cache:
         # Invalidate the skills prompt cache so the new skill appears immediately
         try:
@@ -1069,6 +1100,22 @@ def do_list(source_filter: str = "all",
         summary += f" — {enabled_count} enabled, {disabled_count} disabled"
     summary += "[/]\n"
     c.print(summary)
+
+    try:
+        from agent.skill_commands import get_colliding_skills
+        colliding = get_colliding_skills()
+        if colliding:
+            c.print(
+                f"[yellow]ℹ️  {len(colliding)} skill(s) match core commands and use namespaced slash commands:[/]"
+            )
+            for cmd_name, info in sorted(colliding.items()):
+                c.print(
+                    f"  • [bold]{info['name']}[/]: use [cyan]{info['namespaced_key']}[/]"
+                    f" or [cyan]/skill {info['name']}[/]"
+                )
+            c.print()
+    except Exception:
+        pass
 
 
 def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> None:

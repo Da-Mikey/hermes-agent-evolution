@@ -10,6 +10,7 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    get_colliding_skills,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -347,6 +348,98 @@ class TestScanSkillCommands:
             with caplog.at_level(_logging.WARNING, logger="agent.skill_commands"):
                 scan_skill_commands()
         assert any("already claimed" in r.message for r in caplog.records)
+
+
+class TestSkillCommandCollisions:
+    """Skills colliding with core Hermes slash commands must be safely
+    namespaced under /skill-<name> so they remain discoverable and executable (#3096).
+    """
+
+    def test_colliding_skill_registers_as_namespaced_command(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "config", body="Custom skill for configuration.")
+            _make_skill(tmp_path, "help", body="Custom skill for help.")
+            _make_skill(tmp_path, "custom-skill", body="Ordinary custom skill.")
+
+            cmds = scan_skill_commands()
+            colliding = get_colliding_skills()
+
+            # Direct core collision commands are not registered as bare /config or /help
+            assert "/config" not in cmds
+            assert "/help" not in cmds
+
+            # They are registered under namespaced slash commands
+            assert "/skill-config" in cmds
+            assert "/skill-help" in cmds
+            assert "/custom-skill" in cmds
+
+            # Colliding registry tracks the collisions
+            assert "config" in colliding
+            assert colliding["config"]["namespaced_key"] == "/skill-config"
+            assert "help" in colliding
+            assert colliding["help"]["namespaced_key"] == "/skill-help"
+
+    def test_colliding_skill_resolves_via_various_syntax(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "config", body="Custom config skill.")
+            _make_skill(tmp_path, "undo", body="Custom undo skill.")
+            scan_skill_commands()
+
+            # Namespaced direct resolution
+            assert resolve_skill_command_key("/skill-config") == "/skill-config"
+            assert resolve_skill_command_key("skill-config") == "/skill-config"
+            assert resolve_skill_command_key("skill_config") == "/skill-config"
+
+            # Explicit /skill prefix resolution
+            assert resolve_skill_command_key("/skill config") == "/skill-config"
+            assert resolve_skill_command_key("skill config") == "/skill-config"
+            assert resolve_skill_command_key("skill/config") == "/skill-config"
+
+            # Bare colliding slug resolution (fallback to namespaced key)
+            assert resolve_skill_command_key("config") == "/skill-config"
+            assert resolve_skill_command_key("/undo") == "/skill-undo"
+
+    def test_builds_skill_invocation_message_for_namespaced_command(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "debug", body="Perform advanced AI debugging.")
+            scan_skill_commands()
+
+            msg = build_skill_invocation_message("/skill-debug", user_instruction="inspect auth loop")
+            assert msg is not None
+            assert "Perform advanced AI debugging." in msg
+            assert "inspect auth loop" in msg
+
+    def test_namespaced_skill_does_not_shadow_legitimate_skill_or_duplicate(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            # A skill named skill-config exists alongside a colliding skill named config
+            _make_skill(tmp_path, "skill-config", body="The real skill-config.")
+            _make_skill(tmp_path, "config", body="The config skill.")
+            scan_skill_commands()
+
+            # skill-config keeps its identity
+            cmds = scan_skill_commands()
+            assert cmds["/skill-config"]["name"] == "skill-config"
+
+    def test_cli_slash_skill_dispatch_invokes_colliding_skill(self, tmp_path):
+        import queue
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        class DummyCLI(CLICommandsMixin):
+            def __init__(self):
+                self.session_id = "test-session"
+                self._pending_input = queue.Queue()
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "config", body="Custom configuration helper.")
+            scan_skill_commands()
+
+            cli = DummyCLI()
+            cli._handle_skills_command("/skill config review memory settings")
+
+            assert not cli._pending_input.empty()
+            queued = cli._pending_input.get()
+            assert "Custom configuration helper." in queued
+            assert "review memory settings" in queued
 
 
 class TestResolveSkillCommandKey:

@@ -22,6 +22,7 @@ from agent.skill_preprocessing import (
 logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
+_colliding_skills: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
@@ -423,9 +424,13 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_home
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands_home = _resolve_skill_commands_home()
-    _skill_commands = {}
+    try:
+        _skill_commands.clear()
+        _colliding_skills.clear()
+        _skill_commands_platform = _resolve_skill_commands_platform()
+        _skill_commands_home = _resolve_skill_commands_home()
+    except Exception:
+        pass
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
@@ -437,6 +442,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
+        pending_colliding: list = []
 
         # Scan project dirs first (highest precedence), then local, then external.
         # Project dirs iterate through the quarantine chokepoint.
@@ -487,19 +493,15 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
                     if not cmd_name:
                         continue
-                    # Skip if this skill's auto-generated /command collides
-                    # with a core Hermes slash command (name or alias). The
-                    # skill remains fully loadable via /skill <name>.
-                    # Uses resolve_command() so aliases and case variants are
-                    # covered without maintaining a separate cache.
+
+                    # If this skill's auto-generated /command collides
+                    # with a core Hermes slash command (name or alias), defer
+                    # namespaced registration to pass 2 so real skills (e.g.
+                    # a skill named 'skill-config') are not shadowed (#3096).
                     if resolve_command(cmd_name) is not None:
-                        logger.warning(
-                            "Skill %r generates slash command '/%s' which "
-                            "collides with a core Hermes command; skipping "
-                            "auto-registration. Use '/skill %s' instead.",
-                            name, cmd_name, name,
-                        )
+                        pending_colliding.append((name, cmd_name, description, skill_md))
                         continue
+
                     # Dedup on the resolved slug, not just the raw name: two
                     # distinct frontmatter names can normalize to the same
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
@@ -520,6 +522,45 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     }
                 except Exception:
                     continue
+
+        # Pass 2: Register namespaced commands for colliding skills
+        for name, cmd_name, description, skill_md in pending_colliding:
+            namespaced_key = f"/skill-{cmd_name}"
+            if namespaced_key in _skill_commands:
+                logger.warning(
+                    "Skill %r collides with core command '/%s' and '%s' is already "
+                    "claimed by %r; keeping the first and skipping this one.",
+                    name, cmd_name, namespaced_key, _skill_commands[namespaced_key]["name"],
+                )
+                continue
+            if cmd_name in _colliding_skills:
+                logger.warning(
+                    "Skill %r maps to colliding slug '%s' already claimed "
+                    "by %r; keeping the first and skipping this one.",
+                    name, cmd_name, _colliding_skills[cmd_name]["name"],
+                )
+                continue
+            logger.warning(
+                "Skill %r generates slash command '/%s' which "
+                "collides with a core Hermes command; registering "
+                "namespaced command '%s'. Use '%s' or '/skill %s' instead.",
+                name, cmd_name, namespaced_key, namespaced_key, name,
+            )
+            _colliding_skills[cmd_name] = {
+                "name": name,
+                "cmd_name": cmd_name,
+                "namespaced_key": namespaced_key,
+                "description": description or f"Invoke the {name} skill (namespaced due to collision with core /{cmd_name})",
+                "skill_md_path": str(skill_md),
+                "skill_dir": str(skill_md.parent),
+            }
+            _skill_commands[namespaced_key] = {
+                "name": name,
+                "description": description or f"Invoke the {name} skill (namespaced due to collision with core /{cmd_name})",
+                "skill_md_path": str(skill_md),
+                "skill_dir": str(skill_md.parent),
+                "collides_with": cmd_name,
+            }
     except Exception:
         pass
     return _skill_commands
@@ -608,6 +649,12 @@ def reload_skills() -> Dict[str, Any]:
     }
 
 
+def get_colliding_skills() -> Dict[str, Dict[str, Any]]:
+    """Return skills whose primary slash commands collided with core commands."""
+    get_skill_commands()
+    return dict(_colliding_skills)
+
+
 def resolve_skill_command_key(command: str) -> Optional[str]:
     """Resolve a user-typed /command to its canonical skill_cmds key.
 
@@ -618,13 +665,45 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     (which disallow hyphens, so ``/claude-code`` is registered as
     ``/claude_code`` and comes back in the underscored form).
 
+    Supports:
+    - Direct slug: ``claude-code``, ``/claude-code``, ``claude_code``
+    - Namespaced slug: ``skill-config``, ``/skill-config``, ``skill_config``
+    - Explicit invocation: ``skill config``, ``/skill config``, ``skill/config``
+
     Returns the matching ``/slug`` key from ``get_skill_commands()`` or
     ``None`` if no match.
     """
     if not command:
         return None
-    cmd_key = f"/{command.replace('_', '-')}"
-    return cmd_key if cmd_key in get_skill_commands() else None
+    raw = command.strip().replace("_", "-")
+    clean = raw.lstrip("/")
+    cmds = get_skill_commands()
+
+    # 1. Direct match with leading slash
+    direct_key = f"/{clean}"
+    if direct_key in cmds:
+        return direct_key
+
+    # 2. Namespaced or explicit skill prefix: "skill-foo" or "skill foo" or "skill/foo"
+    if clean.startswith("skill-"):
+        target = clean[6:]
+        if f"/{target}" in cmds:
+            return f"/{target}"
+        if f"/skill-{target}" in cmds:
+            return f"/skill-{target}"
+    elif clean.startswith("skill ") or clean.startswith("skill/"):
+        target = clean.split(None, 1)[1].strip() if " " in clean else clean[6:].strip()
+        target = target.replace("_", "-")
+        if f"/{target}" in cmds:
+            return f"/{target}"
+        if f"/skill-{target}" in cmds:
+            return f"/skill-{target}"
+
+    # 3. If typed bare and collided, resolve to its namespaced key
+    if clean in _colliding_skills:
+        return _colliding_skills[clean]["namespaced_key"]
+
+    return None
 
 
 def build_skill_invocation_message(
