@@ -1,0 +1,4 @@
+name: observational
+description: Deterministic syntax-aware observational context compressor for terminal logs and long-horizon tasks
+version: 1.0.0
+author: Hermes Evolution Team
