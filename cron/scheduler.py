@@ -4604,14 +4604,13 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
 
 
 def _preflight_check_skills(job: dict) -> Optional[str]:
-    """Check attached skills report ready (no missing required env/commands).
+    """Check attached skills exist and report ready (installed and no missing required env/commands).
 
     Consults the same ``readiness_status`` payload ``skill_view`` computes
-    for interactive use. Skills that fail to load at all are left to the
-    existing skipped-skill handling in ``_build_job_prompt`` (fail-open):
-    this check only blocks on an affirmative "setup needed" verdict, i.e.
-    the skill exists but its required environment is missing — a run that
-    is guaranteed to misfire.
+    for interactive use. If an attached skill or bundle member is missing/uninstalled
+    in the active profile or its required environment is missing, preflight blocks the run
+    before constructing the agent so no tokens are burned and the operator is
+    alerted (same fail-before-spend spirit as the #44585 drift guard and #27948).
     """
     skills = job.get("skills")
     if skills is None:
@@ -4623,39 +4622,83 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     if not skill_names:
         return None
 
+    from agent.skill_bundles import (
+        get_skill_bundles,
+        resolve_bundle_command_key,
+    )
+    from agent.skill_utils import normalize_skill_lookup_name
     from tools.skills_tool import skill_view
 
-    for skill_name in skill_names:
+    def _check_single_skill(name: str, context_label: str) -> Optional[str]:
+        lookup_name = normalize_skill_lookup_name(name)
         try:
-            payload = json.loads(skill_view(skill_name))
-        except Exception:
-            continue  # unreadable/missing skill → existing skip handling
-        if not isinstance(payload, dict) or not payload.get("success"):
-            continue
-        if (
+            raw = skill_view(lookup_name)
+            payload = json.loads(raw)
+        except Exception as exc:
+            logger.debug("Cron preflight: could not inspect skill '%s': %s", name, exc)
+            return None  # fail-open on transient I/O or JSON decode errors
+
+        if isinstance(payload, dict) and not payload.get("success"):
+            error_msg = payload.get("error") or "skill not found in active profile"
+            return (
+                f"{context_label} '{name}' is not installed in the active profile ({error_msg}). "
+                "Install the missing skill or detach it from this job."
+            )
+        if isinstance(payload, dict) and (
             payload.get("setup_needed")
             or payload.get("readiness_status") == "setup_needed"
         ):
             missing = [
-                f"env ${name}"
-                for name in payload.get(
+                f"env ${env_var}"
+                for env_var in payload.get(
                     "missing_required_environment_variables"
                 ) or []
             ]
             missing += [
-                f"command '{name}'"
-                for name in payload.get("missing_required_commands") or []
+                f"command '{cmd}'"
+                for cmd in payload.get("missing_required_commands") or []
             ]
             missing += [
-                f"credential file {name}"
-                for name in payload.get("missing_credential_files") or []
+                f"credential file {path}"
+                for path in payload.get("missing_credential_files") or []
             ]
             detail = ", ".join(missing) or "required setup incomplete"
             return (
-                f"attached skill '{skill_name}' is not ready: missing "
+                f"{context_label} '{name}' is not ready: missing "
                 f"{detail}. Provide the missing prerequisites or detach the "
                 "skill from this job."
             )
+        return None
+
+    for skill_name in skill_names:
+        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        if bundle_key:
+            bundles = get_skill_bundles()
+            bundle = bundles.get(bundle_key)
+            if not bundle:
+                return (
+                    f"attached skill bundle '{skill_name}' is not found in the active profile. "
+                    "Install the bundle or detach it from this job."
+                )
+            member_skills = bundle.get("skills") or []
+            if not member_skills:
+                return (
+                    f"attached skill bundle '{skill_name}' has no member skills defined. "
+                    "Add member skills or detach the bundle from this job."
+                )
+            for member in member_skills:
+                member_err = _check_single_skill(
+                    str(member).strip(),
+                    f"attached bundle '{skill_name}' member skill",
+                )
+                if member_err:
+                    return member_err
+            continue
+
+        err = _check_single_skill(skill_name, "attached skill")
+        if err:
+            return err
+
     return None
 
 

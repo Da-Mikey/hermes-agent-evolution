@@ -505,6 +505,64 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def check_job_skills_manifest(
+    skills: Optional[Union[str, List[str]]],
+) -> Tuple[List[str], List[str]]:
+    """Check a list of skill names against installed skills in the active profile.
+
+    Returns:
+        Tuple of (installed_skills, missing_skills)
+    """
+    skill_list = _normalize_skill_list(skills=skills)
+    if not skill_list:
+        return [], []
+
+    from agent.skill_bundles import get_skill_bundles, resolve_bundle_command_key
+    from agent.skill_utils import normalize_skill_lookup_name
+    from tools.skills_tool import skill_view
+
+    installed: List[str] = []
+    missing: List[str] = []
+    bundles = None
+
+    for skill_name in skill_list:
+        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        if bundle_key:
+            if bundles is None:
+                bundles = get_skill_bundles()
+            bundle = bundles.get(bundle_key)
+            if not bundle or not bundle.get("skills"):
+                missing.append(skill_name)
+                continue
+            all_members_installed = True
+            for member in bundle.get("skills", []):
+                try:
+                    raw = skill_view(normalize_skill_lookup_name(str(member).strip()))
+                    payload = json.loads(raw)
+                    if not (isinstance(payload, dict) and payload.get("success")):
+                        all_members_installed = False
+                        break
+                except Exception:
+                    all_members_installed = False
+                    break
+            if all_members_installed:
+                installed.append(skill_name)
+            else:
+                missing.append(skill_name)
+            continue
+
+        try:
+            raw = skill_view(normalize_skill_lookup_name(skill_name))
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and payload.get("success"):
+                installed.append(skill_name)
+            else:
+                missing.append(skill_name)
+        except Exception:
+            missing.append(skill_name)
+    return installed, missing
+
+
 def _coerce_job_text(value: Any, fallback: str = "") -> str:
     """Coerce legacy/hand-edited nullable cron fields to strings for readers."""
     if value is None:

@@ -405,6 +405,16 @@ def cron_create(args):
     print(f"  Schedule: {result['schedule']}")
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
+        from cron.jobs import check_job_skills_manifest
+
+        _, missing = check_job_skills_manifest(result["skills"])
+        if missing:
+            print(
+                color(
+                    f"  ⚠️ Warning: Attached skill(s) not installed in active profile: {', '.join(missing)}",
+                    Colors.YELLOW,
+                )
+            )
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
@@ -481,6 +491,16 @@ def cron_edit(args):
     print(f"  Schedule: {updated['schedule']}")
     if updated.get("skills"):
         print(f"  Skills: {', '.join(updated['skills'])}")
+        from cron.jobs import check_job_skills_manifest
+
+        _, missing = check_job_skills_manifest(updated["skills"])
+        if missing:
+            print(
+                color(
+                    f"  ⚠️ Warning: Attached skill(s) not installed in active profile: {', '.join(missing)}",
+                    Colors.YELLOW,
+                )
+            )
     else:
         print("  Skills: none")
     if updated.get("script"):
