@@ -562,3 +562,159 @@ def test_dry_run_two_failures_shared_error_creates_one_issue(hermes_home, monkey
     diag.diagnose_prs(dry_run=True, client=client, report_dir=report_dir)
     searches = [u for m, u, _ in client.calls if m == "GET" and "/search/issues" in u]
     assert len(searches) == 1  # one group -> one dedup search -> one issue
+
+
+def test_comment_on_existing_skips_when_issue_is_closed():
+    pr = diag.PRInfo(
+        number=42,
+        title="fix: example",
+        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        head_sha="sha123",
+        head_branch="fix",
+    )
+    check = diag.FailedCheck(
+        check_run_id=1,
+        name="tests",
+        conclusion="failure",
+        details_url="https://github.com/check/1",
+        head_sha="sha123",
+        annotations=[],
+    )
+    failure = diag.FailureDetails(
+        error_class="exit-code",
+        classification="complex",
+        message="error",
+        snippet="",
+        source="annotations",
+        mast_mode="3.1",
+    )
+    client = FakeClient([
+        (200, {"state": "closed", "body": "some issue body"}),
+    ])
+    diag._comment_on_existing(
+        client,
+        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        pr,
+        [(check, failure)],
+        "exit-code",
+    )
+    posts = [c for c in client.calls if c[0] == "POST"]
+    assert len(posts) == 0
+
+
+def test_comment_on_existing_skips_when_body_has_same_sha():
+    pr = diag.PRInfo(
+        number=42,
+        title="fix: example",
+        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        head_sha="sha123",
+        head_branch="fix",
+    )
+    check = diag.FailedCheck(
+        check_run_id=1,
+        name="tests",
+        conclusion="failure",
+        details_url="https://github.com/check/1",
+        head_sha="sha123",
+        annotations=[],
+    )
+    failure = diag.FailureDetails(
+        error_class="exit-code",
+        classification="complex",
+        message="error",
+        snippet="",
+        source="annotations",
+        mast_mode="3.1",
+    )
+    client = FakeClient([
+        (200, {"state": "open", "body": "Head SHA: `sha123`"}),
+    ])
+    diag._comment_on_existing(
+        client,
+        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        pr,
+        [(check, failure)],
+        "exit-code",
+    )
+    posts = [c for c in client.calls if c[0] == "POST"]
+    assert len(posts) == 0
+
+
+def test_comment_on_existing_skips_when_comment_has_same_sha_or_url():
+    pr = diag.PRInfo(
+        number=42,
+        title="fix: example",
+        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        head_sha="sha123",
+        head_branch="fix",
+    )
+    check = diag.FailedCheck(
+        check_run_id=1,
+        name="tests",
+        conclusion="failure",
+        details_url="https://github.com/check/1",
+        head_sha="sha123",
+        annotations=[],
+    )
+    failure = diag.FailureDetails(
+        error_class="exit-code",
+        classification="complex",
+        message="error",
+        snippet="",
+        source="annotations",
+        mast_mode="3.1",
+    )
+    client = FakeClient([
+        (200, {"state": "open", "body": "Head SHA: `old_sha`"}),
+        (200, [{"body": "Additional failing check run(s) for `exit-code` on PR #42 (HEAD `sha123`):\n- tests: https://github.com/check/1"}]),
+    ])
+    diag._comment_on_existing(
+        client,
+        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        pr,
+        [(check, failure)],
+        "exit-code",
+    )
+    posts = [c for c in client.calls if c[0] == "POST"]
+    assert len(posts) == 0
+
+
+def test_comment_on_existing_posts_when_new_sha_on_open_issue():
+    pr = diag.PRInfo(
+        number=42,
+        title="fix: example",
+        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        head_sha="new_sha_456",
+        head_branch="fix",
+    )
+    check = diag.FailedCheck(
+        check_run_id=1,
+        name="tests",
+        conclusion="failure",
+        details_url="https://github.com/check/1",
+        head_sha="new_sha_456",
+        annotations=[],
+    )
+    failure = diag.FailureDetails(
+        error_class="exit-code",
+        classification="complex",
+        message="error",
+        snippet="",
+        source="annotations",
+        mast_mode="3.1",
+    )
+    client = FakeClient([
+        (200, {"state": "open", "body": "Head SHA: `old_sha_123`"}),
+        (200, []),
+        (201, {"id": 1, "body": "comment text"}),
+    ])
+    diag._comment_on_existing(
+        client,
+        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        pr,
+        [(check, failure)],
+        "exit-code",
+    )
+    posts = [c for c in client.calls if c[0] == "POST"]
+    assert len(posts) == 1
+    assert "new_sha_456" in (posts[0][2] or "")

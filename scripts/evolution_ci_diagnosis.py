@@ -658,10 +658,42 @@ def _comment_on_existing(
     failures: List[Tuple[FailedCheck, FailureDetails]],
     error_class: str,
 ) -> None:
-    """Attach additional failing check runs to an existing issue."""
+    """Attach additional failing check runs to an existing issue if not already recorded."""
     match = re.search(r"/issues/(\d+)$", existing_url)
     if not match:
         return
+    issue_number = match.group(1)
+
+    # 1. Check if the issue is open and if the body already covers this HEAD SHA
+    issue_data = _get(client, f"{_GITHUB_API}/repos/{_REPO}/issues/{issue_number}")
+    if isinstance(issue_data, dict):
+        if issue_data.get("state") != "open":
+            print(
+                f"[ci-diagnosis] issue #{issue_number} is closed — skipping comment",
+                file=sys.stderr,
+            )
+            return
+        body = str(issue_data.get("body", ""))
+        if pr.head_sha and pr.head_sha in body:
+            return
+
+    # 2. Check existing comments to prevent duplicate comments across runs/nodes
+    comments_data = _get(
+        client, f"{_GITHUB_API}/repos/{_REPO}/issues/{issue_number}/comments"
+    )
+    if isinstance(comments_data, list):
+        for comment in comments_data:
+            if isinstance(comment, dict):
+                c_body = str(comment.get("body", ""))
+                if pr.head_sha and pr.head_sha in c_body:
+                    return
+                if failures and all(
+                    check.details_url in c_body
+                    for check, _ in failures
+                    if check.details_url
+                ):
+                    return
+
     lines = [
         f"Additional failing check run(s) for `{error_class}` on PR "
         f"#{pr.number} (HEAD `{pr.head_sha}`):",
@@ -669,7 +701,7 @@ def _comment_on_existing(
     ]
     for check, failure in failures:
         lines.append(f"- {check.name}: {check.details_url}")
-    url = f"{_GITHUB_API}/repos/{_REPO}/issues/{match.group(1)}/comments"
+    url = f"{_GITHUB_API}/repos/{_REPO}/issues/{issue_number}/comments"
     status, response = client("POST", url, json.dumps({"body": "\n".join(lines)}))
     if status not in {201, 200}:
         print(
