@@ -22,16 +22,9 @@ def _install_discover_spy(monkeypatch):
     def _discover():
         calls.append("discover")
 
-    monkeypatch.setitem(
-        sys.modules,
-        "hermes_cli.plugins",
-        types.SimpleNamespace(
-            discover_plugins=_discover,
-            # main.py now kicks discovery off in a background thread; both
-            # entry points count as "discovery work happened in the launcher".
-            start_background_plugin_discovery=_discover,
-        ),
-    )
+    import hermes_cli.plugins  # noqa: F401
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", _discover, raising=False)
+    monkeypatch.setattr("hermes_cli.plugins.start_background_plugin_discovery", _discover, raising=False)
     return calls
 
 
