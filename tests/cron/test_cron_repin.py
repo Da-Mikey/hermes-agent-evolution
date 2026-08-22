@@ -67,6 +67,32 @@ class TestCronRepin:
             assert job["provider_snapshot"] is None
             assert job["model_snapshot"] is None
 
+    def test_repin_failsafe_when_resolution_fails(self, tmp_path):
+        _create_test_job(tmp_path)
+
+        with cron_jobs.use_cron_store(tmp_path),              patch("cron.jobs._compute_provider_model_snapshots", return_value=(None, None)):
+            updated = cron_jobs.repin_jobs(job_ids=["job-1"])
+            assert len(updated) == 0
+            job = cron_jobs.get_job("job-1")
+            # Snapshots and flags must remain intact to prevent silent unspendable state
+            assert job["provider_snapshot"] == "anthropic"
+            assert job["model_snapshot"] == "claude-3-5-sonnet"
+            assert job.get("drift_alerted") is True
+
+    def test_repin_specific_job_with_drifted_only_ignores_healthy(self, tmp_path):
+        _create_test_job(
+            tmp_path,
+            provider_snapshot="openrouter",
+            model_snapshot="deepseek/deepseek-chat",
+            last_status="success",
+            last_error=None,
+            drift_alerted=False,
+        )
+
+        with cron_jobs.use_cron_store(tmp_path),              patch("cron.jobs._compute_provider_model_snapshots", return_value=("openrouter", "deepseek/deepseek-chat")):
+            updated = cron_jobs.repin_jobs(job_ids=["job-1"], drifted_only=True)
+            assert len(updated) == 0
+
     def test_repin_cli_command(self, tmp_path, capsys):
         _create_test_job(tmp_path)
         args = MagicMock()
@@ -82,3 +108,47 @@ class TestCronRepin:
             out = capsys.readouterr().out
             assert "Re-pinned baseline for 1 job" in out
             assert "job-1" in out
+
+    def test_repin_cli_rejects_both_job_id_and_all(self, tmp_path, capsys):
+        _create_test_job(tmp_path)
+        args = MagicMock()
+        args.cron_command = "repin"
+        args.job_id = "job-1"
+        args.all = True
+        args.drifted = False
+        args.pin = False
+
+        with cron_jobs.use_cron_store(tmp_path):
+            code = cron_command(args)
+            assert code == 1
+            out = capsys.readouterr().out
+            assert "Cannot specify both a job ID and --all" in out
+
+    def test_cli_create_with_pin(self, tmp_path, capsys):
+        args = MagicMock()
+        args.cron_command = "create"
+        args.schedule = "every 2h"
+        args.prompt = "check server"
+        args.name = "server check"
+        args.deliver = "local"
+        args.repeat = None
+        args.skill = None
+        args.skills = None
+        args.script = None
+        args.workdir = None
+        args.model = None
+        args.model_provider = None
+        args.no_agent = False
+        args.monitor_script = None
+        args.monitor_url = None
+        args.continuity = None
+        args.pin = True
+
+        with cron_jobs.use_cron_store(tmp_path),              patch("cron.jobs._compute_provider_model_snapshots", return_value=("nous", "hermes-3-llama-3.1-405b")):
+            code = cron_command(args)
+            assert code == 0
+            jobs = cron_jobs.load_jobs()
+            assert len(jobs) == 1
+            assert jobs[0]["provider"] == "nous"
+            assert jobs[0]["model"] == "hermes-3-llama-3.1-405b"
+            assert jobs[0]["provider_snapshot"] is None

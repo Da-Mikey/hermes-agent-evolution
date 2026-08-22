@@ -612,7 +612,11 @@ def repin_jobs(
             no_agent=False,
         )
 
-        if drifted_only and target_id_set is None:
+        if not snap_p and not snap_m:
+            # Cannot establish runtime baseline; do not corrupt existing drift protection
+            continue
+
+        if drifted_only:
             is_flagged = (
                 job.get("last_status") == "drift_skip"
                 or bool(job.get("drift_alerted"))
@@ -633,14 +637,14 @@ def repin_jobs(
         if pin_explicitly:
             if snap_p:
                 job["provider"] = snap_p
+                job["provider_snapshot"] = None
             if snap_m:
                 job["model"] = snap_m
-            job["provider_snapshot"] = None
-            job["model_snapshot"] = None
+                job["model_snapshot"] = None
         else:
-            if job.get("provider") is None:
+            if job.get("provider") is None and snap_p:
                 job["provider_snapshot"] = snap_p
-            if job.get("model") is None:
+            if job.get("model") is None and snap_m:
                 job["model_snapshot"] = snap_m
 
         job.pop("drift_alerted", None)

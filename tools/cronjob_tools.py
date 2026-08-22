@@ -1491,6 +1491,7 @@ def cronjob(
     delivery_verbosity: Optional[str] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    pin_inference: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1613,6 +1614,7 @@ def cronjob(
                     delivery_verbosity=delivery_verbosity,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    pin_inference=bool(pin_inference),
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()

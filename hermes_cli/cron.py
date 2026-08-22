@@ -396,6 +396,7 @@ def cron_create(args):
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
+        pin_inference=getattr(args, "pin", False) or None,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -649,6 +650,10 @@ def cron_repin(args) -> int:
     all_jobs = bool(getattr(args, "all", False))
     drifted_only = bool(getattr(args, "drifted", False))
     pin = bool(getattr(args, "pin", False))
+
+    if job_id and all_jobs:
+        print(color("Cannot specify both a job ID and --all.", Colors.RED))
+        return 1
 
     target_ids = None
     if job_id:
