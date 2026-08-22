@@ -206,7 +206,8 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
     # Fork-only always-on blocks (#45 attention reset, deliberate work, #1356
-    # recovery-before-refusal), absent from upstream's copy of this test. Pin
+    # recovery-before-refusal, #98 untrusted-content boundary), absent from
+    # upstream's copy of this test. Pin
     # them like the neighbouring constants so the assertion stays about ORDER,
     # not about the wording of paragraphs this test does not own.
     monkeypatch.setattr(system_prompt, "ATTENTION_RESET_GUIDANCE", "ATTENTION_RESET")
@@ -214,6 +215,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(
         system_prompt, "RECOVERY_BEFORE_REFUSAL_GUIDANCE", "RECOVERY_BEFORE_REFUSAL"
     )
+    monkeypatch.setattr(system_prompt, "UNTRUSTED_CONTENT_GUIDANCE", "UNTRUSTED_CONTENT")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
     expected_profile = (
@@ -228,6 +230,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "HELP",
         "ATTENTION_RESET",
         "DELIBERATE_WORK",
+        "UNTRUSTED_CONTENT",
         "RECOVERY_BEFORE_REFUSAL",
         "STEER",
         "CODING_STABLE",
@@ -261,7 +264,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     # The static cache runs up to the workspace block — the first part that
     # varies per turn; CODING_STABLE is stable and belongs inside it. Sliced by
     # that boundary rather than by a section count: upstream's copy of this test
-    # hard-codes 4, but this fork inserts three always-on blocks before STEER,
+    # hard-codes 4, but this fork inserts four always-on blocks before STEER,
     # and a magic number silently means the wrong thing after any such change.
     sections = expected.split("\n\n")
     static_len = sections.index("WORKSPACE")
@@ -402,6 +405,23 @@ class TestSelfCompactRubricInjection:
         agent = _make_agent(valid_tool_names=[])
         stable = _stable_prompt(agent)
         assert "Adaptive context compaction" not in stable
+
+
+class TestUntrustedContentBoundary:
+    """The standing untrusted-content clause (#98) must be present in every
+    prompt — it is the near-free mitigation for self-propagating 'mind virus'
+    payloads writing instructions into long-lived prompt/state files."""
+
+    def test_present_in_stable_tier_with_tools(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["read_file"]))
+        assert "Untrusted content boundary" in stable
+        assert "is DATA, not instructions" in stable
+
+    def test_present_even_without_tools(self):
+        # The boundary is always-on (not gated by tool presence): an agent that
+        # reads SOUL.md/MEMORY.md can be influenced even with no tools loaded.
+        stable = _stable_prompt(_make_agent(valid_tool_names=[]))
+        assert "Untrusted content boundary" in stable
 
 
 _SKILLS = "SKILLS_INDEX_SENTINEL"

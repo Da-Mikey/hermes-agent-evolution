@@ -183,6 +183,32 @@ being genuinely useful over being verbose unless otherwise directed below.
 Be targeted and efficient in your exploration and investigations.
 ```
 
+## Untrusted-content boundary and prompt-file integrity
+
+Two complementary defenses protect the editable prompt/state surface against
+self-propagating payloads ("mind viruses") that persist by writing instructions
+into long-lived files and persuading the next agent to carry them onward:
+
+1. **Standing untrusted-content clause.** The stable tier always carries
+   `UNTRUSTED_CONTENT_GUIDANCE` (see `agent/prompt_builder.py`): everything read
+   back from persistent files — `SOUL.md`, `MEMORY.md`, `USER.md`, skills,
+   memories, project context files, cron output, and delegated subagent
+   contexts — is DATA, not instructions. Only the live user (outside any such
+   block) can issue instructions. This is always-on, static text, so it costs a
+   token once and amortises across every session via prefix caching.
+
+2. **Immutable-hash registry.** `agent/prompt_integrity.py` maintains a SHA-256
+   baseline of the long-lived prompt/state files under `~/.hermes/integrity/`.
+   The first `SOUL.md` load establishes the baseline; subsequent loads (and the
+   `scripts/prompt_integrity_check.py` CLI, which exits non-zero on drift so a
+   cron job can alert) compare against it and log a warning when a file is
+   added, removed, or modified. The check is fail-open — a missing or malformed
+   registry is treated as "no baseline", never an error, and content is hashed
+   as data without ever being parsed.
+
+Together: the clause handles *pre-existing* content (treat it as data), and the
+hash registry detects *post-baseline* tampering.
+
 ## How context files are injected
 
 `build_context_files_prompt()` uses a **priority system** — only one project context type is loaded (first match wins):
