@@ -517,16 +517,40 @@ def check_job_skills_manifest(
     if not skill_list:
         return [], []
 
-    from agent.skill_bundles import resolve_bundle_command_key
+    from agent.skill_bundles import get_skill_bundles, resolve_bundle_command_key
     from agent.skill_utils import normalize_skill_lookup_name
     from tools.skills_tool import skill_view
 
     installed: List[str] = []
     missing: List[str] = []
+    bundles = None
+
     for skill_name in skill_list:
-        if resolve_bundle_command_key(skill_name.lstrip("/")):
-            installed.append(skill_name)
+        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        if bundle_key:
+            if bundles is None:
+                bundles = get_skill_bundles()
+            bundle = bundles.get(bundle_key)
+            if not bundle or not bundle.get("skills"):
+                missing.append(skill_name)
+                continue
+            all_members_installed = True
+            for member in bundle.get("skills", []):
+                try:
+                    raw = skill_view(normalize_skill_lookup_name(str(member).strip()))
+                    payload = json.loads(raw)
+                    if not (isinstance(payload, dict) and payload.get("success")):
+                        all_members_installed = False
+                        break
+                except Exception:
+                    all_members_installed = False
+                    break
+            if all_members_installed:
+                installed.append(skill_name)
+            else:
+                missing.append(skill_name)
             continue
+
         try:
             raw = skill_view(normalize_skill_lookup_name(skill_name))
             payload = json.loads(raw)

@@ -344,6 +344,33 @@ class TestSkillReadiness:
         assert installed == ["installed-one"]
         assert missing == ["missing-two"]
 
+    def test_bundle_with_missing_member_blocks(self, tmp_path):
+        """A skill bundle whose member skill is missing blocks preflight."""
+        fake_bundles = {
+            "my-bundle": {
+                "name": "my-bundle",
+                "skills": ["member-one", "missing-member"],
+            }
+        }
+
+        def fake_skill_view(name, *args, **kwargs):
+            if name == "member-one":
+                return json.dumps({"success": True, "content": "hi"})
+            return json.dumps({"success": False, "error": "not found"})
+
+        job = _job(skills=["/my-bundle"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch("agent.skill_bundles.resolve_bundle_command_key", return_value="my-bundle"), \
+                 patch("agent.skill_bundles.get_skill_bundles", return_value=fake_bundles):
+                success, output, final_response, error, agent_constructed = \
+                    _run_job_patched(job, tmp_path, skill_view=fake_skill_view)
+
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None and "[blocked_config]" in error
+        assert "missing-member" in f"{error} {output}"
+
 
 class TestDeliveryPlatform:
     def test_unknown_delivery_platform_blocks(self, tmp_path):
