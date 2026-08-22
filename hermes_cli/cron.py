@@ -396,6 +396,7 @@ def cron_create(args):
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
+        pin_inference=getattr(args, "pin", False) or None,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -641,6 +642,63 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_repin(args) -> int:
+    """Handle `hermes cron repin [job_id] [--all] [--drifted] [--pin]`."""
+    from cron.jobs import AmbiguousJobReference, repin_jobs, resolve_job_ref
+
+    job_id = getattr(args, "job_id", None)
+    all_jobs = bool(getattr(args, "all", False))
+    drifted_only = bool(getattr(args, "drifted", False))
+    pin = bool(getattr(args, "pin", False))
+
+    if job_id and all_jobs:
+        print(color("Cannot specify both a job ID and --all.", Colors.RED))
+        return 1
+
+    target_ids = None
+    if job_id:
+        try:
+            resolved = resolve_job_ref(job_id)
+            if not resolved:
+                print(color(f"Job not found: {job_id}", Colors.RED))
+                return 1
+            target_ids = [resolved["id"]]
+        except AmbiguousJobReference as exc:
+            print(color(str(exc), Colors.RED))
+            return 1
+
+    # If neither --all nor specific job_id is passed, default to drifted jobs
+    if not target_ids and not all_jobs:
+        drifted_only = True
+
+    updated = repin_jobs(
+        job_ids=target_ids,
+        drifted_only=drifted_only,
+        pin_explicitly=pin,
+    )
+    if not updated:
+        print(color("No matching cron jobs to re-pin.", Colors.YELLOW))
+        return 0
+
+    verb = "Pinned" if pin else "Re-pinned baseline for"
+    print(color(f"{verb} {len(updated)} job{'s' if len(updated) != 1 else ''}:", Colors.GREEN))
+    for job in updated:
+        target_info = []
+        if pin:
+            if job.get("provider"):
+                target_info.append(f"provider={job['provider']}")
+            if job.get("model"):
+                target_info.append(f"model={job['model']}")
+        else:
+            if job.get("provider_snapshot"):
+                target_info.append(f"provider_snapshot={job['provider_snapshot']}")
+            if job.get("model_snapshot"):
+                target_info.append(f"model_snapshot={job['model_snapshot']}")
+        detail = f" ({', '.join(target_info)})" if target_info else ""
+        print(f"  • {job['id']}: {job.get('name', 'unnamed')}{detail}")
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -664,6 +722,9 @@ def cron_command(args):
     if subcmd == "notepad":
         return cron_notepad(args)
 
+    if subcmd == "repin":
+        return cron_repin(args)
+
     if subcmd in {"create", "add"}:
         return cron_create(args)
 
@@ -683,5 +744,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|repin|status|runs|tick]")
     sys.exit(1)

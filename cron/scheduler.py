@@ -5898,7 +5898,9 @@ def _run_job_impl(
                         "pin it explicitly: "
                         f"`hermes cron edit {job_id} --provider <provider> "
                         "--model <model>` (or pin the original values to keep "
-                        "them)."
+                        "them). To resume tracking the new global config: "
+                        f"`hermes cron repin {job_id}` (or `hermes cron repin --all`). "
+                        f"To hard-pin to current config: `hermes cron repin {job_id} --pin`."
                     )
                 logger.warning(
                     "Job '%s': SKIPPED — global inference config drifted since "

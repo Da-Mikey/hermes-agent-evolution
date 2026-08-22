@@ -106,6 +106,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
     cron_create.add_argument(
+        "--pin",
+        action="store_true",
+        default=False,
+        help="Pin the currently active global provider and model explicitly to this job",
+    )
+    cron_create.add_argument(
         "--continuity",
         dest="continuity",
         action="store_const",
@@ -149,16 +155,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_edit.add_argument(
         "--clear-skills",
+        dest="clear_skills",
         action="store_true",
-        help="Remove all attached skills from the job",
+        help="Detach all skills from this job.",
     )
     cron_edit.add_argument(
         "--script",
-        help=(
-            "Path to a script under ~/.hermes/scripts/. Pass empty string to clear. "
-            "With --no-agent the script IS the job; otherwise its stdout is "
-            "injected into the agent's prompt each run."
-        ),
+        help="New script path under ~/.hermes/scripts/. Pass empty string to clear.",
     )
     cron_edit.add_argument(
         "--no-agent",
@@ -167,8 +170,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         const=True,
         default=None,
         help=(
-            "Enable no-agent mode on this job (requires --script or an "
-            "existing script on the job)."
+            "Switch the job to no-agent mode (requires --script; delivers stdout verbatim). "
+            "Mutually exclusive with monitor mode."
         ),
     )
     cron_edit.add_argument(
@@ -176,7 +179,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="no_agent",
         action="store_const",
         const=False,
-        help="Disable no-agent mode on this job (reverts to LLM-driven execution).",
+        help="Switch a no-agent job back to an agent job (the script becomes prompt context).",
     )
     cron_edit.add_argument(
         "--continuity",
@@ -184,20 +187,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         action="store_const",
         const=True,
         default=None,
-        help=(
-            "Turn on run-to-run continuity: each run sees the job's own "
-            "previous output (dedupe, continue where it left off)."
-        ),
+        help="Enable continuity: each run sees the previous run's output.",
     )
     cron_edit.add_argument(
         "--no-continuity",
         dest="continuity",
         action="store_const",
         const=False,
-        help=(
-            "Turn off run-to-run continuity (other context_from job refs "
-            "are preserved)."
-        ),
+        help="Disable continuity.",
     )
     cron_edit.add_argument(
         "--monitor-script",
@@ -249,6 +246,28 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "remove", aliases=["rm", "delete"], help="Remove a scheduled job"
     )
     cron_remove.add_argument("job_id", help="Job ID to remove")
+
+    # cron repin — re-pin unpinned / drifted cron jobs to the active global provider/model
+    cron_repin = cron_subparsers.add_parser(
+        "repin",
+        help="Re-pin unpinned or drifted cron jobs to the active global provider/model",
+    )
+    cron_repin.add_argument("job_id", nargs="?", help="Specific job ID to re-pin")
+    cron_repin.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-pin all jobs across the profile",
+    )
+    cron_repin.add_argument(
+        "--drifted",
+        action="store_true",
+        help="Re-pin only jobs that currently have drift status or drift alerts",
+    )
+    cron_repin.add_argument(
+        "--pin",
+        action="store_true",
+        help="Pin provider and model explicitly (hard pin) rather than updating baseline snapshots",
+    )
 
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
