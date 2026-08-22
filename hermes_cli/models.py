@@ -4654,10 +4654,15 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
         return "chat_completions"
 
     if family == "opencode-go":
-        if normalized.startswith("gpt-"):
-            # GPT models on Go (gpt-5.6-luna) are served via /v1/responses
-            # per the published Go endpoint table, same as GPT on Zen:
-            # https://opencode.ai/docs/go/#endpoints
+        if normalized.startswith("gpt-") or normalized.startswith("grok-"):
+            # GPT and Grok models on Go (gpt-5.6-luna, grok-4.5) are served
+            # via /v1/responses per the published Go endpoint table, same as
+            # GPT/Grok on Zen: https://opencode.ai/docs/go/#endpoints
+            return "codex_responses"
+        if normalized.startswith("muse-spark"):
+            # Muse Spark (standard + contributor) is Responses-only on Go.
+            # /v1/chat/completions returns HTTP 503 with an empty assistant
+            # message; /v1/responses completes. See opencode.ai/docs/go.
             return "codex_responses"
         if normalized.startswith("minimax-"):
             return "anthropic_messages"
@@ -4667,10 +4672,17 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             return "anthropic_messages"
         return "chat_completions"
 
-    if provider == "opencode-zen":
+    if family == "opencode-zen":
         if normalized.startswith("claude-"):
             return "anthropic_messages"
-        if normalized.startswith("gpt-"):
+        if normalized.startswith("gpt-") or normalized.startswith("grok-"):
+            # GPT-5/Codex and all Grok models on Zen (grok-4.6, grok-4.5,
+            # grok-build-0.1) are served via /v1/responses per the Zen
+            # endpoint table.
+            return "codex_responses"
+        if normalized.startswith("muse-spark"):
+            # Standard Muse Spark on Zen is served via /v1/responses:
+            # https://opencode.ai/docs/zen/#endpoints
             return "codex_responses"
         if normalized.startswith("qwen"):
             # Qwen models on Zen moved to /v1/messages per the published
