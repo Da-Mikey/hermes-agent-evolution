@@ -4206,12 +4206,12 @@ def _enable_extended_enter_keys(output=None, env: Optional[Mapping[str, str]] = 
     try:
         target = output
         if target is not None and hasattr(target, "write_raw"):
-            target.write_raw(_EXTENDED_ENTER_KEYS_SEQ)
+            target.write_raw(seq)
             target.flush()
             return True
         stream = sys.stdout
         if stream is not None and stream.isatty():
-            stream.write(_EXTENDED_ENTER_KEYS_SEQ)
+            stream.write(seq)
             stream.flush()
             return True
     except Exception:
