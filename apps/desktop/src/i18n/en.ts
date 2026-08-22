@@ -3015,6 +3015,8 @@ export const en: Translations = {
   },
 
   zones: {
+    showHeader: 'Show header',
+    hideHeader: 'Hide header',
     showTabStrip: 'Show tabs',
     hideTabStrip: 'Hide tabs',
     showStripTab: title => `Show ${title}`,

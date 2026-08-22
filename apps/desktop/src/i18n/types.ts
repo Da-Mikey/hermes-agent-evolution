@@ -2585,6 +2585,8 @@ export interface Translations {
   }
 
   zones: {
+    showHeader: string
+    hideHeader: string
     showTabStrip: string
     hideTabStrip: string
     showStripTab: (title: string) => string

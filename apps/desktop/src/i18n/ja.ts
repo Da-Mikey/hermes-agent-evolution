@@ -2670,6 +2670,8 @@ export const ja = defineLocale({
   },
 
   zones: {
+    showHeader: 'ヘッダーを表示',
+    hideHeader: 'ヘッダーを隠す',
     showTabStrip: 'タブを表示',
     hideTabStrip: 'タブを隠す',
     showStripTab: title => `${title} を表示`,
