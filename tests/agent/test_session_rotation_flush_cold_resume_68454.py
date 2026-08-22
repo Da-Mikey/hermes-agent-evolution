@@ -37,6 +37,12 @@ def _make_flush_agent(db: SessionDB, session_id: str):
         _pending_cli_user_message=None,
     )
     agent._ensure_db_session = lambda: None
+    agent._ensure_session_db_usable = (
+        AIAgent._ensure_session_db_usable.__get__(agent, AIAgent)
+    )
+    agent._spool_unpersisted_messages_to_jsonl = (
+        AIAgent._spool_unpersisted_messages_to_jsonl.__get__(agent, AIAgent)
+    )
     agent._flush_messages_to_session_db = (
         AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
     )

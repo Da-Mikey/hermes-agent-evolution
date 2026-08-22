@@ -589,6 +589,12 @@ def _flush_agent(db, session_id):
         _last_persistence_error_cause=None,
     )
     agent._ensure_db_session = lambda: None
+    agent._ensure_session_db_usable = (
+        AIAgent._ensure_session_db_usable.__get__(agent, AIAgent)
+    )
+    agent._spool_unpersisted_messages_to_jsonl = (
+        AIAgent._spool_unpersisted_messages_to_jsonl.__get__(agent, AIAgent)
+    )
     agent._flush_messages_to_session_db = (
         AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
     )
