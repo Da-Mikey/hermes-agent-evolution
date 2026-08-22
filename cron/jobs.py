@@ -563,6 +563,99 @@ def check_job_skills_manifest(
     return installed, missing
 
 
+def repin_jobs(
+    job_ids: Optional[Union[str, List[str]]] = None,
+    *,
+    drifted_only: bool = False,
+    pin_explicitly: bool = False,
+) -> List[Dict[str, Any]]:
+    """Re-pin inference configuration or baseline snapshots for cron jobs.
+
+    Args:
+        job_ids: Optional job ID or list of IDs. If omitted, applies to all
+            target jobs (or all drifted jobs if ``drifted_only=True``).
+        drifted_only: When True, targets only jobs currently skipped due to drift
+            or carrying drift alerts / drifted from active global config.
+        pin_explicitly: When True, hard-pins ``provider`` and ``model`` on the job
+            to current active global values (clearing snapshots). When False,
+            updates ``provider_snapshot`` and ``model_snapshot`` to the new global
+            baseline (clearing ``drift_alerted`` flag).
+
+    Returns:
+        List of updated job dicts.
+    """
+    jobs = load_jobs()
+    if not jobs:
+        return []
+
+    target_id_set: Optional[set] = None
+    if job_ids is not None:
+        if isinstance(job_ids, str):
+            target_id_set = {job_ids.strip()}
+        else:
+            target_id_set = {str(j).strip() for j in job_ids if str(j).strip()}
+
+    updated_jobs: List[Dict[str, Any]] = []
+
+    for job in jobs:
+        if job.get("no_agent"):
+            continue
+
+        jid = job.get("id")
+        if target_id_set is not None and jid not in target_id_set:
+            continue
+
+        snap_p, snap_m = _compute_provider_model_snapshots(
+            provider=None,
+            model=None,
+            base_url=job.get("base_url"),
+            no_agent=False,
+        )
+
+        if drifted_only and target_id_set is None:
+            is_flagged = (
+                job.get("last_status") == "drift_skip"
+                or bool(job.get("drift_alerted"))
+            )
+            p_drift = (
+                job.get("provider_snapshot") is not None
+                and snap_p is not None
+                and str(job.get("provider_snapshot")).strip().lower() != str(snap_p).strip().lower()
+            )
+            m_drift = (
+                job.get("model_snapshot") is not None
+                and snap_m is not None
+                and str(job.get("model_snapshot")).strip().lower() != str(snap_m).strip().lower()
+            )
+            if not (is_flagged or p_drift or m_drift):
+                continue
+
+        if pin_explicitly:
+            if snap_p:
+                job["provider"] = snap_p
+            if snap_m:
+                job["model"] = snap_m
+            job["provider_snapshot"] = None
+            job["model_snapshot"] = None
+        else:
+            if job.get("provider") is None:
+                job["provider_snapshot"] = snap_p
+            if job.get("model") is None:
+                job["model_snapshot"] = snap_m
+
+        job.pop("drift_alerted", None)
+        if job.get("last_status") == "drift_skip":
+            job["last_status"] = None
+            job["last_error"] = None
+
+        updated_jobs.append(job)
+
+    if updated_jobs:
+        save_jobs(jobs)
+
+    return updated_jobs
+
+
 def _coerce_job_text(value: Any, fallback: str = "") -> str:
     """Coerce legacy/hand-edited nullable cron fields to strings for readers."""
     if value is None:
@@ -1951,6 +2044,7 @@ def create_job(
     delivery_verbosity: Optional[str] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    pin_inference: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2086,6 +2180,14 @@ def create_job(
         base_url=normalized_base_url,
         no_agent=normalized_no_agent,
     )
+
+    if pin_inference and not normalized_no_agent:
+        if normalized_provider is None and provider_snapshot:
+            normalized_provider = provider_snapshot
+            provider_snapshot = None
+        if normalized_model is None and model_snapshot:
+            normalized_model = model_snapshot
+            model_snapshot = None
 
     next_run_at = compute_next_run(parsed_schedule)
     if parsed_schedule.get("kind") == "once" and next_run_at is None:
