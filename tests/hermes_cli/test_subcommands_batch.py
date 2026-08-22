@@ -14,6 +14,7 @@ import argparse
 import pytest
 
 from hermes_cli.subcommands.auth import build_auth_parser
+from hermes_cli.subcommands.audit import build_audit_parser
 from hermes_cli.subcommands.backup import build_backup_parser
 from hermes_cli.subcommands.config import build_config_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
@@ -62,6 +63,7 @@ SINGLE_HANDLER_CASES = [
     ("hooks", build_hooks_parser, "cmd_hooks", ["hooks"]),
     ("doctor", build_doctor_parser, "cmd_doctor", ["doctor"]),
     ("security", build_security_parser, "cmd_security", ["security"]),
+    ("audit", build_audit_parser, "cmd_audit", ["audit", "verify"]),
     ("dump", build_dump_parser, "cmd_dump", ["dump"]),
     ("debug", build_debug_parser, "cmd_debug", ["debug"]),
     ("backup", build_backup_parser, "cmd_backup", ["backup"]),

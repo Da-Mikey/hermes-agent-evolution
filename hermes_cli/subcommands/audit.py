@@ -94,5 +94,10 @@ def build_audit_parser(subparsers, *, cmd_audit: Callable) -> None:
         default=None,
         help="Override retention window in days",
     )
+    prune_parser.add_argument(
+        "--path",
+        default=None,
+        help="Custom path to audit trail JSONL file",
+    )
 
     audit_parser.set_defaults(func=cmd_audit)

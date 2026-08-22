@@ -33,7 +33,7 @@ def cmd_audit(args) -> None:
 
         print(f"═══ Audit Trail for Session: {session_id} ═══")
         chain_icon = "✓" if recon["valid_chain"] else "✗"
-        print(f"Chain Integrity: {chain_icon} ({recon['event_count']} events in session)")
+        print(f"Global Hash-Chain Integrity: {chain_icon} ({recon['event_count']} events in session)")
         summary = recon["summary"]
         print(
             f"Summary: {summary['actions_count']} actions, "
@@ -60,9 +60,9 @@ def cmd_audit(args) -> None:
             print("🔀 Subagent Delegations:")
             for d in recon["delegations"]:
                 status = d.get("status", "unknown")
-                tid = d.get("task_id", "")
-                inp = d.get("inputs", {})
-                goal = inp.get("goal") if isinstance(inp, dict) else str(inp)
+                tid = d.get("task_id", "subagent")
+                meta = d.get("metadata", {})
+                goal = meta.get("goal") or d.get("inputs_digest") or ""
                 print(f"  [{status}] {tid}: {str(goal)[:80]}")
             print()
 
@@ -80,7 +80,10 @@ def cmd_audit(args) -> None:
         session_id = getattr(args, "session_id", None)
         event_type = getattr(args, "event_type", None)
         limit = getattr(args, "limit", 50)
-        events = audit_trail.query_trail(session_id=session_id, event_type=event_type, limit=limit)
+        path = Path(args.path) if getattr(args, "path", None) else None
+        events = audit_trail.query_trail(
+            session_id=session_id, event_type=event_type, limit=limit, path=path
+        )
 
         if getattr(args, "json", False):
             print(json.dumps([e["payload"] for e in events], indent=2, ensure_ascii=False))
@@ -97,6 +100,12 @@ def cmd_audit(args) -> None:
 
     elif subcmd == "prune":
         days = getattr(args, "days", None)
+        path = Path(args.path) if getattr(args, "path", None) else None
         now = time.time()
-        removed = audit_trail.prune(now=now)
+        removed = audit_trail.prune(days=days, now=now, path=path)
         print(f"✓ Pruned {removed} expired audit trail event(s). Hash chain re-anchored.")
+
+    else:
+        print(f"unknown audit subcommand: {subcmd}", file=sys.stderr)
+        sys.exit(2)
+

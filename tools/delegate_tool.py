@@ -5501,15 +5501,17 @@ def delegate_task(
                 if _entry.get("spill_path"):
                     _art_refs.append(f"file://{_entry['spill_path']}")
                 _st = "success" if _entry.get("status") == "completed" else str(_entry.get("status", "failure"))
+                _goal_text = task_labels[_t_idx] if _t_idx < len(task_labels) else ""
                 record_event(
                     event_type="delegation",
                     session_id=_sid,
                     task_id=_tid,
                     tool_name="delegate_task",
-                    inputs={"goal": task_labels[_t_idx] if _t_idx < len(task_labels) else "", "summary": _entry.get("summary")},
+                    inputs={"goal": _goal_text, "summary": _entry.get("summary")},
                     artifact_refs=_art_refs,
                     status=_st,
                     metadata={
+                        "goal": _goal_text,
                         "duration_seconds": _entry.get("duration_seconds", 0),
                         "api_calls": _entry.get("api_calls", 0),
                         "error": _entry.get("error"),
