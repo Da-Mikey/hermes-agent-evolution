@@ -17769,6 +17769,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 skill_cmds = get_skill_commands()
                 cmd_key = resolve_skill_command_key(command)
+                _custom_instruction = None
+                if cmd_key is None and command.lower() in {"skill", "skills"}:
+                    _args_raw = event.get_command_args().strip()
+                    if _args_raw:
+                        _parts = _args_raw.split(None, 1)
+                        _first = _parts[0].lower()
+                        if _first not in {"pending", "approve", "apply", "reject", "deny", "drop", "diff", "approval", "mode"}:
+                            _sub_match = resolve_skill_command_key(_parts[0])
+                            if _sub_match:
+                                cmd_key = _sub_match
+                                _custom_instruction = _parts[1] if len(_parts) > 1 else ""
                 if cmd_key is not None:
                     # Check per-platform disabled status before executing.
                     # get_skill_commands() only applies the *global* disabled
@@ -17783,7 +17794,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"The **{_skill_name}** skill is disabled for {_plat}.\n"
                                 f"Enable it with: `hermes skills config`"
                             )
-                    user_instruction = event.get_command_args().strip()
+                    user_instruction = (
+                        _custom_instruction
+                        if _custom_instruction is not None
+                        else event.get_command_args().strip()
+                    )
                     # Stacked slash-skill invocations: `/skill-a /skill-b do
                     # XYZ` loads every leading skill (up to 5), not just the
                     # first. Inspired by Claude Code v2.1.199. Mirrors CLI.

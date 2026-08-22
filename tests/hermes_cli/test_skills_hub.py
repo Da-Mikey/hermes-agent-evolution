@@ -394,3 +394,25 @@ def test_do_update_unmodified_skill_updates_normally(monkeypatch, tmp_path):
 
     assert installs == ["someone/hub-skill"]
     assert "Updated 1 skill(s)" in sink.getvalue()
+
+
+def test_do_list_displays_colliding_skills_notice(monkeypatch, three_source_env):
+    """When colliding skills exist, do_list prints a notice with namespaced keys."""
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    with patch(
+        "agent.skill_commands.get_colliding_skills",
+        return_value={
+            "config": {
+                "name": "config",
+                "namespaced_key": "/skill-config",
+            }
+        },
+    ):
+        do_list(console=console)
+
+    out = sink.getvalue()
+    assert "match core commands and use namespaced slash commands" in out
+    assert "/skill-config" in out
+    assert "/skill config" in out

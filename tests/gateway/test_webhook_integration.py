@@ -204,6 +204,55 @@ class TestSkillsInjection:
             assert "You are a code reviewer" in event.text
             mock_build.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_colliding_skill_injected_into_webhook_prompt(self):
+        """When a route has a colliding skill like skills: ['config'],
+        resolve_skill_command_key resolves it to /skill-config and injects it."""
+        routes = {
+            "config-hook": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["push"],
+                "prompt": "Inspect config update",
+                "skills": ["config"],
+            }
+        }
+        adapter = _make_adapter(routes)
+        captured_events: list[MessageEvent] = []
+
+        async def _capture(event: MessageEvent):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+
+        skill_content = "Loaded colliding config skill content."
+
+        with patch(
+            "agent.skill_commands.build_skill_invocation_message",
+            return_value=skill_content,
+        ) as mock_build, patch(
+            "agent.skill_commands.get_skill_commands",
+            return_value={"/skill-config": {"name": "config"}},
+        ), patch(
+            "agent.skill_commands.resolve_skill_command_key",
+            return_value="/skill-config",
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/config-hook",
+                    json={"ref": "refs/heads/main"},
+                    headers={
+                        "X-GitHub-Event": "push",
+                        "X-GitHub-Delivery": "skill-test-002",
+                    },
+                )
+                assert resp.status == 202
+
+            await asyncio.sleep(0.05)
+            assert len(captured_events) == 1
+            assert captured_events[0].text == skill_content
+            mock_build.assert_called_once_with("/skill-config", user_instruction="Inspect config update")
+
 
 # ===================================================================
 # Test 3: Cross-platform delivery (webhook → Telegram)
