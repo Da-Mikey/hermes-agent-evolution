@@ -571,6 +571,8 @@ def repin_jobs(
 ) -> List[Dict[str, Any]]:
     """Re-pin inference configuration or baseline snapshots for cron jobs.
 
+    Thread- and process-safe under ``_jobs_lock()``.
+
     Args:
         job_ids: Optional job ID or list of IDs. If omitted, applies to all
             target jobs (or all drifted jobs if ``drifted_only=True``).
@@ -584,80 +586,93 @@ def repin_jobs(
     Returns:
         List of updated job dicts.
     """
-    jobs = load_jobs()
-    if not jobs:
-        return []
+    with _jobs_lock():
+        jobs = load_jobs()
+        if not jobs:
+            return []
 
-    target_id_set: Optional[set] = None
-    if job_ids is not None:
-        if isinstance(job_ids, str):
-            target_id_set = {job_ids.strip()}
-        else:
-            target_id_set = {str(j).strip() for j in job_ids if str(j).strip()}
+        target_id_set: Optional[set] = None
+        if job_ids is not None:
+            if isinstance(job_ids, str):
+                target_id_set = {job_ids.strip()}
+            else:
+                target_id_set = {str(j).strip() for j in job_ids if str(j).strip()}
 
-    updated_jobs: List[Dict[str, Any]] = []
+        updated_jobs: List[Dict[str, Any]] = []
 
-    for job in jobs:
-        if job.get("no_agent"):
-            continue
-
-        jid = job.get("id")
-        if target_id_set is not None and jid not in target_id_set:
-            continue
-
-        snap_p, snap_m = _compute_provider_model_snapshots(
-            provider=None,
-            model=None,
-            base_url=job.get("base_url"),
-            no_agent=False,
-        )
-
-        if not snap_p and not snap_m:
-            # Cannot establish runtime baseline; do not corrupt existing drift protection
-            continue
-
-        if drifted_only:
-            is_flagged = (
-                job.get("last_status") == "drift_skip"
-                or bool(job.get("drift_alerted"))
-            )
-            p_drift = (
-                job.get("provider_snapshot") is not None
-                and snap_p is not None
-                and str(job.get("provider_snapshot")).strip().lower() != str(snap_p).strip().lower()
-            )
-            m_drift = (
-                job.get("model_snapshot") is not None
-                and snap_m is not None
-                and str(job.get("model_snapshot")).strip().lower() != str(snap_m).strip().lower()
-            )
-            if not (is_flagged or p_drift or m_drift):
+        for job in jobs:
+            if job.get("no_agent"):
                 continue
 
-        if pin_explicitly:
-            if snap_p:
-                job["provider"] = snap_p
-                job["provider_snapshot"] = None
-            if snap_m:
-                job["model"] = snap_m
-                job["model_snapshot"] = None
-        else:
-            if job.get("provider") is None and snap_p:
-                job["provider_snapshot"] = snap_p
-            if job.get("model") is None and snap_m:
-                job["model_snapshot"] = snap_m
+            jid = job.get("id")
+            if target_id_set is not None and jid not in target_id_set:
+                continue
 
-        job.pop("drift_alerted", None)
-        if job.get("last_status") == "drift_skip":
-            job["last_status"] = None
-            job["last_error"] = None
+            snap_p, snap_m = _compute_provider_model_snapshots(
+                provider=None,
+                model=None,
+                base_url=job.get("base_url"),
+                no_agent=False,
+            )
 
-        updated_jobs.append(job)
+            # Invariant: every unpinned axis must resolve; do not partially pin
+            unpinned_p = job.get("provider") is None
+            unpinned_m = job.get("model") is None
+            if unpinned_p and not snap_p:
+                continue
+            if unpinned_m and not snap_m:
+                continue
 
-    if updated_jobs:
-        save_jobs(jobs)
+            if drifted_only:
+                is_flagged = (
+                    job.get("last_status") == "drift_skip"
+                    or bool(job.get("drift_alerted"))
+                    or "[drift_skip]" in str(job.get("last_error") or "")
+                )
+                p_drift = (
+                    job.get("provider_snapshot") is not None
+                    and snap_p is not None
+                    and str(job.get("provider_snapshot")).strip().lower() != str(snap_p).strip().lower()
+                )
+                m_drift = (
+                    job.get("model_snapshot") is not None
+                    and snap_m is not None
+                    and str(job.get("model_snapshot")).strip().lower() != str(snap_m).strip().lower()
+                )
+                if not (is_flagged or p_drift or m_drift):
+                    continue
 
-    return updated_jobs
+            if pin_explicitly:
+                if unpinned_p and snap_p:
+                    job["provider"] = snap_p
+                    job["provider_snapshot"] = None
+                if unpinned_m and snap_m:
+                    job["model"] = snap_m
+                    job["model_snapshot"] = None
+            else:
+                if unpinned_p and snap_p:
+                    job["provider_snapshot"] = snap_p
+                if unpinned_m and snap_m:
+                    job["model_snapshot"] = snap_m
+
+            # Heal drift error and alert markers
+            job.pop("drift_alerted", None)
+            if (
+                job.get("last_status") == "drift_skip"
+                or "[drift_skip]" in str(job.get("last_error") or "")
+            ):
+                job["last_status"] = None
+                job["last_error"] = None
+                job["consecutive_errors"] = 0
+                if job.get("state") == "paused" and job.get("enabled"):
+                    job["state"] = "scheduled"
+
+            updated_jobs.append(job)
+
+        if updated_jobs:
+            _save_jobs_unlocked(jobs)
+
+        return updated_jobs
 
 
 def _coerce_job_text(value: Any, fallback: str = "") -> str:
@@ -1968,9 +1983,20 @@ def _compute_provider_model_snapshots(
     model_snapshot: Optional[str] = None
     if normalized_provider is None:
         try:
+            from hermes_cli.config import read_user_config_raw
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            runtime_kwargs = {"requested": None}
+            _cron_def_provider = None
+            try:
+                _cfg = read_user_config_raw() or {}
+                _cron_cfg = _cfg.get("cron") or {}
+                if isinstance(_cron_cfg, dict):
+                    _cron_def_provider = (
+                        _cron_cfg.get("model_provider") or _cron_cfg.get("provider")
+                    )
+            except Exception:
+                pass
+            runtime_kwargs = {"requested": _cron_def_provider or None}
             if normalized_base_url:
                 runtime_kwargs["explicit_base_url"] = normalized_base_url
             snap = resolve_runtime_provider(**runtime_kwargs)
