@@ -1654,6 +1654,16 @@ def _classify_mcp_failure(exc: BaseException) -> str:
         return "permanent"
     if isinstance(root, (NonMcpEndpointError, InvalidMcpUrlError)):
         return "permanent"
+    # Shadow-MCP deny verdict (#90): a policy-deny never clears on retry, so
+    # classify it as permanent to terminate the server task immediately instead
+    # of parking in the reconnect-backoff ladder.
+    try:
+        from evolution.lib.shadow_mcp import ShadowMcpDeniedError  # noqa: PLC0415
+
+        if isinstance(root, ShadowMcpDeniedError):
+            return "permanent"
+    except Exception:
+        pass
     # Stdio command missing: FileNotFoundError, or an OSError carrying ENOENT.
     if isinstance(root, FileNotFoundError):
         return "permanent"
@@ -3850,6 +3860,9 @@ class MCPServerTask:
             )
 
         url = config["url"]
+        # Shadow-MCP governance (#90): record the outbound endpoint and apply
+        # the config-driven allow/deny policy before any bytes leave the box.
+        _govern_outbound_endpoint(self.name, url)
         headers = dict(config.get("headers") or {})
         # Portable Agent Plugins v1 packages set strict_redirect_headers:
         # configured headers are visible package data and MUST NOT be
@@ -6205,6 +6218,37 @@ def _load_mcp_config() -> Dict[str, dict]:
 # ---------------------------------------------------------------------------
 # Server connection helper
 # ---------------------------------------------------------------------------
+
+
+def _govern_outbound_endpoint(server_name: str, url: str) -> None:
+    """Shadow-MCP governance: record + enforce an outbound HTTP endpoint (issue #90).
+
+    Logs every outbound MCP HTTP/SSE endpoint contact and applies the
+    config-driven allow/deny policy from ``config.yaml`` ``shadow_mcp``. A
+    ``deny`` verdict raises :class:`ShadowMcpDeniedError` to refuse the
+    connection — a DISTINCT type that :func:`_classify_mcp_failure` marks
+    ``permanent``, so the server task terminates immediately instead of
+    parking in the reconnect-backoff ladder (an ``alert`` verdict is logged as
+    a warning by the governor itself). Fails open on any import/runtime error
+    so shadow governance can never break MCP dispatch.
+    """
+    if not url:
+        return
+    try:
+        from evolution.lib.shadow_mcp import DENY, ShadowMcpDeniedError, get_governor  # noqa: PLC0415
+
+        verdict = get_governor().record_contact(server_name, url)
+        if verdict == DENY:
+            raise ShadowMcpDeniedError(
+                f"MCP server '{server_name}' endpoint {url} is blocked by the "
+                "shadow_mcp deny policy"
+            )
+    except ShadowMcpDeniedError:
+        raise
+    except Exception:
+        logger.debug(
+            "shadow-mcp governance check failed for '%s'", server_name, exc_info=True
+        )
 
 
 async def _connect_server(name: str, config: dict) -> MCPServerTask:
