@@ -150,11 +150,16 @@ def test_record_event_and_query_trail(tmp_path):
 
     assert entry1 is not None and entry2 is not None and entry3 is not None
 
-    # Query filtered by session
+    # Query filtered by session (default newest_first=True)
     s1_events = audit_trail.query_trail(session_id="session-1", path=log)
     assert len(s1_events) == 2
-    assert s1_events[0]["payload"]["event_type"] == "action"
-    assert s1_events[1]["payload"]["event_type"] == "validation"
+    assert s1_events[0]["payload"]["event_type"] == "validation"
+    assert s1_events[1]["payload"]["event_type"] == "action"
+
+    # Query with newest_first=False
+    s1_events_chrono = audit_trail.query_trail(session_id="session-1", newest_first=False, path=log)
+    assert s1_events_chrono[0]["payload"]["event_type"] == "action"
+    assert s1_events_chrono[1]["payload"]["event_type"] == "validation"
 
     # Query filtered by event_type
     val_events = audit_trail.query_trail(event_type="validation", path=log)
@@ -198,8 +203,77 @@ def test_reconstruct_run_dag(tmp_path):
     assert any("test://pytest tests/test_model.py:passed" in v for v in recon["validations"])
     assert len(recon["delegations"]) == 1
     assert recon["summary"]["success_rate"] == 1.0
-    assert recon["summary"]["actions_count"] == 2
+    assert recon["summary"]["actions_count"] == 1
+    assert recon["summary"]["validations_count"] == 1
     assert recon["summary"]["delegations_count"] == 1
+
+
+def test_concurrent_append_maintains_hash_chain(tmp_path):
+    import concurrent.futures
+
+    log = tmp_path / "concurrent_audit.jsonl"
+    num_threads = 10
+    records_per_thread = 15
+
+    def _worker(thread_idx):
+        for i in range(records_per_thread):
+            audit_trail.record_event(
+                event_type="action",
+                session_id=f"session-{thread_idx}",
+                tool_name="terminal",
+                inputs={"cmd": f"echo {thread_idx}_{i}"},
+                path=log,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [executor.submit(_worker, t) for t in range(num_threads)]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    valid, count = audit_trail.verify(log)
+    assert valid is True
+    assert count == num_threads * records_per_thread
+
+
+def test_sanitize_metadata_redacts_and_truncates():
+    raw_meta = {
+        "api_key": "sk-secret-12345",
+        "result": "Authorization: Bearer my-top-secret-token-abcdef12345\nOutput details here...",
+        "status_code": 200,
+        "huge_output": "x" * 1000,
+    }
+    sanitized = audit_trail.sanitize_metadata(raw_meta)
+    assert sanitized["api_key"] == "[REDACTED]"
+    assert "[REDACTED]" in sanitized["result"]
+    assert len(sanitized["huge_output"]) <= 503  # 500 + '...'
+
+
+def test_extract_artifact_and_validation_accuracy():
+    # read_file should NOT produce an artifact
+    read_refs = audit_trail.extract_artifact_refs("read_file", {"path": "secrets.env"})
+    assert len(read_refs) == 0
+
+    # write_to_file SHOULD produce an artifact
+    write_refs = audit_trail.extract_artifact_refs("write_to_file", {"target_file": "app.py"})
+    assert "file://app.py" in write_refs
+
+    # xfailed should NOT count as failed test
+    xfailed_res = "1 xfailed, 9 passed in 2.0s"
+    val_refs1 = audit_trail.extract_validation_refs("terminal", {"command": "pytest tests/"}, result=xfailed_res)
+    assert len(val_refs1) == 1
+    assert "passed" in val_refs1[0] and "failed" not in val_refs1[0]
+
+    # '10 passed, 0 failed' should be passed, not failed
+    zero_failed_res = "10 passed, 0 failed in 1.2s"
+    val_refs2 = audit_trail.extract_validation_refs("terminal", {"command": "pytest tests/"}, result=zero_failed_res)
+    assert len(val_refs2) == 1
+    assert "passed" in val_refs2[0]
+
+    # Linter tagging
+    lint_res = "ruff check --fix"
+    lint_val = audit_trail.extract_validation_refs("terminal", {"command": lint_res}, result="All checks passed!")
+    assert len(lint_val) == 1
+    assert lint_val[0].startswith("lint://")
 
 
 def test_cmd_audit_cli_verify_and_show(tmp_path, capsys):
@@ -224,3 +298,41 @@ def test_cmd_audit_cli_verify_and_show(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "Audit Trail for Session: session-cli" in captured.out
     assert "file://app.py" in captured.out
+
+    # Test prune with days
+    cmd_audit(Namespace(audit_command="prune", days=1, path=str(log)))
+    captured = capsys.readouterr()
+    assert "Pruned" in captured.out
+
+
+def test_handle_function_call_records_audit_trail(tmp_path, monkeypatch):
+    log = tmp_path / "model_tools_audit.jsonl"
+    monkeypatch.setattr(audit_trail, "_audit_path", lambda: log)
+
+    from model_tools import handle_function_call
+    from tools.registry import registry
+
+    # Register dummy tool for testing
+    registry.register(
+        name="dummy_audit_tool",
+        toolset="core",
+        schema={"type": "function", "function": {"name": "dummy_audit_tool", "parameters": {"type": "object"}}},
+        handler=lambda args, **kw: f"result_{args.get('arg1')}",
+    )
+
+    res = handle_function_call(
+        function_name="dummy_audit_tool",
+        function_args={"arg1": "test_val"},
+        session_id="session-model-tools-test",
+    )
+    assert "result_test_val" in res
+
+    events = audit_trail.query_trail(session_id="session-model-tools-test", path=log)
+    assert len(events) == 1
+    p = events[0]["payload"]
+    assert p["event_type"] == "action"
+    assert p["tool_name"] == "dummy_audit_tool"
+    assert p["status"] == "success"
+    assert "result_test_val" in p["metadata"]["result"]
+
+

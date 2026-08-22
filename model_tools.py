@@ -1943,6 +1943,26 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
+        # Structured audit trail (issue #3065)
+        try:
+            from agent.audit_trail import is_audit_enabled, record_event
+
+            if is_audit_enabled() and function_name != "delegate_task":
+                _eff_sid = session_id or task_id or "default"
+                _is_error = isinstance(result, str) and result.startswith("[TOOL_ERROR]")
+                _st = "failure" if _is_error else "success"
+                record_event(
+                    event_type="action",
+                    session_id=_eff_sid,
+                    task_id=task_id,
+                    tool_name=function_name,
+                    inputs=function_args,
+                    status=_st,
+                    metadata={"result": result, "duration_ms": duration_ms},
+                )
+        except Exception:
+            logger.debug("Audit trail tool call record failed", exc_info=True)
+
         return result
 
     except Exception as e:
@@ -1969,6 +1989,24 @@ def handle_function_call(
             error_message=str(e),
             middleware_trace=list(_tool_middleware_trace),
         )
+
+        try:
+            from agent.audit_trail import is_audit_enabled, record_event
+
+            if is_audit_enabled() and function_name != "delegate_task":
+                _eff_sid = session_id or task_id or "default"
+                record_event(
+                    event_type="action",
+                    session_id=_eff_sid,
+                    task_id=task_id,
+                    tool_name=function_name,
+                    inputs=function_args,
+                    status="failure",
+                    metadata={"result": result, "duration_ms": duration_ms, "error": str(e)},
+                )
+        except Exception:
+            logger.debug("Audit trail tool call error record failed", exc_info=True)
+
         return result
 
 
