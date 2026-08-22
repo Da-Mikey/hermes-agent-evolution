@@ -56,7 +56,10 @@ def _is_glm_5_2(model: str | None) -> bool:
     m = (model or "").strip().lower()
     if not m:
         return False
-    return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
+    return any(
+        token in m
+        for token in ("glm-5.2", "glm-5-2", "glm-5p2", "glm-5.3", "glm-5-3", "glm-5p3")
+    )
 
 
 def _is_glm_5_3(model: str | None) -> bool:
