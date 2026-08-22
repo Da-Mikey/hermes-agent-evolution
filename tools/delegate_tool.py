@@ -5487,6 +5487,37 @@ def delegate_task(
                     entry["live_transcript"] = live_paths[_idx]
         update_manifest_statuses(live_deleg_id, results)
 
+        # Audit trail (issue #3065): record structured delegation events in the tamper-evident log
+        try:
+            from agent.audit_trail import record_event
+
+            _sid = str(getattr(parent_agent, "session_id", "") or _origin_ui_session_id or "delegation")
+            for _entry in results:
+                _t_idx = _entry.get("task_index", 0)
+                _tid = f"{live_deleg_id}_task_{_t_idx}" if live_deleg_id else None
+                _art_refs = []
+                if _entry.get("live_transcript"):
+                    _art_refs.append(f"file://{_entry['live_transcript']}")
+                if _entry.get("spill_path"):
+                    _art_refs.append(f"file://{_entry['spill_path']}")
+                _st = "success" if _entry.get("status") == "completed" else str(_entry.get("status", "failure"))
+                record_event(
+                    event_type="delegation",
+                    session_id=_sid,
+                    task_id=_tid,
+                    tool_name="delegate_task",
+                    inputs={"goal": task_labels[_t_idx] if _t_idx < len(task_labels) else "", "summary": _entry.get("summary")},
+                    artifact_refs=_art_refs,
+                    status=_st,
+                    metadata={
+                        "duration_seconds": _entry.get("duration_seconds", 0),
+                        "api_calls": _entry.get("api_calls", 0),
+                        "error": _entry.get("error"),
+                    },
+                )
+        except Exception:
+            logger.debug("Audit trail delegation record failed", exc_info=True)
+
         combined: Dict[str, Any] = {
             "results": results,
             "total_duration_seconds": total_duration,
