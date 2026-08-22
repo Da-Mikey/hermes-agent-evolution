@@ -53,6 +53,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     TQMEMORY_GUIDANCE,
+    UNTRUSTED_CONTENT_GUIDANCE,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -416,6 +417,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # acting, audit and rate your own work after. Always on — static text, scoped
     # to non-trivial work, so it raises quality without slowing simple replies.
     stable_parts.append(DELIBERATE_WORK_GUIDANCE)
+
+    # Universal untrusted-content boundary (#98). Always on — static text in
+    # the cached stable tier. Teaches the agent to treat everything read back
+    # from persistent prompt/state files, cron output, and delegated subagent
+    # contexts as DATA, never instructions — the near-free mitigation for
+    # self-propagating "mind virus" payloads.
+    stable_parts.append(UNTRUSTED_CONTENT_GUIDANCE)
 
     # Recovery-before-refusal guidance (#1356): steer the model toward
     # proposing alternative tool paths before issuing a soft-capability
