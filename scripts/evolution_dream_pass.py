@@ -4,32 +4,53 @@
 Phase 1 of grade-weighted memory retention ("dreaming"): reads recent cycle
 outcomes from ``metrics.jsonl`` and adjusts a file-backed note store so
 high-grade runs get promoted (weight raised) and revision-needed runs get a
-failure-mode tag.
+failure-mode tag. Pure file-based — no LLM, no MCP dependency.
 
-Also hosts slice 1 of issue #48 (Oracular Dream upgrade): a deterministic
-contradiction scanner over the same note store. Notes sharing a topic whose
-lifecycle signals disagree (one promoted, one failure-tagged) are paired into
-a prune/promote proposal — the newer note is authoritative and the older is
-deprecation-linked for audit. Pure file-based — no LLM, no MCP dependency.
+Also hosts slice 1 of issue #48 (Oracular Dream upgrade), REWORK after PR #3110
+was sent back by code review. The original scanner read a note store that
+does not exist; the dream's real store is **tqmemory** (``~/.turbo-quant-memory/
+projects/*/notes/*.json``) — the dream-consolidation skill stores typed notes
+there every night at 02:00 and already performs filesystem-level note surgery
+(Step 6 episodic housekeeping). This slice points the same deterministic,
+conservative pairing logic at that live store and is scheduled as a ``no_agent``
+cron job (``evolution-dream-contradiction-scan``, 02:45 daily — see
+``cron/evolution/dream-contradiction-scan.yaml``).
+
+Contradiction semantics: two ACTIVE notes with the same normalized title are an
+unresolved duplicate/contradiction — the dream's write-time near-duplicate
+check (``similar_notes`` → ``supersede_candidate`` → ``deprecate_note``) should
+have deprecation-linked the older one. If both are still active, the newer
+observation (by ``created_at``) overrides the older, and the older is
+deprecation-linked for audit by writing exactly the record tqmemory's
+``MemoryStore.deprecate_note`` would write (``note_status=superseded``,
+``deprecated_at``, ``deprecation_reason``, ``superseded_by``), so the MCP server
+and the filesystem stay consistent. Deterministic, read-only except for the
+explicit apply step — no LLM, no embeddings, no MCP dependency.
+
+Entry point for the scheduled pass: ``evolution_dream_contradiction_scan.py``.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 PROMOTE_BUMP = 0.5  # weight increment for high-grade cycles
 WEIGHT_CAP = 2.0
 
-#: Lifecycle signals the dream pass itself writes. A note tagged ``promoted``
-#: or carrying weight > 1.0 asserts "this worked"; ``failure:unmerged``
-#: asserts "this did not". Two notes about the same topic carrying opposite
-#: signals are a contradiction candidate.
-POSITIVE_SIGNAL_TAGS = ("promoted",)
-NEGATIVE_SIGNAL_TAGS = ("failure:unmerged",)
-POSITIVE_WEIGHT = 1.0  # weight strictly above this counts as positive signal
-NEGATIVE_WEIGHT = 1.0  # weight strictly below this counts as negative signal
+# --- tqmemory store contract (mirrors turbo-memory-mcp store.py) -----------
+TQMEMORY_DEFAULT_ROOT = Path("~/.turbo-quant-memory").expanduser()
+ACTIVE_NOTE_STATUS = "active"
+SUPERSEDED_NOTE_STATUS = "superseded"
+
+#: Maximum age of an older note that may be deprecation-linked by the scanner.
+#: tqmemory's own lint already suggests deprecating stale episodic notes, and
+#: deprecating a years-old durable note purely because a newer same-title note
+#: exists is not what this scanner is for — it resolves ACTIVE conflicts within
+#: the recent window the dream actually curates. Conservative by design.
+MAX_OLDER_AGE_DAYS = 90
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -118,162 +139,251 @@ def dream_pass(
     return summary
 
 
-def _topic_of(note: dict[str, Any]) -> str | None:
-    """The grouping key for contradiction detection.
-
-    Prefers an explicit ``topic`` field; falls back to ``title`` when present.
-    Notes with neither cannot be grouped and are skipped.
-    """
-    for key in ("topic", "title"):
-        val = note.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip().lower()
-    return None
+# --- Slice 1 of #48: contradiction scanner over the LIVE tqmemory store ------
 
 
-def _signal(note: dict[str, Any]) -> str:
-    """Lifecycle signal of a note: ``positive``, ``negative`` or ``neutral``.
-
-    Positive: tagged ``promoted`` (written by the dream pass) or weight > 1.0.
-    Negative: tagged ``failure:unmerged`` (written by the dream pass) or
-    weight < 1.0.  Anything else is neutral — no contradiction is asserted.
-    """
-    tags = note.get("tags") or []
-    try:
-        weight = float(note.get("weight", 1.0))
-    except (TypeError, ValueError):
-        weight = 1.0
-    if any(t in POSITIVE_SIGNAL_TAGS for t in tags) or weight > POSITIVE_WEIGHT:
-        return "positive"
-    if any(t in NEGATIVE_SIGNAL_TAGS for t in tags) or weight < NEGATIVE_WEIGHT:
-        return "negative"
-    return "neutral"
-
-
-def scan_contradictions(
-    notes_file: Path, notes: list[dict[str, Any]] | None = None
+def load_tqmemory_notes(
+    tqmemory_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Slice 1 of #48: detect contradictory notes in the file-backed store.
+    """Read every note record from the tqmemory filesystem store.
 
-    Two notes about the same topic with opposite lifecycle signals (one
-    positive, one negative) form a contradiction.  For each pair the newer
-    note (by ``cycle``) is authoritative: the proposal says the newer
-    observation overrides the older one, and the older should be
-    deprecation-linked for audit.  Deterministic, read-only — callers decide
-    whether to apply the proposals (see :func:`apply_deprecations`).
+    Layout (as written by turbo-memory-mcp)::
+
+        <root>/projects/<project_id>/notes/<note_id>.json
+
+    Each record keeps its source file path in ``source_path`` so the apply
+    step can write the deprecation record back to the exact file the MCP
+    server reads. Malformed/unreadable files are skipped — a single corrupt
+    note must never take the scheduled pass down.
+    """
+    root = Path(tqmemory_root or TQMEMORY_DEFAULT_ROOT)
+    notes: list[dict[str, Any]] = []
+    notes_dir = root / "projects"
+    if not notes_dir.is_dir():
+        return notes
+    for note_file in sorted(notes_dir.glob("*/notes/*.json")):
+        try:
+            obj = json.loads(note_file.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if isinstance(obj, dict) and obj.get("note_id"):
+            obj["source_path"] = str(note_file)
+            notes.append(obj)
+    return notes
+
+
+def _topic_key(note: dict[str, Any]) -> str | None:
+    """Grouping key: normalized ``title`` (lowercased, whitespace-collapsed).
+
+    Notes without a usable title are never grouped — conservatism beats a
+    false pairing here (the semantic ``similar_notes`` path at write time
+    handles fuzzier matches; this scanner is the deterministic safety net).
+    """
+    title = note.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+    return " ".join(title.strip().lower().split())
+
+
+def _created_at_utc(note: dict[str, Any]) -> datetime | None:
+    """Parse ``created_at`` as an aware UTC datetime; None when unusable."""
+    raw = note.get("created_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:  # naive timestamps are treated as UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _is_active(note: dict[str, Any]) -> bool:
+    return note.get("note_status", ACTIVE_NOTE_STATUS) == ACTIVE_NOTE_STATUS
+
+
+def scan_tqmemory_contradictions(
+    notes: list[dict[str, Any]],
+    *,
+    max_older_age_days: int = MAX_OLDER_AGE_DAYS,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Detect unresolved same-topic active note pairs in the tqmemory store.
+
+    Groups active notes by normalized title. For every group with two or more
+    active notes, the NEWEST (by ``created_at``) is authoritative and each
+    OLDER active note becomes one proposal: deprecate the older, keep the
+    newer. Deterministic, conservative, read-only:
+
+    * only ACTIVE notes participate (already-deprecated/superseded are inert),
+    * notes with missing/unparseable ``created_at`` cannot be ordered — skipped,
+    * pairs with identical timestamps cannot be ordered — skipped,
+    * an older note older than ``max_older_age_days`` is NOT touched (the
+      scanner resolves fresh conflicts, not archaeology).
 
     Returns a list of proposal dicts::
 
         {
-          "topic": "...",
-          "older_id": "...", "older_cycle": "...",
-          "newer_id": "...", "newer_cycle": "...",
+          "topic": "<normalized title>",
+          "older_id": "...", "older_created_at": "...", "older_project_id": "...",
+          "newer_id": "...", "newer_created_at": "...", "newer_project_id": "...",
           "resolution": "newer-overrides-older",
           "action": "deprecate-older",
         }
-
-    Notes without a topic/title are never grouped and are silently skipped.
-    Cycles compare as strings; if either note lacks a comparable cycle the
-    pair is skipped — conservatism beats a false positive here.
     """
-    if notes is None:
-        notes = load_notes(notes_file)
+    now = now or datetime.now(timezone.utc)
     by_topic: dict[str, list[dict[str, Any]]] = {}
     for n in notes:
-        topic = _topic_of(n)
-        if topic is None:
+        topic = _topic_key(n)
+        if topic is None or not _is_active(n):
             continue
         by_topic.setdefault(topic, []).append(n)
+
     proposals: list[dict[str, Any]] = []
     for topic, group in by_topic.items():
-        for i, older in enumerate(group):
-            for newer in group[i + 1 :]:
-                o_cycle, n_cycle = older.get("cycle"), newer.get("cycle")
-                if not isinstance(o_cycle, str) or not isinstance(n_cycle, str):
-                    continue  # cannot determine recency — skip
-                if o_cycle == n_cycle:
-                    continue  # same cycle: no ordering to adjudicate
-                o_sig, n_sig = _signal(older), _signal(newer)
-                if o_sig == "neutral" or n_sig == "neutral" or o_sig == n_sig:
-                    continue
-                if n_cycle > o_cycle:
-                    older_note, newer_note = older, newer
-                else:
-                    older_note, newer_note = newer, older
-                proposals.append({
-                    "topic": topic,
-                    "older_id": older_note.get("id"),
-                    "older_cycle": older_note.get("cycle"),
-                    "newer_id": newer_note.get("id"),
-                    "newer_cycle": newer_note.get("cycle"),
-                    "resolution": "newer-overrides-older",
-                    "action": "deprecate-older",
-                })
+        dated: list[tuple[datetime, dict[str, Any]]] = []
+        for n in group:
+            ts = _created_at_utc(n)
+            if ts is not None:
+                dated.append((ts, n))
+        if len(dated) < 2:
+            continue
+        dated.sort(key=lambda pair: pair[0])  # oldest -> newest
+        newest_ts, newest = dated[-1]
+        for older_ts, older in dated[:-1]:
+            if older_ts == newest_ts:
+                continue  # no ordering to adjudicate — conservative
+            if (now - older_ts).days > max_older_age_days:
+                continue  # archaeology, not conflict resolution
+            proposals.append({
+                "topic": topic,
+                "older_id": older["note_id"],
+                "older_created_at": older_ts.isoformat(),
+                "older_project_id": older.get("project_id"),
+                "newer_id": newest["note_id"],
+                "newer_created_at": newest_ts.isoformat(),
+                "newer_project_id": newest.get("project_id"),
+                "resolution": "newer-overrides-older",
+                "action": "deprecate-older",
+            })
     return proposals
 
 
-def apply_deprecations(notes_file: Path, proposals: list[dict[str, Any]]) -> int:
-    """Apply deprecation links for contradiction proposals (issue #48).
+def _utc_now_iso(now: datetime | None) -> str:
+    return (
+        (now or datetime.now(timezone.utc))
+        .astimezone(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
-    For each proposal, the older note is tagged ``deprecated:by=<newer_id>``
-    and marked ``deprecated: true`` — the entry stays for audit, but is
-    flagged so downstream readers treat the newer note as authoritative.
-    Idempotent: notes already deprecated are left untouched.
 
-    Returns the number of notes newly deprecated.
+def apply_tqmemory_deprecations(
+    notes: list[dict[str, Any]],
+    proposals: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Apply deprecation links for the contradiction proposals (issue #48).
+
+    For each proposal, the OLDER active note is flipped to ``superseded`` by
+    writing exactly the record ``MemoryStore.deprecate_note`` would write:
+    ``note_status``, ``deprecated_at``, ``updated_at``, ``deprecation_reason``
+    and a ``superseded_by`` reference to the newer note. The write goes to the
+    note's own file (``source_path``), so the MCP server's direct reads see the
+    new status immediately; the semantic index catches up on its next
+    incremental sync, exactly as with the dream skill's existing filesystem
+    housekeeping step.
+
+    Idempotent: a note already superseded/deprecated is skipped. Returns the
+    number of notes newly superseded (or that WOULD be, in dry-run).
     """
-    notes = load_notes(notes_file)
+    by_id = {n.get("note_id"): n for n in notes}
+    stamp = _utc_now_iso(now)
     applied = 0
     for prop in proposals:
-        older_id = prop.get("older_id")
-        for n in notes:
-            if n.get("id") != older_id or n.get("deprecated"):
-                continue
-            tags = n.setdefault("tags", [])
-            tag = f"deprecated:by={prop.get('newer_id')}"
-            if tag not in tags:
-                tags.append(tag)
-            n["deprecated"] = True
+        older = by_id.get(prop.get("older_id"))
+        newer = by_id.get(prop.get("newer_id"))
+        if older is None or newer is None:
+            continue
+        if not _is_active(older) or not _is_active(newer):
+            continue  # a previous run (or the write-time path) already handled it
+        if dry_run:
             applied += 1
-            break
-    if applied and notes:
-        txt = "".join(json.dumps(n) + "\n" for n in notes)
-        notes_file.write_text(txt, encoding="utf-8")
+            continue
+        older["note_status"] = SUPERSEDED_NOTE_STATUS
+        older["deprecated_at"] = stamp
+        older["updated_at"] = stamp
+        older["deprecation_reason"] = (
+            "Contradiction resolution (dream scanner, issue #48): superseded "
+            f"by newer same-title note {newer['note_id']}"
+        )
+        older["superseded_by"] = {
+            "scope": newer.get("scope", "project"),
+            "project_id": newer.get("project_id"),
+            "project_name": newer.get("project_name"),
+            "note_id": newer["note_id"],
+            "title": newer.get("title"),
+            "source_path": newer.get("source_path"),
+        }
+        src = Path(older["source_path"])
+        try:
+            src.write_text(
+                json.dumps(older, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            continue  # unreadable store dir: report the failure via the summary
+        applied += 1
     return applied
 
 
-def dream_pass_with_contradictions(
-    metrics_file: Path,
-    notes_file: Path,
+def dream_contradiction_scan(
+    tqmemory_root: Path | None = None,
     *,
-    recent: int = 7,
+    dry_run: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Full dream pass: grade-weighted retention + contradiction scan (slice 1
-    of #48).
+    """Run the full contradiction scan over the live tqmemory store.
 
-    Runs the existing :func:`dream_pass`, then scans the (post-promotion)
-    note store for same-topic contradictions, applies deprecation links, and
-    writes ``contradiction_proposals.json`` next to the notes file.  The
-    returned summary extends the base summary with ``contradictions_found``
-    and ``deprecations_applied``.
+    Loads every note, detects unresolved same-title active pairs, applies the
+    deprecation links (unless ``dry_run``) and returns a summary the scheduled
+    runner writes to its report file::
+
+        {
+          "scanned_at": "...",
+          "notes_scanned": int,
+          "active_notes": int,
+          "contradictions_found": int,
+          "deprecations_applied": int,
+          "dry_run": bool,
+          "proposals": [...],
+        }
     """
-    summary = dream_pass(metrics_file, notes_file, recent=recent)
-    proposals = scan_contradictions(notes_file)
-    deprecated = apply_deprecations(notes_file, proposals)
-    (notes_file.parent / "contradiction_proposals.json").write_text(
-        json.dumps(proposals, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    summary["contradictions_found"] = len(proposals)
-    summary["deprecations_applied"] = deprecated
-    (metrics_file.parent / "dream_pass.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    return summary
+    notes = load_tqmemory_notes(tqmemory_root)
+    active_before = sum(1 for n in notes if _is_active(n))
+    proposals = scan_tqmemory_contradictions(notes, now=now)
+    applied = apply_tqmemory_deprecations(notes, proposals, now=now, dry_run=dry_run)
+    return {
+        "scanned_at": _utc_now_iso(now),
+        "tqmemory_root": str(Path(tqmemory_root or TQMEMORY_DEFAULT_ROOT)),
+        "notes_scanned": len(notes),
+        "active_notes": active_before,
+        "contradictions_found": len(proposals),
+        "deprecations_applied": applied,
+        "dry_run": dry_run,
+        "proposals": proposals,
+    }
 
 
 if __name__ == "__main__":  # pragma: no cover
     import sys
 
+    # Original CLI contract preserved: the grade-weighted pass over an
+    # evolution data dir (backwards compatible). The scheduled contradiction
+    # pass has its own entry point (evolution_dream_contradiction_scan.py).
     evo = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("evolution")
-    dream_pass_with_contradictions(evo / "metrics.jsonl", evo / "notes.jsonl")
+    dream_pass(evo / "metrics.jsonl", evo / "notes.jsonl")

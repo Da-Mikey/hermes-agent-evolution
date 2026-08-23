@@ -1,0 +1,28 @@
+name: evolution-dream-contradiction-scan
+# 02:45 daily — 45 minutes after the 02:00 dreaming-pipeline /
+# dream-consolidation jobs finish writing tqmemory notes, so a contradiction is
+# flagged within 24h of the conflicting entries appearing (issue #48 success
+# criterion). Off the :00/:30 marks, like the other deterministic jobs.
+schedule: "45 2 * * *"
+enabled: true
+mode: PRIVATE
+
+# Deterministic scan — NO LLM agent. The script IS the job: reads the live
+# tqmemory note store, detects same-title ACTIVE note pairs, deprecation-links
+# the older (newer-by-created_at is authoritative), writes
+# ~/.hermes/evolution/dream_contradiction_scan.json. Issue #48 slice 1
+# (rework of PR #3110, which was dead code on a nonexistent notes.jsonl).
+no_agent: true
+script: evolution_dream_contradiction_scan.py
+
+# Report to disk only; a scan run is data, not an alert.
+deliver: local
+
+prompt: |
+  Deterministic contradiction scan over the live tqmemory note store (no LLM).
+  Groups ACTIVE notes by normalized title; a same-title group with >1 active
+  note is an unresolved contradiction — the newest (by created_at) is
+  authoritative and each older note is deprecation-linked (note_status
+  superseded + superseded_by reference, mirroring tqmemory's deprecate_note
+  record) for audit. Writes dream_contradiction_scan.json under the evolution
+  data dir. Issue #48 slice 1 (child #102, parent #48 stays open).
