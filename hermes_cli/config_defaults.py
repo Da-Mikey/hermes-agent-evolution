@@ -2427,6 +2427,13 @@ DEFAULT_CONFIG = {
         # jobs from silently inheriting a paid default. Set to false only when
         # jobs should deliberately track changing global inference defaults.
         "model_drift_guard": True,
+        # Opt-in companion to model_drift_guard: when true, a drifted unpinned
+        # job is automatically re-pinned to the new global baseline (snapshots
+        # refreshed, drift alert cleared) and runs on schedule instead of
+        # being skipped. Default false preserves the fail-closed spend safety:
+        # drift keeps skipping the job until an operator pins or repins it.
+        # Only the literal YAML boolean ``true`` enables this.
+        "model_drift_auto_repin": False,
         # Default inference model for cron jobs (Axis A — WHAT model an
         # agent job runs on). Resolution at fire time: per-job user pin >
         # cron.model > global model.default. When set, unpinned jobs follow
