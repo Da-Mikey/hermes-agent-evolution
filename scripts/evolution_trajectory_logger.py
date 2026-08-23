@@ -171,6 +171,22 @@ class TrajectoryEntry:
             duration_ms=duration_ms,
         )
 
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TrajectoryEntry":
+        """Rebuild an entry from its ``to_dict()`` shape (tolerant of gaps).
+
+        Unknown statuses and missing fields are preserved as-is rather than
+        defaulted, so a replay sees exactly what was recorded — a recorded
+        ``"pending"`` must not silently become ``"unknown"``."""
+        return cls(
+            tool=str(d.get("tool", "unknown")),
+            args_summary=d.get("args_summary", {}) or {},
+            result_status=str(d.get("result_status", "unknown")),
+            result_summary=str(d.get("result_summary", "")),
+            timestamp=str(d.get("timestamp", "")),
+            duration_ms=d.get("duration_ms"),
+        )
+
 
 class TrajectoryLog:
     """In-memory trajectory log for a single cron session."""
@@ -216,9 +232,7 @@ class TrajectoryLog:
         Pure logging: measures delegation overhead (who talked to whom, via
         which channel, at what token cost) without changing behavior.
         """
-        self.edges.append(
-            CoordinationEdge(source, target, edge_type, cost_tokens)
-        )
+        self.edges.append(CoordinationEdge(source, target, edge_type, cost_tokens))
 
     def add_tool_call(
         self,
@@ -298,6 +312,29 @@ class TrajectoryLog:
     def tools_used(self) -> set[str]:
         return {e.tool for e in self.entries}
 
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TrajectoryLog":
+        """Rebuild a log from its ``to_dict()`` shape.
+
+        Shared by ``load_trajectory`` and ``iter_trajectories`` so the
+        .json and .jsonl storage formats both round-trip through the same
+        reader. Absent optional fields (``completed``, ``task_key``, edges)
+        stay absent — a pre-#1363 cron-stage trajectory must read back
+        exactly as it was written."""
+        log = cls(
+            session_id=str(d.get("session_id", "")),
+            date=str(d.get("date", "")),
+            completed=d.get("completed"),
+            task_key=str(d.get("task_key", "")),
+        )
+        for ed in d.get("entries", []):
+            if isinstance(ed, dict):
+                log.entries.append(TrajectoryEntry.from_dict(ed))
+        for ed in d.get("edges", []):
+            if isinstance(ed, dict):
+                log.edges.append(CoordinationEdge.from_dict(ed))
+        return log
+
     def failure_count(self) -> int:
         return sum(1 for e in self.entries if e.result_status in ("failure", "error"))
 
@@ -321,31 +358,44 @@ def load_trajectory(path: Path) -> Optional[TrajectoryLog]:
         return None
     if not isinstance(data, dict):
         return None
-    log = TrajectoryLog(
-        session_id=data.get("session_id", ""),
-        date=data.get("date", ""),
-        # Absent on pre-#1363 cron-stage trajectories; None/"" there means
-        # "not recorded", which consumers must treat differently from a
-        # recorded failure.
-        completed=data.get("completed"),
-        task_key=data.get("task_key", ""),
-    )
-    for ed in data.get("entries", []):
-        if isinstance(ed, dict):
-            log.entries.append(
-                TrajectoryEntry(
-                    tool=ed.get("tool", "unknown"),
-                    args_summary=ed.get("args_summary", {}),
-                    result_status=ed.get("result_status", "unknown"),
-                    result_summary=ed.get("result_summary", ""),
-                    timestamp=ed.get("timestamp", ""),
-                    duration_ms=ed.get("duration_ms"),
-                )
-            )
-    for ed in data.get("edges", []):
-        if isinstance(ed, dict):
-            log.edges.append(CoordinationEdge.from_dict(ed))
-    return log
+    return TrajectoryLog.from_dict(data)
+
+
+def iter_trajectories(path: Path) -> List[TrajectoryLog]:
+    """Load every trajectory in a file, in order — both storage formats.
+
+    ``save()`` writes one pretty-printed JSON object (``.json``);
+    ``append()`` writes one compact JSON object per line (``.jsonl``) so a
+    multi-turn session keeps every turn. Whole-file parse is tried first
+    (covers the .json format), then line-by-line (covers .jsonl). Malformed
+    lines are skipped — a torn write must never take a replay down (#85)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    # Single pretty-printed object (TrajectoryLog.save / load_trajectory).
+    try:
+        data = json.loads(stripped)
+        if isinstance(data, dict):
+            return [TrajectoryLog.from_dict(data)]
+    except ValueError:
+        pass
+    # JSONL append format: one compact object per line.
+    logs: List[TrajectoryLog] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            data = json.loads(s)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            logs.append(TrajectoryLog.from_dict(data))
+    return logs
 
 
 def main(argv: List[str]) -> int:
