@@ -4446,6 +4446,58 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return cron_cfg.get("preflight", True) is not False
 
 
+def _cron_drift_auto_repin_enabled(cfg: dict) -> bool:
+    """Whether drifted unpinned jobs auto-repin to the new baseline.
+
+    Default OFF — the #44585 spend-safety guard stays fail-closed unless the
+    user opts in with the literal YAML boolean ``true`` under
+    ``cron.model_drift_auto_repin``. Missing or malformed values stay off
+    (inverse of ``cron_model_drift_guard_enabled`` semantics).
+    """
+    cron_cfg = (cfg or {}).get("cron")
+    if not isinstance(cron_cfg, dict):
+        return False
+    return cron_cfg.get("model_drift_auto_repin", False) is True
+
+
+def _auto_repin_drifted_job(job_id: str, changes: str) -> bool:
+    """Best-effort baseline re-pin of a drifted job (warn-and-repin).
+
+    Refreshes the job's provider/model snapshots to the current global
+    baseline via ``repin_jobs`` so it tracks the new config and runs this
+    tick instead of staying skipped. Returns True only when the job was
+    actually updated; on any failure the caller falls back to the default
+    drift skip so a broken repin can never silently enable spend.
+    """
+    try:
+        from cron.jobs import repin_jobs
+
+        repinned = repin_jobs(job_id)
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': drift auto-repin failed (%s); falling back to the "
+            "default drift skip.",
+            job_id,
+            exc,
+        )
+        return False
+    if not repinned:
+        logger.warning(
+            "Job '%s': drift auto-repin did not update the job (unresolvable "
+            "axis); falling back to the default drift skip.",
+            job_id,
+        )
+        return False
+    logger.warning(
+        "Job '%s': global inference config drifted since creation (%s); "
+        "cron.model_drift_auto_repin is enabled — snapshots re-pinned to "
+        "the new baseline and the job runs this tick instead of skipping.",
+        job_id,
+        changes,
+    )
+    return True
+
+
 def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     """READ-ONLY probe: would provider resolution fail for lack of a key?
 
@@ -5876,63 +5928,70 @@ def _run_job_impl(
                 _drift.append(f"{_axis} '{_snapshot}' -> '{_current}'")
             if _drift:
                 _changes = "; ".join(_drift)
-                # Lifecycle-aware remediation (#72056, @sashmatash): a finite
-                # one-shot is consumed by this attempted dispatch — telling an
-                # operator to edit a spent job is a dead end. Recurring and
-                # repeatable jobs get the pin command instead.
-                _repeat = job.get("repeat") if isinstance(job.get("repeat"), dict) else {}
-                _finite_oneshot = (
-                    isinstance(job.get("schedule"), dict)
-                    and job["schedule"].get("kind") == "once"
-                    and _repeat.get("times") == 1
-                )
-                if _finite_oneshot:
-                    _remediation = (
-                        "This finite one-shot job is consumed by this attempted run; "
-                        "create a new one-shot job at a future time with an explicit "
-                        "provider and model."
+                # Opt-in warn-and-repin (#drift-auto-repin): when enabled, a
+                # drifted unpinned job is re-pinned to the new baseline and
+                # runs this tick. Default stays the fail-closed skip below.
+                _auto_repin_done = False
+                if _cron_drift_auto_repin_enabled(_cfg):
+                    _auto_repin_done = _auto_repin_drifted_job(job_id, _changes)
+                if not _auto_repin_done:
+                    # Lifecycle-aware remediation (#72056, @sashmatash): a finite
+                    # one-shot is consumed by this attempted dispatch — telling an
+                    # operator to edit a spent job is a dead end. Recurring and
+                    # repeatable jobs get the pin command instead.
+                    _repeat = job.get("repeat") if isinstance(job.get("repeat"), dict) else {}
+                    _finite_oneshot = (
+                        isinstance(job.get("schedule"), dict)
+                        and job["schedule"].get("kind") == "once"
+                        and _repeat.get("times") == 1
                     )
-                else:
-                    _remediation = (
-                        "To run on the new config, on the host running Hermes "
-                        "pin it explicitly: "
-                        f"`hermes cron edit {job_id} --provider <provider> "
-                        "--model <model>` (or pin the original values to keep "
-                        "them). To resume tracking the new global config: "
-                        f"`hermes cron repin {job_id}` (or `hermes cron repin --all`). "
-                        f"To hard-pin to current config: `hermes cron repin {job_id} --pin`."
+                    if _finite_oneshot:
+                        _remediation = (
+                            "This finite one-shot job is consumed by this attempted run; "
+                            "create a new one-shot job at a future time with an explicit "
+                            "provider and model."
+                        )
+                    else:
+                        _remediation = (
+                            "To run on the new config, on the host running Hermes "
+                            "pin it explicitly: "
+                            f"`hermes cron edit {job_id} --provider <provider> "
+                            "--model <model>` (or pin the original values to keep "
+                            "them). To resume tracking the new global config: "
+                            f"`hermes cron repin {job_id}` (or `hermes cron repin --all`). "
+                            f"To hard-pin to current config: `hermes cron repin {job_id} --pin`."
+                        )
+                    logger.warning(
+                        "Job '%s': SKIPPED — global inference config drifted since "
+                        "creation (%s) and this job is unpinned. Skipped to prevent "
+                        "unintended spend. %s",
+                        job_id,
+                        _changes,
+                        _remediation,
                     )
-                logger.warning(
-                    "Job '%s': SKIPPED — global inference config drifted since "
-                    "creation (%s) and this job is unpinned. Skipped to prevent "
-                    "unintended spend. %s",
-                    job_id,
-                    _changes,
-                    _remediation,
-                )
-                # Alert-once (#73506 shape): persist the drift_alerted bit so
-                # only the FIRST drifted tick delivers; run_one_job suppresses
-                # delivery on the silent marker. mark_job_run clears the bit
-                # when a run succeeds (drift healed), re-arming the alert.
-                _drift_already_alerted = False
-                try:
-                    from cron.jobs import mark_drift_alerted
+                    # Alert-once (#73506 shape): persist the drift_alerted bit so
+                    # only the FIRST drifted tick delivers; run_one_job suppresses
+                    # delivery on the silent marker. mark_job_run clears the bit
+                    # when a run succeeds (drift healed), re-arming the alert.
+                    _drift_already_alerted = False
+                    try:
+                        from cron.jobs import mark_drift_alerted
 
-                    _drift_already_alerted = mark_drift_alerted(job_id)
-                except Exception:
-                    pass  # fail open: better a duplicate alert than none
-                _drift_marker = (
-                    DRIFT_SKIP_SILENT_MARKER if _drift_already_alerted
-                    else DRIFT_SKIP_MARKER
-                )
-                raise RuntimeError(
-                    f"{_drift_marker} Skipped to prevent unintended spend: global "
-                    f"inference config drifted since this job was created "
-                    f"({_changes}), and this job is unpinned. No inference call "
-                    f"was made. {_remediation} "
-                    f"This alert is sent once; the job stays skipped until the "
-                    f"config is pinned or restored. See #44585."
-                )
+                        _drift_already_alerted = mark_drift_alerted(job_id)
+                    except Exception:
+                        pass  # fail open: better a duplicate alert than none
+                    _drift_marker = (
+                        DRIFT_SKIP_SILENT_MARKER if _drift_already_alerted
+                        else DRIFT_SKIP_MARKER
+                    )
+                    raise RuntimeError(
+                        f"{_drift_marker} Skipped to prevent unintended spend: global "
+                        f"inference config drifted since this job was created "
+                        f"({_changes}), and this job is unpinned. No inference call "
+                        f"was made. {_remediation} "
+                        f"This alert is sent once; the job stays skipped until the "
+                        f"config is pinned or restored. See #44585."
+                    )
 
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
