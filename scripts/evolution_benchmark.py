@@ -143,6 +143,53 @@ def cmd_tasks(args) -> int:
     return 0
 
 
+def cmd_baselines(args) -> int:
+    """Compare the latest benchmark score against naive test-time-scaling arms (#41).
+
+    The TTS question is "did the evolved harness earn its keep, or would
+    best-of-N naive re-runs have matched it?". The comparison is pure
+    arithmetic over the recorded history: the latest run's score is the
+    evolved result, and the prior runs' scores are the attempt samples that
+    best-of-N / pass-at-k operate on. Explicit ``--samples`` overrides the
+    history so a caller can feed a dedicated sampling study.
+    """
+    from evolution_tts_baselines import compare_against_baseline
+
+    metrics_path = Path(args.metrics_path) if getattr(args, "metrics_path", None) else None
+    samples = getattr(args, "samples", None)
+    if not samples:
+        history = load_benchmark_history(days=getattr(args, "days", 7) or 7, metrics_path=metrics_path)
+        samples = [h.composite_rsi_score for h in history if getattr(h, "composite_rsi_score", None) is not None]
+    if not samples:
+        print("No benchmark runs in window and no --samples given; nothing to compare.")
+        return 0
+
+    current = samples[-1] if getattr(args, "evolved", None) is None else args.evolved
+    result = compare_against_baseline(
+        current,
+        samples[:-1] if getattr(args, "evolved", None) is None else samples,
+        threshold=float(getattr(args, "threshold", 0.75) or 0.75),
+        margin=float(getattr(args, "margin", 0.02) or 0.02),
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    print("═══ TTS Baseline Comparison (issue #41) ═══")
+    print(f"Evolved score : {result['evolved_score']:.3f}")
+    print(f"Best-of-N     : {result['best_of_n']:.3f} (n={result['n_samples']})")
+    print(f"Pass@k        : {result['pass_at_k']:.3f}")
+    print(f"Verdict       : {result['verdict']}")
+    if result["verdict"] == "TIES_BASELINE":
+        print("  Naive test-time scaling would have bought the same result — not an improvement.")
+    elif result["verdict"] == "LOSES_TO_BASELINE":
+        print("  The evolved harness is WORSE than doing nothing clever.")
+    elif result["verdict"] == "BEATS_BASELINE":
+        print("  The evolved harness clears the naive baseline — earns its keep.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="evolution_benchmark.py",
@@ -169,6 +216,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks = subparsers.add_parser("tasks", help="List benchmark tasks")
     p_tasks.add_argument("--json", action="store_true", help="Output raw JSON")
     p_tasks.set_defaults(func=cmd_tasks)
+
+    # baselines (issue #41): naive test-time-scaling comparison arms
+    p_base = subparsers.add_parser(
+        "baselines", help="Compare latest score against naive test-time-scaling baselines"
+    )
+    p_base.add_argument("--days", type=int, default=7, help="Lookback days (default: 7)")
+    p_base.add_argument("--metrics-path", help="Custom metrics JSONL path")
+    p_base.add_argument(
+        "--samples", type=float, nargs="*",
+        help="Explicit attempt scores (overrides benchmark history)",
+    )
+    p_base.add_argument("--evolved", type=float, help="Evolved harness score (default: latest run)")
+    p_base.add_argument("--threshold", type=float, default=0.75, help="Acceptance threshold")
+    p_base.add_argument("--margin", type=float, default=0.02, help="Beat-baseline margin")
+    p_base.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_base.set_defaults(func=cmd_baselines)
 
     return parser
 
