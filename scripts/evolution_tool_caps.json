@@ -1,0 +1,12 @@
+{
+  "default": {"max_bytes": 1048576, "max_args": 16},
+  "read_file": {"max_bytes": 262144, "max_args": 4},
+  "write_file": {"max_bytes": 524288, "max_args": 6},
+  "search_files": {"max_bytes": 131072, "max_args": 8},
+  "terminal": {"max_bytes": 65536, "max_args": 8},
+  "patch": {"max_bytes": 1048576, "max_args": 6},
+  "web_extract": {"max_bytes": 262144, "max_args": 5},
+  "web_search": {"max_bytes": 8192, "max_args": 5},
+  "skill_view": {"max_bytes": 131072, "max_args": 4},
+  "delegate_task": {"max_bytes": 262144, "max_args": 12}
+}
