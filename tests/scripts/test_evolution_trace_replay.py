@@ -56,8 +56,7 @@ class TestIterTrajectories:
         assert [e.tool for e in logs[0].entries] == ["tool_0", "tool_1"]
 
     def test_jsonl_append_format_multi_turn(self, tmp_path):
-        p = tmp_path / "2026-08-23_s1.jsonl"
-        _make_log("success", session_id="s1").append(tmp_path)
+        p = _make_log("success", session_id="s1").append(tmp_path)
         _make_log("failure", session_id="s1").append(tmp_path)
         logs = iter_trajectories(p)
         assert len(logs) == 2
