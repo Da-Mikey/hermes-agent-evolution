@@ -37,6 +37,20 @@ are the pure core (unit-tested with synthetic diff stats); ``lint_skill_edit_bud
 is the git-diff IO boundary, run via ``--skill-edit-budget`` (not part of the
 default ``lint_repo()`` static check, since it is inherently relative to a base
 ref — see ``main()``).
+
+Part 3 — checked lowering for declared tool inputs (#77, SkillEffect, S2)
+-------------------------------------------------------------------------
+``scripts/evolution_tool_cap_check.py`` (S1) is the pure per-tool input-cap
+checker; THIS is the real call site that wires it into the skill gate, per the
+#77 implementation brief ("gate evolution-generated skills behind S1 at the
+skill gate before they are trusted for reuse"). A skill may DECLARE the tool
+invocations it intends to make in a ``declared_inputs:`` frontmatter block
+(see :func:`extract_declared_inputs`). The deterministic lint then runs each
+declaration through ``check_input_caps`` and rejects skills whose declared
+inputs exceed the per-tool caps — closing the issue's acceptance criterion
+("adversarial oversized-input proposals rejected before execution") at the
+skill gate, without touching the core tool path (that is S3, bounded
+execution, which needs its own design review).
 """
 
 from __future__ import annotations
@@ -47,6 +61,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from evolution_tool_cap_check import check_input_caps, load_caps
 
 # A script invocation the stage is told to RUN — `python/python3/bash/sh scripts/X`
 # or `./scripts/X`. Bare inline mentions (no runner, no `./`) are NOT commands.
@@ -183,6 +199,96 @@ def find_violations(
     return out
 
 
+# ── Checked lowering for declared tool inputs (#77 — S2 call site) ──────────
+def extract_declared_inputs(skill_text: str) -> List[Dict[str, Any]]:
+    """Parse the ``declared_inputs:`` frontmatter block of a SKILL.md.
+
+    Declarations are OPT-IN: a skill with no block yields ``[]`` and is not
+    flagged, so the existing corpus has zero false positives. Accepted shapes:
+
+    .. code-block:: yaml
+
+       declared_inputs:
+         - tool: read_file
+           args: {path: "data/big.txt"}
+         - {tool: search_files, args: {pattern: "*.py", limit: 50}}
+         - read_file: {path: "data/big.txt"}      # single-tool map form
+
+    Returns a normalized list of ``{"tool": str, "args": dict}``. Malformed
+    blocks degrade to ``[]`` (never raise) — a broken declaration must not
+    crash the gate, and an absent one is simply no declaration.
+    """
+    try:
+        import yaml
+    except Exception:
+        return []
+    text = skill_text or ""
+    if "---" not in text:
+        return []
+    # Frontmatter = the YAML between the FIRST two ``---`` lines.
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return []
+    try:
+        fm = yaml.safe_load(parts[1]) or {}
+    except Exception:
+        return []
+    raw = fm.get("declared_inputs")
+    out: List[Dict[str, Any]] = []
+    if raw is None:
+        return out
+    if isinstance(raw, dict):
+        # Map form: {tool: {arg: val}} or {tool: {"args": {...}}}.
+        for tool, spec in raw.items():
+            if not isinstance(tool, str):
+                continue
+            if isinstance(spec, dict) and "args" in spec and isinstance(spec["args"], dict):
+                out.append({"tool": tool, "args": dict(spec["args"])})
+            elif isinstance(spec, dict):
+                out.append({"tool": tool, "args": dict(spec)})
+        return out
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            tool = item.get("tool")
+            if not isinstance(tool, str) or not tool:
+                continue
+            args = item.get("args")
+            out.append({"tool": tool, "args": dict(args) if isinstance(args, dict) else {}})
+        return out
+    return out
+
+
+def find_cap_violations(
+    declared_inputs: List[Dict[str, Any]],
+    caps: Optional[Dict[str, Dict[str, int]]] = None,
+) -> List[Dict[str, str]]:
+    """Run declared tool inputs through :func:`check_input_caps`.
+
+    Pure core, mirrors ``find_violations``. Each returned dict gains the
+    ``kind`` prefix ``cap_`` so violations from the two gates are
+    distinguishable in output and tests.
+    """
+    out: List[Dict[str, str]] = []
+    for decl in declared_inputs or []:
+        tool = decl.get("tool") or ""
+        args = decl.get("args")
+        if not tool:
+            continue
+        for v in check_input_caps(tool, args, caps=caps):
+            out.append(
+                {
+                    "kind": f"cap_{v['kind']}",
+                    "tool": v["tool"],
+                    "detail": v["detail"],
+                    "declared": v.get("declared", ""),
+                    "cap": v.get("cap", ""),
+                }
+            )
+    return out
+
+
 # ── IO boundary ────────────────────────────────────────────────────────────────
 def _load_stages(cron_dir: Path) -> List[Dict[str, Any]]:
     import yaml
@@ -223,7 +329,16 @@ def lint_repo(repo_root: Optional[Path] = None) -> List[Dict[str, str]]:
     existing = {
         f"scripts/{p.name}" for p in (root / "scripts").glob("*") if p.is_file()
     }
-    return find_violations(stages, skill_texts, existing)
+    violations = find_violations(stages, skill_texts, existing)
+    # #77 S2: checked lowering — a skill that DECLARES tool inputs must stay
+    # within per-tool caps before it is trusted for reuse. load_caps() never
+    # raises, so this can only add cap_* violations, never crash the gate.
+    caps = load_caps()
+    for name, text in skill_texts.items():
+        for v in find_cap_violations(extract_declared_inputs(text), caps=caps):
+            v["skill"] = name
+            violations.append(v)
+    return violations
 
 
 def _git_show_line_count(repo_root: Path, ref: str, path: str) -> int:
