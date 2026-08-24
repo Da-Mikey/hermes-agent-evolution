@@ -54,6 +54,7 @@ import json
 import os
 import secrets
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -71,6 +72,9 @@ __all__ = [
     "extract_model_calls",
     "build_trajectory_log",
     "capture_turn",
+    "replay_trajectory",
+    "resume_index",
+    "branch_trajectory",
 ]
 
 #: Result summaries are already truncated by the logger; this bounds the
@@ -98,7 +102,12 @@ _SALT_FILENAME = ".trajectory_key_salt"
 
 def capture_enabled() -> bool:
     """True when trajectory capture is switched on for this process."""
-    return os.environ.get(_CAPTURE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get(_CAPTURE_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _salt(trajectory_dir: Optional[Path] = None) -> bytes:
@@ -220,15 +229,13 @@ def extract_tool_calls(
             content = results.get(cid)
             if isinstance(content, str) and len(content) > _MAX_RESULT_CHARS:
                 content = content[:_MAX_RESULT_CHARS]
-            calls.append(
-                {
-                    "tool": str(name),
-                    "args": args if isinstance(args, dict) else {},
-                    "result": content,
-                    "status": _result_status(content) if has_result else "pending",
-                    "duration_ms": timings.get(cid) if cid else None,
-                }
-            )
+            calls.append({
+                "tool": str(name),
+                "args": args if isinstance(args, dict) else {},
+                "result": content,
+                "status": _result_status(content) if has_result else "pending",
+                "duration_ms": timings.get(cid) if cid else None,
+            })
     return calls
 
 
@@ -262,13 +269,11 @@ def extract_model_calls(
     for msg in messages:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
-        calls.append(
-            {
-                "model": str(msg.get("model") or ""),
-                "decision": _classify_model_decision(msg),
-                "tool_call_count": len(msg.get("tool_calls") or []),
-            }
-        )
+        calls.append({
+            "model": str(msg.get("model") or ""),
+            "decision": _classify_model_decision(msg),
+            "tool_call_count": len(msg.get("tool_calls") or []),
+        })
     return calls
 
 
@@ -340,3 +345,132 @@ def capture_turn(
         return log.append(trajectory_dir)
     except Exception:
         return None
+
+
+# --- Replay / resume / branch over recorded trajectories (#85) --------------
+#
+# Capture records *what happened*; these turn a record back into something
+# an optimizer can reason about deterministically. Moirai's trace-optimization
+# concept needs exactly this: replay a session to see where it went wrong,
+# branch from the first bad step with a corrected instruction, resume an
+# interrupted session from its first pending call. All three are pure
+# functions over a TrajectoryLog — no IO, no LLM, no mutation of the source.
+
+_FAILURE_STATUSES = ("failure", "error")
+_INCOMPLETE_STATUSES = ("pending", "unknown")
+
+
+def _window_entries(
+    log: "TrajectoryLog",
+    *,
+    start_at: int = 0,
+    stop_at: Optional[int] = None,
+) -> List[tuple[int, Any]]:
+    """Return ``(absolute_index, entry)`` pairs for the replay window.
+
+    Bounds are clamped to the entry list; negative or inverted windows yield
+    an empty list rather than an error — replay is analysis, not a crash."""
+    n = len(log.entries)
+    start = max(0, int(start_at))
+    stop = n if stop_at is None else min(n, max(0, int(stop_at)))
+    if start >= stop:
+        return []
+    return list(enumerate(log.entries))[start:stop]
+
+
+def replay_trajectory(
+    log: "TrajectoryLog",
+    *,
+    start_at: int = 0,
+    stop_at: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Deterministic replay summary of a recorded trajectory (#85).
+
+    Walks the (clamped) entry window and produces the action sequence an
+    optimizer reasons over — tool names, per-step statuses, durations — plus
+    a single task-level ``outcome``:
+
+    * ``success`` — every step succeeded (nothing to fix),
+    * ``failed`` — at least one step recorded a failure/error,
+    * ``incomplete`` — no hard failure, but a step is pending/unknown (the
+      session was interrupted; the trace is not a completed story),
+    * ``empty`` — no steps in the window.
+
+    ``first_failure_index`` is the absolute index of the first failed step
+    (None when the outcome is not ``failed``); ``stopped_at`` is the absolute
+    index one past the last replayed step, i.e. where a resume would continue.
+    """
+    window = _window_entries(log, start_at=start_at, stop_at=stop_at)
+    steps: List[Dict[str, Any]] = []
+    failure_idx: Optional[int] = None
+    for idx, entry in window:
+        status = str(getattr(entry, "result_status", "unknown"))
+        steps.append({
+            "index": idx,
+            "tool": str(getattr(entry, "tool", "unknown")),
+            "status": status,
+            "duration_ms": getattr(entry, "duration_ms", None),
+        })
+        if status in _FAILURE_STATUSES and failure_idx is None:
+            failure_idx = idx
+    if not steps:
+        outcome = "empty"
+    elif failure_idx is not None:
+        outcome = "failed"
+    elif any(s["status"] in _INCOMPLETE_STATUSES for s in steps):
+        outcome = "incomplete"
+    else:
+        outcome = "success"
+    return {
+        "outcome": outcome,
+        "steps": steps,
+        "step_count": len(steps),
+        "tool_sequence": [s["tool"] for s in steps],
+        "first_failure_index": failure_idx,
+        "started_at": start_at if steps else None,
+        "stopped_at": (steps[-1]["index"] + 1) if steps else None,
+    }
+
+
+def resume_index(log: "TrajectoryLog") -> Optional[int]:
+    """First step worth resuming/branching from, or None for a clean run.
+
+    The first entry whose status is not ``success`` is the point of interest:
+    for a failed run it is where the trace went wrong (branch here with a
+    corrected instruction); for an interrupted run it is the first call that
+    never completed (resume here). A fully successful trajectory has nothing
+    to resume from — None.
+    """
+    for idx, entry in enumerate(log.entries):
+        status = str(getattr(entry, "result_status", "unknown"))
+        if status != "success":
+            return idx
+    return None
+
+
+def branch_trajectory(
+    log: "TrajectoryLog",
+    up_to_index: int,
+) -> "TrajectoryLog":
+    """Copy the prefix of a trajectory up to (and including) a step.
+
+    The branch is a fresh :class:`TrajectoryLog` sharing the source's session
+    id, date, completion flag and task key, with deep-copied entries
+    ``[0 .. up_to_index]`` (clamped) and the same coordination edges. The
+    source log is never mutated — an optimizer can branch repeatedly from
+    different points without corrupting the record it is optimizing over.
+    """
+    n = len(log.entries)
+    stop = n if up_to_index is None else min(n, max(0, int(up_to_index) + 1))
+    branch = TrajectoryLog(
+        session_id=log.session_id,
+        date=log.date,
+        completed=log.completed,
+        task_key=log.task_key,
+    )
+    # Deep-copy the entries directly rather than round-tripping through
+    # add_tool_call: the source entries are ALREADY redacted/summarized, and
+    # re-running those transforms could distort the copy.
+    branch.entries = [deepcopy(e) for e in log.entries[:stop]]
+    branch.edges = list(log.edges)
+    return branch
