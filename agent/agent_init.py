@@ -2034,6 +2034,17 @@ def init_agent(
                 from plugins.memory import load_memory_provider as _load_mem
 
                 agent._memory_manager = _MemoryManager()
+                # Adaptive memory dosage (#75): config-gated, default off
+                # (agent.memory_injection.enabled: false). The policy only
+                # ever SHORTENS injected prefetch context — it never touches
+                # the static MEMORY_GUIDANCE prefix (prompt caching is
+                # sacred); see agent/memory_dosage.py.
+                try:
+                    agent._memory_manager.configure_dosage(
+                        _agent_cfg.get("memory_injection") or {}
+                    )
+                except Exception:
+                    pass  # dosage is optional — never break memory init
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

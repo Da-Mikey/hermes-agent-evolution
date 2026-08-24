@@ -1294,7 +1294,15 @@ def build_turn_context(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                # model_id feeds adaptive memory dosage (#75) — config-gated
+                # in agent_init, default off; when active it only ever
+                # shortens the injected prefetch context.
+                ext_prefetch_cache = (
+                    agent._memory_manager.prefetch_all(
+                        _query, model_id=getattr(agent, "model", None)
+                    )
+                    or ""
+                )
         except Exception:
             pass
         # Deterministic, model-independent recall indicator: when memory was

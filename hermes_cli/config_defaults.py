@@ -333,6 +333,53 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+
+        # Adaptive memory dosage (#75): calibrate injected memory volume to
+        # model capability. Default OFF until calibration shows cost savings
+        # without accuracy loss. When enabled, the merged prefetch context is
+        # capped per the model tier's profile — the policy only ever SHORTENS
+        # the injected context and never touches the byte-stable guidance
+        # prefix (prompt caching is sacred). See agent/memory_dosage.py.
+        "memory_injection": {
+            "enabled": False,
+            "profiles": {
+                "full": {"max_items": 8, "max_chars": 6000},
+                "curated": {"max_items": 4, "max_chars": 3000},
+                "minimal": {"max_items": 1, "max_chars": 1000},
+            },
+            # Ordered (tier, [regex patterns]) — first match wins against the
+            # model id. Frontier models absorb full context; compact models
+            # get minimal (small windows, weaker models distract easier);
+            # unknown models get the default_profile. tier_profiles maps a
+            # tier to an injection profile (fallback: same-name profile).
+            "tier_patterns": [
+                [
+                    "frontier",
+                    [
+                        "(?i)claude-opus",
+                        "(?i)gpt-4o",
+                        "(?i)gpt-5",
+                        "(?i)o[1-4](?:\\b|-)",
+                        "(?i)gemini-2\\.5-pro",
+                        "(?i)deepseek-reasoner",
+                        "(?i)sonnet",
+                    ],
+                ],
+                [
+                    "compact",
+                    [
+                        "(?i)flash",
+                        "(?i)mini",
+                        "(?i)nano",
+                        "(?i)tiny",
+                        "(?i)(?:^|[^0-9])(?:1|3|7|8|9)b",
+                        "(?i)small",
+                    ],
+                ],
+            ],
+            "tier_profiles": {"frontier": "full", "compact": "minimal"},
+            "default_profile": "curated",
+        },
     },
 
     "terminal": {

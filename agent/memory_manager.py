@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_importance import EpisodicMemoryStore, MemoryEvent, score_importance
 from agent.memory_contradiction import ContradictionFlag, detect_contradictions
+from agent.memory_dosage import apply_profile, load_dosage_config, profile_for
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
@@ -409,6 +410,23 @@ class MemoryManager:
         # session_id) pairs logged during prefetch_all. Cleared after
         # outcomes are recorded in sync_all.
         self._pending_retrievals: List[tuple[str, str]] = []
+        # Adaptive memory dosage (#75): normalized ``agent.memory_injection``
+        # config, or None (default) = policy off, injection unchanged. Set
+        # via configure_dosage() by the agent init path. When active it only
+        # ever SHORTENS merged prefetch context (byte-stable head).
+        self._dosage_config: Optional[Dict[str, Any]] = None
+
+    def configure_dosage(self, config: Optional[Dict[str, Any]]) -> None:
+        """Enable/disable adaptive memory injection (#75).
+
+        ``config`` is an ``agent.memory_injection`` section (see
+        ``agent/memory_dosage.py``). Invalid or disabled configs are stored
+        as ``None`` — dosage stays off. Never raises.
+        """
+        try:
+            self._dosage_config = load_dosage_config(config)
+        except Exception:
+            self._dosage_config = None
 
     # -- Registration --------------------------------------------------------
 
@@ -637,11 +655,19 @@ class MemoryManager:
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    def prefetch_all(
+        self, query: str, *, session_id: str = "", model_id: Optional[str] = None
+    ) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
+
+        ``model_id`` feeds adaptive memory dosage (#75): when the manager has
+        a dosage config (configure_dosage) and a model id is supplied, the
+        merged context is capped per the resolved model tier's profile. The
+        filter only SHORTENS (byte-stable head) and is non-fatal — any
+        dosage failure falls back to the undosed merge.
         """
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
@@ -663,7 +689,22 @@ class MemoryManager:
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
-        return "\n\n".join(parts)
+        merged = "\n\n".join(parts)
+        if self._dosage_config and model_id and merged:
+            try:
+                profile = profile_for(model_id, self._dosage_config)
+                if profile:
+                    # Dosage operates on the \n\n-separated segments of the
+                    # merged text (a provider may itself return several
+                    # sections), so max_items/truncation never cut a provider
+                    # block mid-way — the byte-stable head is preserved.
+                    segments = [s for s in merged.split("\n\n") if s.strip()]
+                    dosed = apply_profile(profile, segments or [merged])
+                    if dosed:
+                        return dosed
+            except Exception as e:
+                logger.debug("Memory dosage filter skipped (non-fatal): %s", e)
+        return merged
 
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
