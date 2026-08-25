@@ -56,9 +56,13 @@ class TestIterTrajectories:
         assert [e.tool for e in logs[0].entries] == ["tool_0", "tool_1"]
 
     def test_jsonl_append_format_multi_turn(self, tmp_path):
-        p = tmp_path / "2026-08-23_s1.jsonl"
-        _make_log("success", session_id="s1").append(tmp_path)
+        # Derive the filename from the log's own date (append() names the file
+        # "{date}_{session_id}.jsonl") — a hardcoded date here breaks every PR
+        # CI run after that date passes (issue #104).
+        log = _make_log("success", session_id="s1")
+        log.append(tmp_path)
         _make_log("failure", session_id="s1").append(tmp_path)
+        p = tmp_path / f"{log.date}_s1.jsonl"
         logs = iter_trajectories(p)
         assert len(logs) == 2
         assert logs[0].entries[0].result_status == "success"
