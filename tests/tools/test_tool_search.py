@@ -640,16 +640,22 @@ class TestBridgeDispatch:
         result = dispatch_tool_describe({}, current_tool_defs=[])
         assert "error" in json.loads(result)
 
-    def test_tool_describe_rejects_non_deferrable(self):
-        """If the model asks to describe a core tool, refuse — it's already
-        in the visible list."""
+    def test_tool_describe_returns_schema_for_direct_tool(self):
+        """A directly-available (non-deferrable) tool in the active toolset
+        is described, not rejected: its schema is right there in
+        current_tool_defs (#107)."""
         from tools.tool_search import dispatch_tool_describe
 
-        result = dispatch_tool_describe(
-            {"name": "terminal"},
-            current_tool_defs=[_td("terminal", "Run shell")],
+        result = json.loads(
+            dispatch_tool_describe(
+                {"name": "terminal"},
+                current_tool_defs=[_td("terminal", "Run shell")],
+            )
         )
-        assert "error" in json.loads(result)
+        assert "error" not in result
+        assert result["name"] == "terminal"
+        assert result["description"] == "Run shell"
+        assert "parameters" in result
 
     def test_empty_search_keeps_connected_sources_discoverable(self):
         from tools.registry import registry
