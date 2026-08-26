@@ -26,6 +26,12 @@ prompt: |
   2. DECIDE which stages have fresh upstream output newer than their consumer.
   3. DISPATCH up to 3 subagents per tick, upstream stages first.
   4. APPEND a brief record to KNOWLEDGE/hydra-dispatch-{date}.jsonl.
+     NAMING CONVENTION (#120): tick1 IS the base file hydra-dispatch-{date}.jsonl —
+     there is no separate hydra-dispatch-{date}-tick1.json(l). Per-tick snapshots
+     are named hydra-dispatch-{date}-tickN.jsonl for N >= 2 ONLY. Before reading a
+     dispatch artifact, list KNOWLEDGE/hydra-dispatch-* and read the newest existing
+     file; never guess a tickN path (that File-not-found breaks the pre-run gate).
+     Canonical templates live in ONE place: scripts/evolution_dispatch_paths.py.
 
   ## Stage definitions (delegate_task goal only)
   research – scan for new AI agent frameworks/papers/trends.
