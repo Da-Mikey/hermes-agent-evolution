@@ -1,0 +1,29 @@
+name: evolution-config-mutation-scan
+# 03:15 daily — after the 02:00 dreaming pipeline and before the 03:30
+# memory-poison-scan, so both audits run in the same quiet band. A config/skill
+# mutation is flagged within 24h of landing (issue #89 success criterion).
+schedule: "15 3 * * *"
+enabled: true
+mode: PRIVATE
+
+# Deterministic audit — NO LLM agent. The script IS the job: snapshots the
+# config/skill/hook trees under HERMES_HOME (sha256 + mtime), persists the
+# baseline to config_baseline.json (auto-initialized on first run), and every
+# run after diffs current vs baseline into config_mutation_scan.json (added /
+# removed / modified). Report-only — attribution of session-owned writes is
+# slice B. Issue #89 slice A.
+no_agent: true
+script: evolution_config_mutation_scan.py
+
+# Report to disk only; a scan run is data, not an alert. Alerting via the
+# audit channel is slice C.
+deliver: local
+
+prompt: |
+  Deterministic baseline + diff audit over the agent config/skill/hook trees
+  (no LLM). First run snapshots sha256/mtime of config-ish files under
+  HERMES_HOME (yaml/json/toml/conf/md/txt/sh/py, volatile subtrees excluded)
+  into config_baseline.json; every run after compares and writes
+  config_mutation_scan.json listing added / removed / modified files. No
+  attribution yet (slice B); report-only. Issue #89 slice A (parent stays
+  open for slices B-C).

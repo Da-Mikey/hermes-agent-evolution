@@ -1327,6 +1327,28 @@ def _fuzzy_tool_names(query: str, available: List[str], limit: int = 3) -> List[
     return [n for n in scored if _dist(q, n) <= max(3, len(q) // 3)]
 
 
+def _tool_schema_payload(
+    tool_defs: List[Dict[str, Any]], name: str
+) -> Optional[Dict[str, Any]]:
+    """Return the describe payload for ``name`` if its def is in ``tool_defs``.
+
+    Exact-name lookup across the FULL active toolset (visible + deferrable),
+    not just the deferred subset. A directly-available (core) tool's schema
+    lives in the model-facing array; ``tool_describe`` should hand it over
+    rather than erroring (#107). Returns None when the name is not present so
+    callers fall through to fuzzy suggestions / error paths.
+    """
+    for td in tool_defs:
+        fn = td.get("function") or {}
+        if fn.get("name") == name:
+            return {
+                "name": name,
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+            }
+    return None
+
+
 def dispatch_tool_describe(
     args: Dict[str, Any],
     *,
@@ -1370,6 +1392,15 @@ def _dispatch_tool_describe_inner(
 ) -> str:
     """Inner logic for dispatch_tool_describe, separated for caching."""
     if not is_deferrable_tool_name(name, config):
+        # #107 — a directly-available (non-deferrable) tool's schema is in
+        # the active toolset. Return it instead of the "not a deferrable
+        # tool" error: the model asked for the schema and it is right here.
+        # This also covers mcp__*/plugin tools granted to the session whose
+        # registry entry is transiently missing at dispatch time — the def
+        # list is the session's truth.
+        payload = _tool_schema_payload(current_tool_defs, name)
+        if payload is not None:
+            return json.dumps(payload, ensure_ascii=False)
         # #978 — fuzzy name matching even for non-deferrable names: the
         # model may have slightly misspelled a deferrable tool. Suggest
         # close matches from the current tool defs so it can self-correct

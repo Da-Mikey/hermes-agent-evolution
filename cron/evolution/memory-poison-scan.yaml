@@ -1,0 +1,31 @@
+name: evolution-memory-poison-scan
+# 03:30 daily — 90 minutes after the 02:00 dreaming-pipeline / dream-
+# consolidation jobs finish writing tqmemory notes, so a poisoned write is
+# flagged within 24h of landing in the store (issue #101 success criterion).
+# Off the :00/:30 marks of the other deterministic jobs where possible; 03:15
+# (config-mutation-scan) and 03:30 share the 03:00 band but are independent.
+schedule: "30 3 * * *"
+enabled: true
+mode: PRIVATE
+
+# Deterministic audit — NO LLM agent. The script IS the job: scans the
+# file-based persistent memory stores (HERMES memories, tqmemory notes, mem0)
+# line-by-line for sleeper-poisoning injection markers (zero-width/bidi control
+# chars, "ignore previous instructions" phrasing, fake system:/assistant:
+# roleplay lines) using evolution_extract's marker table, writes
+# ~/.hermes/evolution/memory_poison_scan.json. Issue #101 slice A.
+no_agent: true
+script: evolution_memory_poison_scan.py
+
+# Report to disk only; a scan run is data, not an alert. Alerting via the
+# audit channel is a later slice.
+deliver: local
+
+prompt: |
+  Deterministic nightly audit for sleeper-poisoning injection markers over the
+  persistent memory stores (no LLM). Scans ~/.hermes/memories/*.md,
+  ~/.turbo-quant-memory/projects/*/notes/*.json and ~/.hermes/mem0.json for
+  zero-width/bidi hidden characters and instruction-shaped payloads (ignore
+  previous instructions, fake system:/assistant: roleplay). Read-only; writes
+  memory_poison_scan.json. Issue #101 slice A (child of #101, parent stays
+  open for slices B-D).
