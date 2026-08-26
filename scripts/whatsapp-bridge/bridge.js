@@ -48,6 +48,19 @@ import {
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
 
+// #118: Baileys 7 requires global WebCrypto ('subtle'), which is only
+// stable on Node >= 20. Fail fast with an actionable message instead of
+// the cryptic "Cannot destructure property 'subtle'" startup TypeError
+// that currently crash-loops the bridge on older Node runtimes.
+const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
+if (Number.isFinite(NODE_MAJOR) && NODE_MAJOR < 20) {
+  console.error(
+    `❌ hermes-whatsapp-bridge requires Node >= 20 (found ${process.versions.node}). ` +
+    'Install Node 20+ (or run with --experimental-global-webcrypto on Node 18).'
+  );
+  process.exit(1);
+}
+
 // Parse CLI args
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
@@ -419,6 +432,9 @@ async function startSocket() {
     },
   });
 
+  // #118: consecutive-close counter for flap backoff (resets on open).
+  let consecutiveReconnects = 0;
+
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
   sock.ev.on('connection.update', (update) => {
@@ -454,10 +470,20 @@ async function startSocket() {
             console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
           }
         }
-        scheduleReconnect(reason === 515 ? 1000 : 3000);
+        // #118: exponential backoff on repeated closes (428/503 flap) so the
+        // reconnect loop stops hammering the WhatsApp servers; capped at 60s.
+        // 515 (restart requested) always reconnects fast.
+        if (reason === 515) {
+          scheduleReconnect(1000);
+        } else {
+          consecutiveReconnects += 1;
+          const backoffMs = Math.min(3000 * 2 ** (consecutiveReconnects - 1), 60000);
+          scheduleReconnect(backoffMs);
+        }
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      consecutiveReconnects = 0;  // #118: flap backoff resets on a stable connection
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
