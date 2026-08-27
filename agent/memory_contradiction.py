@@ -146,6 +146,28 @@ _STOPWORDS = frozenset({
     "not",
     "no",
     "never",
+    # Generic entity/context tokens (#121): co-occur across unrelated
+    # observations (system state lines, pipeline logs) and make the shared
+    # token bar fire on noise. Treated as polarity-neutral.
+    "system",
+    "pipeline",
+    "memory",
+    "data",
+    "user",
+    "agent",
+    "time",
+    "day",
+    "morning",
+    "evening",
+    "yesterday",
+    "today",
+    "job",
+    "task",
+    "message",
+    "session",
+    "log",
+    "status",
+    "error",
 })
 
 #: Tokens that look like negation fragments even after tokenize() mangling
@@ -272,11 +294,12 @@ def detect_contradictions(
         if stored_negated == obs_negated:
             continue
         shared = obs_tokens & _content_tokens(stored_text)
-        # Require at least TWO shared content tokens. A single shared token is
-        # usually a common predicate ("sleeping") with different subjects —
-        # "the cat is sleeping" vs "the dog is not sleeping" is NOT a
-        # contradiction. Two+ shared tokens means subject AND claim overlap.
-        if len(shared) < 2:
+        # Require at least THREE shared content tokens (#121). A single token
+        # is usually a common predicate; two still fires on unrelated
+        # observations sharing a generic subject + common predicate (the
+        # over-fire that produced 1,090 warnings in 3 days). Three shared
+        # tokens means subject AND claim overlap on distinctive content.
+        if len(shared) < 3:
             continue
         if obs_negated:
             reason = (
@@ -288,7 +311,7 @@ def detect_contradictions(
                 "new observation conflicts with a negated claim in stored memory "
                 f"(shared subject: {', '.join(sorted(shared))})"
             )
-        confidence = min(0.9, 0.6 + 0.05 * min(len(shared), 6))
+        confidence = min(0.9, 0.55 + 0.05 * min(len(shared), 6))
         flags.append(
             ContradictionFlag(
                 event_id=event.event_id,
