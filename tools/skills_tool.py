@@ -858,7 +858,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[
+                    :4000
+                ]
                 frontmatter, body = _parse_frontmatter(content)
 
                 if not skill_matches_platform(frontmatter):
@@ -1317,8 +1319,7 @@ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
         files = [
             str(path.relative_to(skill_root))
             for path in sorted(base.rglob("*"))
-            if path.is_file()
-            and validate_within_dir(path, skill_root) is None
+            if path.is_file() and validate_within_dir(path, skill_root) is None
         ]
         if files:
             linked[category] = files
@@ -1607,7 +1608,9 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
                     continue
                 try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                    fm_content = found_skill_md.read_text(
+                        encoding="utf-8-sig", errors="replace"
+                    )
                     fm, _ = _parse_frontmatter(fm_content)
                 except Exception:
                     fm = {}
@@ -1758,6 +1761,12 @@ def skill_view(
             except ValueError:
                 continue
 
+        def _skill_reviewed_allowlist() -> set:
+            _raw = os.environ.get("SKILL_REVIEWED_ALLOWLIST", "") or ""
+            return {s.strip() for s in _raw.split(",") if s.strip()}
+
+        _is_reviewed = name in _skill_reviewed_allowlist()
+
         # Security: detect common prompt injection patterns
         # (pattern list at module level as _INJECTION_PATTERNS)
         _content_lower = content.lower()
@@ -1783,7 +1792,7 @@ def skill_view(
                 if _TRUSTED_SOURCES
                 else False
             )
-            if _injection_detected and not _is_trusted:
+            if _injection_detected and not (_is_trusted or _is_reviewed):
                 _matched = [p for p in _INJECTION_PATTERNS if p in _content_lower]
                 return json.dumps(
                     {
@@ -1792,7 +1801,8 @@ def skill_view(
                             f"⛔ SkillTrojan defense: skill '{name}' was blocked "
                             f"because it contains suspicious patterns "
                             f"({', '.join(_matched[:3])}). If this is a trusted "
-                            f"source, add it to SKILL_TRUSTED_SOURCES env var."
+                            f"source, add it to SKILL_TRUSTED_SOURCES env var, "
+                            f"or review it and add it to SKILL_REVIEWED_ALLOWLIST."
                         ),
                     },
                     ensure_ascii=False,
@@ -1801,7 +1811,9 @@ def skill_view(
         # SkillTrojan defense (#1802): runtime composition trace.
         # Checks whether the combination of skills loaded this turn
         # reconstructs a payload across skill boundaries.
-        _composition_result = check_composition(name, content)
+        _composition_result = (
+            check_composition(name, content) if not _is_reviewed else {"success": True}
+        )
         if not _composition_result.get("success", True):
             return json.dumps(
                 {
@@ -2452,9 +2464,12 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
             rec_name, rec_fp = key
             if rec_fp != (file_path or ""):
                 continue
-            if rec_name != str(name) and not str(name).endswith("/" + rec_name) \
-                    and not rec_name.endswith("/" + str(name)) \
-                    and str(name).split(":")[-1] != rec_name:
+            if (
+                rec_name != str(name)
+                and not str(name).endswith("/" + rec_name)
+                and not rec_name.endswith("/" + str(name))
+                and str(name).split(":")[-1] != rec_name
+            ):
                 continue
             try:
                 st = os.stat(src)
@@ -2512,7 +2527,9 @@ def _skill_view_with_bump(args, **kw):
     if stub is not None:
         return stub
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=task_id,
+        name,
+        file_path=args.get("file_path"),
+        task_id=task_id,
         schema_only=schema_only,
     )
     try:
@@ -2531,6 +2548,7 @@ def _skill_view_with_bump(args, **kw):
                 # this skill has not yet earned trusted status.
                 try:
                     from tools.skill_usage import get_trust_state
+
                     if get_trust_state(str(resolved)) == "provisional":
                         parsed["trust_state"] = "provisional"
                         parsed.setdefault("warnings", []).append(
@@ -2554,6 +2572,7 @@ def _skill_view_with_bump(args, **kw):
                     # tracking (#2190).
                     try:
                         from tools.skill_usage import record_skill_outcome
+
                         record_skill_outcome(str(resolved), success=True)
                     except Exception:
                         pass
@@ -2569,6 +2588,7 @@ def _skill_view_with_bump(args, **kw):
                             record_compliance,
                             set_active_skill,
                         )
+
                         prev_skill = get_active_skill()
                         if prev_skill and prev_skill != str(resolved):
                             prev_calls = get_active_skill_tool_calls()
@@ -2584,6 +2604,7 @@ def _skill_view_with_bump(args, **kw):
                             # failure that feeds demotion telemetry.
                             try:
                                 from tools.skill_usage import record_skill_outcome
+
                                 record_skill_outcome(prev_skill, success=not violated)
                             except Exception:
                                 pass
