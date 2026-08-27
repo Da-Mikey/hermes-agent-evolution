@@ -276,6 +276,10 @@ def detect_contradictions(
         # usually a common predicate ("sleeping") with different subjects —
         # "the cat is sleeping" vs "the dog is not sleeping" is NOT a
         # contradiction. Two+ shared tokens means subject AND claim overlap.
+        # (Generic context tokens that co-occur across unrelated observations
+        # are handled by the #121 stopword list above, NOT by raising this bar —
+        # subject+claim pairs like "nas healthy" vs "nas not healthy" are
+        # genuine contradictions and must still fire with two shared tokens.)
         if len(shared) < 2:
             continue
         if obs_negated:
