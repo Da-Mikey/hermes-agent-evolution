@@ -449,6 +449,114 @@ def _validate_workdir(workdir: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Preflight guard (#3243): catch the most common terminal failure classes
+# BEFORE the shell runs, so the model gets a clear, actionable error instead
+# of a runtime failure. Deliberately conservative — only flags unambiguous
+# cases and never blocks shell builtins, pipelines, or compound commands.
+# Dangerous-command patterns are intentionally NOT duplicated here: they are
+# already enforced by tools/approval.py's check_all_command_guards.
+# ---------------------------------------------------------------------------
+_SHELL_BUILTINS = frozenset({
+    "cd",
+    "pwd",
+    "echo",
+    "printf",
+    "export",
+    "unset",
+    "source",
+    ".",
+    "test",
+    "[",
+    "[[",
+    "true",
+    "false",
+    "exec",
+    "exit",
+    "command",
+    "builtin",
+    "type",
+    "alias",
+    "unalias",
+})
+
+
+def _first_command_token(command: str) -> str | None:
+    """Return the first executable token of a simple command, or None.
+
+    Returns None for compound commands (pipes, ``&&``/``||``, ``;``,
+    redirection, background ``&``, command substitution) and for commands
+    that begin with env-var assignments — those are left to the shell.
+    """
+    if not command or not command.strip():
+        return None
+    stripped = command.strip()
+    if any(ch in stripped for ch in "|&;<>`"):
+        return None
+    if "$(" in stripped:
+        return None
+    try:
+        parts = shlex.split(stripped)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    first = parts[0]
+    # Skip leading env-var assignments (FOO=bar cmd ...).
+    if "=" in first and not first.startswith("/"):
+        return None
+    return first
+
+
+def _is_shell_builtin(token: str) -> bool:
+    return token in _SHELL_BUILTINS
+
+
+def _preflight_check(
+    command: str,
+    workdir: Optional[str],
+    timeout: Optional[int],
+    env_type: str = "local",
+    is_mock_env: bool = False,
+) -> str | None:
+    """Return an error string if the command fails a preflight check, else None.
+
+    Checks, in order:
+      1. Timeout realism: reject a sub-second timeout (non-positive values
+         are already rejected by the caller).
+      2. For local, non-mocked environments: an explicitly provided ``workdir``
+         exists and is a directory on the local host.
+      3. For local, non-mocked environments: the first command token resolves
+         to an executable in PATH (or is an absolute path that exists and is
+         executable). Only checked for simple single commands; compound commands
+         are left to the shell.
+    """
+    if timeout is not None and timeout < 1:
+        return f"Preflight: timeout must be a positive integer in seconds (must be at least 1 second, got {timeout})."
+    if env_type != "local" or is_mock_env:
+        return None
+    if workdir and not os.path.isdir(workdir):
+        return (
+            f"Preflight: workdir {workdir!r} does not exist or is not a "
+            "directory. Create it first or pass an existing directory."
+        )
+    first = _first_command_token(command)
+    if first is None or _is_shell_builtin(first):
+        return None
+    if os.path.sep in first:
+        if not os.path.exists(first) or not os.access(first, os.X_OK):
+            return (
+                f"Preflight: {first!r} does not exist or is not executable. "
+                "Check the path or install the tool."
+            )
+    elif shutil.which(first) is None:
+        return (
+            f"Preflight: {first!r} was not found in PATH. Install it or use "
+            "an absolute path."
+        )
+    return None
+
+
 def _handle_sudo_failure(output: str, env_type: str) -> str:
     """
     Check for sudo failure and add helpful message for messaging contexts.
@@ -3055,6 +3163,26 @@ def terminal_tool(
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+
+        from tools.environments.local import LocalEnvironment
+        active_env = _active_environments.get(effective_task_id) or _active_environments.get("default")
+        is_mock_env = active_env is not None and not isinstance(active_env, LocalEnvironment)
+
+        # Lightweight preflight guard: fail fast on common, deterministic mistakes
+        # before paying for environment setup / shell execution (#3243).
+        preflight_error = _preflight_check(
+            command, workdir, timeout, env_type=env_type, is_mock_env=is_mock_env
+        )
+        if preflight_error:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": preflight_error,
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
