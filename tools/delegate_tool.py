@@ -1997,6 +1997,35 @@ _FILESYSTEM_DEPENDENT_VERBS = frozenset({
     "repo_map",
 })
 
+# Verbs that strongly indicate the task requires web/network access (#126).
+# Matched as whole words (case-insensitive) against goal + context text.
+# Conservative: false positives (auto-adding `web` when not strictly needed)
+# are harmless because `web` is a core tool; false negatives fall back to the
+# existing behavior where the subagent may report it lacks web — the failure
+# mode #126 documented (research subagents arriving with no host web fallback
+# when the only provisioned MCP web path is exhausted).
+_WEB_DEPENDENT_VERBS = frozenset({
+    "web",
+    "search",
+    "fetch",
+    "scrape",
+    "crawl",
+    "browse",
+    "url",
+    "http",
+    "https",
+    "website",
+    "download",
+    "research",
+    "news",
+    "rss",
+    # Tool names themselves (matched as literal words): a goal that says
+    # "use web_search" must trigger the heuristic even though the underscore
+    # is a word char and blocks a bare \b(web)\b match.
+    "web_search",
+    "web_extract",
+})
+
 
 def _goal_needs_terminal(goal: str, context: Optional[str] = None) -> bool:
     """Return True if the task goal/context text references shell-dependent work.
@@ -2035,6 +2064,32 @@ def _goal_needs_file(goal: str, context: Optional[str] = None) -> bool:
         return False
     pattern = re.compile(
         r"\b(" + "|".join(re.escape(v) for v in _FILESYSTEM_DEPENDENT_VERBS) + r")\b",
+        re.IGNORECASE,
+    )
+    return bool(pattern.search(text))
+
+
+def _goal_needs_web(goal: str, context: Optional[str] = None) -> bool:
+    """Return True if the task goal/context text references web/network-dependent work (#126).
+
+    Static heuristic — no LLM call. Scans for web-dependent verbs as whole
+    words (bounded by non-alphanumeric boundaries) in the goal and optional
+    context text. Conservative: false positives (auto-adding `web` when not
+    strictly needed) are harmless because `web` is a core tool; false
+    negatives (missing a verb) fall back to the existing behavior where a
+    research subagent arrives with no host web fallback and its only web
+    path (an MCP toolset like firecrawl) is exhausted — the failure mode
+    #126 documented.
+    """
+    import re
+
+    text = goal or ""
+    if context:
+        text = f"{text}\n{context}"
+    if not text:
+        return False
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(v) for v in _WEB_DEPENDENT_VERBS) + r")\b",
         re.IGNORECASE,
     )
     return bool(pattern.search(text))
@@ -2425,6 +2480,23 @@ def _build_child_agent(
                 "delegate_task: auto-added 'file' toolset for task %d "
                 "(goal references filesystem-dependent verbs but resolved toolset "
                 "omitted it) — #3093",
+                task_index,
+            )
+    # #126: same for `web` — research/sync subagents arrived with no host web
+    # fallback when their only provisioned web path (an MCP toolset such as
+    # firecrawl) was exhausted, and announced the gap mid-run instead of
+    # completing. The parent intersection already bounded the child to
+    # parent-capable toolsets, so we only add `web` when the parent itself can
+    # provide it.
+    if _goal_needs_web(goal, context) and "web" not in child_toolsets:
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        if "web" in expanded_parent:
+            child_toolsets.append("web")
+            _toolset_adjusted = True
+            logger.info(
+                "delegate_task: auto-added 'web' toolset for task %d "
+                "(goal references web-dependent verbs but resolved toolset "
+                "omitted it) — #126",
                 task_index,
             )
 
