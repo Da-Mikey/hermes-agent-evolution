@@ -9,6 +9,11 @@ for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
   Always-load means always-load. No exceptions.
+* Session-gated GUI toolsets (``desktop_ui``, ``project``) are also never
+  deferred. They stay off the core list so CLI and messaging never pay for
+  their schemas, but once a session enables them they stay in the
+  model-facing array. Tool Search is for MCP/plugin catalog bloat, not for
+  hiding the tools that define this session's surface.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -421,15 +426,20 @@ def effective_core_tool_names(
     return frozenset(core - opted_in)
 
 
+_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+
+
 def is_deferrable_tool_name(
     name: str, config: Optional[ToolSearchConfig] = None
 ) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in the *effective* core set. Core tools are never deferred
-    (this protects against accidental shadowing) unless their toolset is
-    explicitly opted in via ``defer_core_toolsets``.
+    OR it is neither in the *effective* core set nor a session-gated GUI
+    surface toolset. Core tools are never deferred (this protects against
+    accidental shadowing) unless their toolset is explicitly opted in via
+    ``defer_core_toolsets``; direct-surface tools (desktop_ui, project) stay
+    visible whenever their session enables them.
 
     ``config`` is resolved from the user config when omitted so the
     no-config call sites (bridge dispatch, scope validation) stay in sync
@@ -459,6 +469,8 @@ def is_deferrable_tool_name(
             return False
         if entry.toolset.startswith("mcp-"):
             return True
+        if entry.toolset in _DIRECT_SURFACE_TOOLSETS:
+            return False
         # Non-MCP, non-core → plugin tool, eligible.
         return True
     except Exception:
@@ -472,9 +484,8 @@ def classify_tools(
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
-    every effective-core tool, plus any tool we can't classify. ``deferrable``
-    is the candidate set for catalog entry. ``config`` is resolved from the
-    user config when omitted.
+    every core tool, every session-gated GUI surface tool, plus any tool we
+    can't classify. ``deferrable`` is the candidate set for catalog entry.
     """
     if config is None:
         config = load_config()

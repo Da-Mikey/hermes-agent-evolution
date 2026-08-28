@@ -125,9 +125,7 @@ def _(rid, params: dict) -> dict:
     try:
         with _profile_db(params) as db:
             if db is None:
-                return _ok(
-                    rid, {"projects": [], "active_id": None, "scoped_session_ids": []}
-                )
+                return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
 
             tree, active_id = _build_project_tree(
                 db,
@@ -138,11 +136,7 @@ def _(rid, params: dict) -> dict:
             )
             return _ok(
                 rid,
-                {
-                    "projects": tree["projects"],
-                    "active_id": active_id,
-                    "scoped_session_ids": tree["scoped_session_ids"],
-                },
+                {"projects": tree["projects"], "active_id": active_id, "scoped_session_ids": tree["scoped_session_ids"]},
             )
     except Exception as e:
         return _err(rid, 5061, str(e))
@@ -166,10 +160,7 @@ def _(rid, params: dict) -> dict:
             # Drill-in only needs the entered project (which has sessions), so skip
             # the zero-session discovery tier entirely.
             tree, _active = _build_project_tree(
-                db,
-                preview_limit=0,
-                hydrate=True,
-                session_limit=int(params.get("session_limit") or 5000),
+                db, preview_limit=0, hydrate=True, session_limit=int(params.get("session_limit") or 5000),
                 include_discovered=False,
             )
             proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
