@@ -169,6 +169,56 @@ class TestTakeCheckpoint:
         (work_dir / "main.py").write_text("print('modified')\n")
         assert mgr.ensure_checkpoint(str(work_dir), "turn 2") is True
 
+    def test_unreadable_subdir_does_not_kill_checkpoint(self, mgr, work_dir):
+        """#127: a root-owned /tmp/systemd-private-* style dir (unreadable to
+        the agent) must not silently kill the whole checkpoint — the readable
+        content still lands in the snapshot."""
+        locked = work_dir / "locked"
+        locked.mkdir()
+        (locked / "secret.txt").write_text("nope\n")
+        locked.chmod(0o000)
+        try:
+            assert mgr.ensure_checkpoint(str(work_dir), "with locked dir") is True
+        finally:
+            locked.chmod(0o755)
+        snapshots = mgr.list_checkpoints(str(work_dir))
+        assert len(snapshots) == 1
+
+    def test_unreadable_subdir_retry_excludes_and_succeeds(
+        self, mgr, work_dir, monkeypatch,
+    ):
+        """#127: when `git add -A` fails (rc=128, unreadable dirs), the retry
+        excludes those paths from staging and still snapshots readable content."""
+        import tools.checkpoint_manager as ckm
+
+        locked = work_dir / "locked"
+        locked.mkdir()
+        (locked / "secret.txt").write_text("nope\n")
+        locked.chmod(0o000)
+
+        real_run_git = ckm._run_git
+        calls: list = []
+
+        def flaky_add(args, store, working_dir, **kw):
+            calls.append(list(args))
+            if args[:2] == ["add", "-A"] and "--ignore-errors" not in args:
+                return False, "", (
+                    "warning: could not open directory 'locked/': Permission denied"
+                )
+            return real_run_git(args, store, working_dir, **kw)
+
+        monkeypatch.setattr(ckm, "_run_git", flaky_add)
+        try:
+            assert mgr.ensure_checkpoint(str(work_dir), "with locked dir") is True
+        finally:
+            locked.chmod(0o755)
+
+        retry = [c for c in calls if "--ignore-errors" in c]
+        assert retry, "expected a retry add with --ignore-errors"
+        assert any(":(exclude,top)locked" in str(p) for p in retry[0])
+        snapshots = mgr.list_checkpoints(str(work_dir))
+        assert len(snapshots) == 1
+
 
 # =========================================================================
 # CheckpointManager — listing

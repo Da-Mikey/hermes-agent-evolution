@@ -420,6 +420,31 @@ def _run_git(
         return False, "", str(exc)
 
 
+def _unreadable_dirs(working_dir: Path) -> List[str]:
+    """Return top-relative paths of directories under *working_dir* that cannot be read.
+
+    ``git add -A`` can fail hard (rc=128) when the working tree contains
+    directories it cannot open — e.g. root-owned ``/tmp/systemd-private-*``
+    trees — even though it only prints warnings. Callers can exclude these
+    from staging with ``:(exclude,top)<rel>`` pathspecs so one inaccessible
+    subtree does not silently kill every checkpoint of the project (#127).
+    """
+    unreadable: List[str] = []
+    for root, dirs, _files in os.walk(working_dir):
+        kept: List[str] = []
+        for name in dirs:
+            path = Path(root) / name
+            if os.access(path, os.R_OK | os.X_OK):
+                kept.append(name)
+            else:
+                try:
+                    unreadable.append(str(path.relative_to(working_dir)))
+                except ValueError:
+                    unreadable.append(str(path))
+        dirs[:] = kept
+    return unreadable
+
+
 # ---------------------------------------------------------------------------
 # Store initialisation + legacy migration
 # ---------------------------------------------------------------------------
@@ -1317,8 +1342,30 @@ class CheckpointManager:
             timeout=_GIT_TIMEOUT * 2, index_file=index_file,
         )
         if not ok:
-            logger.debug("Checkpoint git-add failed: %s", err)
-            return False
+            # #127: `git add -A` fails rc=128 when the working tree contains
+            # directories the agent cannot read (e.g. root-owned
+            # /tmp/systemd-private-* dirs), even when git only prints warnings
+            # for them. Every subsequent checkpoint of that project then fails
+            # and session snapshots silently stop being persisted. Locate the
+            # unreadable paths, exclude them from staging, and retry once —
+            # the checkpoint still captures everything readable.
+            work_path = _normalize_path(working_dir)
+            unreadable = _unreadable_dirs(work_path) if work_path.is_dir() else []
+            if unreadable:
+                pathspecs = [f":(exclude,top){rel}" for rel in unreadable]
+                logger.warning(
+                    "Checkpoint git-add failed — excluding %d unreadable "
+                    "path(s) from staging and retrying: %s",
+                    len(unreadable), ", ".join(pathspecs),
+                )
+                ok, _, err = _run_git(
+                    ["add", "-A", "--ignore-errors", "--", *pathspecs],
+                    store, working_dir,
+                    timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+                )
+            if not ok:
+                logger.error("Checkpoint git-add failed after retry: %s", err)
+                return False
 
         if self.max_file_size_mb > 0:
             self._drop_oversize_from_index(store, working_dir, index_file)
