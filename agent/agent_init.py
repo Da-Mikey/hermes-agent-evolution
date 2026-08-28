@@ -628,6 +628,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    write_guard_policy: Any = None,
 ):
     """
     Initialize the AI Agent.
@@ -717,6 +718,7 @@ def init_agent(
     )
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent.write_guard_policy = write_guard_policy
     # Background review (memory/skill) opt-out switch. When True, skips the
     # _spawn_background_review fork at end-of-turn -- avoids ~30K tokens /
     # event of extra LLM cost on cron-style sessions where review forks
@@ -1986,11 +1988,32 @@ def init_agent(
         agent.lmstudio_load_mode = "explicit"
 
     try:
-        from agent.policy_interceptors import build_registry_from_config
+        from agent.policy_interceptors import (
+            RegisteredPolicy,
+            build_registry_from_config,
+        )
+        from agent.write_guard import WriteGuardPolicy, make_write_guard
 
         _policy_registry = build_registry_from_config(
             _agent_cfg.get("policy_interceptors", {})
         )
+        _raw_wg = getattr(agent, "write_guard_policy", None) or _agent_cfg.get(
+            "write_guard", {}
+        )
+        _wg_policy = (
+            _raw_wg
+            if isinstance(_raw_wg, WriteGuardPolicy)
+            else WriteGuardPolicy.from_mapping(_raw_wg)
+        )
+        if _wg_policy.enabled:
+            _policy_registry._policies.append(
+                RegisteredPolicy(
+                    name="write_guard",
+                    interceptor=make_write_guard(_wg_policy),
+                )
+            )
+        agent._write_guard_policy = _wg_policy
+
         # #1041 — recheck-suppression controller (off by default). Passed to the
         # guardrail so before_call can suppress a single redundant read-only
         # recheck when ``recheck_suppression.enabled`` is set.

@@ -242,9 +242,16 @@ def _build_deny_tools(options: Mapping[str, Any]) -> PolicyInterceptor:
     return make_deny_tools(_frozenset_opt(options.get("tools"), frozenset()))
 
 
+def _build_write_guard(options: Mapping[str, Any]) -> PolicyInterceptor:
+    from agent.write_guard import WriteGuardPolicy, make_write_guard
+
+    return make_write_guard(WriteGuardPolicy.from_mapping(options))
+
+
 BUILTIN_POLICY_FACTORIES: dict[str, PolicyFactory] = {
     "require_read_before_write": _build_require_read_before_write,
     "deny_tools": _build_deny_tools,
+    "write_guard": _build_write_guard,
 }
 
 
