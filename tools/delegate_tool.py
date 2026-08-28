@@ -2747,6 +2747,12 @@ def _build_child_agent(
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
+                write_guard_policy=getattr(
+                    parent_agent,
+                    "write_guard_policy",
+                    None,
+                )
+                or getattr(parent_agent, "_write_guard_policy", None),
                 **child_optional_kwargs,
             )
         except BaseException:
@@ -6547,9 +6553,10 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = (
         _build_tasks_param_description()
     )
-    overrides_params["properties"]["role"]["description"] = (
-        _build_role_param_description()
-    )
+    if "role" in overrides_params["properties"]:
+        overrides_params["properties"]["role"]["description"] = (
+            _build_role_param_description()
+        )
 
     # Prune ACP overrides from the schema when no known ACP CLI is on PATH.
     # The runtime guard in _build_child_agent remains as defense-in-depth for
@@ -6634,11 +6641,6 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Per-task ACP args override. Leave empty unless acp_command is set.",
                         },
-                        "role": {
-                            "type": "string",
-                            "enum": ["leaf", "orchestrator"],
-                            "description": "Per-task role override. See top-level 'role' for semantics.",
-                        },
                         "output_schema": {
                             "type": "object",
                             "description": (
@@ -6694,19 +6696,6 @@ DELEGATE_TASK_SCHEMA = {
                 # NOTE: the handler also accepts a per-task `role` — legacy,
                 # ignored: delegation capability is depth-derived, not
                 # caller-declared. Unadvertised on purpose; do not re-add.
-                "description": "(rebuilt at get_definitions() time)",
-            },
-            "output_schema": {
-                "type": "object",
-                "description": (
-                    "Optional JSON Schema for the single-goal form — the "
-                    "subagent's final answer must validate against it "
-                    "(same semantics as tasks[].output_schema)."
-                ),
-            },
-            "role": {
-                "type": "string",
-                "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
             "background": {

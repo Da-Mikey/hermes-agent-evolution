@@ -3091,9 +3091,11 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
     def test_unknown_role_coerces_to_leaf(self):
         """role='nonsense' → _normalize_role warns and returns 'leaf'."""
         import logging
+        from tools.delegate_tool import _normalize_role
+
         with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
-            child = self._run_with_mock_child("nonsense")
-        self.assertEqual(child._delegate_role, "leaf")
+            normalized = _normalize_role("nonsense")
+        self.assertEqual(normalized, "leaf")
         self.assertTrue(any("coercing" in m.lower() for m in cm.output))
 
     def test_acp_command_description_has_do_not_set_guidance(self):
@@ -3286,12 +3288,8 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def test_batch_mode_per_task_role_override(self, mock_cfg, mock_creds):
-        """Per-task role beats top-level; no top-level role → "leaf".
-
-        tasks=[{role:'orchestrator'},{role:'leaf'},{}] → first gets
-        delegation, second and third don't.  Requires max_spawn_depth>=2
-        (raised explicitly here) since the new default is 1 (flat).
-        """
+        """Role is depth-derived: with max_spawn_depth=2, all depth-1 children
+        have depth budget left and receive delegation capability."""
         mock_creds.return_value = {
             "provider": None, "base_url": None,
             "api_key": None, "api_mode": None, "model": None,
@@ -3309,13 +3307,13 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
                 tasks=[
                     {"goal": "Investigate orchestrator work", "role": "orchestrator"},
                     {"goal": "Investigate leaf work A", "role": "leaf"},
-                    {"goal": "Investigate leaf work B"},  # no role → falls back to top_role (leaf)
+                    {"goal": "Investigate leaf work B"},
                 ],
                 parent_agent=parent,
             )
         self.assertIn("delegation", built_toolsets[0])
-        self.assertNotIn("delegation", built_toolsets[1])
-        self.assertNotIn("delegation", built_toolsets[2])
+        self.assertIn("delegation", built_toolsets[1])
+        self.assertIn("delegation", built_toolsets[2])
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
