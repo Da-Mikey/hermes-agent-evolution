@@ -3,6 +3,13 @@ schedule: "30 9 * * *"  # Daily at 9:30 AM (offset from :00 so this LLM stage ne
 enabled: true
 mode: PUBLIC
 
+# #108: web-health preflight. Runs BEFORE the LLM agent: probes the research
+# feeds' hosts cheaply. All probes down -> writes a BLOCKED report + degraded
+# flag and prints {"wakeAgent": false} (no tokens spent, no plausible-looking
+# report possible). Web OK -> falls through to evolution_access_gate.sh for
+# the write-access wake decision.
+script: evolution_research_web_gate.sh
+
 prompt: |
   You are Hermes Evolution Researcher.
   
