@@ -262,6 +262,37 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
         agent._session_db_created = False
 
 
+def test_malformed_memory_config_still_builds_default_store():
+    """A non-mapping memory section must not leave an advertised dead tool."""
+    malformed = {"memory": "not-a-mapping"}
+    with (
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value=malformed,
+        ),
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("memory"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=["memory"],
+        )
+
+    assert agent._memory_enabled is True
+    assert agent._user_profile_enabled is True
+    assert agent._memory_store is not None
+    assert agent._memory_store.memory_enabled is True
+    assert agent._memory_store.user_profile_enabled is True
+
+
 @pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""
@@ -1494,11 +1525,48 @@ class TestBuildSystemPrompt:
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
+        agent_with_memory_tool._memory_enabled = True
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
 
     def test_no_memory_guidance_without_tool(self, agent):
         from agent.prompt_builder import MEMORY_GUIDANCE
+
+    def test_no_memory_guidance_when_both_builtin_stores_disabled(
+        self, agent_with_memory_tool
+    ):
+        """Guidance must follow the stores, not just the tool's presence.
+
+        With both built-in stores off, ``agent_init`` never builds a
+        ``MemoryStore``, so every memory call returns "Memory is not
+        available" — telling the model to save facts there is a dead
+        instruction paid for on every API call.
+        """
+        from agent.prompt_builder import MEMORY_GUIDANCE, USER_PROFILE_GUIDANCE
+
+        agent_with_memory_tool._memory_enabled = False
+        agent_with_memory_tool._user_profile_enabled = False
+        prompt = agent_with_memory_tool._build_system_prompt()
+        assert MEMORY_GUIDANCE not in prompt
+        assert USER_PROFILE_GUIDANCE not in prompt
+
+    def test_profile_guidance_when_only_user_profile_enabled(
+        self, agent_with_memory_tool
+    ):
+        """USER.md alone gets the narrower profile-only guidance.
+
+        The full MEMORY_GUIDANCE block instructs the model to save notes to a
+        MEMORY.md store that does not exist in this configuration, so the
+        profile-specific block is injected instead.
+        """
+        from agent.prompt_builder import MEMORY_GUIDANCE, USER_PROFILE_GUIDANCE
+
+        agent_with_memory_tool._memory_enabled = False
+        agent_with_memory_tool._user_profile_enabled = True
+        prompt = agent_with_memory_tool._build_system_prompt()
+        assert MEMORY_GUIDANCE not in prompt
+        assert USER_PROFILE_GUIDANCE in prompt
+
 
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
@@ -1795,6 +1863,72 @@ class TestToolUseEnforcementConfig:
             a.client = MagicMock()
             prompt = a._build_system_prompt()
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
+
+
+class TestExecutionGuidanceConfig:
+    """End-to-end tests for the agent.execution_guidance config option —
+    from config.yaml through agent_init to the built system prompt."""
+
+    def _make_agent(self, model="deepseek/deepseek-v4-pro", execution_guidance=None):
+        agent_cfg = {"tool_use_enforcement": False}
+        if execution_guidance is not None:
+            agent_cfg["execution_guidance"] = execution_guidance
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": agent_cfg},
+            ), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": agent_cfg},
+            ),
+        ):
+            a = AIAgent(
+                model=model,
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_deepseek_gets_guidance_by_default(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(model="deepseek/deepseek-v4-pro")
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
+
+    def test_gpt_still_gets_guidance(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(model="openai/gpt-4.1")
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
+
+    def test_config_false_suppresses(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(
+            model="deepseek/deepseek-v4-pro", execution_guidance=False
+        )
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in agent._build_system_prompt()
+
+    def test_config_list_matches(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(
+            model="moonshotai/kimi-k3", execution_guidance=["kimi"]
+        )
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
+
+    def test_config_list_non_match_suppresses(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(
+            model="openai/gpt-4.1", execution_guidance=["kimi"]
+        )
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in agent._build_system_prompt()
 
 
 class TestTaskCompletionGuidance:
@@ -4421,8 +4555,11 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
         ("read_preview", {}),
+        ("drive_preview", {"action": "elements"}),
+        ("annotate_preview", {"action": "clear"}),
         ("read_window_below", {}),
         ("setup_mcp", {"server": "linear", "action": "install"}),
+        ("tour", {"action": "stop"}),
         ("delegate_task", {"goal": "Check the child path"}),
         # Fork-only: agent-driven compaction (#1568 SelfCompact) routes through
         # the same agent-level path, so it owns its post hook exactly like the
@@ -4471,6 +4608,22 @@ class TestAgentRuntimePostHookOwnershipSync:
         # about compaction — the hook-emission contract is all that is on test.
         monkeypatch.setattr(
             "tools.compact_context_tool.compact_context_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.read_preview_tool.read_preview_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.drive_preview_tool.drive_preview_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.annotate_preview_tool.annotate_preview_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.read_window_tool.read_window_below_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
@@ -7638,6 +7791,660 @@ class TestRunConversation:
         mock_compress.assert_called_once()
         assert result["final_response"] == "Done"
         assert result["completed"] is True
+
+
+
+    def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
+        """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
+        self._setup_agent(agent)
+        agent.compression_enabled = True  # this test verifies overflow→compression fires
+        err_400 = Exception(
+            "Error code: 400 - {'error': {'code': '1261', 'message': 'Prompt exceeds max length'}}"
+        )
+        err_400.status_code = 400
+        ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "compressed system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_called_once()
+        assert result["final_response"] == "Recovered after compression"
+        assert result["completed"] is True
+
+
+
+    def test_length_finish_reason_requests_continuation(self, agent):
+        """Normal truncation (partial real content) triggers continuation."""
+        self._setup_agent(agent)
+        first = _mock_response(content="Part 1 ", finish_reason="length")
+        second = _mock_response(content="Part 2", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == "Part 1 Part 2"
+
+        second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        assert second_call_messages[-1]["role"] == "user"
+        assert "truncated by the output length limit" in second_call_messages[-1]["content"]
+
+    def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
+        """Continuation retries must not shrink a higher provider default cap."""
+        self._setup_agent(agent)
+        agent.max_tokens = None
+        requested_caps = []
+
+        def _fake_build_api_kwargs(api_messages):
+            ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
+            if ephemeral is not None:
+                agent._ephemeral_max_output_tokens = None
+            cap = ephemeral if ephemeral is not None else 65536
+            requested_caps.append(cap)
+            return {"model": agent.model, "messages": api_messages, "max_tokens": cap}
+
+        first = _mock_response(content="Part 1 ", finish_reason="length")
+        second = _mock_response(content="Part 2", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=_fake_build_api_kwargs),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Part 1 Part 2"
+        assert requested_caps == [65536, 65536]
+
+    def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
+        """Ollama-hosted GLM responses can misreport truncated output as stop."""
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.1:cloud"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        misreported_stop = _mock_response(
+            content="Based on the search results, the best next",
+            finish_reason="stop",
+        )
+        continued = _mock_response(
+            content=" step is to update the config.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            misreported_stop,
+            continued,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 3
+        assert (
+            result["final_response"]
+            == "Based on the search results, the best next step is to update the config."
+        )
+
+        third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
+        assert third_call_messages[-1]["role"] == "user"
+        assert "truncated by the output length limit" in third_call_messages[-1]["content"]
+
+
+
+
+
+
+
+    def test_length_thinking_exhausted_skips_continuation(self, agent):
+        """When finish_reason='length' but content is only thinking, skip retries."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="<think>internal reasoning</think>",
+            finish_reason="length",
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Should return immediately — no continuation, only 1 API call
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert "reasoning" in result["error"].lower()
+        assert "output tokens" in result["error"].lower()
+        # Should have a user-friendly response (not None)
+        assert result["final_response"] is not None
+        assert "Thinking Budget Exhausted" in result["final_response"]
+        assert "/thinkon" in result["final_response"]
+
+
+    def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
+        self._setup_agent(agent)
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        resp = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write the report")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "truncated due to output length limit" in result["error"]
+        mock_handle_function_call.assert_not_called()
+
+    def test_truncated_tool_call_retries_once_before_refusing(self, agent):
+        """When tool call args are truncated, the agent retries the API call
+        (up to 3 times). If a retry succeeds (valid JSON args), tool execution
+        proceeds."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        truncated_resp = _mock_response(
+            content="", finish_reason="length", tool_calls=[bad_tc],
+        )
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(
+            content="", finish_reason="stop", tool_calls=[good_tc],
+        )
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            # First call: truncated → retry. Second: valid → execute tool.
+            # Third: final text response.
+            final_resp = _mock_response(content="Done!", finish_reason="stop")
+            agent.client.chat.completions.create.side_effect = [
+                truncated_resp, good_resp, final_resp,
+            ]
+            result = agent.run_conversation("write the report")
+
+        # Tool was executed on the retry (good_resp)
+        mock_hfc.assert_called_once()
+        assert result["final_response"] == "Done!"
+
+    def test_stub_stall_mid_tool_call_recovers_within_3_retries(self, agent):
+        """A network stream stall mid tool-call (PARTIAL_STREAM_STUB_ID) must
+        retry up to 3 times rather than hard-failing after one — and recover
+        if a retry produces a complete tool call. Regression for the false
+        'model hit max output tokens' on Opus when the stream simply dropped."""
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        # Two consecutive stub-stall responses, then a clean tool call.
+        stall1 = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        stall1.id = PARTIAL_STREAM_STUB_ID
+        stall2 = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        stall2.id = PARTIAL_STREAM_STUB_ID
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(content="", finish_reason="stop", tool_calls=[good_tc])
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.client.chat.completions.create.side_effect = [
+                stall1, stall2, good_resp, final_resp,
+            ]
+            result = agent.run_conversation("write the report")
+
+        # Recovered on the 3rd attempt instead of refusing after the 1st.
+        mock_hfc.assert_called_once()
+        assert result["final_response"] == "Done!"
+
+    def test_zero_byte_tool_args_stub_recovers_within_retries(self, agent):
+        """#80498: a stream that dies before a single argument byte arrives
+        (name-only tool call) produces a stub with tool_calls=None and
+        _dropped_tool_names set — the real shape _build_partial_stream_stub
+        returns, distinct from the truncated-JSON stub above (which still
+        carries a tool_calls list). Confirms the zero-byte trigger is wired
+        end-to-end through the retry loop, not just detected at the
+        chat_completion_helpers unit level."""
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+
+        stall = _mock_response(content="", finish_reason="length", tool_calls=None)
+        stall.id = PARTIAL_STREAM_STUB_ID
+        stall._dropped_tool_names = ["write_file"]
+
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(content="", finish_reason="stop", tool_calls=[good_tc])
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.client.chat.completions.create.side_effect = [
+                stall, good_resp, final_resp,
+            ]
+            result = agent.run_conversation("write the report")
+
+        # The zero-byte stub must trigger a retry, not silently execute
+        # write_file with coerced empty arguments (the #80498 regression).
+        mock_hfc.assert_called_once()
+        assert result["final_response"] == "Done!"
+
+
+    def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
+        """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"ok.md","content":"x"}',
+            call_id="c_ok",
+        )
+        good_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[good_tc],
+        )
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c_bad",
+        )
+        bad_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[bad_tc],
+        )
+        agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}'),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write then truncate")
+
+        assert result.get("partial") is True
+        msgs = result.get("messages") or []
+        assert msgs[-1].get("role") == "assistant"
+        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
+
+
+    def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
+        """Regression: kanban worker must signal the dispatcher when its
+        iteration budget is exhausted, otherwise the task silently re-runs
+        forever without ever tripping the failure_limit circuit breaker
+        (issue #23216 / #29747 gap 2).
+
+        As of #29747, the exhaustion path routes through
+        ``kanban_db._record_task_failure(outcome="timed_out")`` so the
+        ``consecutive_failures`` counter increments and the dispatcher's
+        ``failure_limit`` breaker eventually trips. The legacy
+        ``kanban_block`` call was replaced because blocked-outcome runs
+        bypass the failure counter.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+
+        # Return a tool call for every iteration to exhaust the budget.
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        # Final summary response from _handle_max_iterations.
+        summary_resp = _mock_response(
+            content="Could not finish — budget exhausted.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, summary_resp,
+        ]
+
+        mock_record_failure = MagicMock(return_value=False)
+        mock_connect = MagicMock(return_value=MagicMock())
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db._record_task_failure",
+                  mock_record_failure),
+            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        # The agent should have reported the task as not completed.
+        assert result["completed"] is False
+
+        # _record_task_failure should have been called exactly once for
+        # the exhaustion event, with outcome="timed_out".
+        assert mock_record_failure.call_count == 1, (
+            f"Expected exactly 1 _record_task_failure call, "
+            f"got {mock_record_failure.call_count}. "
+            f"Calls: {mock_record_failure.call_args_list}"
+        )
+        call = mock_record_failure.call_args_list[0]
+        # Positional: (conn, task_id, ...)
+        assert call.args[1] == "t_test_task_123"
+        assert call.kwargs.get("outcome") == "timed_out"
+        assert call.kwargs.get("release_claim") is True
+        assert call.kwargs.get("end_run") is True
+        assert "Iteration budget exhausted" in call.kwargs.get("error", "")
+
+    def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
+        """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
+        is unset (non-kanban runs are unaffected by #29747 gap 2)."""
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Summary.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, summary_resp,
+        ]
+
+        mock_record_failure = MagicMock(return_value=False)
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db._record_task_failure",
+                  mock_record_failure),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("do stuff")
+
+        assert mock_record_failure.call_count == 0, (
+            "_record_task_failure should not be called outside kanban mode"
+        )
+
+    # ── Output-cap retry: safe_out uses provider available_out + request estimate ──
+
+    def test_output_cap_retry_uses_provider_available_out(self, agent):
+        """run_conversation retries an output-cap error with max_tokens <=
+        available_out - 64, and does NOT halve context_length or trigger
+        compression.
+        """
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "openrouter"
+        agent.model = "some/model"
+        agent.max_tokens = 65_536
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.should_compress = MagicMock(return_value=False)
+
+        error_msg = (
+            "max_tokens: 65536 > context_window: 200000 "
+            "- input_tokens: 199000 = available_tokens: 1000"
+        )
+        exc = Exception(error_msg)
+        exc.status_code = 400
+        exc.code = 400
+
+        ok_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", mock_compress),
+        ):
+            result = agent.run_conversation("hello")
+
+        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert result["completed"] is True
+        assert second_call["max_tokens"] <= 936
+        assert agent.context_compressor.context_length == 200_000
+        mock_compress.assert_called_once()
+
+    def test_output_cap_retry_before_generic_retry_exhaustion(self, agent):
+        """Provider max-output-cap 400s clamp via the output-cap handler, not
+        the generic retry loop ("failed after 3 retries").
+        """
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "deepseek"
+        agent.base_url = "https://api.deepseek.com/v1"
+        agent.model = "deepseek-v4-flash"
+        agent.max_tokens = 98_304
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.should_compress = MagicMock(return_value=False)
+
+        error_msg = (
+            "[400]: max_tokens (98304) exceeds model's maximum output tokens "
+            "(65536) for model deepseek-v4-flash "
+            "(ref: 7735422e-9cb4-4075-a779-dfecb3204a0e)"
+        )
+        exc = Exception(error_msg)
+        exc.status_code = 400
+        exc.code = 400
+
+        ok_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", mock_compress),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert len(agent.client.chat.completions.create.call_args_list) == 2
+        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert result["completed"] is True
+        assert second_call["max_tokens"] <= 65_472
+        assert agent.context_compressor.context_length == 200_000
+
+    def test_output_cap_retry_when_gateway_wraps_error_as_rate_limit(self, agent):
+        """Some relays wrap the upstream max-output 400 as HTTP 429. The
+        parseable output cap must still route into the output-cap handler
+        instead of burning generic rate-limit retries (#72281).
+        """
+        self._run_wrapped_429_output_cap(agent, fallback_chain=[])
+
+    def test_wrapped_output_cap_429_not_consumed_by_eager_fallback(self, agent):
+        """With a NON-EMPTY fallback chain, the eager rate-limit fallback must
+        NOT consume the wrapped output-cap 429 — the failure is a deterministic
+        request-shape problem the clamp fixes in one retry; switching provider
+        burns a fallback slot for nothing (#72281 ordering guard).
+        """
+        self._run_wrapped_429_output_cap(
+            agent,
+            fallback_chain=[{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}],
+        )
+
+    def _run_wrapped_429_output_cap(self, agent, *, fallback_chain):
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "custom"
+        agent.base_url = "http://192.168.1.254:20128/v1"
+        agent.model = "deepseekv4flash"
+        agent.max_tokens = 98_304
+        agent.compression_enabled = True
+        agent._fallback_chain = fallback_chain
+        agent._fallback_index = 0
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.should_compress = MagicMock(return_value=False)
+
+        error_msg = (
+            "Error code: 429 - {'error': {'message': \"[400]: max_tokens "
+            "(98304) exceeds model's maximum output tokens (65536) for model "
+            "deepseek-v4-flash (ref: 37bde60f-44e7-44e2-b995-4af17fba6d6b)\", "
+            "'type': 'rate_limit_error', 'code': 'rate_limit_exceeded'}}"
+        )
+        exc = Exception(error_msg)
+        exc.status_code = 429
+        exc.code = "rate_limit_exceeded"
+
+        ok_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", mock_compress),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert len(agent.client.chat.completions.create.call_args_list) == 2
+        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert result["completed"] is True
+        assert second_call["max_tokens"] <= 65_472
+        assert agent.context_compressor.context_length == 200_000
+        # The clamp, not provider failover, must have recovered: no fallback
+        # slot consumed and the model unchanged.
+        assert agent._fallback_index == 0
+        assert agent.model == "deepseekv4flash"
+
+    def test_output_cap_retry_with_large_api_only_content(self, agent):
+        """When a large system prompt makes api_messages huge while persisted
+        messages stay tiny, the retry cap must still respect provider
+        available_tokens — not blow up to the full context window.
+        """
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "openrouter"
+        agent.model = "some/model"
+        agent.max_tokens = 65_536
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.should_compress = MagicMock(return_value=False)
+
+        # Huge API-only system prompt; persisted messages are tiny.
+        agent._cached_system_prompt = "S" * 796_000
+
+        error_msg = (
+            "max_tokens: 65536 > context_window: 200000 "
+            "- input_tokens: 199000 = available_tokens: 1000"
+        )
+        exc = Exception(error_msg)
+        exc.status_code = 400
+        exc.code = 400
+
+        ok_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", mock_compress),
+        ):
+            result = agent.run_conversation("hello")
+
+        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert result["completed"] is True
+        # The current branch (messages-only estimate) would send max_tokens
+        # near 199927 — this test fails on it.
+        assert second_call["max_tokens"] <= 936
+        assert agent.context_compressor.context_length == 200_000
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_triggers_compression_and_recovers(self, agent):
         """Regression for the output-cap death-loop (#55546 / #61761).

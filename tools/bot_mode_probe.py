@@ -341,6 +341,13 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     except Exception:
         surface["peers"] = []
     try:
+        # Peer gateways are part of the messaging surface: registering one
+        # must refresh eternal Bot Chat prompts so the cross-machine DM
+        # paragraph appears on the next message.
+        surface["peers"] = _peers(_hermes_root(resolved))
+    except Exception:
+        surface["peers"] = []
+    try:
         blob = json.dumps(surface, sort_keys=True).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()[:12]
     except Exception:
