@@ -1476,6 +1476,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
             self._running = True
             self._start_liveness_probe()
+            # Plugin-registered native handlers (discord.py Bot — add_listener()/event hooks).
+            self._wire_plugin_handlers(self._client)
             return True
 
         except asyncio.TimeoutError:
@@ -8571,7 +8573,7 @@ class DiscordAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:

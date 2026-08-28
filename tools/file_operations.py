@@ -11,16 +11,16 @@ so we wrap the terminal backend's execute() interface to provide a unified file 
 Usage:
     from tools.file_operations import ShellFileOperations
     from tools.terminal_tool import _active_environments
-
+    
     # Get file operations for a terminal environment
     file_ops = ShellFileOperations(terminal_env)
-
+    
     # Read a file
     result = file_ops.read_file("/path/to/file.py")
-
+    
     # Write a file
     result = file_ops.write_file("/path/to/new.py", "print('hello')")
-
+    
     # Search for content
     result = file_ops.search("TODO", path=".", file_glob="*.py")
 """
@@ -29,15 +29,14 @@ import base64
 import binascii
 import os
 import re
-import base64
-import binascii
+import sys
 import difflib
 import hashlib
 import json
 import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, ClassVar
+from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
 
@@ -54,6 +53,52 @@ from agent.file_safety import (
 # ---------------------------------------------------------------------------
 
 _HOME = str(Path.home())
+
+_MACOS_TCC_PROTECTED_HOME_DIRS = (
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Library",
+    "Movies",
+    "Music",
+    "Pictures",
+)
+
+
+def _macos_protected_search_exclusions(
+    path: str,
+    *,
+    cwd: Optional[str] = None,
+    home: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> List[str]:
+    """Return protected home directories below a broad macOS search root.
+
+    Direct searches inside a protected directory remain allowed. Only an
+    ancestor search (for example ``$HOME`` or ``/Users``) receives exclusions,
+    preventing recursive tools from triggering unattended TCC prompts.
+    """
+    if (platform or sys.platform) != "darwin":
+        return []
+
+    home_path = Path(home or Path.home()).expanduser()
+    root = Path(path).expanduser()
+    if not root.is_absolute():
+        root = Path(cwd or os.getcwd()) / root
+    root = Path(os.path.normpath(str(root)))
+    home_path = Path(os.path.normpath(str(home_path)))
+
+    exclusions: List[str] = []
+    for dirname in _MACOS_TCC_PROTECTED_HOME_DIRS:
+        protected = home_path / dirname
+        try:
+            relative = protected.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts:
+            exclusions.append(relative.as_posix())
+    return exclusions
+
 
 WRITE_DENIED_PATHS = build_write_denied_paths(_HOME)
 
@@ -142,7 +187,7 @@ def _strip_bom(text: str) -> tuple[str, bool]:
     left alone (it's legitimate data there, not a file marker).
     """
     if text and text.startswith(_UTF8_BOM):
-        return text[len(_UTF8_BOM) :], True
+        return text[len(_UTF8_BOM):], True
     return text, False
 
 
@@ -160,238 +205,9 @@ def _is_write_denied(path: str) -> bool:
 # Result Data Classes
 # =============================================================================
 
-
-def classify_file_error(
-    error: Optional[str],
-    *,
-    similar_files: Optional[List[str]] = None,
-    structured_error: Optional[str] = None,
-) -> Optional[Tuple[str, str]]:
-    """Map a read/patch error string to ``(error_class, recovery)`` for #216, or
-    None when there is no error. Lets the model route to the right recovery —
-    create the file, fix the patch text, use a different tool — instead of
-    re-issuing the same failing call. Derived from the already-set ``error``
-    string so no error-producing site has to be touched.
-
-    ``structured_error`` is the richer diagnostic produced by
-    :func:`tools.fuzzy_match.format_structured_error` (e.g.
-    "Error type: indentation_mismatch — ..."). When the raw ``error`` string is
-    generic (the fuzzy matcher's no-match message is identical regardless of
-    the *real* cause), the structured diagnostic already carries the precise
-    sub-classification. Consulting it here decomposes the dominant "other"
-    bucket (#1586: 68/78 patch failures) into actionable sub-classes
-    (indentation_mismatch, escape_drift, old_string_empty) without touching any
-    error-producing site."""
-    if not error:
-        return None
-    low = error.lower()
-    if "denied" in low or "protected" in low or "permission" in low:
-        return "permission", (
-            "The path is protected/denied and can't be elevated. Use an allowed "
-            "path — do NOT retry the same one."
-        )
-    if "is a directory" in low or "directory, not a file" in low:
-        return "directory", (
-            "The path is a directory, not a file — read_file expects a file. "
-            "To list or read the directory's contents, use search_files "
-            "(target='files') to find files within it; do NOT retry read_file "
-            "on the same directory path."
-        )
-    if "binary file" in low:
-        return "binary", (
-            "This is a binary file. Don't read it as text; use a tool suited to the "
-            "file type."
-        )
-    if "not found" in low or "no such file" in low:
-        if similar_files:
-            return "fuzzy_match", (
-                "The exact path wasn't found. Did you mean one of: "
-                f"{', '.join(similar_files[:5])}? Otherwise create it with write_file."
-            )
-        return "not_found", (
-            "The file doesn't exist. Create it with write_file, or re-check the path "
-            "(it may be dynamic) — don't repeat the same read."
-        )
-    if "parse patch" in low or ("parse" in low and "patch" in low):
-        return "patch_parse", (
-            "The patch couldn't be parsed. Fix the patch format/markers before retrying."
-        )
-    if "verification" in low:
-        return "verification", (
-            "The write succeeded but re-read verification failed. Re-read the file to "
-            "see actual state before editing again."
-        )
-    if "found" in low and "matches" in low and "old_string" in low:
-        # #2354: decompose ambiguous_match into actionable subclasses, each with
-        # explicit anti-retry language to break the 21-deep retry spirals.
-        if "replace_all" in low:
-            return "replace_all_intent", (
-                "Multiple matches found and the resolution suggests replace_all. "
-                "If you intend to replace ALL occurrences, re-send the patch with "
-                "replace_all=True. Do NOT retry the same old_string with "
-                "replace_all unset — it will fail the same way."
-            )
-        if "more context" in low or "surrounding context" in low or "longer" in low:
-            return "ambiguous_insufficient_context", (
-                "old_string is too short to be unique — multiple regions match. "
-                "Re-read the file with read_file, then include more surrounding "
-                "context lines (function signature, class name, unique nearby "
-                "lines) so only one location matches. Do NOT retry the same "
-                "old_string — it is inherently ambiguous."
-            )
-        return "ambiguous_not_unique", (
-            "Multiple matches found for old_string — it is not unique. Do NOT "
-            "retry the same old_string (it will match the same locations again). "
-            "Either add more surrounding context to make it unique, or use "
-            "replace_all=True if you intend to replace all occurrences."
-        )
-    # ── Sub-classify the fuzzy matcher's distinctive failure strings (#1586) ──
-    # These previously fell through to the generic "error" bucket (the 'other'
-    # class that dominated patch failures). Each now gets a targeted recovery.
-    if "escape-drift" in low or "escape drift" in low:
-        return "escape_drift", (
-            "Tool-call serialization added a spurious backslash before a quote/apostrophe "
-            "in old_string/new_string. Re-read the file and pass the strings without "
-            "backslash-escaping those characters."
-        )
-    if "old_string cannot be empty" in low or "old_string is empty" in low:
-        return "old_string_empty", (
-            "old_string was empty. Provide a non-empty search block that matches the "
-            "file; use read_file to see the current content if needed."
-        )
-    if (
-        "did not match" in low
-        or "no match" in low
-        or ("match" in low and "block" in low)
-        # The fuzzy matcher's dominant failure message is "Could not find a
-        # match for old_string in the file" (#1537) — it contains neither
-        # "did not match" nor "no match", so without this arm it fell through
-        # to the generic "error" class whose recovery ("The operation failed.
-        # ... CHANGE the call.") gives the model no signal to re-read the
-        # file, driving the observed retry spirals (up to 6 deep).
-        or "could not find" in low
-        or "not find a match" in low
-    ):
-        # Before settling for the coarse "fuzzy_match" class, check whether the
-        # structured diagnostic already pinpointed a narrower cause (e.g.
-        # indentation_mismatch). The structured_error field is populated by
-        # patch_replace via format_structured_error and carries the real reason
-        # the match failed — promoting it here keeps the agent's recovery hint
-        # precise instead of generic (#1586).
-        finer = _class_from_structured_error(structured_error)
-        if finer:
-            return finer
-        return "fuzzy_match", (
-            "The search block didn't match the file. Re-read the file and copy the EXACT "
-            "current text into the patch — don't retry the same block."
-        )
-    if "failed to write" in low or ("write" in low and "fail" in low):
-        return "write_error", (
-            "The write failed. Check disk space / permissions and the path before retrying."
-        )
-    if "failed to read" in low:
-        return "read_error", (
-            "The read failed. Check the path/permissions; don't repeat the same call blindly."
-        )
-    # ── Decompose remaining "other" failures (#2244) ────────────────────
-    # 55 patch failures/7d fell through to the generic "error" catch-all
-    # below. These patterns capture the common sub-reasons that were never
-    # classified: encoding/Unicode issues, line-ending conflicts, BOM
-    # markers, and concurrent modification (file changed between read and
-    # write). Each gets a targeted recovery hint so the agent can correct
-    # without guessing.
-    if (
-        "unicode" in low
-        or "codec can't decode" in low
-        or "invalid byte" in low
-        or "invalid continuation byte" in low
-        or "can't decode" in low
-    ):
-        return "encoding_error", (
-            "The file has a byte sequence that can't be decoded as UTF-8. "
-            "It may be a non-UTF-8 encoding or contain invalid bytes. "
-            "Use write_file to replace the content, or handle the encoding "
-            "explicitly via execute_code."
-        )
-    if "line ending" in low or "crlf" in low or "line-ending" in low:
-        return "line_ending_conflict", (
-            "The file uses different line endings (CRLF vs LF) than "
-            "old_string. Re-read the file and copy the EXACT line endings, "
-            "or use write_file to replace the whole file."
-        )
-    if "bom" in low or "ufeff" in low or "u+feff" in low or "byte order mark" in low:
-        return "bom_conflict", (
-            "The file has a UTF-8 BOM (byte order mark) prefix that "
-            "interferes with the match. Re-read the file from line 1 and "
-            "include the BOM in old_string, or use write_file."
-        )
-    if (
-        ("concurrent" in low)
-        or ("modified" in low and "since" in low)
-        or ("changed" in low and "since" in low)
-        or ("stale" in low and "handle" in low)
-    ):
-        return "concurrent_modification", (
-            "The file was modified between the read and the write. "
-            "Re-read the current content and retry the patch against the "
-            "latest version."
-        )
-    # Last resort: the structured diagnostic may still classify an otherwise
-    # generic message before we fall back to the catch-all "error" bucket.
-    finer = _class_from_structured_error(structured_error)
-    if finer:
-        return finer
-    return "error", (
-        "The operation failed. Read the message, fix the root cause, and CHANGE the call."
-    )
-
-
-# Sub-class recovery hints for causes the fuzzy matcher pinpoints in its
-# structured_error field but whose raw error string is generic (#1586).
-# Keys mirror the labels emitted by tools.fuzzy_match.classify_error /
-# format_structured_error ("Error type: <key> — ...").
-_STRUCTURED_SUBCLASS_RECOVERY: Dict[str, Tuple[str, str]] = {
-    "indentation_mismatch": (
-        "indentation_mismatch",
-        "The text matches but the leading whitespace differs (spaces vs tabs, "
-        "indent level). Re-read the file and copy the EXACT indentation into "
-        "old_string, or use write_file to replace the whole region.",
-    ),
-    "escape_drift": (
-        "escape_drift",
-        "Tool-call serialization added a spurious backslash before a quote/apostrophe. "
-        "Re-read the file and pass old_string/new_string without backslash-escaping "
-        "those characters.",
-    ),
-    "old_string_empty": (
-        "old_string_empty",
-        "old_string was empty. Provide a non-empty search block; use read_file to "
-        "see the current content if needed.",
-    ),
-}
-
-
-def _class_from_structured_error(
-    structured_error: Optional[str],
-) -> Optional[Tuple[str, str]]:
-    """Extract a ``(error_class, recovery)`` from a fuzzy_match structured_error
-    string, if it advertises a known sub-class. The structured diagnostic is
-    formatted as "Error type: <key> — <desc>" (see format_structured_error), so
-    we parse the leading label and look it up. Returns None when the field is
-    absent or the label isn't one we promote (#1586)."""
-    if not structured_error:
-        return None
-    m = re.search(r"Error type:\s*([a-z_]+)", structured_error, re.IGNORECASE)
-    if not m:
-        return None
-    label = m.group(1).lower()
-    return _STRUCTURED_SUBCLASS_RECOVERY.get(label)
-
-
 @dataclass
 class ReadResult:
     """Result from reading a file."""
-
     content: str = ""
     total_lines: int = 0
     file_size: int = 0
@@ -404,19 +220,14 @@ class ReadResult:
     dimensions: Optional[str] = None  # For images: "WIDTHxHEIGHT"
     error: Optional[str] = None
     similar_files: List[str] = field(default_factory=list)
-
+    
     def to_dict(self) -> dict:
-        d = {k: v for k, v in self.__dict__.items() if v is not None and v != []}
-        hit = classify_file_error(self.error, similar_files=self.similar_files)
-        if hit:
-            d["error_class"], d["recovery"] = hit
-        return d
+        return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
 
 
 @dataclass
 class WriteResult:
     """Result from writing a file."""
-
     bytes_written: int = 0
     dirs_created: bool = False
     # True when the on-disk sha256 matched the intended content after the
@@ -442,7 +253,6 @@ class WriteResult:
 @dataclass
 class PatchResult:
     """Result from patching a file."""
-
     success: bool = False
     diff: str = ""
     files_modified: List[str] = field(default_factory=list)
@@ -452,14 +262,6 @@ class PatchResult:
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
-    # Structured error context for self-correction (#996).  Contains
-    # error-type classification, the closest matching region with line
-    # numbers, and a recovery suggestion.  Populated by patch_replace
-    # on match failures; consumed by patch_tool to add a ``_diagnostic``
-    # field to the tool result so the model can correct on its next
-    # turn without re-reading the file.
-    structured_error: Optional[str] = None
-    similar_files: List[str] = field(default_factory=list)
     # Set on success-shaped no-ops: the requested edit was already present
     # in the file, so nothing was written. Carries a short note for the
     # model explaining why no diff is included.
@@ -486,25 +288,12 @@ class PatchResult:
             result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
             result["error"] = self.error
-            # Both diagnostics feed the classifier: similar_files drives the
-            # fuzzy_match "did you mean" recovery (#1587), structured_error
-            # decomposes the generic patch-failure bucket (#1586).
-            hit = classify_file_error(
-                self.error,
-                similar_files=self.similar_files,
-                structured_error=self.structured_error,
-            )
-            if hit:
-                result["error_class"], result["recovery"] = hit
-        if self.structured_error:
-            result["_diagnostic"] = self.structured_error
         return result
 
 
 @dataclass
 class SearchMatch:
     """A single search match."""
-
     path: str
     line_number: int
     content: str
@@ -514,7 +303,6 @@ class SearchMatch:
 @dataclass
 class SearchResult:
     """Result from searching."""
-
     matches: List[SearchMatch] = field(default_factory=list)
     files: List[str] = field(default_factory=list)
     counts: Dict[str, int] = field(default_factory=dict)
@@ -523,7 +311,7 @@ class SearchResult:
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
-
+    
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
     # the path-grouping header costs more than it saves.
@@ -592,12 +380,11 @@ class SearchResult:
 @dataclass
 class LintResult:
     """Result from linting a file."""
-
     success: bool = True
     skipped: bool = False
     output: str = ""
     message: str = ""
-
+    
     def to_dict(self) -> dict:
         if self.skipped:
             return {"status": "skipped", "message": self.message}
@@ -610,7 +397,6 @@ class LintResult:
 @dataclass
 class ExecuteResult:
     """Result from executing a shell command."""
-
     stdout: str = ""
     exit_code: int = 0
 
@@ -623,86 +409,6 @@ def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]
     if result.exit_code == 124:
         return _SEARCH_TIMEOUT_MARKER_RE.sub("", result.stdout), "search_timeout"
     return result.stdout, None
-
-
-def _enrich_search_parse_error(
-    error_msg: str, pattern: str, file_glob: str = ""
-) -> str:
-    """Enrich a regex parse-error with actionable guidance (#1588).
-
-    When rg/grep reject a pattern (exit 2), the raw message is typically::
-
-        rg: regex parse error:
-            (?:[
-               ^
-        error: unclosed character class
-
-    or::
-
-        grep: Invalid regular expression
-
-    The agent sees "Search failed: …" but can't tell whether the fix is
-    "rewrite the regex" or "this is a glob, use target=files".  This helper:
-
-    1. Keeps the original error text (the compile-failure reason is valuable).
-    2. Detects whether the pattern looks like a **glob** (contains ``*`` or
-       ``?`` but lacks regex metacharacters like ``(``, ``[``, ``+``) and
-       appends a "use target=files" hint.
-    3. For genuine regex syntax errors, appends a "fix or simplify the regex"
-       hint.
-    """
-    base = f"Search failed: {error_msg}"
-    low = error_msg.lower()
-
-    is_parse_error = (
-        "regex parse error" in low
-        or "invalid regular expression" in low
-        or "unrecognized repeat" in low
-        or "unbalanced" in low
-        or "unclosed" in low
-        or "invalid repetition" in low
-    )
-    if not is_parse_error:
-        return base
-
-    # Heuristic: does the pattern look like a glob that the agent passed as
-    # regex? Globs use *, ?, and character classes [abc] — but NOT regex-only
-    # constructs like (), +, |, {n}, \\d, \\w, etc.  If the ONLY metacharacters
-    # are glob-style AND the pattern contains at least one of the primary
-    # glob signals (* or ?), the agent likely intended a filename search.
-    # A bare "[" or "]" without * or ? is a regex bracket, not a glob.
-    # Note: "." is excluded from regex_only_chars because it appears in
-    # every filename extension (*.py, config.yaml) and would cause false
-    # negatives for the most common glob confusion case.
-    # A caller that already passed ``file_glob`` is filtering filenames by that
-    # glob and searching content with the pattern — so a glob-shaped pattern is
-    # deliberate regex, not the target='files' confusion this hint addresses.
-    # Suggesting target='files' there would send them to a tool that cannot do
-    # what they asked.
-    regex_only_chars = set("()+|{}^$\\")
-    chars_in_pattern = set(pattern)
-    has_star_or_q = "*" in chars_in_pattern or "?" in chars_in_pattern
-    looks_like_glob = (
-        has_star_or_q
-        and not (regex_only_chars & chars_in_pattern)
-        and not file_glob
-    )
-
-    hints: list[str] = []
-    if looks_like_glob:
-        hints.append(
-            f"Pattern '{pattern}' looks like a filename glob, but search_files "
-            "with target='content' treats it as a regex. Use target='files' "
-            "instead (e.g. search_files(pattern='*.py', target='files'))."
-        )
-    else:
-        hints.append(
-            f"Pattern '{pattern}' is not valid regex. Fix the syntax error "
-            "above, simplify the pattern, or use a plain substring search "
-            "(regex special characters: ( ) [ ] { } + * ? | ^ $ \\ .)."
-        )
-
-    return base + "\n\n" + " ".join(hints)
 
 
 def _split_tool_diagnostics(output: str) -> tuple[str, str]:
@@ -727,7 +433,7 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
     """
     diagnostics: list[str] = []
     payload: list[str] = []
-    for line in output.split("\n"):
+    for line in output.split('\n'):
         if not line.strip():
             continue
         # Tool diagnostics always carry the "<tool>: " prefix (e.g.
@@ -751,7 +457,7 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
             payload.append(line)
         else:
             diagnostics.append(line)
-    return "\n".join(diagnostics), "\n".join(payload)
+    return '\n'.join(diagnostics), '\n'.join(payload)
 
 
 # A real rg/grep output line starts with a path token and is followed by a
@@ -759,7 +465,7 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 # diagnostics ("rg: ...", "grep: ...", "error: ...", indented carets) never
 # match because the path token forbids whitespace and a leading tool prefix
 # like "rg" is followed by ": " (space) which the negated class rejects.
-_SEARCH_OUTPUT_RE = re.compile(r"^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$")
+_SEARCH_OUTPUT_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$')
 
 
 def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
@@ -774,17 +480,17 @@ def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
         return None
 
     match = None
-    for candidate in re.finditer(r"-(\d+)-", line):
+    for candidate in re.finditer(r'-(\d+)-', line):
         match = candidate
 
     if match is None:
         return None
 
-    path = line[: match.start()]
+    path = line[:match.start()]
     if not path:
         return None
 
-    return path, int(match.group(1)), line[match.end() :]
+    return path, int(match.group(1)), line[match.end():]
 
 
 # =============================================================================
@@ -857,7 +563,7 @@ def describe_binary_file(sample: Optional[bytes], file_size: int) -> str:
 
 class FileOperations(ABC):
     """Abstract interface for file operations across terminal backends."""
-
+    
     @abstractmethod
     def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> ReadResult:
         """Read a file with pagination support."""
@@ -884,9 +590,8 @@ class FileOperations(ABC):
         ...
 
     @abstractmethod
-    def patch_replace(
-        self, path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> PatchResult:
+    def patch_replace(self, path: str, old_string: str, new_string: str,
+                      replace_all: bool = False) -> PatchResult:
         """Replace text in a file using fuzzy matching."""
         ...
 
@@ -907,9 +612,7 @@ class FileOperations(ABC):
         should override.
         """
         if recursive:
-            return WriteResult(
-                error="Recursive delete not implemented for this backend"
-            )
+            return WriteResult(error="Recursive delete not implemented for this backend")
         return self.delete_file(path)
 
     @abstractmethod
@@ -918,17 +621,9 @@ class FileOperations(ABC):
         ...
 
     @abstractmethod
-    def search(
-        self,
-        pattern: str,
-        path: str = ".",
-        target: str = "content",
-        file_glob: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-        output_mode: str = "content",
-        context: int = 0,
-    ) -> SearchResult:
+    def search(self, pattern: str, path: str = ".", target: str = "content",
+               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               output_mode: str = "content", context: int = 0) -> SearchResult:
         """Search for content or files."""
         ...
 
@@ -938,17 +633,17 @@ class FileOperations(ABC):
 # =============================================================================
 
 # Image extensions (subset of binary that we can return as base64)
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"}
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico'}
 
 # Shell-based linters by file extension.  Invoked via _exec() with the
 # filesystem path.  Cover languages where a compile/type check needs an
 # external toolchain (py_compile, node, tsc, go vet, rustfmt).
 LINTERS = {
-    ".py": "python -m py_compile {file} 2>&1",
-    ".js": "node --check {file} 2>&1",
-    ".ts": "npx tsc --noEmit {file} 2>&1",
-    ".go": "go vet {file} 2>&1",
-    ".rs": "rustfmt --check {file} 2>&1",
+    '.py': 'python -m py_compile {file} 2>&1',
+    '.js': 'node --check {file} 2>&1',
+    '.ts': 'npx tsc --noEmit {file} 2>&1',
+    '.go': 'go vet {file} 2>&1',
+    '.rs': 'rustfmt --check {file} 2>&1',
 }
 
 # Extensions where the per-file shell linter is structurally weaker than
@@ -987,7 +682,7 @@ LINTERS = {
 # extensions — the ``lsp_diagnostics`` channel carries the real signal.
 # Everything else in ``LINTERS`` (Python ``py_compile``, ``node --check``)
 # is fast, file-local, and correct, so it runs unconditionally.
-_SHELL_LINTER_LSP_REDUNDANT = frozenset({".ts", ".go", ".rs"})
+_SHELL_LINTER_LSP_REDUNDANT = frozenset({'.ts', '.go', '.rs'})
 
 
 # Patterns that indicate the linter base command exists on PATH but
@@ -1001,24 +696,24 @@ _SHELL_LINTER_LSP_REDUNDANT = frozenset({".ts", ".go", ".rs"})
 #
 # Patterns are matched case-insensitively against linter stdout.
 _LINTER_UNUSABLE_PATTERNS = {
-    "npx": (
+    'npx': (
         # npx prints this banner when the package isn't installed locally
         # AND it can't auto-install (no internet, registry off, etc.) or
         # when the binary it tried to run is the wrong one.
-        "this is not the tsc command you are looking for",
+        'this is not the tsc command you are looking for',
         # npx with --no-install resolution failures
-        "could not determine executable to run",
-        "not found in npm registry",
+        'could not determine executable to run',
+        'not found in npm registry',
     ),
-    "rustfmt": (
+    'rustfmt': (
         # rustfmt outside a Cargo project
-        "no input filename given",
-        "error: not a workspace",
+        'no input filename given',
+        'error: not a workspace',
     ),
-    "go": (
+    'go': (
         # ``go vet`` on a file outside a module / GOPATH
-        "cannot find package",
-        "go: cannot find main module",
+        'cannot find package',
+        'go: cannot find main module',
     ),
 }
 
@@ -1042,7 +737,6 @@ def _looks_like_linter_unusable(base_cmd: str, output: str) -> bool:
 def _lint_json_inproc(content: str) -> tuple[bool, str]:
     """In-process JSON syntax check.  Returns (ok, error_message)."""
     import json as _json
-
     try:
         _json.loads(content)
         return True, ""
@@ -1103,7 +797,6 @@ def _lint_python_inproc(content: str) -> tuple[bool, str]:
     subprocess overhead and no dependency on a ``python`` in PATH.
     """
     import ast as _ast
-
     try:
         _ast.parse(content)
         return True, ""
@@ -1120,11 +813,11 @@ def _lint_python_inproc(content: str) -> tuple[bool, str]:
 # string of ``"__SKIP__"`` signals the linter isn't available (missing
 # dependency) and should be treated as "no linter".
 LINTERS_INPROC = {
-    ".py": _lint_python_inproc,
-    ".json": _lint_json_inproc,
-    ".yaml": _lint_yaml_inproc,
-    ".yml": _lint_yaml_inproc,
-    ".toml": _lint_toml_inproc,
+    '.py': _lint_python_inproc,
+    '.json': _lint_json_inproc,
+    '.yaml': _lint_yaml_inproc,
+    '.yml': _lint_yaml_inproc,
+    '.toml': _lint_toml_inproc,
 }
 
 # Subset of LINTERS_INPROC that the pre-write fail-closed gate in
@@ -1164,9 +857,8 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
-def normalize_read_pagination(
-    offset: Any = DEFAULT_READ_OFFSET, limit: Any = DEFAULT_READ_LIMIT
-) -> tuple[int, int]:
+def normalize_read_pagination(offset: Any = DEFAULT_READ_OFFSET,
+                              limit: Any = DEFAULT_READ_LIMIT) -> tuple[int, int]:
     """Return safe read_file pagination bounds.
 
     Tool schemas declare minimum/maximum values, but not every caller or
@@ -1177,7 +869,6 @@ def normalize_read_pagination(
     config.yaml (defaults to the module-level ``MAX_LINES`` constant).
     """
     from tools.tool_output_limits import get_max_lines
-
     max_lines = get_max_lines()
     normalized_offset = max(1, _coerce_int(offset, DEFAULT_READ_OFFSET))
     normalized_limit = _coerce_int(limit, DEFAULT_READ_LIMIT)
@@ -1185,9 +876,8 @@ def normalize_read_pagination(
     return normalized_offset, normalized_limit
 
 
-def normalize_search_pagination(
-    offset: Any = DEFAULT_SEARCH_OFFSET, limit: Any = DEFAULT_SEARCH_LIMIT
-) -> tuple[int, int]:
+def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
+                                limit: Any = DEFAULT_SEARCH_LIMIT) -> tuple[int, int]:
     """Return safe search pagination bounds for shell head/tail pipelines."""
     normalized_offset = max(0, _coerce_int(offset, DEFAULT_SEARCH_OFFSET))
     normalized_limit = max(1, _coerce_int(limit, DEFAULT_SEARCH_LIMIT))
@@ -1214,12 +904,10 @@ def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     """Return True for rg's hard error when multiline mode is required."""
     if not error:
         return False
-    return 'literal "\\n" is not allowed' in error and "--multiline" in error
+    return "literal \"\\n\" is not allowed" in error and "--multiline" in error
 
 
-def _maybe_warn_line_oriented_newline_pattern(
-    result: SearchResult, pattern: str
-) -> SearchResult:
+def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str) -> SearchResult:
     """Attach a newline-regex warning only when search found no usable results."""
     if result.total_count != 0 or not _pattern_has_regex_newline(pattern):
         return result
@@ -1238,11 +926,11 @@ def _maybe_warn_line_oriented_newline_pattern(
 class ShellFileOperations(FileOperations):
     """
     File operations implemented via shell commands.
-
+    
     Works with ANY terminal backend that has execute(command, cwd) method.
     This includes local, docker, singularity, ssh, modal, and daytona environments.
     """
-
+    
     def __init__(self, terminal_env, cwd: str = None):
         """
         Initialize file operations with a terminal environment.
@@ -1272,19 +960,14 @@ class ShellFileOperations(FileOperations):
         # IMPORTANT: do NOT fall back to os.getcwd() -- that's the HOST's local
         # path which doesn't exist inside container/cloud backends (modal, docker).
         # If nothing provides a cwd, use "/" as a safe universal default.
-        self.cwd = (
-            cwd
-            or getattr(terminal_env, "cwd", None)
-            or getattr(getattr(terminal_env, "config", None), "cwd", None)
-            or "/"
-        )
+        self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
+                   getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
 
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
-
-    def _exec(
-        self, command: str, cwd: str = None, timeout: int = None, stdin_data: str = None
-    ) -> ExecuteResult:
+    
+    def _exec(self, command: str, cwd: str = None, timeout: int = None,
+              stdin_data: str = None) -> ExecuteResult:
         """Execute command via terminal backend.
 
         Args:
@@ -1302,13 +985,13 @@ class ShellFileOperations(FileOperations):
         """
         kwargs = {}
         if timeout:
-            kwargs["timeout"] = timeout
+            kwargs['timeout'] = timeout
         if stdin_data is not None:
-            kwargs["stdin_data"] = stdin_data
+            kwargs['stdin_data'] = stdin_data
 
         # Resolve cwd from the live env so `cd` commands are picked up.
         # Fall through to init-time self.cwd only if the env doesn't track cwd.
-        effective_cwd = cwd or getattr(self.env, "cwd", None) or self.cwd
+        effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
         result = self.env.execute(command, cwd=effective_cwd, **kwargs)
         exit_code = result.get("returncode", 0)
         # A stdin write failure with an otherwise-clean child exit is still
@@ -1321,14 +1004,14 @@ class ShellFileOperations(FileOperations):
             stdout=result.get("output", ""),
             exit_code=exit_code
         )
-
+    
     def _has_command(self, cmd: str) -> bool:
         """Check if a command exists in the environment (cached)."""
         if cmd not in self._command_cache:
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
-            self._command_cache[cmd] = result.stdout.strip() == "yes"
+            self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
-
+    
     def _sample_file_bytes(self, path: str, length: int = 1000):
         """Fetch the first ``length`` raw bytes of a file through the terminal.
 
@@ -1395,27 +1078,16 @@ class ShellFileOperations(FileOperations):
                     pass
             return True
 
-    def _file_is_binary(self, path: str) -> bool:
-        """Prefer byte-layer detection; fall back to the text heuristic."""
-        sample_bytes = self._sample_file_bytes(path)
-        if sample_bytes is not None:
-            ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
-            return ext_binary or self._is_likely_binary_bytes(sample_bytes)
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        return self._is_likely_binary(path, sample_output)
-
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
-
+        
         Uses extension check (fast) + content analysis (fallback).
         """
         ext = os.path.splitext(path)[1].lower()
         if ext in BINARY_EXTENSIONS:
             return True
-
+        
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
             # Undecodable bytes: the terminal env decodes stdout with
@@ -1432,14 +1104,14 @@ class ShellFileOperations(FileOperations):
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
-
+        
         return False
-
+    
     def _is_image(self, path: str) -> bool:
         """Check if file is an image we can return as base64."""
         ext = os.path.splitext(path)[1].lower()
         return ext in IMAGE_EXTENSIONS
-
+    
     def _add_line_numbers(self, content: str, start_line: int = 1) -> str:
         """Add line numbers to content in ``LINE_NUM|CONTENT`` format.
 
@@ -1456,54 +1128,53 @@ class ShellFileOperations(FileOperations):
         numbers, just not the padding.
         """
         from tools.tool_output_limits import get_max_line_length
-
         max_line_length = get_max_line_length()
-        lines = content.split("\n")
+        lines = content.split('\n')
         numbered = []
         for i, line in enumerate(lines, start=start_line):
             # Truncate long lines
             if len(line) > max_line_length:
                 line = line[:max_line_length] + "... [truncated]"
             numbered.append(f"{i}|{line}")
-        return "\n".join(numbered)
-
+        return '\n'.join(numbered)
+    
     def _expand_path(self, path: str) -> str:
         """
         Expand shell-style paths like ~ and ~user to absolute paths.
-
+        
         This must be done BEFORE shell escaping, since ~ doesn't expand
         inside single quotes.
         """
         if not path:
             return path
-
+        
         # Handle ~ and ~user
-        if path.startswith("~"):
+        if path.startswith('~'):
             # Get home directory via the terminal environment
             result = self._exec("echo $HOME")
             if result.exit_code == 0 and result.stdout.strip():
                 home = result.stdout.strip()
-                if path == "~":
+                if path == '~':
                     return home
-                elif path.startswith("~/"):
+                elif path.startswith('~/'):
                     return home + path[1:]  # Replace ~ with home
                 # ~username format - extract and validate username before
                 # letting shell expand it (prevent shell injection via
                 # paths like "~; rm -rf /").
                 rest = path[1:]  # strip leading ~
-                slash_idx = rest.find("/")
+                slash_idx = rest.find('/')
                 username = rest[:slash_idx] if slash_idx >= 0 else rest
-                if username and re.fullmatch(r"[a-zA-Z0-9._-]+", username):
+                if username and re.fullmatch(r'[a-zA-Z0-9._-]+', username):
                     # Only expand ~username (not the full path) to avoid shell
                     # injection via path suffixes like "~user/$(malicious)".
                     expand_result = self._exec(f"echo ~{username}")
                     if expand_result.exit_code == 0 and expand_result.stdout.strip():
                         user_home = expand_result.stdout.strip()
-                        suffix = path[1 + len(username) :]  # e.g. "/rest/of/path"
+                        suffix = path[1 + len(username):]  # e.g. "/rest/of/path"
                         return user_home + suffix
-
+        
         return path
-
+    
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands.
 
@@ -1637,9 +1308,7 @@ class ShellFileOperations(FileOperations):
         )
         return self._exec(script, stdin_data=content)
 
-    def _detect_file_line_ending(
-        self, path: str, pre_content: Optional[str] = None
-    ) -> Optional[str]:
+    def _detect_file_line_ending(self, path: str, pre_content: Optional[str] = None) -> Optional[str]:
         """Detect the dominant line ending of a file on disk.
 
         If ``pre_content`` is already available (we just read the file
@@ -1679,15 +1348,18 @@ class ShellFileOperations(FileOperations):
             return False
         return _has_bom(head_result.stdout)
 
+
     def _unified_diff(self, old_content: str, new_content: str, filename: str) -> str:
         """Generate unified diff between old and new content."""
         old_lines = old_content.splitlines(keepends=True)
         new_lines = new_content.splitlines(keepends=True)
         diff = difflib.unified_diff(
-            old_lines, new_lines, fromfile=f"a/{filename}", tofile=f"b/{filename}"
+            old_lines, new_lines,
+            fromfile=f"a/{filename}",
+            tofile=f"b/{filename}"
         )
-        return "".join(diff)
-
+        return ''.join(diff)
+    
     # =========================================================================
     # READ Implementation
     # =========================================================================
@@ -1835,18 +1507,18 @@ class ShellFileOperations(FileOperations):
     def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> ReadResult:
         """
         Read a file with pagination, binary detection, and line numbers.
-
+        
         Args:
             path: File path (absolute or relative to cwd)
             offset: Line number to start from (1-indexed, default 1)
             limit: Maximum lines to return (default 500, max 2000)
-
+        
         Returns:
             ReadResult with content, metadata, or error info
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
-
+        
         offset, limit = normalize_read_pagination(offset, limit)
         
         # Check if file exists and get size (POSIX, works on Linux + macOS)
@@ -1869,15 +1541,8 @@ class ShellFileOperations(FileOperations):
                 )
                 result.hint = f"{note} {result.hint}" if result.hint else note
                 return result
-            # No equivalent spelling — diagnose the real reason (#1488):
-            # wc -c with stderr suppressed can't tell us WHY the read
-            # failed (missing file, directory, permission denied).
-            # _diagnose_read_failure probes with test -e / test -d to
-            # disambiguate, producing a classify_file_error-friendly message
-            # so the agent picks the right recovery instead of blind-retrying
-            # (and it includes similar-file suggestions).
-            _err, _sim = self._diagnose_read_failure(path, operation="read")
-            return ReadResult(error=_err, similar_files=_sim)
+            # No equivalent spelling — suggest similar files
+            return self._suggest_similar_files(path)
 
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         if stat_output.strip() == NOT_REGULAR_SENTINEL:
@@ -1886,12 +1551,12 @@ class ShellFileOperations(FileOperations):
             file_size = int(stat_output.strip())
         except ValueError:
             file_size = 0
-
+        
         # Check if file is too large
         if file_size > MAX_FILE_SIZE:
             # Still try to read, but warn
             pass
-
+        
         # Images are never inlined — redirect to the vision tool
         if self._is_image(path):
             return ReadResult(
@@ -1903,7 +1568,7 @@ class ShellFileOperations(FileOperations):
                     "Use vision_analyze with this file path to inspect the image contents."
                 ),
             )
-
+        
         # Read a sample to check for binary content — at the byte layer when
         # the transport allows, falling back to the legacy text heuristic.
         sample_bytes = self._sample_file_bytes(path)
@@ -1911,7 +1576,11 @@ class ShellFileOperations(FileOperations):
             ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
             is_binary = ext_binary or self._is_likely_binary_bytes(sample_bytes)
         else:
-            is_binary = self._file_is_binary(path)
+            sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+            sample_result = self._exec(sample_cmd)
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
+
         if is_binary:
             # UTF-16 rescue (ported from MoonshotAI/kimi-code#2647): the
             # terminal env decodes stdout as UTF-8 with errors="replace", so
@@ -1961,24 +1630,16 @@ class ShellFileOperations(FileOperations):
             f" | cut -b1-{line_clamp_bytes}"
         )
         read_result = self._exec(read_cmd)
-
+        
         if read_result.exit_code != 0:
-            # #2333 — the file passed wc -c (exists) and binary detection,
-            # but sed failed. This was an opaque "other" error (217/7d,
-            # 20-deep spiral). Probe WHY it failed so the agent gets a
-            # concrete category instead of blind-retrying.
-            _err, _sim = self._diagnose_read_failure(path, operation="read")
-            return ReadResult(
-                error=_err or f"Failed to read file: {read_result.stdout}",
-                similar_files=_sim,
-            )
+            return ReadResult(error=f"Failed to read file: {read_result.stdout}")
         read_output = _strip_terminal_fence_leaks(read_result.stdout)
         # Strip a leading UTF-8 BOM so the model never sees a phantom U+FEFF
         # before the first real character. Only meaningful on the first
         # chunk (the marker lives at byte 0); later pages can't carry it.
         if offset == 1:
             read_output, _ = _strip_bom(read_output)
-
+        
         # Get total line count
         wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
         wc_result = self._exec(wc_cmd)
@@ -1987,18 +1648,11 @@ class ShellFileOperations(FileOperations):
             total_lines = int(wc_output.strip())
         except ValueError:
             total_lines = 0
-
+        
         # Check if truncated
         truncated = total_lines > end_line
         hint = None
-        if total_lines == 0:
-            hint = "This file is empty."
-        elif offset > total_lines:
-            hint = (
-                f"offset={offset} is beyond the end of the file "
-                f"({total_lines} lines). Use offset=1 to reread from the start."
-            )
-        elif truncated:
+        if truncated:
             hint = f"Use offset={end_line + 1} to continue reading (showing {offset}-{end_line} of {total_lines} lines)"
 
         # ``cut`` (unlike sed -n p) always newline-terminates its output,
@@ -2040,7 +1694,7 @@ class ShellFileOperations(FileOperations):
             total_lines=total_lines,
             file_size=file_size,
             truncated=truncated,
-            hint=hint,
+            hint=hint
         )
     
     def _unicode_variant_match(self, path: str) -> Optional[str]:
@@ -2088,15 +1742,7 @@ class ShellFileOperations(FileOperations):
         return None
 
     def _suggest_similar_files(self, path: str) -> ReadResult:
-        """Suggest similar files when the requested file is not found.
-
-        When the parent directory exists, scores its entries by similarity to
-        the requested filename.  When no similar files are found (or the
-        directory itself doesn't exist), falls back to listing the available
-        files in the nearest existing ancestor directory so the agent can see
-        what *is* on disk instead of guessing blindly — the root cause of
-        read_file file-not-found spirals (#886).
-        """
+        """Suggest similar files when the requested file is not found."""
         dir_path = os.path.dirname(path) or "."
         filename = os.path.basename(path)
         basename_no_ext = os.path.splitext(filename)[0]
@@ -2107,13 +1753,11 @@ class ShellFileOperations(FileOperations):
         ls_cmd = f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50"
         ls_result = self._exec(ls_cmd)
 
-        dir_entries: list[str] = []
         scored: list = []  # (score, filepath) — higher is better
         if ls_result.exit_code == 0 and ls_result.stdout.strip():
-            for f in ls_result.stdout.strip().split("\n"):
+            for f in ls_result.stdout.strip().split('\n'):
                 if not f:
                     continue
-                dir_entries.append(f)
                 lf = f.lower()
                 score = 0
 
@@ -2151,72 +1795,11 @@ class ShellFileOperations(FileOperations):
         scored.sort(key=lambda x: -x[0])
         similar = [fp for _, fp in scored[:5]]
 
-        # ── Anti-spiral fallback (#886) ──────────────────────────────
-        # When no similar files were found, list what IS available so the
-        # agent stops guessing and uses a real path.  When the parent
-        # directory itself doesn't exist, walk up to the nearest existing
-        # ancestor and list *its* contents (including subdirectories) so
-        # the agent can see which path components are valid.
-        hint_parts: list[str] = []
-        if not similar and dir_entries:
-            # Directory exists but nothing scored — show all entries.
-            available = sorted(dir_entries[:20])
-            hint_parts.append(
-                f"No similar files found in {dir_path}. "
-                f"Available files: {', '.join(available)}"
-            )
-        elif not similar and not dir_entries:
-            # Parent directory doesn't exist (or is empty) — walk up to
-            # the nearest existing ancestor and list its contents.
-            ancestor = dir_path
-            ancestor_entries: list[str] = []
-            while ancestor and ancestor != "/" and ancestor != ".":
-                check_cmd = (
-                    f"ls -1 {self._escape_shell_arg(ancestor)} 2>/dev/null | head -30"
-                )
-                check_result = self._exec(check_cmd)
-                if check_result.exit_code == 0 and check_result.stdout.strip():
-                    ancestor_entries = [
-                        e for e in check_result.stdout.strip().split("\n") if e
-                    ]
-                    break
-                parent = os.path.dirname(ancestor)
-                if parent == ancestor:
-                    break
-                ancestor = parent
-
-            if ancestor_entries:
-                ancestor_display = (
-                    ancestor if ancestor != dir_path else "parent directory"
-                )
-                hint_parts.append(
-                    f"Directory {dir_path} does not exist. "
-                    f"Contents of nearest existing ancestor ({ancestor_display}): "
-                    f"{', '.join(sorted(ancestor_entries[:20]))}"
-                )
-            else:
-                hint_parts.append(
-                    f"File not found: {path}. "
-                    f"The path {dir_path} does not exist and no ancestor "
-                    f"directory was found. Verify the path before retrying."
-                )
-
-        error_msg = f"File not found: {path}"
-        # #1587 — the "did you mean?" suggestion MUST be inlined into the
-        # error text. The caller (_diagnose_read_failure → line ~1782) only
-        # reads ``.error``, so a suggestion left in the separate
-        # ``similar_files`` field is invisible to the agent and the 71/wk
-        # file-not-found spiral persists unchanged.
-        if similar:
-            error_msg += (
-                "\n\nDid you mean: " + ", ".join(similar) + "? "
-                "Re-run read_file with one of these paths instead of guessing."
-            )
-        if hint_parts:
-            error_msg += "\n\n" + "\n".join(hint_parts)
-
-        return ReadResult(error=error_msg, similar_files=similar)
-
+        return ReadResult(
+            error=f"File not found: {path}",
+            similar_files=similar
+        )
+    
     def read_file_raw(self, path: str) -> ReadResult:
         """Read the complete file content as a plain string.
 
@@ -2226,12 +1809,7 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
         stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
-            # #1488 — same disambiguation as read_file: wc -c with stderr
-            # suppressed can't distinguish missing / directory / permission
-            # denied. Probe the real cause so classify_file_error routes
-            # the agent to the right recovery.
-            _err, _sim = self._diagnose_read_failure(path, operation="read")
-            return ReadResult(error=_err, similar_files=_sim)
+            return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         if stat_output.strip() == NOT_REGULAR_SENTINEL:
             return self._not_regular_error(path)
@@ -2241,11 +1819,18 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        if self._file_is_binary(path):
+        sample_bytes = self._sample_file_bytes(path)
+        if sample_bytes is not None:
+            ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
+            is_binary = ext_binary or self._is_likely_binary_bytes(sample_bytes)
+        else:
+            sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
+        if is_binary:
             return ReadResult(
-                is_binary=True,
-                file_size=file_size,
-                error=describe_binary_file(self._sample_file_bytes(path), file_size),
+                is_binary=True, file_size=file_size,
+                error=describe_binary_file(sample_bytes, file_size),
             )
         cat_result = self._exec(f"cat {self._escape_shell_arg(path)}")
         if cat_result.exit_code != 0:
@@ -2352,9 +1937,7 @@ class ShellFileOperations(FileOperations):
             result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
 
         if result.exit_code != 0:
-            return WriteResult(
-                error=f"Failed to delete {path}: {(result.stdout or '').strip() or 'unknown error'}"
-            )
+            return WriteResult(error=f"Failed to delete {path}: {(result.stdout or '').strip() or 'unknown error'}")
 
         return WriteResult()
 
@@ -2622,9 +2205,7 @@ class ShellFileOperations(FileOperations):
             content_verified = None
 
         # Post-write lint with delta refinement.
-        lint_result = self._check_lint_delta(
-            path, pre_content=pre_content, post_content=content
-        )
+        lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
 
         # Semantic diagnostics from the LSP layer — separate channel.
         # Only fired when the syntax tier reported clean (no point asking
@@ -2647,69 +2228,13 @@ class ShellFileOperations(FileOperations):
             lint=lint_result.to_dict() if lint_result else None,
             lsp_diagnostics=lsp_diagnostics,
         )
-
+    
     # =========================================================================
     # PATCH Implementation (Replace Mode)
     # =========================================================================
-
-    def _diagnose_read_failure(
-        self, path: str, operation: str = "patch"
-    ) -> tuple[str, list[str]]:
-        """Build a distinct, classifiable error for a failed file read.
-
-        Both ``patch_replace`` and ``read_file`` / ``read_file_raw`` probe
-        the target via shell redirects (``cat`` / ``wc -c``) with stderr
-        suppressed, which discards *why* the read failed. Before #1326 /
-        #1488, every miss (missing file, directory, permission error)
-        collapsed to the same generic string. That classifies as
-        ``read_error`` (never ``not_found`` or ``permission``), so the
-        agent never learned the right recovery — it kept blind-retrying.
-        This probe runs ONLY after a failed read (happy path unchanged)
-        and produces a ``classify_file_error``-friendly message carrying
-        a create-on-miss hint when the file is absent.
-
-        ``operation`` ("patch" or "read") controls the wording of the
-        directory / permission messages so they stay actionable for the
-        caller that triggered the probe.
-
-        Returns ``(error_str, similar_files)``.  ``similar_files`` is
-        non-empty only when the path was not found and candidate matches
-        were scored — the caller can attach it to the ``ReadResult`` /
-        ``PatchResult`` so ``classify_file_error`` routes to
-        ``fuzzy_match`` (with a "Did you mean …?" recovery hint) instead
-        of the generic ``not_found`` class (#1587).
-        """
-        esc = self._escape_shell_arg(path)
-        # Does the path exist at all?  ``-e`` follows symlinks; combined
-        # with ``-d`` below it cleanly separates missing / directory /
-        # unreadable-file.
-        exists = self._exec(f"test -e {esc} && echo yes || echo no")
-        if (exists.stdout or "").strip() == "no":
-            # Reuse the rich not-found suggestion (similar files / nearest
-            # ancestor listing) so the message classifies as ``not_found``
-            # and tells the agent how to recover.
-            suggest_result = self._suggest_similar_files(path)
-            return (
-                suggest_result.error or f"File not found: {path}",
-                list(suggest_result.similar_files),
-            )
-        # Path exists but the read failed — is it a directory?
-        is_dir = self._exec(f"test -d {esc} && echo yes || echo no")
-        if (is_dir.stdout or "").strip() == "yes":
-            return (
-                f"Cannot {operation} a directory: {path} is a directory, not a file.",
-                [],
-            )
-        # Exists and is a regular file — most likely a permission error.
-        return (
-            f"Permission denied reading file: {path}. Check read permissions "
-            f"before retrying — do not repeat the same {operation} blindly.",
-            [],
-        )
-
-    def patch_replace(
-        self, path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> PatchResult:
+    
+    def patch_replace(self, path: str, old_string: str, new_string: str,
+                      replace_all: bool = False) -> PatchResult:
         """
         Replace text in a file using fuzzy matching.
 
@@ -2733,23 +2258,10 @@ class ShellFileOperations(FileOperations):
         # Read current content
         read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
         read_result = self._exec(read_cmd)
-
+        
         if read_result.exit_code != 0:
-            # #1326 — The old ``cat ... 2>/dev/null`` swallowed the reason
-            # the read failed, so a missing file, a directory, and a
-            # permission error all produced the identical generic
-            # "Failed to read file: {path}". That string classifies as
-            # ``read_error`` (never ``not_found``), so the agent never
-            # learned that ``write_file`` is the right tool to create the
-            # file — it kept retrying patch against a non-existent path.
-            # File-not-found was the dominant patch-failure class (68%
-            # of patch errors across recent sessions). Probe the reason
-            # here so the error classifies distinctly and carries a
-            # create-on-miss hint. The happy path (file exists) is
-            # unchanged: these probes only run on failure.
-            _err, _sim = self._diagnose_read_failure(path)
-            return PatchResult(error=_err, similar_files=_sim)
-
+            return PatchResult(error=f"Failed to read file: {path}")
+        
         content = read_result.stdout
         # Preserve raw content (including BOM) for write_file's pre_content
         # so write_file can detect/restore BOM correctly.
@@ -2763,42 +2275,11 @@ class ShellFileOperations(FileOperations):
 
         # Import and use fuzzy matching
         from tools.fuzzy_match import fuzzy_find_and_replace
-
+        
         new_content, match_count, _strategy, error = fuzzy_find_and_replace(
             content, old_string, new_string, replace_all
         )
-
-        # ── Identical-strings no-op (#889) ────────────────────────────
-        # When old_string == new_string, the fuzzy matcher returns a
-        # sentinel (strategy="identical") so we can surface a clean
-        # "no changes needed" message instead of a hard error.  This
-        # eliminates the 14 identical-edit failures observed in the
-        # introspection data where the agent accidentally submitted a
-        # no-op edit and then wasted turns retrying.
-        if _strategy == "identical":
-            # #1258 — Return success, not an error. A no-op edit is NOT a
-            # failure: the file content is already in the desired state.
-            # Returning error= here caused downstream failure detection
-            # (file_mutation_result_landed checks data.get("error") at
-            # tool_result_classification.py:34, and classify_tool_failure
-            # checks '"error"' in the result) to flag this as a failure,
-            # inflating the patch failure count and triggering unnecessary
-            # retry spirals. With success=True and no_change=True, the result
-            # is correctly classified as a landed no-op.
-            #
-            # BUT: if the identical string is NOT present in the file, this
-            # is genuinely an error (the edit targets text that doesn't exist).
-            if old_string in content or new_string in content:
-                return PatchResult(
-                    success=True,
-                    no_change=True,
-                    note=(
-                        "old_string and new_string are identical — no changes "
-                        "needed. The file content is already in the desired state."
-                    ),
-                )
-            # Identical old/new but neither present → fall through to error
-
+        
         if error or match_count == 0:
             # Already-applied detection: the most common patch failure in
             # production is a re-send of an edit that has already landed
@@ -2818,39 +2299,12 @@ class ShellFileOperations(FileOperations):
                     ),
                 )
             err_msg = error or f"Could not find match for old_string in {path}"
-            # Build structured error context for self-correction (#996).
-            # This gives the model the closest matching region with line
-            # numbers and a classified error type so it can produce a
-            # corrected patch without re-reading the file.
-            structured_err = ""
             try:
-                from tools.fuzzy_match import format_structured_error
-
-                structured_err = format_structured_error(
-                    error,
-                    match_count,
-                    old_string,
-                    new_string,
-                    content,
-                    file_path=path,
-                    strategy=_strategy,
-                )
+                from tools.fuzzy_match import format_no_match_hint
+                err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
             except Exception:
                 pass
-            # Append the legacy "Did you mean?" hint only when the
-            # structured error didn't already produce a richer context
-            # snippet (the structured error is strictly more useful
-            # because it includes line numbers and a recovery hint).
-            if not structured_err:
-                try:
-                    from tools.fuzzy_match import format_no_match_hint
-
-                    err_msg += format_no_match_hint(
-                        err_msg, match_count, old_string, content
-                    )
-                except Exception:
-                    pass
-            return PatchResult(error=err_msg, structured_error=structured_err or None)
+            return PatchResult(error=err_msg)
 
         # ── Line-ending preservation ──────────────────────────────────
         # Models nearly always send old_string/new_string with bare LF
@@ -2880,9 +2334,7 @@ class ShellFileOperations(FileOperations):
         verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
         verify_result = self._exec(verify_cmd)
         if verify_result.exit_code != 0:
-            return PatchResult(
-                error=f"Post-write verification failed: could not re-read {path}"
-            )
+            return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
         # Normalize line endings before comparing.  On Windows, Python's
         # default text-mode ``open()`` translates ``\n`` → ``\r\n`` on
         # write, so the file on disk legitimately holds CRLFs while our
@@ -2895,20 +2347,16 @@ class ShellFileOperations(FileOperations):
         # matched against, so the comparison must drop it to stay
         # apples-to-apples.
         _verify_bomless, _ = _strip_bom(verify_result.stdout)
-        _verify_stdout_normalized = _verify_bomless.replace("\r\n", "\n").replace(
-            "\r", "\n"
-        )
+        _verify_stdout_normalized = _verify_bomless.replace("\r\n", "\n").replace("\r", "\n")
         _new_content_normalized = new_content.replace("\r\n", "\n").replace("\r", "\n")
         if _verify_stdout_normalized != _new_content_normalized:
-            return PatchResult(
-                error=(
-                    f"Post-write verification failed for {path}: on-disk content "
-                    f"differs from intended write "
-                    f"(wrote {len(_new_content_normalized)} chars, read back "
-                    f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
-                    "The patch did not persist. Re-read the file and try again."
-                )
-            )
+            return PatchResult(error=(
+                f"Post-write verification failed for {path}: on-disk content "
+                f"differs from intended write "
+                f"(wrote {len(_new_content_normalized)} chars, read back "
+                f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
+                "The patch did not persist. Re-read the file and try again."
+            ))
 
         # Generate diff
         diff = self._unified_diff(content, new_content, path)
@@ -2916,9 +2364,7 @@ class ShellFileOperations(FileOperations):
         # Auto-lint with delta refinement: only surface errors introduced
         # by this patch, filtering out pre-existing lint failures so the
         # agent isn't distracted by problems that were already there.
-        lint_result = self._check_lint_delta(
-            path, pre_content=content, post_content=new_content
-        )
+        lint_result = self._check_lint_delta(path, pre_content=content, post_content=new_content)
 
         return PatchResult(
             success=True,
@@ -2933,11 +2379,11 @@ class ShellFileOperations(FileOperations):
             # syntax-check ``lint`` so the agent can read both signals.
             lsp_diagnostics=write_result.lsp_diagnostics,
         )
-
+    
     def patch_v4a(self, patch_content: str) -> PatchResult:
         """
         Apply a V4A format patch.
-
+        
         V4A format:
             *** Begin Patch
             *** Update File: path/to/file.py
@@ -2946,24 +2392,24 @@ class ShellFileOperations(FileOperations):
             -removed line
             +added line
             *** End Patch
-
+        
         Args:
             patch_content: V4A format patch string
-
+        
         Returns:
             PatchResult with changes made
         """
         # Import patch parser
         from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
-
+        
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")
-
+        
         # Apply operations
         result = apply_v4a_operations(operations, self)
         return result
-
+    
     def _check_lint(self, path: str, content: Optional[str] = None) -> LintResult:
         """
         Run syntax check on a file after editing.
@@ -2994,16 +2440,11 @@ class ShellFileOperations(FileOperations):
                 read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
                 read_result = self._exec(read_cmd)
                 if read_result.exit_code != 0:
-                    return LintResult(
-                        skipped=True, message=f"Failed to read {path} for lint"
-                    )
+                    return LintResult(skipped=True, message=f"Failed to read {path} for lint")
                 content = read_result.stdout
             ok, err = inproc(content)
             if err == "__SKIP__":
-                return LintResult(
-                    skipped=True,
-                    message=f"No linter available for {ext} (missing dependency)",
-                )
+                return LintResult(skipped=True, message=f"No linter available for {ext} (missing dependency)")
             return LintResult(success=ok, output="" if ok else err)
 
         # Fall back to shell linter.
@@ -3060,16 +2501,13 @@ class ShellFileOperations(FileOperations):
         cmd = linter_cmd.replace("{file}", self._escape_native_tool_arg(path))
         result = self._exec(cmd, timeout=30)
 
-        if result.exit_code != 0 and _looks_like_linter_unusable(
-            base_cmd, result.stdout
-        ):
+        if result.exit_code != 0 and _looks_like_linter_unusable(base_cmd, result.stdout):
             # The linter command exists on PATH but couldn't actually run
             # (e.g. ``npx tsc`` when tsc isn't in node_modules; ``rustfmt
             # --check`` without a Cargo project).  This is a tooling gap,
             # not a real lint failure — surface it as ``skipped`` so the
             # write doesn't get flagged AND so the LSP tier still runs.
             from tools.ansi_strip import strip_ansi
-
             cleaned = strip_ansi(result.stdout).strip()
             # Collapse to a single line — the npx banner is multi-line ASCII.
             first_line = next(
@@ -3083,12 +2521,11 @@ class ShellFileOperations(FileOperations):
 
         return LintResult(
             success=result.exit_code == 0,
-            output=result.stdout.strip() if result.stdout.strip() else "",
+            output=result.stdout.strip() if result.stdout.strip() else ""
         )
 
-    def _check_lint_delta(
-        self, path: str, pre_content: Optional[str], post_content: Optional[str] = None
-    ) -> LintResult:
+    def _check_lint_delta(self, path: str, pre_content: Optional[str],
+                          post_content: Optional[str] = None) -> LintResult:
         """
         Run post-write syntax lint with pre-write baseline comparison.
 
@@ -3152,11 +2589,7 @@ class ShellFileOperations(FileOperations):
         # new on top — the agent knows it's inherited state, not fresh
         # damage, without silently dropping the error.
         pre_lines = {ln.strip() for ln in pre.output.splitlines() if ln.strip()}
-        post_lines = [
-            ln
-            for ln in post.output.splitlines()
-            if ln.strip() and ln.strip() not in pre_lines
-        ]
+        post_lines = [ln for ln in post.output.splitlines() if ln.strip() and ln.strip() not in pre_lines]
 
         if not post_lines:
             # Every error in post was also in pre — this edit didn't make
@@ -3173,7 +2606,7 @@ class ShellFileOperations(FileOperations):
             output=(
                 "New lint errors introduced by this edit "
                 "(pre-existing errors filtered out):\n" + "\n".join(post_lines)
-            ),
+            )
         )
 
     def _lsp_local_only(self) -> bool:
@@ -3294,7 +2727,6 @@ class ShellFileOperations(FileOperations):
             return
         try:
             from agent.lsp import get_service
-
             svc = get_service()
         except Exception:  # noqa: BLE001
             return
@@ -3349,54 +2781,38 @@ class ShellFileOperations(FileOperations):
         # remaps baseline diagnostics into post-edit coordinates so
         # the strict (range-aware) delta key matches correctly.
         line_shift = None
-        if (
-            pre_content is not None
-            and post_content is not None
-            and pre_content != post_content
-        ):
+        if pre_content is not None and post_content is not None and pre_content != post_content:
             try:
                 from agent.lsp.range_shift import build_line_shift
-
                 line_shift = build_line_shift(pre_content, post_content)
             except Exception:  # noqa: BLE001
                 line_shift = None
 
         try:
-            diagnostics = svc.get_diagnostics_sync(
-                path, delta=True, line_shift=line_shift
-            )
+            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
         except Exception:  # noqa: BLE001
             return ""
         if not diagnostics:
             return ""
         try:
             from agent.lsp.reporter import report_for_file, truncate
-
             block = report_for_file(path, diagnostics)
             if not block:
                 return ""
             return truncate("LSP diagnostics introduced by this edit:\n" + block)
         except Exception:  # noqa: BLE001
             return ""
-
+    
     # =========================================================================
     # SEARCH Implementation
     # =========================================================================
-
-    def search(
-        self,
-        pattern: str,
-        path: str = ".",
-        target: str = "content",
-        file_glob: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-        output_mode: str = "content",
-        context: int = 0,
-    ) -> SearchResult:
+    
+    def search(self, pattern: str, path: str = ".", target: str = "content",
+               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               output_mode: str = "content", context: int = 0) -> SearchResult:
         """
         Search for content or files.
-
+        
         Args:
             pattern: Regex (for content) or glob pattern (for files)
             path: Directory/file to search (default: cwd)
@@ -3406,7 +2822,7 @@ class ShellFileOperations(FileOperations):
             offset: Skip first N results
             output_mode: "content", "files_only", or "count"
             context: Lines of context around matches
-
+        
         Returns:
             SearchResult with matches or file list
         """
@@ -3414,11 +2830,9 @@ class ShellFileOperations(FileOperations):
 
         # Expand ~ and other shell paths
         path = self._expand_path(path)
-
+        
         # Validate that the path exists before searching
-        check = self._exec(
-            f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found"
-        )
+        check = self._exec(f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found")
         if "not_found" in check.stdout:
             # Multi-path recovery: models frequently pass several paths in
             # one string ("dir1 dir2 dir3" or comma-separated). Instead of
@@ -3444,22 +2858,57 @@ class ShellFileOperations(FileOperations):
                 if ls_result.exit_code == 0 and ls_result.stdout.strip():
                     lower_q = basename_query.lower()
                     candidates = []
-                    for entry in ls_result.stdout.strip().split("\n"):
+                    for entry in ls_result.stdout.strip().split('\n'):
                         if not entry:
                             continue
                         le = entry.lower()
                         if lower_q in le or le in lower_q or le.startswith(lower_q[:3]):
                             candidates.append(os.path.join(parent, entry))
                     if candidates:
-                        hint_parts.append("Similar paths: " + ", ".join(candidates[:5]))
-            return SearchResult(error=". ".join(hint_parts), total_count=0)
-
+                        hint_parts.append(
+                            "Similar paths: " + ", ".join(candidates[:5])
+                        )
+            return SearchResult(
+                error=". ".join(hint_parts),
+                total_count=0
+            )
+        
         if target == "files":
-            return self._search_files(pattern, path, limit, offset)
+            result = self._search_files(pattern, path, limit, offset)
         else:
-            return self._search_content(pattern, path, file_glob, limit, offset,
-                                        output_mode, context)
+            result = self._search_content(pattern, path, file_glob, limit, offset,
+                                          output_mode, context)
 
+        exclusions = self._macos_search_exclusions(path)
+        if exclusions and not result.error:
+            skipped = ", ".join(item.split("/")[-1] for item in exclusions)
+            result.warning = (
+                "Skipped macOS protected folders during broad search to avoid "
+                f"an unattended privacy prompt: {skipped}. Search a protected "
+                "folder directly when access is intentional."
+            )
+        return result
+
+    def _macos_search_exclusions(self, path: str) -> List[str]:
+        """Protected descendants to prune for this search root, if any.
+
+        Gated on ``env.is_local``: ``sys.platform``/``Path.home()`` describe
+        the CONTROLLER, but search commands execute on ``self.env``'s host — a
+        macOS controller driving a Linux container/SSH backend must not prune
+        the remote's (unprotected) Downloads, and TCC doesn't exist there
+        anyway. A Linux controller driving a macOS SSH host keeps today's
+        behavior (no pruning); detecting the remote OS is out of scope here.
+        Environments without the flag (test fakes, plugins) default to local
+        semantics — pruning is a warning-carrying skip, never data loss.
+        """
+        env = getattr(self, "env", None)
+        if env is not None and getattr(env, "is_local", True) is False:
+            return []
+        cwd = getattr(self.env, "cwd", None) or self.cwd
+        return _macos_protected_search_exclusions(
+            path, cwd=cwd, home=_HOME, platform=sys.platform
+        )
+    
     def _try_multi_path_search(self, pattern: str, path: str, target: str,
                                file_glob: Optional[str], limit: int, offset: int,
                                output_mode: str, context: int) -> Optional[SearchResult]:
@@ -3589,10 +3038,10 @@ class ShellFileOperations(FileOperations):
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
         # Auto-prepend **/ for recursive search if not already present
-        if not pattern.startswith("**/") and "/" not in pattern:
+        if not pattern.startswith('**/') and '/' not in pattern:
             search_pattern = pattern
         else:
-            search_pattern = pattern.split("/")[-1]
+            search_pattern = pattern.split('/')[-1]
 
         search_root = Path(path)
         has_hidden_path_ancestor = any(
@@ -3603,15 +3052,15 @@ class ShellFileOperations(FileOperations):
         # Prefer ripgrep: respects .gitignore, excludes hidden dirs by
         # default, and has parallel directory traversal (~200x faster than
         # find on wide trees).  Mirrors _search_content which already uses rg.
-        if self._has_command("rg"):
+        if self._has_command('rg'):
             return self._search_files_rg(search_pattern, path, limit, offset)
 
         # Fallback: find (slower, no .gitignore awareness)
-        if not self._has_command("find"):
+        if not self._has_command('find'):
             return SearchResult(
                 error="File search requires 'rg' (ripgrep) or 'find'. "
-                "Install ripgrep for best results: "
-                "https://github.com/BurntSushi/ripgrep#installation"
+                      "Install ripgrep for best results: "
+                      "https://github.com/BurntSushi/ripgrep#installation"
             )
 
         # Exclude hidden directories (matching ripgrep's default behavior).
@@ -3625,29 +3074,38 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = (
-            f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} "
-            f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
-        )
+        # Prune protected directories before traversal so macOS never receives
+        # an access attempt (filtering matched paths after descent is too late).
+        protected_paths = [
+            os.path.normpath(os.path.join(path, item))
+            for item in self._macos_search_exclusions(path)
+        ]
+        prune_expr = ""
+        if protected_paths:
+            prune_terms = " -o ".join(
+                f"-path {self._escape_shell_arg(item)}" for item in protected_paths
+            )
+            prune_expr = f" \\( {prune_terms} \\) -prune -o"
+
+        cmd = f"find {self._escape_shell_arg(path)}{prune_expr}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+              f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = (
-                f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} "
-                f"2>/dev/null | sort -rn{pagination_expr}"
-            )
+            cmd_simple = f"find {self._escape_shell_arg(path)}{prune_expr}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+                        f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
 
         files = []
-        for line in stdout.strip().split("\n"):
+        for line in stdout.strip().split('\n'):
             if not line:
                 continue
-            parts = line.split(" ", 1)
-            if len(parts) == 2 and parts[0].replace(".", "").isdigit():
+            parts = line.split(' ', 1)
+            if len(parts) == 2 and parts[0].replace('.', '').isdigit():
                 files.append(parts[1])
             else:
                 files.append(line)
@@ -3660,18 +3118,13 @@ class ShellFileOperations(FileOperations):
             filtered_files = []
             for file_path in files:
                 try:
-                    rel_parts = (
-                        Path(file_path).resolve().relative_to(normalized_root).parts
-                    )
+                    rel_parts = Path(file_path).resolve().relative_to(normalized_root).parts
                 except ValueError:
                     rel_parts = Path(file_path).parts
-                if any(
-                    part not in {".", ".."} and part.startswith(".")
-                    for part in rel_parts
-                ):
+                if any(part not in {".", ".."} and part.startswith(".") for part in rel_parts):
                     continue
                 filtered_files.append(file_path)
-            files = filtered_files[offset : offset + limit]
+            files = filtered_files[offset:offset + limit]
         # pagination for standard roots is already applied in shell
 
         return SearchResult(
@@ -3681,9 +3134,7 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
-    def _search_files_rg(
-        self, pattern: str, path: str, limit: int, offset: int
-    ) -> SearchResult:
+    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
         rg --files respects .gitignore and excludes hidden directories by
@@ -3693,34 +3144,41 @@ class ShellFileOperations(FileOperations):
         """
         # rg --files -g uses glob patterns; wrap bare names so they match
         # at any depth (equivalent to find -name).
-        if "/" not in pattern and not pattern.startswith("*"):
+        if '/' not in pattern and not pattern.startswith('*'):
             glob_pattern = f"*{pattern}"
         else:
             glob_pattern = pattern
 
         fetch_limit = limit + offset
+        exclusion_globs = " ".join(
+            f"--glob {self._escape_shell_arg(f'!{item}/**')}"
+            for item in self._macos_search_exclusions(path)
+        )
+        exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
+            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)}"
+            f"{exclusion_args} "
             f"{self._escape_native_tool_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [f for f in stdout.strip().split("\n") if f]
+        all_files = [f for f in stdout.strip().split('\n') if f]
 
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                f"rg --files -g {self._escape_shell_arg(glob_pattern)}"
+                f"{exclusion_args} "
                 f"{self._escape_native_tool_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
-            all_files = [f for f in stdout.strip().split("\n") if f]
+            all_files = [f for f in stdout.strip().split('\n') if f]
 
-        page = all_files[offset : offset + limit]
+        page = all_files[offset:offset + limit]
 
         return SearchResult(
             files=page,
@@ -3728,17 +3186,9 @@ class ShellFileOperations(FileOperations):
             truncated=len(all_files) >= fetch_limit or bool(limit_reason),
             limit_reason=limit_reason,
         )
-
-    def _search_content(
-        self,
-        pattern: str,
-        path: str,
-        file_glob: Optional[str],
-        limit: int,
-        offset: int,
-        output_mode: str,
-        context: int,
-    ) -> SearchResult:
+    
+    def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
+                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search for content inside files (grep-like)."""
         # Try ripgrep first (fast), fallback to grep (slower but works)
         used_rg = False
@@ -3753,7 +3203,7 @@ class ShellFileOperations(FileOperations):
             # Neither rg nor grep available (Windows without Git Bash, etc.)
             return SearchResult(
                 error="Content search requires ripgrep (rg) or grep. "
-                "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
+                      "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
             )
 
         # Zero-match steering: a 0-match result with no guidance is a dead
@@ -3774,17 +3224,9 @@ class ShellFileOperations(FileOperations):
         if used_rg:
             return result
         return _maybe_warn_line_oriented_newline_pattern(result, pattern)
-
-    def _search_with_rg(
-        self,
-        pattern: str,
-        path: str,
-        file_glob: Optional[str],
-        limit: int,
-        offset: int,
-        output_mode: str,
-        context: int,
-    ) -> SearchResult:
+    
+    def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
+                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search using ripgrep."""
         cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
 
@@ -3800,17 +3242,21 @@ class ShellFileOperations(FileOperations):
         # Add context if requested
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
+        
+        # Exclude macOS TCC-protected descendants during broad searches.
+        for item in self._macos_search_exclusions(path):
+            cmd_parts.extend(["--glob", self._escape_shell_arg(f"!{item}/**")])
 
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
-
+        
         # Output mode handling
         if output_mode == "files_only":
             cmd_parts.append("-l")  # Files only
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
-
+        
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
@@ -3823,7 +3269,7 @@ class ShellFileOperations(FileOperations):
         # so we grab generously and filter in Python.
         fetch_limit = limit + offset + 200 if context > 0 else limit + offset
         cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])
-
+        
         # `set -o pipefail` so rg's exit status propagates through `| head`.
         # Without it the pipeline reports head's status (0), masking rg's
         # error code (2) and making the guard below unreachable. rg handles a
@@ -3845,10 +3291,7 @@ class ShellFileOperations(FileOperations):
         # usable match payload remains. Otherwise we keep the real matches.
         if result.exit_code == 2 and not payload.strip():
             error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-            enriched = _enrich_search_parse_error(
-                error_msg, pattern, file_glob or ""
-            )
-            return SearchResult(error=enriched, total_count=0)
+            return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
 
         # Parse the diagnostic-free payload so error text never becomes a match.
         stdout = payload
@@ -3858,9 +3301,9 @@ class ShellFileOperations(FileOperations):
         ) if multiline else None
         # Parse results based on output mode
         if output_mode == "files_only":
-            all_files = [f for f in stdout.strip().split("\n") if f]
+            all_files = [f for f in stdout.strip().split('\n') if f]
             total = len(all_files)
-            page = all_files[offset : offset + limit]
+            page = all_files[offset:offset + limit]
             return SearchResult(
                 files=page,
                 total_count=total,
@@ -3868,12 +3311,12 @@ class ShellFileOperations(FileOperations):
                 limit_reason=limit_reason,
                 warning=_ml_note,
             )
-
+        
         elif output_mode == "count":
             counts = {}
-            for line in stdout.strip().split("\n"):
-                if ":" in line:
-                    parts = line.rsplit(":", 1)
+            for line in stdout.strip().split('\n'):
+                if ':' in line:
+                    parts = line.rsplit(':', 1)
                     if len(parts) == 2:
                         try:
                             counts[parts[0]] = int(parts[1])
@@ -3885,7 +3328,7 @@ class ShellFileOperations(FileOperations):
                 truncated=bool(limit_reason),
                 limit_reason=limit_reason,
             )
-
+        
         else:
             # Parse content matches and context lines.
             # rg match lines:   "file:lineno:content"  (colon separator)
@@ -3893,39 +3336,35 @@ class ShellFileOperations(FileOperations):
             # rg group seps:    "--"
             # Note: on Windows, paths contain drive letters (e.g. C:\path),
             # so naive split(":") breaks. Use regex to handle both platforms.
-            _match_re = re.compile(r"^([A-Za-z]:)?(.*?):(\d+):(.*)$")
+            _match_re = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
             matches = []
-            for line in stdout.strip().split("\n"):
+            for line in stdout.strip().split('\n'):
                 if not line or line == "--":
                     continue
-
+                
                 # Try match line first (colon-separated: file:line:content)
                 m = _match_re.match(line)
                 if m:
-                    matches.append(
-                        SearchMatch(
-                            path=(m.group(1) or "") + m.group(2),
-                            line_number=int(m.group(3)),
-                            content=m.group(4)[:500],
-                        )
-                    )
+                    matches.append(SearchMatch(
+                        path=(m.group(1) or '') + m.group(2),
+                        line_number=int(m.group(3)),
+                        content=m.group(4)[:500]
+                    ))
                     continue
-
+                
                 # Try context line (dash-separated: file-line-content)
                 # Only attempt if context was requested to avoid false positives
                 if context > 0:
                     parsed = _parse_search_context_line(line)
                     if parsed:
-                        matches.append(
-                            SearchMatch(
-                                path=parsed[0],
-                                line_number=parsed[1],
-                                content=parsed[2][:500],
-                            )
-                        )
-
+                        matches.append(SearchMatch(
+                            path=parsed[0],
+                            line_number=parsed[1],
+                            content=parsed[2][:500]
+                        ))
+            
             total = len(matches)
-            page = matches[offset : offset + limit]
+            page = matches[offset:offset + limit]
             return SearchResult(
                 matches=page,
                 total_count=total,
@@ -3933,38 +3372,47 @@ class ShellFileOperations(FileOperations):
                 limit_reason=limit_reason,
                 warning=_ml_note,
             )
-
-    def _search_with_grep(
-        self,
-        pattern: str,
-        path: str,
-        file_glob: Optional[str],
-        limit: int,
-        offset: int,
-        output_mode: str,
-        context: int,
-    ) -> SearchResult:
+    
+    def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
+                          limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Fallback search using grep."""
         cmd_parts = ["grep", "-rnHE"]  # -H forces filenames; -E matches rg regex behavior
-
+        
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.
         cmd_parts.append("--exclude-dir='.*'")
 
+        # Protected-dir pruning CANNOT use --exclude-dir here: grep matches
+        # exclude-dir globs against BASENAMES anywhere in the tree, so
+        # --exclude-dir=Downloads would silently skip every nested directory
+        # named Downloads (a repo's own Downloads/ folder included), not just
+        # the protected home child. When exclusions apply (darwin broad-home
+        # search on a local backend), route through find's path-scoped -prune
+        # instead — same traversal-prevention the find backend uses.
+        protected_paths = [
+            os.path.normpath(os.path.join(path, item))
+            for item in self._macos_search_exclusions(path)
+        ]
+        if protected_paths:
+            return self._search_with_grep_pruned(
+                pattern, path, file_glob, limit, offset, output_mode, context,
+                protected_paths,
+            )
+        
         # Add context if requested
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
-
+        
         # Add file pattern filter (must be quoted to prevent shell expansion)
         if file_glob:
             cmd_parts.extend(["--include", self._escape_shell_arg(file_glob)])
-
+        
         # Output mode handling
         if output_mode == "files_only":
             cmd_parts.append("-l")
         elif output_mode == "count":
             cmd_parts.append("-c")
-
+        
         # Add pattern and path. grep applies --exclude-dir to the command-line
         # search root too, so passing the default relative root ``.`` causes
         # ``.*`` to exclude the entire search. Anchor relative paths at the
@@ -3982,11 +3430,11 @@ class ShellFileOperations(FileOperations):
             if relative_path not in {"", "."}:
                 search_root += f"/{self._escape_shell_arg(relative_path)}"
         cmd_parts.append(search_root)
-
+        
         # Fetch generously so we can compute total before slicing
         fetch_limit = limit + offset + (200 if context > 0 else 0)
         cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])
-
+        
         # `set -o pipefail` so grep's exit status propagates through `| head`
         # (without it the pipeline reports head's 0, masking grep's error 2).
         # A truncating head makes grep exit 141 (SIGPIPE) on an otherwise
@@ -3994,6 +3442,56 @@ class ShellFileOperations(FileOperations):
         # pipefail does not turn truncated results into false errors.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
         result = self._exec(cmd, timeout=60)
+        return self._parse_grep_search_output(result, output_mode, limit, offset, context)
+
+    def _search_with_grep_pruned(self, pattern: str, path: str, file_glob: Optional[str],
+                                 limit: int, offset: int, output_mode: str, context: int,
+                                 protected_paths: List[str]) -> SearchResult:
+        """grep fallback with PATH-scoped protected-dir pruning.
+
+        Files are enumerated by ``find`` with the same ``-path ... -prune``
+        expression the find backend uses (traversal never enters the protected
+        dirs, so macOS never sees an access attempt), then handed to grep via
+        ``-exec {} +``. This exists because grep's own ``--exclude-dir``
+        matches basenames anywhere in the tree — it cannot express "only the
+        home-level Downloads". Hidden directories are pruned to mirror the
+        plain path's ``--exclude-dir='.*'``. Trade-off: with ``-exec {} +``
+        find folds grep's exit code into its own generic non-zero, so a hard
+        grep error surfaces as an empty result rather than exit 2 — acceptable
+        for this darwin-local-broad-search-only branch.
+        """
+        grep_parts = ["grep", "-nHE"]
+        if context > 0:
+            grep_parts.extend(["-C", str(context)])
+        if output_mode == "files_only":
+            grep_parts.append("-l")
+        elif output_mode == "count":
+            grep_parts.append("-c")
+        grep_parts.append(self._escape_shell_arg(pattern))
+
+        prune_terms = " -o ".join(
+            f"-path {self._escape_shell_arg(item)}" for item in protected_paths
+        )
+        find_parts = [
+            "find", self._escape_shell_arg(path or "."),
+            f"\\( {prune_terms} \\) -prune", "-o",
+            "\\( -type d -name '.*' \\) -prune", "-o",
+            "-type f",
+        ]
+        if file_glob:
+            find_parts.extend(["-name", self._escape_shell_arg(file_glob)])
+        find_parts.extend(["-exec", *grep_parts, "{}", "+"])
+        fetch_limit = limit + offset + (200 if context > 0 else 0)
+        cmd = (
+            "set -o pipefail; " + " ".join(find_parts)
+            + f" 2>/dev/null | head -n {fetch_limit}"
+        )
+        result = self._exec(cmd, timeout=60)
+        return self._parse_grep_search_output(result, output_mode, limit, offset, context)
+
+    def _parse_grep_search_output(self, result, output_mode: str, limit: int,
+                                  offset: int, context: int) -> SearchResult:
+        """Shared grep output parsing for the plain and pruned variants."""
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         # _exec merges stderr into stdout, so grep's diagnostic lines
@@ -4008,28 +3506,25 @@ class ShellFileOperations(FileOperations):
         # usable match payload remains.
         if result.exit_code == 2 and not payload.strip():
             error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-            enriched = _enrich_search_parse_error(
-                error_msg, pattern, file_glob or ""
-            )
-            return SearchResult(error=enriched, total_count=0)
+            return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
 
         stdout = payload
         if output_mode == "files_only":
-            all_files = [f for f in stdout.strip().split("\n") if f]
+            all_files = [f for f in stdout.strip().split('\n') if f]
             total = len(all_files)
-            page = all_files[offset : offset + limit]
+            page = all_files[offset:offset + limit]
             return SearchResult(
                 files=page,
                 total_count=total,
                 truncated=bool(limit_reason),
                 limit_reason=limit_reason,
             )
-
+        
         elif output_mode == "count":
             counts = {}
-            for line in stdout.strip().split("\n"):
-                if ":" in line:
-                    parts = line.rsplit(":", 1)
+            for line in stdout.strip().split('\n'):
+                if ':' in line:
+                    parts = line.rsplit(':', 1)
                     if len(parts) == 2:
                         try:
                             counts[parts[0]] = int(parts[1])
@@ -4041,43 +3536,40 @@ class ShellFileOperations(FileOperations):
                 truncated=bool(limit_reason),
                 limit_reason=limit_reason,
             )
-
+        
         else:
             # grep match lines:   "file:lineno:content" (colon)
             # grep context lines: "file-lineno-content"  (dash)
             # grep group seps:    "--"
             # Note: on Windows, paths contain drive letters (e.g. C:\path),
             # so naive split(":") breaks. Use regex to handle both platforms.
-            _match_re = re.compile(r"^([A-Za-z]:)?(.*?):(\d+):(.*)$")
+            _match_re = re.compile(r'^([A-Za-z]:)?(.*?):(\d+):(.*)$')
             matches = []
-            for line in stdout.strip().split("\n"):
+            for line in stdout.strip().split('\n'):
                 if not line or line == "--":
                     continue
-
+                
                 m = _match_re.match(line)
                 if m:
-                    matches.append(
-                        SearchMatch(
-                            path=(m.group(1) or "") + m.group(2),
-                            line_number=int(m.group(3)),
-                            content=m.group(4)[:500],
-                        )
-                    )
+                    matches.append(SearchMatch(
+                        path=(m.group(1) or '') + m.group(2),
+                        line_number=int(m.group(3)),
+                        content=m.group(4)[:500]
+                    ))
                     continue
-
+                
                 if context > 0:
                     parsed = _parse_search_context_line(line)
                     if parsed:
-                        matches.append(
-                            SearchMatch(
-                                path=parsed[0],
-                                line_number=parsed[1],
-                                content=parsed[2][:500],
-                            )
-                        )
+                        matches.append(SearchMatch(
+                            path=parsed[0],
+                            line_number=parsed[1],
+                            content=parsed[2][:500]
+                        ))
 
+            
             total = len(matches)
-            page = matches[offset : offset + limit]
+            page = matches[offset:offset + limit]
             return SearchResult(
                 matches=page,
                 total_count=total,

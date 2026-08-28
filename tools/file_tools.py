@@ -7,11 +7,8 @@ import json
 import logging
 import os
 import posixpath
-import re
 import sys
-import tempfile
 import threading
-import unicodedata
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -26,276 +23,12 @@ from tools.file_operations import (
     normalize_search_pagination,
 )
 from tools import file_state
-from tools.path_validation import format_nearby_hint, suggest_nearby_paths
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
-
-# Invisible / compatibility spaces that render like a normal space in a
-# terminal. Folding them (plus NFC) lets read_file recover a path the
-# model retyped visually-correctly but with the wrong bytes.
-_FILENAME_SPACE_FOLDS = (
-    "\u00a0",  # no-break space
-    "\u202f",  # narrow no-break space
-    "\u2007",  # figure space
-    "\u2009",  # thin space
-    "\u200a",  # hair space
-)
-
-
-def _fold_filename_for_unicode_match(name: str) -> str:
-    folded = unicodedata.normalize("NFC", name)
-    for src in _FILENAME_SPACE_FOLDS:
-        folded = folded.replace(src, " ")
-    return folded
-
-
-def _find_unicode_equivalent_path(requested: Path) -> Path | None:
-    """Return the single same-dir file that is a unicode-equivalent of *requested*.
-
-    Conservative: only NFC + invisible-space folding, and only when exactly
-    one sibling matches. Visible differences (straight vs curly quote,
-    missing accents) stay as not-found + similar_files.
-    """
-    try:
-        parent = requested.parent
-        if not parent.is_dir():
-            return None
-        target = _fold_filename_for_unicode_match(requested.name)
-        matches = [
-            entry
-            for entry in parent.iterdir()
-            if entry.is_file()
-            and _fold_filename_for_unicode_match(entry.name) == target
-        ]
-    except OSError:
-        return None
-    if len(matches) == 1 and matches[0].name != requested.name:
-        return matches[0]
-    return None
-
-
-def _find_auto_repaired_path(
-    requested: Path,
-    raw_path: str,
-    task_id: str = "default",
-) -> tuple[Path | None, str | None]:
-    """Find a single unambiguous valid path candidate when *requested* does not exist (#2411).
-
-    Strategies evaluated in priority order:
-      1. Unicode normalization (NFC + invisible-space folding via _find_unicode_equivalent_path)
-      2. Case-insensitive match in the requested parent directory (e.g. readme.md -> README.md)
-      3. Case-insensitive component-wise path traversal (e.g. Tools/file_tools.py -> tools/file_tools.py)
-      4. Workspace-root fallback (if relative path failed against cwd)
-      5. Extraneous prefix stripping (e.g. hermes-agent/tools/foo.py -> tools/foo.py)
-      6. Unique filename in workspace tree (for non-generic filenames >3 chars)
-
-    Returns (repaired_path, explanation_hint) or (None, None) if ambiguous or none found.
-    """
-    # 1. Unicode normalization
-    unicode_hit = _find_unicode_equivalent_path(requested)
-    if unicode_hit is not None and unicode_hit.is_file():
-        return (
-            unicode_hit,
-            f"Opened unicode-equivalent filename {unicode_hit.name!r} instead of {requested.name!r}.",
-        )
-
-    # 2. Case-insensitive match in parent directory
-    try:
-        parent = requested.parent
-        if parent.is_dir():
-            target_lower = requested.name.lower()
-            ci_matches = [
-                entry
-                for entry in parent.iterdir()
-                if entry.is_file() and entry.name.lower() == target_lower
-            ]
-            if len(ci_matches) == 1 and ci_matches[0].name != requested.name:
-                return (
-                    ci_matches[0],
-                    f"Opened case-corrected filename {ci_matches[0].name!r} instead of {requested.name!r}.",
-                )
-    except OSError:
-        pass
-
-    # 3. Case-insensitive component-wise path traversal
-    try:
-        curr_dir = requested.parent
-        unresolved_parts = [requested.name]
-        while not curr_dir.exists() and curr_dir.parent != curr_dir:
-            unresolved_parts.insert(0, curr_dir.name)
-            curr_dir = curr_dir.parent
-        if (
-            curr_dir.exists()
-            and curr_dir.is_dir()
-            and unresolved_parts != [requested.name]
-        ):
-            matched_all = True
-            for part in unresolved_parts:
-                if not curr_dir.is_dir():
-                    matched_all = False
-                    break
-                part_lower = part.lower()
-                matches = [
-                    e for e in curr_dir.iterdir() if e.name.lower() == part_lower
-                ]
-                if len(matches) == 1:
-                    curr_dir = matches[0]
-                else:
-                    matched_all = False
-                    break
-            if matched_all and curr_dir.is_file() and curr_dir != requested:
-                return (
-                    curr_dir,
-                    f"Opened case-corrected path '{curr_dir}' instead of '{raw_path}'.",
-                )
-    except OSError:
-        pass
-
-    # 4. Workspace / Project root vs CWD fallback
-    ws_root = None
-    base_dir = None
-    try:
-        ws_root = _authoritative_workspace_root(task_id)
-        base_dir = str(_resolve_base_dir(task_id, container_paths=False))
-        if not Path(raw_path).is_absolute():
-            # Check explicit workspace root
-            if ws_root and ws_root != base_dir:
-                ws_candidate = (Path(ws_root) / raw_path).resolve()
-                if ws_candidate.is_file() and ws_candidate != requested:
-                    return (
-                        ws_candidate,
-                        f"Resolved path relative to workspace root '{ws_root}' instead of working directory.",
-                    )
-            # Check project root by walking up to find .git, pyproject.toml, package.json, config.yaml
-            start_dir = Path(base_dir if base_dir else os.getcwd())
-            proj_root = start_dir
-            while proj_root.parent != proj_root:
-                if (
-                    (proj_root / ".git").exists()
-                    or (proj_root / "pyproject.toml").exists()
-                    or (proj_root / "package.json").exists()
-                    or (proj_root / "config.yaml").exists()
-                ):
-                    break
-                proj_root = proj_root.parent
-            if proj_root != start_dir:
-                proj_cand = (proj_root / raw_path).resolve()
-                if proj_cand.is_file() and proj_cand != requested:
-                    return (
-                        proj_cand,
-                        f"Resolved path relative to project root '{proj_root}' instead of working directory.",
-                    )
-            if base_dir:
-                cwd_candidate = (Path(base_dir) / raw_path).resolve()
-                if cwd_candidate.is_file() and cwd_candidate != requested:
-                    return (
-                        cwd_candidate,
-                        f"Resolved path relative to working directory '{base_dir}'.",
-                    )
-    except Exception:
-        pass
-
-    # 5. Extraneous prefix stripping (e.g. repo name or /workspace/ or workspace/)
-    try:
-        raw_parts = Path(raw_path.lstrip("/\\")).parts
-        if len(raw_parts) > 1:
-            base_p = Path(base_dir if base_dir else os.getcwd())
-            ws_p = Path(ws_root) if ws_root else base_p
-            # Try stripping 1 leading component
-            stripped_1 = Path(*raw_parts[1:])
-            for anchor in (base_p, ws_p):
-                cand = (anchor / stripped_1).resolve()
-                if cand.is_file() and cand != requested:
-                    return (
-                        cand,
-                        f"Stripped leading directory prefix from '{raw_path}' to '{cand}'.",
-                    )
-            # If 2+ components and starts with common container/repo names, try stripping 2
-            if len(raw_parts) > 2 and raw_parts[0].lower() in {
-                "workspace",
-                "config",
-                "app",
-            }:
-                stripped_2 = Path(*raw_parts[2:])
-                for anchor in (base_p, ws_p):
-                    cand = (anchor / stripped_2).resolve()
-                    if cand.is_file() and cand != requested:
-                        return (
-                            cand,
-                            f"Stripped leading directory prefix from '{raw_path}' to '{cand}'.",
-                        )
-    except Exception:
-        pass
-
-    # 6. Unique matching file in workspace tree for non-generic filenames
-    _GENERIC_NAMES = frozenset({
-        "__init__.py",
-        "index.js",
-        "index.ts",
-        "index.html",
-        "setup.py",
-        "pyproject.toml",
-        "package.json",
-        "cargo.toml",
-        "main.py",
-        "app.py",
-        "readme.md",
-        "license",
-        "config.yaml",
-        "config.yml",
-        "config.json",
-        "conftest.py",
-        "makefile",
-        "dockerfile",
-    })
-    filename = requested.name
-    if filename.lower() not in _GENERIC_NAMES and len(filename) > 3:
-        try:
-            ws_root_path = Path(
-                ws_root if ws_root else (base_dir if base_dir else os.getcwd())
-            )
-            if ws_root_path.is_dir():
-                matches = []
-                target_name_lower = filename.lower()
-                for root_dir, dirs, files in os.walk(ws_root_path):
-                    dirs[:] = [
-                        d
-                        for d in dirs
-                        if d
-                        not in {
-                            ".git",
-                            ".venv",
-                            "venv",
-                            "node_modules",
-                            "__pycache__",
-                            ".pytest_cache",
-                            ".claude",
-                        }
-                    ]
-                    for f in files:
-                        if f.lower() == target_name_lower:
-                            matches.append(Path(root_dir) / f)
-                            if len(matches) > 1:
-                                break
-                    if len(matches) > 1:
-                        break
-                if (
-                    len(matches) == 1
-                    and matches[0].is_file()
-                    and matches[0] != requested
-                ):
-                    return (
-                        matches[0],
-                        f"Found unique matching file '{matches[0]}' in workspace for '{raw_path}'.",
-                    )
-        except Exception:
-            pass
-
-    return None, None
 
 
 def _expand_tilde(path: str) -> str:
@@ -345,7 +78,6 @@ def _get_max_read_chars() -> int:
         return _max_read_chars_cached
     try:
         from hermes_cli.config import load_config
-
         cfg = load_config()
         val = cfg.get("file_read_max_chars")
         if isinstance(val, (int, float)) and val > 0:
@@ -355,39 +87,6 @@ def _get_max_read_chars() -> int:
         pass
     _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
     return _max_read_chars_cached
-
-
-# ── Self-correction retry threshold (issue #996) ─────────────────────────
-# Controls how many consecutive patch failures on the same file are allowed
-# before the error is classified as "permanent" and the model is told to
-# stop retrying.  Read from ``patch.self_correction_retries`` in config.yaml
-# on first call, cached for the process lifetime.  Default 3, max 5.
-_DEFAULT_SELF_CORRECTION_RETRIES = 3
-_MAX_SELF_CORRECTION_RETRIES = 5
-_self_correction_retries_cached: int | None = None
-
-
-def _get_self_correction_retries() -> int:
-    """Return the configured self-correction retry threshold for patches."""
-    global _self_correction_retries_cached
-    if _self_correction_retries_cached is not None:
-        return _self_correction_retries_cached
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        patch_cfg = cfg.get("patch", {})
-        val = patch_cfg.get("self_correction_retries")
-        if (
-            isinstance(val, (int, float))
-            and 1 <= int(val) <= _MAX_SELF_CORRECTION_RETRIES
-        ):
-            _self_correction_retries_cached = int(val)
-            return _self_correction_retries_cached
-    except Exception:
-        pass
-    _self_correction_retries_cached = _DEFAULT_SELF_CORRECTION_RETRIES
-    return _self_correction_retries_cached
 
 
 def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bool]:
@@ -444,21 +143,13 @@ _LARGE_FILE_HINT_BYTES = 512_000  # 512 KB
 # ---------------------------------------------------------------------------
 _BLOCKED_DEVICE_PATHS = frozenset({
     # Infinite output — never reach EOF
-    "/dev/zero",
-    "/dev/random",
-    "/dev/urandom",
-    "/dev/full",
+    "/dev/zero", "/dev/random", "/dev/urandom", "/dev/full",
     # Blocks waiting for input
-    "/dev/stdin",
-    "/dev/tty",
-    "/dev/console",
+    "/dev/stdin", "/dev/tty", "/dev/console",
     # Nonsensical to read
-    "/dev/stdout",
-    "/dev/stderr",
+    "/dev/stdout", "/dev/stderr",
     # fd aliases
-    "/dev/fd/0",
-    "/dev/fd/1",
-    "/dev/fd/2",
+    "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
 })
 
 
@@ -478,13 +169,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({
-    "docker",
-    "singularity",
-    "modal",
-    "daytona",
-    "vercel_sandbox",
-})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -502,9 +187,7 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         except Exception:
             container_key = task_id
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(
-                task_id
-            )
+            env = _active_environments.get(container_key) or _active_environments.get(task_id)
         if env is not None:
             name = env.__class__.__name__.lower()
             if "local" in name:
@@ -519,6 +202,9 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return "modal"
             if "daytona" in name:
                 return "daytona"
+            stamped = getattr(env, "_hermes_backend_name", None)
+            if isinstance(stamped, str) and stamped:
+                return stamped
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
@@ -526,13 +212,13 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
 
 
 def _uses_container_paths(task_id: str = "default") -> bool:
+    env_type = _terminal_env_type_for_task(task_id)
     try:
-        from tools.terminal_tool import _CONTAINER_BACKENDS
+        from tools.terminal_tool import _is_container_backend
 
-        container_backends = _CONTAINER_BACKENDS
+        return _is_container_backend(env_type)
     except Exception:
-        container_backends = _CONTAINER_PATH_BACKENDS_FALLBACK
-    return _terminal_env_type_for_task(task_id) in container_backends
+        return env_type in _CONTAINER_PATH_BACKENDS_FALLBACK
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -684,9 +370,7 @@ def _resolve_base_dir(
     return base.resolve()
 
 
-def _resolve_path_for_task(
-    filepath: str, task_id: str = "default"
-) -> Path | PurePosixPath:
+def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory.
 
     See :func:`_resolve_base_dir` for how the base is chosen. Absolute input
@@ -713,9 +397,7 @@ def _resolve_path_for_task(
 
         if ntpath.isabs(expanded):
             return Path(ntpath.normpath(expanded))
-        joined = ntpath.join(
-            str(_resolve_base_dir(task_id, container_paths=False)), expanded
-        )
+        joined = ntpath.join(str(_resolve_base_dir(task_id, container_paths=False)), expanded)
         return Path(ntpath.normpath(joined))
 
     p = Path(expanded)
@@ -725,9 +407,7 @@ def _resolve_path_for_task(
     return resolved.resolve()
 
 
-def _path_resolution_warning(
-    filepath: str, resolved: Path, task_id: str = "default"
-) -> str | None:
+def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a relative path resolved OUTSIDE the task's workspace root.
 
     Surfaces the worktree-cwd divergence the moment it would matter: if the
@@ -820,7 +500,7 @@ def _rewrite_v4a_patch_paths_for_host(
         return f"{prefix}{resolved}"
 
     patch = _re.sub(
-        r"^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+)$",
+        r'^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+)$',
         _replace_single,
         patch,
         flags=_re.MULTILINE,
@@ -833,7 +513,7 @@ def _rewrite_v4a_patch_paths_for_host(
         return f"{prefix}{src} -> {dst}"
 
     patch = _re.sub(
-        r"^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$",
+        r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$',
         _replace_move,
         patch,
         flags=_re.MULTILINE,
@@ -847,11 +527,9 @@ def _is_blocked_device_path(path: str) -> bool:
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
-    if normalized.startswith("/proc/") and normalized.endswith((
-        "/fd/0",
-        "/fd/1",
-        "/fd/2",
-    )):
+    if normalized.startswith("/proc/") and normalized.endswith(
+        ("/fd/0", "/fd/1", "/fd/2")
+    ):
         return True
     # /proc/*/environ, /proc/*/cmdline, /proc/*/maps (and the maps variants
     # smaps, smaps_rollup, numa_maps) can leak secrets, command-line args, and
@@ -862,17 +540,19 @@ def _is_blocked_device_path(path: str) -> bool:
     # load addresses — an ASLR oracle on par with maps. /proc/*/pagemap exposes
     # virtual->physical translation. Both are blocked alongside the maps family.
     # endswith matches both /proc/<pid>/X and /proc/<pid>/task/<tid>/X.
-    if normalized.startswith("/proc/") and normalized.endswith((
-        "/environ",
-        "/cmdline",
-        "/maps",
-        "/smaps",
-        "/smaps_rollup",
-        "/numa_maps",
-        "/mem",
-        "/auxv",
-        "/pagemap",
-    )):
+    if normalized.startswith("/proc/") and normalized.endswith(
+        (
+            "/environ",
+            "/cmdline",
+            "/maps",
+            "/smaps",
+            "/smaps_rollup",
+            "/numa_maps",
+            "/mem",
+            "/auxv",
+            "/pagemap",
+        )
+    ):
         return True
     return False
 
@@ -915,31 +595,6 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     if _is_blocked_device_path(resolved):
         return True
     return False
-
-
-def _read_document_bytes(file_ops, path: str, max_bytes: int):
-    """Fetch document bytes across the backend boundary when possible.
-
-    Prefer ``file_ops.read_file_bytes`` (remote backends + tests). Fall
-    back to a host-path read so local extraction still works when the
-    file-operations backend has not yet grown a byte reader.
-    """
-    reader = getattr(file_ops, "read_file_bytes", None)
-    if callable(reader):
-        return reader(path, max_bytes=max_bytes)
-
-    from tools.file_operations import ReadResult
-
-    try:
-        size = os.path.getsize(path)
-        data = Path(path).read_bytes()
-        return ReadResult(
-            base64_content=base64.b64encode(data).decode("ascii"),
-            file_size=size,
-            is_binary=True,
-        )
-    except OSError as exc:
-        return ReadResult(error=str(exc))
 
 
 def _search_result_read_block_error(path: str, task_id: str = "default") -> str | None:
@@ -994,17 +649,14 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
 # Paths that file tools should refuse to write to without going through the
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
 _SENSITIVE_PATH_PREFIXES = (
-    "/etc/",
-    "/boot/",
-    "/usr/lib/systemd/",
+    "/etc/", "/boot/", "/usr/lib/systemd/",
     "/private/etc/",
     # macOS: /private/var mirrors /var. Block the sensitive subtrees, NOT the
     # whole thing — a blanket "/private/var/" refused every legitimate temp-file
     # write, because $TMPDIR, /tmp, and /var/folders all realpath() into
     # /private/var/folders/... on macOS (and _resolve_path_for_task resolves
     # symlinks), and /private/var/tmp is a normal temp dir.
-    "/private/var/db/",
-    "/private/var/root/",
+    "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -1020,13 +672,10 @@ def _get_hermes_config_resolved() -> str | None:
     _hermes_config_resolved_loaded = True
     try:
         from hermes_cli.config import get_config_path
-
         _hermes_config_resolved = str(get_config_path().resolve())
     except Exception:
         try:
-            _hermes_config_resolved = str(
-                Path(_expand_tilde("~/.hermes/config.yaml")).resolve()
-            )
+            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
         except Exception:
             _hermes_config_resolved = None
     return _hermes_config_resolved
@@ -1043,33 +692,11 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
-    # The OS temp dir is user scratch space, never a sensitive SYSTEM path.
-    # On macOS it lives under /var/folders -> realpath /private/var/folders,
-    # which the /private/var/ prefix below would otherwise reject. Exempt temp
-    # from the SYSTEM-PATH checks ONLY — the Hermes-config guard further down
-    # still applies (a fake config placed in a temp dir must stay protected).
-    try:
-        _tmp = os.path.realpath(tempfile.gettempdir())
-    except Exception:
-        _tmp = ""
-    _temp_roots = tuple(
-        p
-        for p in (
-            _tmp + os.sep if _tmp else "",
-            "/var/folders/",
-            "/private/var/folders/",
-        )
-        if p
-    )
-    in_temp = any(
-        resolved.startswith(s) or normalized.startswith(s) for s in _temp_roots
-    )
-    if not in_temp:
-        for prefix in _SENSITIVE_PATH_PREFIXES:
-            if resolved.startswith(prefix) or normalized.startswith(prefix):
-                return _err
-        if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    for prefix in _SENSITIVE_PATH_PREFIXES:
+        if resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err
+    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+        return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -1293,6 +920,7 @@ def _request_protected_instruction_approval(
         choice = _approval.prompt_dangerous_approval(
             display, description,
             allow_permanent=False,
+            allow_session=False,
             approval_callback=callback,
         )
         if choice in {"once", "session", "always"}:
@@ -1385,6 +1013,11 @@ def _check_approval_required_write(paths: list[str],
         display_target=f"<write to {display_targets}>",
         cron_deny_message=blocked.format(
             why="requires approval but this cron session denies it."),
+        single_query_deny_message=blocked.format(
+            why="requires approval but single-query (-q) sessions run "
+                "without a user present to approve it. To allow flagged "
+                "actions in single-query mode, set approvals.single_query_mode: "
+                "approve in config.yaml."),
         autoapprove_log_prefix="ssh_config_write",
         fail_closed_when_no_human=True,
         no_human_block_message=blocked.format(
@@ -1412,9 +1045,7 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
 
     try:
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(
-                task_id
-            )
+            env = _active_environments.get(container_key) or _active_environments.get(task_id)
 
         if env is not None:
             if env.__class__.__name__ == "DockerEnvironment" and bool(
@@ -1504,7 +1135,6 @@ def _is_expected_write_exception(exc: Exception) -> bool:
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
 
-
 # Track files read per task to detect re-read loops and deduplicate reads.
 # Per task_id we store:
 #   "last_key":     the key of the most recent read/search call (or None)
@@ -1549,24 +1179,6 @@ def _record_patch_failure(task_id: str, resolved_path: str) -> int:
         return task_failures[resolved_path]
 
 
-def _get_patch_failure_count(task_id: str, resolved_path: str) -> int:
-    """Return the current consecutive-failure count for a path (0 if none)."""
-    with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.get(task_id)
-        if not task_failures:
-            return 0
-        return task_failures.get(resolved_path, 0)
-
-
-def _read_file_content(path: str) -> str:
-    """Read a file's content for patch auto-suggest. Returns empty on error."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except Exception:
-        return ""
-
-
 def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
     """Clear consecutive-failure counts for the given paths."""
     if not resolved_paths:
@@ -1578,139 +1190,17 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
         for rp in resolved_paths:
             task_failures.pop(rp, None)
 
-
-# ── #1703 — empty-old_string loop guard ────────────────────────────────────
-# When the model calls the patch tool in replace mode with an EMPTY (falsy)
-# old_string, no valid replace can ever match — it is a usage error, not a
-# match failure. The old "is None" guard at the top of patch_tool let an empty
-# string fall through to patch_replace, which returned a generic error the
-# model then retried 5-8 times (#1703). We return a targeted, actionable
-# diagnostic at the tool boundary, and track consecutive identical failures
-# per task+path so the second one escalates to a hard STOP — breaking the
-# spiral at 2 instead of 8.
-_empty_old_string_lock = threading.Lock()
-_empty_old_string_tracker: dict = {}  # {task_id: {path: count}}
-
-
-def _record_empty_old_string(task_id: str, path: str) -> int:
-    """Increment and return the consecutive empty-old_string count for a path."""
-    with _empty_old_string_lock:
-        per_task = _empty_old_string_tracker.setdefault(task_id, {})
-        if len(per_task) >= 64 and path not in per_task:
-            try:
-                first_key = next(iter(per_task))
-                del per_task[first_key]
-            except StopIteration:
-                pass
-        per_task[path] = per_task.get(path, 0) + 1
-        return per_task[path]
-
-
-def _reset_empty_old_string(task_id: str, path: str) -> None:
-    """Clear the empty-old_string counter for a path — called when the model
-    supplies a non-empty old_string (it has moved past the empty shape) or
-    when a patch to that path succeeds."""
-    if not path:
-        return
-    with _empty_old_string_lock:
-        per_task = _empty_old_string_tracker.get(task_id)
-        if per_task:
-            per_task.pop(path, None)
-
-
-def _empty_old_string_error(path: str, task_id: str) -> str:
-    """Non-retryable diagnostic for replace-mode with an empty old_string."""
-    count = _record_empty_old_string(task_id, path)
-    msg = (
-        "replace mode requires a non-empty old_string. The old_string is the "
-        "exact text to find and replace in the file; an empty string cannot be "
-        "matched. Either supply the text to replace, or use mode=patch (V4A "
-        "format) for insertions."
-    )
-    if count >= 2:
-        suffix = {2: "nd", 3: "rd"}.get(count % 10, "th")
-        msg += (
-            f" STOP: this is the {count}{suffix} consecutive replace-mode call with an "
-            f"empty old_string on {path!r}. Do not retry this shape — re-read the "
-            f"file to see the exact text, then supply a real old_string, or use "
-            f"mode=patch / write_file instead."
-        )
-    return tool_error(msg)
-
-
 # Per-task bounds for the containers inside each _read_tracker[task_id].
 # A CLI session uses one stable task_id for its lifetime; without these
 # caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
 # is never referenced again (only the most recent reads matter for dedup,
 # loop detection, and external-edit warnings).  Hard caps bound the
 # accretion to a few hundred KB regardless of session length.
-
-# #3238 — patch preflight counter: every replace-mode call blocked for an
-# empty/short/ambiguous old_string increments this per-task counter.  It is
-# surfaced in the structured error so the spiral guard can act on it.
-_patch_preflight_blocked_lock = threading.Lock()
-_patch_preflight_blocked_counter: dict[str, int] = {}
-
-
-def _record_patch_preflight_blocked(task_id: str) -> int:
-    """Increment and return the per-task patch-preflight block count."""
-    with _patch_preflight_blocked_lock:
-        _patch_preflight_blocked_counter[task_id] = (
-            _patch_preflight_blocked_counter.get(task_id, 0) + 1
-        )
-        return _patch_preflight_blocked_counter[task_id]
-
-
-def _patch_preflight_blocked_structured(
-    path: str, reason: str, task_id: str, extra_message: str = ""
-) -> str:
-    """Return a structured re_read_file instruction for a blocked patch.
-
-    The payload is a non-retryable correction request that tells the model to
-    re-read the target file and try again with a more precise old_string.
-    """
-    count = _record_empty_old_string(task_id, path)
-    preflight_count = _record_patch_preflight_blocked(task_id)
-    msg = (
-        "replace mode requires a non-empty old_string. The old_string is the "
-        "exact text to find and replace in the file; an empty string cannot be "
-        "matched. Either supply the text to replace, or use mode=patch (V4A "
-        "format) for insertions."
-    )
-    if count >= 2:
-        suffix = {2: "nd", 3: "rd"}.get(count % 10, "th")
-        msg += (
-            f" STOP: this is the {count}{suffix} consecutive replace-mode call with an "
-            f"empty old_string on {path!r}. Do not retry this shape — re-read the "
-            f"file to see the exact text, then supply a real old_string, or use "
-            f"mode=patch / write_file instead."
-        )
-    message = (
-        f"Patch blocked by preflight: {reason}. "
-        f"Re-read {path!r} with read_file, copy the exact text you want to replace, "
-        f"and retry with a longer, unambiguous old_string."
-    )
-    if extra_message:
-        message += " " + extra_message
-    return json.dumps(
-        {
-            "error": msg,
-            "action": "re_read_file",
-            "path": path,
-            "reason": reason,
-            "message": message,
-            "patch_preflight_blocked": preflight_count,
-            "argument_shape_spiral": preflight_count >= 3,
-        },
-        ensure_ascii=False,
-    )
-_READ_HISTORY_CAP = 500  # set; used only by get_read_files_summary
-_DEDUP_CAP = 1000  # dict; skip-identical-reread guard
-_READ_TIMESTAMPS_CAP = 1000  # dict; external-edit detection for write/patch
-_NOT_FOUND_CAP = 500  # dict; per-task negative-result cache for missing paths
-_NOT_FOUND_TTL_SECONDS = (
-    60.0  # short TTL — a path that didn't exist may be created soon
-)
+_READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
+_DEDUP_CAP = 1000             # dict; skip-identical-reread guard
+_READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
+_NOT_FOUND_CAP = 500          # dict; per-task negative-result cache for missing paths
+_NOT_FOUND_TTL_SECONDS = 60.0 # short TTL — a path that didn't exist may be created soon
 _READ_DEDUP_STATUS_MESSAGE = (
     "File unchanged since last read. The content from "
     "the earlier read_file result in this conversation is "
@@ -1793,7 +1283,6 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     """
     import os as _os
     import time
-
     with _read_tracker_lock:
         task_data = _read_tracker.get(task_id)
         if not task_data:
@@ -1829,24 +1318,15 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     return cached_json
 
 
-def _record_not_found(
-    op: str, resolved_str: str, task_id: str, error_json: str
-) -> None:
+def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str) -> None:
     """Cache a not-found error so the next *op* call for *resolved_str* skips I/O."""
     import time
-
     with _read_tracker_lock:
-        task_data = _read_tracker.setdefault(
-            task_id,
-            {
-                "last_key": None,
-                "consecutive": 0,
-                "read_history": set(),
-                "dedup": {},
-                "dedup_hits": {},
-                "read_timestamps": {},
-            },
-        )
+        task_data = _read_tracker.setdefault(task_id, {
+            "last_key": None, "consecutive": 0,
+            "read_history": set(), "dedup": {},
+            "dedup_hits": {}, "read_timestamps": {},
+        })
         nf = task_data.setdefault("not_found", {})
         nf[(op, resolved_str)] = (time.monotonic(), error_json)
         _cap_read_tracker_data(task_data)
@@ -1877,9 +1357,8 @@ def _is_internal_file_status_text(content: str) -> bool:
         return False
     if stripped == _READ_DEDUP_STATUS_MESSAGE:
         return True
-    if _READ_DEDUP_STATUS_MESSAGE in stripped and len(stripped) <= 2 * len(
-        _READ_DEDUP_STATUS_MESSAGE
-    ):
+    if _READ_DEDUP_STATUS_MESSAGE in stripped and \
+            len(stripped) <= 2 * len(_READ_DEDUP_STATUS_MESSAGE):
         return True
     return False
 
@@ -1913,16 +1392,18 @@ def _looks_like_read_file_line_numbered_content(content: str) -> bool:
         return False
 
     consecutive_pairs = sum(
-        1 for prev, current in zip(numbered, numbered[1:]) if current == prev + 1
+        1 for prev, current in zip(numbered, numbered[1:])
+        if current == prev + 1
     )
     return consecutive_pairs >= len(numbered) - 1
 
 
 def _is_internal_file_tool_content(content: str) -> bool:
     """Return True when content is file-tool display text, not intended file bytes."""
-    return _is_internal_file_status_text(
-        content
-    ) or _looks_like_read_file_line_numbered_content(content)
+    return (
+        _is_internal_file_status_text(content)
+        or _looks_like_read_file_line_numbered_content(content)
+    )
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -1941,12 +1422,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     a registered env override keep their isolation.
     """
     from tools.terminal_tool import (
-        _active_environments,
-        _env_lock,
-        _create_environment,
-        _get_env_config,
-        _last_activity,
-        _start_cleanup_thread,
+        _active_environments, _env_lock, _create_environment,
+        _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
         _resolve_container_task_id,
@@ -2020,9 +1497,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
             elif env_type == "singularity":
-                image = (
-                    overrides.get("singularity_image") or config["singularity_image"]
-                )
+                image = overrides.get("singularity_image") or config["singularity_image"]
             elif env_type == "modal":
                 image = overrides.get("modal_image") or config["modal_image"]
             elif env_type == "daytona":
@@ -2032,7 +1507,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
             try:
                 from tools.terminal_tool import get_session_cwd
-
                 recorded_cwd = get_session_cwd(raw_task_id)
             except Exception:
                 recorded_cwd = None
@@ -2054,23 +1528,15 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     logger.info(
                         "Ignoring host/relative cwd override %r for %s backend "
                         "(won't exist in sandbox). Using %r instead.",
-                        cwd,
-                        env_type,
-                        config["cwd"],
+                        cwd, env_type, config["cwd"],
                     )
                 cwd = config["cwd"]
-            logger.info(
-                "Creating new %s environment for task %s...", env_type, task_id[:8]
-            )
+            logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {
-                "docker",
-                "singularity",
-                "modal",
-                "daytona",
-                "vercel_sandbox",
-            }:
+            from tools.terminal_tool import _is_container_backend as _is_container
+
+            if _is_container(env_type):
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
@@ -2078,13 +1544,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_persistent": config.get("container_persistent", True),
                     "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
-                    "docker_mount_cwd_to_workspace": config.get(
-                        "docker_mount_cwd_to_workspace", False
-                    ),
+                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
-                    "docker_run_as_host_user": config.get(
-                        "docker_run_as_host_user", False
-                    ),
+                    "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
                 }
 
@@ -2179,11 +1641,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
-        device_base = (
-            None
-            if Path(path).expanduser().is_absolute()
-            else _resolve_base_dir(task_id)
-        )
+        device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
             return tool_error(
                 f"Cannot read '{path}': this is a device file that would "
@@ -2208,11 +1666,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                         "interact with it."
                     ),
                 })
-            if os.path.isdir(_resolved):
-                return tool_error(
-                    f"Cannot read '{path}': not a regular file (directory). "
-                    "Use search_files or list the directory instead."
-                )
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -2229,13 +1682,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         if is_extractable_document(str(_resolved)):
             file_ops = _get_file_ops(task_id)
             try:
-                binary = _read_document_bytes(
-                    file_ops, str(_resolved), MAX_DOCUMENT_BYTES
+                binary = file_ops.read_file_bytes(
+                    str(_resolved), max_bytes=MAX_DOCUMENT_BYTES
                 )
                 if binary.error or binary.base64_content is None:
                     raise ExtractionError(binary.error or "Document bytes unavailable")
-                document_bytes = base64.b64decode(binary.base64_content, validate=True)
-                extracted_text = extract_document_bytes(document_bytes, str(_resolved))
+                document_bytes = base64.b64decode(
+                    binary.base64_content, validate=True
+                )
+                extracted_text = extract_document_bytes(
+                    document_bytes, str(_resolved)
+                )
             except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
                 # For binary document formats, surface the specific failure
@@ -2265,11 +1722,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
-                page_text = "\n".join(lines[offset - 1 : end_line])
+                page_text = "\n".join(lines[offset - 1:end_line])
                 result_dict = {
-                    "content": file_ops._add_line_numbers(page_text, offset)
-                    if page_text
-                    else "",
+                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
                     "file_size": binary.file_size,
                     "truncated": total_lines > end_line,
@@ -2308,9 +1763,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                             "retrievable via offset."
                         )
                 if result_dict["content"]:
-                    result_dict["content"] = redact_sensitive_text(
-                        result_dict["content"], file_read=True
-                    )
+                    result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
                 return json.dumps(result_dict, ensure_ascii=False)
 
         # ── Binary file guard ─────────────────────────────────────────
@@ -2352,17 +1805,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(
-                task_id,
-                {
-                    "last_key": None,
-                    "consecutive": 0,
-                    "read_history": set(),
-                    "dedup": {},
-                    "dedup_hits": {},
-                    "read_timestamps": {},
-                },
-            )
+            task_data = _read_tracker.setdefault(task_id, {
+                "last_key": None, "consecutive": 0,
+                "read_history": set(), "dedup": {},
+                "dedup_hits": {}, "read_timestamps": {},
+            })
             # Backward-compat for pre-existing tracker entries that predate
             # dedup_hits/read_timestamps (long-lived task or crossed an
             # upgrade boundary).
@@ -2370,8 +1817,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 task_data["dedup_hits"] = {}
             if "read_timestamps" not in task_data:
                 task_data["read_timestamps"] = {}
-            if "read_failures" not in task_data:
-                task_data["read_failures"] = 0
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
         if cached_mtime is not None:
@@ -2401,28 +1846,19 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                             already_read=hits + 1,
                         )
 
-                    return json.dumps(
-                        {
-                            "status": "unchanged",
-                            "message": _READ_DEDUP_STATUS_MESSAGE,
-                            "path": path,
-                            "dedup": True,
-                            "content_returned": False,
-                        },
-                        ensure_ascii=False,
-                    )
+                    return json.dumps({
+                        "status": "unchanged",
+                        "message": _READ_DEDUP_STATUS_MESSAGE,
+                        "path": path,
+                        "dedup": True,
+                        "content_returned": False,
+                    }, ensure_ascii=False)
             except OSError:
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        # Pass the RESOLVED path (str(_resolved)) to FileOperations.read_file
-        # so the shell commands inside (wc -c, sed, head) use the fully-
-        # qualified absolute path.  Passing the raw *path* here means a
-        # relative path is resolved by the shell's cwd, which may differ
-        # from the terminal env's tracked cwd — the root cause of the
-        # read_file file-not-found spiral (#1044, #886, #970).
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(str(_resolved), offset, limit)
+        result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
         # ── Populate negative-result cache on not-found ───────────────
@@ -2436,61 +1872,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # optimization; recording must stay side-effect-identical.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
-            repaired_path, repair_note = _find_auto_repaired_path(
-                Path(str(_resolved)), raw_path=path, task_id=task_id
-            )
-            if repaired_path is not None:
-                repaired = file_ops.read_file(str(repaired_path), offset, limit)
-                repaired_dict = repaired.to_dict()
-                if not repaired_dict.get("error"):
-                    existing_hint = repaired_dict.get("hint") or ""
-                    repaired_dict["hint"] = (
-                        f"{existing_hint} {repair_note}".strip()
-                        if existing_hint
-                        else repair_note
-                    )
-                    result = repaired
-                    result_dict = repaired_dict
-                    _err = ""
-            if isinstance(_err, str) and _err.startswith("File not found:"):
-                # #2293 — if the shell-based _suggest_similar_files found nothing
-                # (no similar_files), fall back to the shared pure-Python module
-                # so the agent still gets a nearby-files hint. This exercises the
-                # reusable path-validation layer in a real call site (Slice B
-                # extends it to terminal/search_files/patch).
-                if not result_dict.get("similar_files"):
-                    _nearby = suggest_nearby_paths(str(_resolved))
-                    _hint = format_nearby_hint(str(_resolved), _nearby)
-                    if _hint:
-                        result_dict["error"] = _err + "\n\n" + _hint
-                _not_found_json = json.dumps(result_dict, ensure_ascii=False)
-                _record_not_found(
-                    "read", resolved_str_for_neg, task_id, _not_found_json
-                )
-
-        # ── Per-session read_file failure-rate directive (#1370) ──────
-        # read_file has the highest failure rate of any core tool (10.6%,
-        # 782 failures across 220 sessions). Root cause is path
-        # hallucination, not a tool bug. Track cumulative failures per
-        # session and inject a directive when they pile up — before the
-        # agent burns another 5 turns guessing wrong paths.
-        if result_dict.get("error") or result_dict.get("error_class"):
-            _rf = 0
-            with _read_tracker_lock:
-                task_data2 = _read_tracker.get(task_id)
-                if task_data2 is not None:
-                    task_data2["read_failures"] = task_data2.get("read_failures", 0) + 1
-                    _rf = task_data2["read_failures"]
-            if _rf >= 4:
-                result_dict.setdefault(
-                    "_rate_directive",
-                    (
-                        f"read_file has failed {_rf} times this session. "
-                        "You are likely hallucinating paths. STOP guessing — "
-                        "use search_files(target='files') or repo_map to "
-                        "discover the REAL path before reading again."
-                    ),
-                )
+            _not_found_json = json.dumps(result_dict, ensure_ascii=False)
+            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -2541,20 +1924,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         # Large-file hint: if the file is big and the caller didn't ask
         # for a narrow window, nudge toward targeted reads.
-        if (
-            file_size
-            and file_size > _LARGE_FILE_HINT_BYTES
-            and limit > 200
-            and result_dict.get("truncated")
-        ):
-            result_dict.setdefault(
-                "_hint",
-                (
-                    f"This file is large ({file_size:,} bytes). "
-                    "Consider reading only the section you need with offset and limit "
-                    "to keep context usage efficient."
-                ),
-            )
+        if (file_size and file_size > _LARGE_FILE_HINT_BYTES
+                and limit > 200
+                and result_dict.get("truncated")):
+            result_dict.setdefault("_hint", (
+                f"This file is large ({file_size:,} bytes). "
+                "Consider reading only the section you need with offset and limit "
+                "to keep context usage efficient."
+            ))
 
         # ── Track for consecutive-loop detection ──────────────────────
         read_key = ("read", path, offset, limit)
@@ -2624,6 +2001,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         return tool_error(str(e))
+
+
 
 
 def reset_file_dedup(task_id: str = None):
@@ -2944,17 +2323,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
-def patch_tool(
-    mode: str = "replace",
-    path: str = None,
-    old_string: str = None,
-    new_string: str = None,
-    replace_all: bool = False,
-    patch: str = None,
-    task_id: str = "default",
-    cross_profile: bool = False,
-    session_id: str | None = None,
-) -> str:
+def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
+               new_string: str = None, replace_all: bool = False, patch: str = None,
+               task_id: str = "default", cross_profile: bool = False,
+               session_id: str | None = None) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
@@ -2972,7 +2344,6 @@ def patch_tool(
     if mode == "patch" and patch:
         import re as _re
         from tools.path_security import has_traversal_component
-
         def _reject_v4a_traversal(v4a_path: str) -> str | None:
             # V4A path headers come from patch CONTENT, not the explicit
             # ``path=`` arg — so they're more attacker-influenceable (skill
@@ -3008,9 +2379,7 @@ def patch_tool(
         # but was never extracted, so a Move targeting /etc/crontab skipped the
         # sensitive-path pre-check. Check BOTH endpoints, and run them through
         # the same ``..`` traversal rejection as the other headers.
-        for _m in _re.finditer(
-            r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$", patch, _re.MULTILINE
-        ):
+        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
             for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
                 _err = _reject_v4a_traversal(v4a_path)
                 if _err:
@@ -3056,7 +2425,6 @@ def patch_tool(
         # path this degenerates to one lock; on empty list (unresolvable)
         # it's a no-op and execution falls through unchanged.
         from contextlib import ExitStack
-
         with ExitStack() as _locks:
             for _r in _resolved_paths:
                 _locks.enter_context(file_state.lock_path(_r))
@@ -3085,68 +2453,15 @@ def patch_tool(
             if mode == "replace":
                 if not path:
                     return tool_error("path required")
-                # #1703/#3238 — Preflight: reject empty old_string before
-                # attempting the patch. Return a structured re_read_file
-                # instruction so the model fixes the shape instead of blind-retrying.
-                _old = (old_string or "").strip()
-                if not _old:
-                    return _patch_preflight_blocked_structured(
-                        path, "empty old_string", task_id
-                    )
-                _reset_empty_old_string(task_id, path)
-                if new_string is None:
+                if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
-                # Hard stop: refuse further patch attempts to a file that has
-                # already exceeded the consecutive-failure threshold (#1037).
-                # Previously the code only emitted a "_hint" after the
-                # threshold — the model could keep retrying and wasting API
-                # calls.  Now we refuse the call outright and direct the
-                # model to re-read or use write_file.
-                # EXCEPTION: if the old_string is actually present in the
-                # file (exact match), let the patch proceed — it would
-                # succeed and clear the failure counter, which is the
-                # desired recovery path.
-                _resolved_for_gate = _path_to_resolved.get(path) or path
-                _prior_failures = _get_patch_failure_count(task_id, _resolved_for_gate)
-                if _prior_failures >= _get_self_correction_retries():
-                    # Check if old_string exists in the file — if it does,
-                    # this is a valid patch that should proceed.
-                    _gate_content = _read_file_content(_resolved_for_gate)
-                    if _gate_content and old_string and old_string not in _gate_content:
-                        _suggested = ""
-                        try:
-                            from tools.fuzzy_match import suggest_closest_match
-
-                            if _gate_content:
-                                _suggested = suggest_closest_match(
-                                    old_string, _gate_content
-                                )
-                        except Exception:
-                            pass
-                        _suggest_block = ""
-                        if _suggested:
-                            _suggest_block = (
-                                f"\n\nSuggested old_string (closest match in file):\n"
-                                f"---\n{_suggested}\n---\n"
-                            )
-                        return tool_error(
-                            f"PATCH REFUSED: {path} has {_prior_failures} consecutive "
-                            f"patch failures (threshold: {_get_self_correction_retries()}). "
-                            f"Stop retrying with variations of the same old_string. "
-                            f"Either: (1) re-read the file with read_file to verify "
-                            f"current content, (2) use write_file to replace the "
-                            f"entire file, or (3) use the suggested match below if "
-                            f"applicable.{_suggest_block}"
-                        )
                 # Pass the resolved ABSOLUTE path to the shell layer so it
                 # operates on the exact file the tool layer resolved — the
                 # shell's own cwd may differ (worktree-cwd bug), and a relative
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(
-                    _replace_target, old_string, new_string, replace_all
-                )
+                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
@@ -3163,35 +2478,8 @@ def patch_tool(
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
-            # #2242 Slice B — when patch targets a non-existent file, surface
-            # nearby paths (mirrors read_file #2293 / search_files). Covers
-            # both replace-mode ("File not found:") and V4A-mode ("file not
-            # found") errors. Suppressed when the impl already attached
-            # similar_files (shell-based suggestion found something).
-            _patch_nf_err = result_dict.get("error") or ""
-            if (
-                isinstance(_patch_nf_err, str)
-                and "not found" in _patch_nf_err.lower()
-                and not result_dict.get("similar_files")
-            ):
-                # resolve the first path mentioned in the error back to its
-                # absolute form via _path_to_resolved (replace mode); fall back
-                # to the raw path for V4A multi-file patches.
-                _nf_path = path or ""
-                if mode != "replace" and _paths_to_check:
-                    _nf_path = _paths_to_check[0]
-                _nf_resolved = _path_to_resolved.get(_nf_path) or _nf_path or ""
-                if _nf_resolved:
-                    _nearby = suggest_nearby_paths(_nf_resolved)
-                    _hint = format_nearby_hint(_nf_resolved, _nearby)
-                    if _hint:
-                        result_dict["error"] = _patch_nf_err + "\n\n" + _hint
             if stale_warnings:
-                result_dict["_warning"] = (
-                    stale_warnings[0]
-                    if len(stale_warnings) == 1
-                    else " | ".join(stale_warnings)
-                )
+                result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
             # mismatch (e.g. a worktree session editing the main checkout) is
             # visible in the response instead of silently landing elsewhere.
@@ -3204,9 +2492,7 @@ def patch_tool(
                 result_dict["files_modified"] = _resolved_modified
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
-                _mark_verification_stale(
-                    task_id, _resolved_modified, session_id=session_id
-                )
+                _mark_verification_stale(task_id, _resolved_modified, session_id=session_id)
                 for _p in _paths_to_check:
                     _update_read_timestamp(_p, task_id)
                     _r = _path_to_resolved.get(_p)
@@ -3215,30 +2501,14 @@ def patch_tool(
                 # Successful patch: clear any prior consecutive-failure
                 # counters for the touched paths so a future failure on
                 # the same path starts the escalation cycle fresh.
-                _reset_patch_failures(
-                    task_id,
-                    [
-                        _r
-                        for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check)
-                        if _r
-                    ],
-                )
-        # Hint when patch fails — saves iterations where the agent retries
-        # with stale content or an ambiguous old_string instead of
-        # re-reading the file or providing more context.
-        # Covers both no-match ("Could not find") and ambiguous-match
-        # ("Found N matches") failures — both cause the same spiral
-        # pattern where the agent retries with slight variations.
+                _reset_patch_failures(task_id, [
+                    _r for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check) if _r
+                ])
+        # Hint when old_string not found — saves iterations where the agent
+        # retries with stale content instead of re-reading the file.
         # Suppressed when patch_replace already attached a rich "Did you mean?"
-        # snippet or a structured _diagnostic (#996) — both are strictly
-        # more useful than the generic hint.
-        err_str = str(result_dict.get("error") or "")
-        is_no_match = "Could not find" in err_str
-        is_ambiguous = (
-            "Found" in err_str and "matches" in err_str and "old_string" in err_str
-        )
-        has_diagnostic = bool(result_dict.get("_diagnostic"))
-        if err_str and (is_no_match or is_ambiguous):
+        # snippet (which is strictly more useful than the generic hint).
+        if result_dict.get("error") and "Could not find" in str(result_dict["error"]):
             # Track per-file consecutive failures for replace mode.  The
             # ``path`` arg only exists for replace mode; for V4A patches
             # we'd need to walk the headers, but in practice V4A failures
@@ -3248,13 +2518,7 @@ def patch_tool(
                 resolved = _path_to_resolved.get(path) or path
                 failure_count = _record_patch_failure(task_id, resolved)
 
-            # Config-gated retry threshold (#996).  After this many
-            # consecutive failures on the same file, classify the failure
-            # as "permanent" and instruct the model to stop retrying and
-            # use an alternative strategy (re-read or write_file).
-            retry_threshold = _get_self_correction_retries()
-
-            if failure_count >= retry_threshold:
+            if failure_count >= 3:
                 # Escalating hint after multiple consecutive failures on the
                 # same path.  Most common cause is a stale view of the file —
                 # the model is retrying with the same old_string against
@@ -3262,183 +2526,28 @@ def patch_tool(
                 # so the model recognises it's in a loop and breaks out by
                 # re-reading or falling back to write_file.
                 result_dict["_hint"] = (
-                    f"PERMANENT FAILURE: This is failure #{failure_count} "
-                    f"patching {path!r}, exceeding the retry threshold of "
-                    f"{retry_threshold}. Stop retrying with variations of "
-                    f"the same old_string. Either: (1) re-read the file fresh "
-                    f"to verify current content, (2) use a longer / more "
-                    f"unique old_string with surrounding context lines, or "
-                    f"(3) use write_file to replace the entire file if the "
-                    f"targeted region is hard to anchor."
+                    f"This is failure #{failure_count} patching {path!r}. "
+                    "Stop retrying with variations of the same old_string. "
+                    "Either: (1) re-read the file fresh to verify current "
+                    "content, (2) use a longer / more unique old_string with "
+                    "surrounding context lines, or (3) use write_file to "
+                    "replace the entire file if the targeted region is hard "
+                    "to anchor."
                 )
-            elif failure_count >= 2 and is_no_match:
-                # Earlier write_file nudge (#1537). Before reaching the hard
-                # refuse threshold, surface write_file as the recommended
-                # escape on the 2nd consecutive no-match failure on the same
-                # file. The introspection evidence (70 patch-no-match
-                # failures/7d, spirals up to 6 deep) showed the model keeps
-                # retrying near-identical old_string variants past the point a
-                # full rewrite would have been faster. Putting write_file
-                # FIRST here — ahead of the "re-read / longer old_string"
-                # options — biases the model toward the reliably-terminating
-                # path before the refuse-gate has to fire.
-                #
-                # Note: deliberately NOT gated on ``not has_diagnostic`` (unlike
-                # the other branches below). The structured _diagnostic gives
-                # the model the corrected old_string to try, but it does NOT
-                # surface the consecutive-failure count or the write_file
-                # escape — both of which become the right call once the same
-                # file has missed twice in a row. The two signals are
-                # complementary, not mutually exclusive.
-                result_dict["_hint"] = (
-                    f"This is failure #{failure_count} patching {path!r} "
-                    f"with a not-found old_string. The targeted region is "
-                    f"hard to anchor with patch — switch to write_file with "
-                    f"the full intended file content now, or re-read the "
-                    f"file and copy the exact current text before retrying "
-                    f"patch. Do not retry the same old_string again."
-                )
-            elif is_ambiguous and not has_diagnostic:
-                result_dict["_hint"] = (
-                    "Multiple matches found — old_string is not unique. Do NOT "
-                    "retry the same old_string (it will match the same locations "
-                    "again). The error message above lists the exact match lines "
-                    "(L<line>: <snippet>); verify WHICH of those locations is the "
-                    "intended target, then provide a longer old_string with more "
-                    "surrounding context to make it unique, or use replace_all=True "
-                    "if you intend to replace all occurrences."
-                )
-            elif (
-                not has_diagnostic
-                and "Did you mean one of these sections?" not in err_str
-            ):
+            elif "Did you mean one of these sections?" not in str(result_dict["error"]):
                 result_dict["_hint"] = (
                     "old_string not found. Use read_file to verify the current "
                     "content, or search_files to locate the text."
                 )
-
-            # Auto-suggest the closest matching substring from the file
-            # so the model can use it as the corrected old_string instead
-            # of guessing (#1037).  Runs for ALL no-match failures,
-            # including those where patch_replace already added a "Did
-            # you mean?" snippet or where the generic hint was set above.
-            if is_no_match and mode == "replace" and path:
-                try:
-                    from tools.fuzzy_match import suggest_closest_match
-
-                    _rp = _path_to_resolved.get(path) or path
-                    _fc = _read_file_content(_rp)
-                    if _fc:
-                        _suggest = suggest_closest_match(old_string or "", _fc)
-                        if _suggest:
-                            _suggest_block = (
-                                "\n\nSuggested old_string "
-                                "(closest match in file):\n"
-                                f"---\n{_suggest}\n---\n"
-                            )
-                            _existing_hint = result_dict.get("_hint", "") or ""
-                            if _existing_hint:
-                                result_dict["_hint"] = _existing_hint + _suggest_block
-                            else:
-                                result_dict["_hint"] = (
-                                    "old_string not found. "
-                                    "Use read_file to verify the "
-                                    f"current content.{_suggest_block}"
-                                )
-                except Exception:
-                    pass
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         return tool_error(str(e))
 
 
-# ---------------------------------------------------------------------------
-# #1486 — no-match enrichment for search_files
-# ---------------------------------------------------------------------------
-
-
-def _build_no_match_hint(
-    path: str,
-    pattern: str,
-    target: str,
-    resolved_path: "Path | PurePosixPath | None",
-) -> "str | None":
-    """Build a hint for the agent when search_files finds zero matches.
-
-    Lists what *does* exist in the search directory so the agent can correct
-    its pattern or verify the path instead of blind-retrying.  Returns None
-    when no useful hint can be constructed (e.g. the directory doesn't exist
-    or is empty), so the caller can skip adding an empty field.
-    """
-    search_dir = resolved_path if resolved_path else Path(path)
-
-    try:
-        search_dir = Path(os.path.expanduser(str(search_dir)))
-        if not search_dir.is_dir():
-            if search_dir.exists() and search_dir.is_file():
-                return (
-                    f"Pattern {pattern!r} matched nothing in {path!r}. "
-                    "The path is a single file — verify the pattern or "
-                    "read_file the file directly."
-                )
-            return None
-    except (OSError, ValueError, RuntimeError):
-        return None
-
-    try:
-        children = sorted(
-            search_dir.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
-        )
-    except (OSError, PermissionError):
-        return None
-
-    _max = 10
-    dirs = [c.name + "/" for c in children if c.is_dir() and not c.name.startswith(".")]
-    files_list = [
-        c.name for c in children if c.is_file() and not c.name.startswith(".")
-    ]
-    entries = dirs[:_max]
-    remaining = _max - len(entries)
-    if remaining > 0:
-        entries.extend(files_list[:remaining])
-
-    if not entries:
-        return (
-            f"Pattern {pattern!r} matched nothing in {path!r}. "
-            "The directory exists but contains no visible entries. "
-            "Verify the path is correct."
-        )
-
-    mode_desc = "file search" if target == "files" else "content search"
-    listing = ", ".join(entries)
-    hint = (
-        f"Pattern {pattern!r} matched nothing in {path!r} ({mode_desc}). "
-        f"Entries that DO exist in this directory: {listing}"
-    )
-    if target == "files":
-        hint += (
-            ". Try a broader glob (e.g. '*.py' instead of a specific name), "
-            "or use target='content' to search inside files."
-        )
-    else:
-        hint += (
-            ". Try a different regex pattern, or use target='files' with a "
-            "glob like '*.py' to list files first."
-        )
-    return hint
-
-
-def search_tool(
-    pattern: str,
-    target: str = "content",
-    path: str = ".",
-    file_glob: str = None,
-    limit: int = 50,
-    offset: int = 0,
-    output_mode: str = "content",
-    context: int = 0,
-    task_id: str = "default",
-) -> str:
+def search_tool(pattern: str, target: str = "content", path: str = ".",
+                file_glob: str = None, limit: int = 50, offset: int = 0,
+                output_mode: str = "content", context: int = 0,
+                task_id: str = "default") -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
@@ -3456,14 +2565,9 @@ def search_tool(
             offset,
         )
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(
-                task_id,
-                {
-                    "last_key": None,
-                    "consecutive": 0,
-                    "read_history": set(),
-                },
-            )
+            task_data = _read_tracker.setdefault(task_id, {
+                "last_key": None, "consecutive": 0, "read_history": set(),
+            })
             if task_data["last_key"] == search_key:
                 task_data["consecutive"] += 1
             else:
@@ -3484,9 +2588,7 @@ def search_tool(
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
-        block_error = get_read_block_error(
-            str(resolved_path) if resolved_path else path
-        )
+        block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return tool_error(block_error)
 
@@ -3499,93 +2601,21 @@ def search_tool(
             resolved_search_path = str(_resolve_path_for_task(path, task_id))
         except (OSError, ValueError):
             resolved_search_path = path
-        cached_search_nf = _check_not_found_cache(
-            "search", resolved_search_path, task_id
-        )
+        cached_search_nf = _check_not_found_cache("search", resolved_search_path, task_id)
         if cached_search_nf is not None:
             return cached_search_nf
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern,
-            path=path,
-            target=target,
-            file_glob=file_glob,
-            limit=limit,
-            offset=offset,
-            output_mode=output_mode,
-            context=context,
+            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
-        if hasattr(result, "matches"):
+        if hasattr(result, 'matches'):
             for m in result.matches:
-                if hasattr(m, "content") and m.content:
+                if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, file_read=True)
         result_dict = result.to_dict(densify=True)
-
-        # ── Empty-result enrichment + spiral detection (#1372, #1486) ──
-        # search_files returns {"total_count": 0} with no error key on a
-        # successful-but-empty search. Two distinct problems are handled here.
-        #
-        # #1486 — when the pattern matches nothing the agent has no hint about
-        # what *does* exist, so it blind-retries or falls back to a terminal
-        # directory listing, burning extra turns (95 file-not-found events/7d,
-        # 27-deep spirals observed). The FIRST empty result is enriched with
-        # what actually exists in the search path.
-        #
-        # #1372/#1149/#1589 — the tool_guardrails spiral_failure_cap only
-        # counts errors, so diverse-query spirals (the agent reformulates each
-        # time and gets empty each time) slip through. Empty results are
-        # tracked per session; at 3 an advisory directive is injected, and at
-        # 6 it escalates to a real error key so classify_tool_failure sees the
-        # failure and the cross-turn spiral_failure_cap (search_files is in
-        # _SPIRAL_PRONE_TOOLS) can accumulate and halt. The advisory alone had
-        # no teeth — 31 sessions hit 11 consecutive empty searches.
-        _SEARCH_EMPTY_HARD_CAP = 6
-        if result_dict.get("total_count", 0) == 0 and not result_dict.get("error"):
-            with _read_tracker_lock:
-                td = _read_tracker.setdefault(
-                    task_id,
-                    {"last_key": None, "consecutive": 0, "read_history": set()},
-                )
-                td["empty_searches"] = td.get("empty_searches", 0) + 1
-                _es = td["empty_searches"]
-
-            # ── #1486: immediate no-match hint on the FIRST empty result ─
-            # List what *does* exist in the search directory so the agent can
-            # correct the pattern instead of blind-retrying.  Runs before the
-            # spiral directive so even the first miss gets actionable info.
-            if _es == 1:
-                _hint = _build_no_match_hint(path, pattern, target, resolved_path)
-                if _hint:
-                    result_dict["_no_match_hint"] = _hint
-
-            if _es >= _SEARCH_EMPTY_HARD_CAP:
-                result_dict["error"] = (
-                    f"search_files has returned 0 results {_es} times. Your "
-                    "queries are consistently not matching anything — this is a "
-                    "deterministic dead end. STOP searching and switch strategy: "
-                    "(a) use search_files target='files' with a glob like '*.py', "
-                    "(b) call repo_map for a structural overview, or "
-                    "(c) read_file on a known path instead of searching."
-                )
-            elif _es >= 3:
-                result_dict.setdefault(
-                    "_search_directive",
-                    (
-                        f"search_files has returned 0 results {_es} times. "
-                        "Your queries are not matching anything. SWITCH STRATEGY: "
-                        "(a) use search_files target='files' with a glob like '*.py', "
-                        "(b) call repo_map for a structural overview, or "
-                        "(c) read_file on a known path instead of searching."
-                    ),
-                )
-        elif result_dict.get("total_count", 0) > 0:
-            # Successful search with results — reset the empty counter.
-            with _read_tracker_lock:
-                td = _read_tracker.get(task_id)
-                if td is not None:
-                    td["empty_searches"] = 0
 
         if omitted:
             result_dict["_omitted"] = (
@@ -3598,13 +2628,6 @@ def search_tool(
         # flowing through the consecutive-search bookkeeping below.
         _search_err = result_dict.get("error") or ""
         if isinstance(_search_err, str) and _search_err.startswith("Path not found:"):
-            # #2242 Slice B — surface nearby paths so the agent can correct a
-            # hallucinated search root in one turn instead of guessing. Mirrors
-            # the read_file integration (#2293) at the same call-site pattern.
-            _nearby = suggest_nearby_paths(resolved_search_path)
-            _hint = format_nearby_hint(resolved_search_path, _nearby)
-            if _hint:
-                result_dict["error"] = _search_err + "\n\n" + _hint
             _search_nf_json = json.dumps(result_dict, ensure_ascii=False)
             _record_not_found("search", resolved_search_path, task_id, _search_nf_json)
 
@@ -3625,6 +2648,8 @@ def search_tool(
         return tool_error(str(e))
 
 
+
+
 # ---------------------------------------------------------------------------
 # Schemas + Registry
 # ---------------------------------------------------------------------------
@@ -3634,36 +2659,20 @@ from tools.registry import registry, tool_error
 def _check_file_reqs():
     """Lazy wrapper to avoid circular import with tools/__init__.py."""
     from tools import check_file_requirements
-
     return check_file_requirements()
-
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images. The 'path' parameter can also be a list of paths to read multiple files in one call (batch mode, max 10 files).",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {
-                "type": ["string", "array"],
-                "items": {"type": "string"},
-                "description": "Path to the file to read (absolute, relative, or ~/path), or a list of up to 10 paths for batch reading",
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Line number to start reading from (1-indexed, default: 1)",
-                "default": 1,
-                "minimum": 1,
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.",
-                "default": 2000,
-                "maximum": 2000,
-            },
+            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+            "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
         },
-        "required": ["path"],
-    },
+        "required": ["path"]
+    }
 }
 
 WRITE_FILE_SCHEMA = {
@@ -3672,22 +2681,16 @@ WRITE_FILE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {
-                "type": "string",
-                "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)",
-            },
-            "content": {
-                "type": "string",
-                "description": "Complete content to write to the file",
-            },
+            "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
+            "content": {"type": "string", "description": "Complete content to write to the file"},
             "cross_profile": {
                 "type": "boolean",
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
         },
-        "required": ["path", "content"],
-    },
+        "required": ["path", "content"]
+    }
 }
 
 PATCH_SCHEMA = {
@@ -3743,104 +2746,27 @@ PATCH_SCHEMA = {
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents. On macOS, broad searches above the user home automatically skip TCC-protected folders (Desktop, Documents, Downloads, Library, Movies, Music, Pictures); target one directly when access is intentional.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
     "parameters": {
         "type": "object",
         "properties": {
-            "pattern": {
-                "type": "string",
-                "description": "Regex pattern for content search, or glob pattern (e.g., '*.py') for file search. When target='content', glob patterns are auto-converted to regex for convenience, but prefer file_glob to filter by filename.",
-            },
-            "target": {
-                "type": "string",
-                "enum": ["content", "files"],
-                "description": "'content' searches inside file contents, 'files' searches for files by name",
-                "default": "content",
-            },
-            "path": {
-                "type": "string",
-                "description": "Directory or file to search in (default: current working directory)",
-                "default": ".",
-            },
-            "file_glob": {
-                "type": "string",
-                "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of results to return (default: 50)",
-                "default": 50,
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Skip first N results for pagination (default: 0)",
-                "default": 0,
-            },
-            "output_mode": {
-                "type": "string",
-                "enum": ["content", "files_only", "count"],
-                "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file",
-                "default": "content",
-            },
-            "context": {
-                "type": "integer",
-                "description": "Number of context lines before and after each match (grep mode only)",
-                "default": 0,
-            },
+            "pattern": {"type": "string", "description": "Regex pattern for content search, or glob pattern (e.g., '*.py') for file search"},
+            "target": {"type": "string", "enum": ["content", "files"], "description": "'content' searches inside file contents, 'files' searches for files by name", "default": "content"},
+            "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
+            "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
+            "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
+            "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
+            "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
         },
-        "required": ["pattern"],
-    },
+        "required": ["pattern"]
+    }
 }
 
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    path = args.get("path", "")
-    # #757/#784 — batch mode: read multiple files in one tool call.
-    if isinstance(path, list):
-        return _handle_read_file_batch(path, args, tid)
-    return read_file_tool(
-        path=path,
-        offset=args.get("offset", 1),
-        limit=args.get("limit", 500),
-        task_id=tid,
-    )
-
-
-_BATCH_READ_MAX_FILES = 10
-
-
-def _handle_read_file_batch(paths: list, args: dict, tid: str) -> str:
-    """Read multiple files in one call. Returns JSON with per-file results."""
-    if len(paths) > _BATCH_READ_MAX_FILES:
-        return json.dumps({
-            "error": (
-                f"Batch read supports at most {_BATCH_READ_MAX_FILES} files per call; "
-                f"got {len(paths)}. Split into smaller batches."
-            ),
-        })
-    offset = args.get("offset", 1)
-    limit = args.get("limit", 500)
-    files = []
-    for p in paths:
-        if not isinstance(p, str):
-            files.append({
-                "path": str(p),
-                "error": "Invalid path type: expected string",
-            })
-            continue
-        raw = read_file_tool(path=p, offset=offset, limit=limit, task_id=tid)
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            parsed = {"raw": raw}
-        entry = {"path": p}
-        if "error" in parsed:
-            entry["error"] = parsed["error"]
-        else:
-            entry.update(parsed)
-        files.append(entry)
-    return json.dumps({"batch": True, "files": files}, ensure_ascii=False)
+    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
 def _handle_write_file(args, **kw):
@@ -3864,9 +2790,7 @@ def _handle_write_file(args, **kw):
             f"{type(args['content']).__name__}."
         )
     return write_file_tool(
-        path=args["path"],
-        content=args["content"],
-        task_id=tid,
+        path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
     )
@@ -3875,211 +2799,11 @@ def _handle_write_file(args, **kw):
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
     return patch_tool(
-        mode=args.get("mode", "replace"),
-        path=args.get("path"),
-        old_string=args.get("old_string"),
-        new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False),
-        patch=args.get("patch"),
-        task_id=tid,
+        mode=args.get("mode", "replace"), path=args.get("path"),
+        old_string=args.get("old_string"), new_string=args.get("new_string"),
+        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
-    )
-
-
-def _looks_like_glob(pattern: str) -> bool:
-    """Heuristic: does *pattern* look like a shell glob rather than a regex?
-
-    Globs use ``*``, ``?``, and ``[...]`` as wildcards without regex escaping.
-    In a regex those same characters are metacharacters, but a bare ``*.py`` or
-    ``*config*`` is almost certainly a glob the model intended as a filename
-    pattern, not a regex. We flag it so the caller can auto-redirect.
-    """
-    if not pattern:
-        return False
-    # A real regex would escape these as \*, \?, \[ — so an unescaped
-    # wildcard is the signal.  ``**/`` (recursive glob) is also glob-only.
-    # Exception: ``.*`` and ``.+`` etc. are common regex idioms where the
-    # ``*``/``+`` quantifier follows a regex metacharacter — those should
-    # NOT be flagged as globs.  The distinguishing signal: in a glob, ``*``
-    # is typically preceded by a literal character (``*.py``, ``*config*``)
-    # or a ``/`` (``**/*.py``), not by a regex metacharacter like ``.``.
-    for i, ch in enumerate(pattern):
-        if ch == "*":
-            if i > 0 and pattern[i - 1] == "\\":
-                continue  # escaped — regex literal
-            if i > 0 and pattern[i - 1] in ".+?^$":
-                # ``.*``, ``+*`` (unusual but not a glob) — ``*`` is a
-                # regex quantifier following a metacharacter, not a glob.
-                # But ``?*`` is ambiguous — treat as regex here since
-                # ``?*`` as a glob is extremely rare.
-                continue
-            if i > 0 and pattern[i - 1] == "*" and i >= 2 and pattern[i - 2] == "*":
-                # ``**`` (recursive glob) — ``**/`` is glob-only
-                if i + 1 < len(pattern) and pattern[i + 1] == "/":
-                    return True
-                continue
-            return True
-        if ch == "?":
-            if i > 0 and pattern[i - 1] == "\\":
-                continue
-            # ``?`` in regex means "zero or one" — preceded by a
-            # metacharacter it's a quantifier, not a glob wildcard.
-            # ``(`` is included so lookarounds ``(?!…)``, ``(?<=…)``,
-            # ``(?:…)`` and other ``(?…)`` groups are NOT misclassified
-            # as glob ``?`` wildcards (#1484 — caused 59 retries/7d).
-            if i > 0 and pattern[i - 1] in ".+*^$[(":
-                continue
-            return True
-    return False
-
-
-def _is_valid_regex(pattern: str) -> bool:
-    """Return True if *pattern* compiles as a valid Python regex.
-
-    Used to short-circuit the glob-vs-regex heuristic in
-    :func:`_handle_search_files`: the guard's only purpose (#887) is to catch
-    patterns that would cause a ripgrep *regex parse error*, and a pattern that
-    compiles cannot cause one.  Treating such a pattern as a glob is a
-    false-positive redirect (e.g. ``"verdict":\\s*null`` — the heuristic sees
-    ``*`` preceded by ``s`` because it does not track the ``\\s`` escape span,
-    yet the pattern compiles and is exactly what the caller wanted to search for).
-    """
-    try:
-        re.compile(pattern)
-        return True
-    except re.error:
-        return False
-
-
-def _glob_to_regex(glob: str) -> str:
-    """Convert a shell glob pattern to an equivalent regex (#1788).
-
-    Translates ``*`` → ``.*``, ``?`` → ``.``, and passes ``[...]`` character
-    classes through (they share syntax between glob and regex).  All other
-    regex metacharacters (``.``, ``+``, ``(``, ``)``, ``{``, ``}``, ``|``,
-    ``^``, ``$``, ``\\``) are escaped so the result is a literal-matching
-    regex.  The output is **not anchored** — callers match substrings.
-    """
-    _REGEX_META = set(".^$+{}\\|()")
-    i = 0
-    n = len(glob)
-    out: list[str] = []
-    while i < n:
-        c = glob[i]
-        if c == "*":
-            out.append(".*")
-        elif c == "?":
-            out.append(".")
-        elif c == "[":
-            j = i + 1
-            if j < n and glob[j] == "!":
-                j += 1
-            if j < n and glob[j] == "]":
-                j += 1
-            while j < n and glob[j] != "]":
-                j += 1
-            if j < n:
-                out.append(glob[i : j + 1])
-                i = j
-            else:
-                out.append("\\[")
-        elif c in _REGEX_META:
-            out.append("\\" + c)
-        else:
-            out.append(c)
-        i += 1
-    return "".join(out)
-
-
-def _classify_regex_error(pattern: str, exc) -> tuple:
-    """#2308 — decompose a regex compile failure into a sub-cause + recovery.
-
-    The pre-validation in ``_handle_search_files`` catches patterns that fail
-    ``re.compile`` before ripgrep ever sees them, but the returned error was
-    a single generic bucket with no sub-cause and no recovery directive —
-    so the agent blind-retried with near-identical patterns (74/7d, 17-deep
-    spirals). This classifies the ``re.error`` message into a structured
-    reason with a corrected-pattern suggestion.
-
-    Returns ``(reason, recovery)`` where ``reason`` is one of:
-      - ``invalid_regex_syntax`` — malformed regex (unclosed bracket/group,
-        bad escape, dangling quantifier)
-      - ``glob_as_regex`` — a shell glob that slipped past the auto-convert
-        guard (e.g. a ``[!...]`` negation or a pattern the heuristic missed)
-      - ``unsupported_feature`` — a regex feature ripgrep/Python rejects
-      - ``other`` — unclassified compile failure
-    """
-    if exc is None:
-        return (
-            "other",
-            "The regex failed to compile. Read the error text, fix the "
-            "pattern, and re-run — do NOT retry the same pattern unchanged.",
-        )
-    low = str(exc).lower()
-    # #2308 — glob_as_regex is checked BEFORE invalid_regex_syntax because
-    # it is more specific: a pattern containing ``[!`` (glob negation
-    # syntax, which is invalid in Python regex) is almost certainly a
-    # shell glob the model intended as a filename pattern. We key on the
-    # pattern-level signal ``[!`` rather than the error message text,
-    # because "unterminated character set" fires for ANY unclosed ``[``,
-    # including plain malformed regex like ``[unclosed`` that has no glob
-    # intent.
-    if "[!" in pattern:
-        return (
-            "glob_as_regex",
-            "This looks like a shell glob (filename pattern) passed as a "
-            "regex — the '[!' glob negation syntax is not valid regex. Use "
-            "target='files' or move it to the file_glob parameter instead of "
-            "the regex pattern.",
-        )
-    # Unclosed character class / group / dangling quantifier — the classic
-    # malformed-regex family.
-    if any(
-        tok in low
-        for tok in (
-            "unterminated",
-            "unclosed",
-            "missing ), unterminated subpattern",
-            "nothing to repeat",
-            "multiple repeat",
-            "unexpected end of pattern",
-            "bad escape",
-            "invalid escape",
-            "trailing backslash",
-        )
-    ):
-        return (
-            "invalid_regex_syntax",
-            "The regex is malformed (unclosed bracket/group, bad escape, or "
-            "dangling quantifier). Fix the syntax — e.g. close the '[' or '(' "
-            "and escape literal metacharacters with '\\'. Do NOT retry the "
-            "same malformed pattern.",
-        )
-    # Lookbehind/lookahead or other engine-specific feature rejection.
-    if any(
-        tok in low
-        for tok in (
-            "look-behind",
-            "lookbehind",
-            "fixed-width",
-            "variable-length",
-            "not supported",
-            "unsupported",
-            "invalid group",
-        )
-    ):
-        return (
-            "unsupported_feature",
-            "The regex uses a feature the search engine does not support "
-            "(e.g. variable-width lookbehind). Rewrite it with a supported "
-            "construct — do NOT retry the same pattern.",
-        )
-    return (
-        "other",
-        "The regex failed to compile for an unclassified reason. Read the "
-        "error text, fix the pattern, and re-run — do NOT retry the same "
-        "pattern unchanged.",
     )
 
 
@@ -4088,117 +2812,13 @@ def _handle_search_files(args, **kw):
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
-    pattern = args.get("pattern", "")
-
-    # Issue #887 / #1788: when the model passes a glob pattern (e.g. ``*.py``)
-    # as the regex ``pattern`` in content-search mode, ripgrep fails with a
-    # regex parse error.  Instead of returning an error and forcing a retry
-    # (#1788 — 227 failures / 300 sessions, 70% glob-as-regex), we now
-    # transparently convert the glob to an equivalent regex and proceed with
-    # the search.  This prevents the error entirely and saves a round-trip.
-    #
-    # The conversion is ONLY applied when the pattern would actually fail
-    # ``re.compile`` — a pattern that compiles is a legitimate regex, even if
-    # it contains glob-like metacharacters (see _is_valid_regex above for the
-    # false-positive rationale).
-    if (
-        target == "content"
-        and not args.get("file_glob")
-        and _looks_like_glob(pattern)
-        and not _is_valid_regex(pattern)
-    ):
-        pattern = _glob_to_regex(pattern)
-
-    # #1588 — when a pattern that does NOT look like a glob still fails to
-    # compile as a regex, ripgrep returns a bare parse error with no guidance,
-    # causing 59/week parse-error spirals. Pre-validate and surface the exact
-    # compile-failure reason plus a glob-vs-regex hint so the agent can fix
-    # the pattern instead of blind-retrying with a near-identical one.
-    # Guard ``file_glob``: when it is set, the caller is intentionally
-    # combining a filename filter with their pattern, so the pattern should
-    # pass through even if it happens to be a bare glob.
-    if (
-        target == "content"
-        and not args.get("file_glob")
-        and not _is_valid_regex(pattern)
-    ):
-        try:
-            re.compile(pattern)
-            compile_reason = ""
-            # Defensive default — this branch is only reached when the
-            # pattern fails _is_valid_regex, so compile always raises, but
-            # keep the classifier result bound for the type checker.
-            reason, recovery = _classify_regex_error(pattern, None)
-        except re.error as exc:
-            compile_reason = str(exc)
-            # #2308 — decompose the compile failure into a structured
-            # sub-cause + recovery directive so the agent fixes the pattern
-            # instead of blind-retrying with a near-identical one.
-            reason, recovery = _classify_regex_error(pattern, exc)
-        return json.dumps(
-            {
-                "error": (
-                    f"Invalid regex pattern {pattern!r}: {compile_reason}.\n\n"
-                    "To fix:\n"
-                    "  - If you meant a literal string, escape regex metacharacters "
-                    "(e.g. replace '[' with '\\[', '*' with '\\*').\n"
-                    "  - If you meant a filename pattern (like '*.py'), use target='files' "
-                    "or move it to the file_glob parameter instead of the regex pattern.\n"
-                    "  - Re-run search_files with a corrected regex pattern."
-                ),
-                # #2308 — structured reason + recovery.
-                "reason": reason,
-                "recovery": recovery,
-            },
-            ensure_ascii=False,
-        )
-
     return search_tool(
-        pattern=pattern,
-        target=target,
-        path=args.get("path", "."),
-        file_glob=args.get("file_glob"),
-        limit=args.get("limit", 50),
-        offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"),
-        context=args.get("context", 0),
-        task_id=tid,
-    )
+        pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
+        file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(
-    name="read_file",
-    toolset="file",
-    schema=READ_FILE_SCHEMA,
-    handler=_handle_read_file,
-    check_fn=_check_file_reqs,
-    emoji="📖",
-    max_result_size_chars=100_000,
-)
-registry.register(
-    name="write_file",
-    toolset="file",
-    schema=WRITE_FILE_SCHEMA,
-    handler=_handle_write_file,
-    check_fn=_check_file_reqs,
-    emoji="✍️",
-    max_result_size_chars=100_000,
-)
-registry.register(
-    name="patch",
-    toolset="file",
-    schema=PATCH_SCHEMA,
-    handler=_handle_patch,
-    check_fn=_check_file_reqs,
-    emoji="🔧",
-    max_result_size_chars=100_000,
-)
-registry.register(
-    name="search_files",
-    toolset="file",
-    schema=SEARCH_FILES_SCHEMA,
-    handler=_handle_search_files,
-    check_fn=_check_file_reqs,
-    emoji="🔎",
-    max_result_size_chars=100_000,
-)
+registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
+registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)

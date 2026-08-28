@@ -209,6 +209,8 @@ def test_non_ghostty_terminals_still_push_kitty_protocol():
     assert result is True
     assert b"\x1b[>1u" in out.written
     assert b"\x1b[>4;2m" in out.written
+
+
 @pytest.mark.linux_only
 def test_proc_version_microsoft_marker_preserves_newline():
     """WSL detection via /proc when env vars are scrubbed (sudo etc.).
