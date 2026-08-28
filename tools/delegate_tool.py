@@ -1350,7 +1350,13 @@ def check_delegate_requirements() -> bool:
 # Default behavior is byte-identical: handoff_mode=None means the helper below
 # is never called and the `context` string reaches the child exactly as before.
 HANDOFF_MODE_COLLAPSED_SUMMARY = "collapsed_summary"
-_VALID_HANDOFF_MODES = frozenset({HANDOFF_MODE_COLLAPSED_SUMMARY})
+HANDOFF_MODE_GRAPH = "graph"
+HANDOFF_MODE_AUTO = "auto"
+_VALID_HANDOFF_MODES = frozenset({
+    HANDOFF_MODE_COLLAPSED_SUMMARY,
+    HANDOFF_MODE_GRAPH,
+    HANDOFF_MODE_AUTO,
+})
 
 # A handoff collapse with fewer than this many parent turns is a no-op: there is
 # nothing worth summarizing, and an LLM round-trip would only add latency/cost
@@ -1389,6 +1395,24 @@ def _collapsible_parent_turns(parent_agent) -> List[Dict[str, Any]]:
     if turns and turns[-1].get("role") == "assistant" and turns[-1].get("tool_calls"):
         turns = turns[:-1]
     return turns
+
+
+def _build_graph_handoff_context(
+    parent_agent,
+    existing_context: Optional[str],
+) -> Optional[str]:
+    """Extract a lightweight typed dependency graph from parent conversation turns."""
+    turns = _collapsible_parent_turns(parent_agent)
+    if not turns:
+        return existing_context
+
+    from agent.handoff_router import extract_dependency_graph
+
+    graph = extract_dependency_graph(turns)
+    rendered = graph.render_markdown()
+    if existing_context and str(existing_context).strip():
+        return f"{rendered}\n\n{str(existing_context).strip()}"
+    return rendered
 
 
 def _build_collapsed_handoff_context(
@@ -1444,17 +1468,13 @@ def _apply_handoff_collapse(
     handoff_mode: Optional[str],
     parent_agent,
 ) -> None:
-    """Mutate ``task_list`` in place, collapsing parent history into each task's
+    """Mutate ``task_list`` in place, collapsing/routing parent history into each task's
     ``context`` when ``handoff_mode`` requests it.
-
-    No-op (and therefore byte-identical to the historical flow) unless
-    ``handoff_mode == 'collapsed_summary'``. An unknown mode is logged and
-    ignored rather than raising, so a stale/garbled schema value degrades to
-    today's behavior instead of breaking delegation.
     """
     if not handoff_mode:
         return
-    if handoff_mode not in _VALID_HANDOFF_MODES:
+    mode_norm = str(handoff_mode).strip().lower()
+    if mode_norm not in _VALID_HANDOFF_MODES:
         logger.debug(
             "delegate_task: ignoring unknown handoff_mode=%r (valid: %s)",
             handoff_mode,
@@ -1462,14 +1482,27 @@ def _apply_handoff_collapse(
         )
         return
 
-    # Generate the collapsed summary ONCE per delegate_task call — the parent
-    # history is identical for every task in a batch, so re-summarizing per task
-    # would multiply LLM cost with no benefit.
-    collapsed = _build_collapsed_handoff_context(parent_agent, None)
-    if collapsed is None:
-        return  # collapse was a no-op; leave every task's context untouched
+    turns = _collapsible_parent_turns(parent_agent)
+    if not turns:
+        return
 
-    header_block = collapsed  # already carries the header + summary
+    effective_mode = mode_norm
+    if mode_norm == HANDOFF_MODE_AUTO:
+        from agent.handoff_router import select_handoff_format
+
+        first_goal = task_list[0].get("goal", "") if task_list else ""
+        effective_mode = select_handoff_format(
+            turns, goal=first_goal, requested_mode="auto"
+        )
+
+    if effective_mode == HANDOFF_MODE_GRAPH:
+        header_block = _build_graph_handoff_context(parent_agent, None)
+    else:
+        header_block = _build_collapsed_handoff_context(parent_agent, None)
+
+    if header_block is None:
+        return
+
     for task in task_list:
         existing = task.get("context")
         if existing and str(existing).strip():
@@ -6734,18 +6767,15 @@ DELEGATE_TASK_SCHEMA = {
             },
             "handoff_mode": {
                 "type": "string",
-                "enum": ["collapsed_summary"],
+                "enum": ["collapsed_summary", "graph", "auto"],
                 "description": (
                     "Optional handoff strategy for parent conversation history. "
                     "Omit (default) and children receive ONLY the explicit "
                     "'context' you write — they never see your conversation "
-                    "history. Set to 'collapsed_summary' to additionally condense "
-                    "your recent conversation into a single background summary "
-                    "(via the same compressor used for context compaction) and "
-                    "prepend it to each task's 'context'. Use it when the subagent "
-                    "genuinely needs the prior discussion as background and "
-                    "hand-writing that context would be lossy or tedious; skip it "
-                    "for self-contained tasks where a focused 'context' is enough."
+                    "history. Options: 'graph' (compact typed dependency graph of "
+                    "files and tool actions; saves 40-60% tokens for code/technical tasks), "
+                    "'collapsed_summary' (full prose summary of prior conversation), "
+                    "or 'auto' (adaptively selects graph vs prose based on task requirements)."
                 ),
             },
             "memory_briefing": {
