@@ -248,7 +248,7 @@ def recover_from_failure(
 RECOVERY_GUIDANCE_PREFIX = "Recovery strategy"
 
 
-def _format_recovery_guidance(action: RecoveryAction) -> str:
+def _format_recovery_guidance(action: RecoveryAction, raw_error: str = "") -> str:
     """Render a single structured guidance line for a recovery action."""
     parts = [
         f"{RECOVERY_GUIDANCE_PREFIX}: {action.strategy.value}",
@@ -258,7 +258,24 @@ def _format_recovery_guidance(action: RecoveryAction) -> str:
     if action.backoff_seconds is not None:
         parts.append(f"backoff={action.backoff_seconds:g}s")
     line = "; ".join(parts)
-    return f"\n\n[{line}. {action.directive}]"
+    rendered = f"\n\n[{line}. {action.directive}]"
+
+    # Symptom-driven intervention (#3284)
+    if raw_error:
+        try:
+            from agent.symptom_intervention import (
+                classify_failure_symptom,
+                plan_symptom_intervention,
+            )
+
+            symptom = classify_failure_symptom(raw_error)
+            if symptom.category.value != "unknown":
+                plan = plan_symptom_intervention(symptom)
+                rendered += f"\n\n{plan.render_markdown()}"
+        except Exception:
+            pass
+
+    return rendered
 
 
 def _terminal_exit_code(result: str) -> int | None:
@@ -307,4 +324,4 @@ def maybe_append_recovery_guidance(
         )
     except Exception:
         return text
-    return text + _format_recovery_guidance(action)
+    return text + _format_recovery_guidance(action, raw_error=text[:2000])
