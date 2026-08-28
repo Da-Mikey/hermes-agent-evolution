@@ -2193,8 +2193,8 @@ def execute_code(
             # freed by server_sock.close() above.
             if sock_path:
                 os.unlink(sock_path)
-            except OSError:
-                pass  # already cleaned up or never created
+        except OSError:
+            pass  # already cleaned up or never created
 
 
 def _kill_process_group(proc, escalate: bool = False):
