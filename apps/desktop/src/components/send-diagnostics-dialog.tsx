@@ -21,13 +21,9 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { useI18n } from '@/i18n'
-import { openExternalLink } from '@/lib/external-link'
+import { ExternalLink as ExternalLinkAnchor, openExternalLink } from '@/lib/external-link'
 import { ExternalLink, Loader2Icon, Lock } from '@/lib/icons'
-import {
-  $sendDiagnostics,
-  confirmSendDiagnostics,
-  dismissSendDiagnostics
-} from '@/store/send-diagnostics'
+import { $sendDiagnostics, confirmSendDiagnostics, dismissSendDiagnostics } from '@/store/send-diagnostics'
 
 const SUPPORT_LINKS = [
   { key: 'github', url: 'https://github.com/NousResearch/hermes-agent/issues' },
@@ -60,9 +56,7 @@ export function SendDiagnosticsHost() {
                 <Lock className="size-4 text-(--ui-text-tertiary)" />
                 {copy.title}
               </DialogTitle>
-              <DialogDescription className="whitespace-pre-line text-left">
-                {copy.privacyNotice}
-              </DialogDescription>
+              <DialogDescription className="whitespace-pre-line text-left">{copy.privacyNotice}</DialogDescription>
             </DialogHeader>
             <DialogFooter>
               <Button onClick={dismissSendDiagnostics} variant="ghost">
@@ -103,12 +97,34 @@ export function SendDiagnosticsHost() {
               <DialogDescription className="text-left">{copy.doneDescription}</DialogDescription>
             </DialogHeader>
             {(state.result?.viewUrl || state.result?.uploadId) && (
-              <div className="flex items-center gap-2 rounded-md border border-(--ui-stroke-tertiary) px-3 py-2">
-                <code className="min-w-0 flex-1 truncate text-[0.78rem] text-(--ui-text-secondary)">
-                  {state.result.viewUrl ?? copy.uploadIdFallback(state.result.uploadId ?? '')}
-                </code>
+              <div
+                className="flex items-center gap-2 rounded-md border border-(--ui-stroke-tertiary) px-3 py-2"
+                data-selectable-text="true"
+              >
+                {state.result.viewUrl ? (
+                  // A real anchor, not a <code> span: right-click resolves the
+                  // link context menu (open / copy URL), left-click opens it,
+                  // and the row's data-selectable-text keeps drag-to-select
+                  // working. `truncate` only clips the paint — selection and
+                  // copy still carry the full URL. `native` because the in-app
+                  // preview pane would open BEHIND this modal dialog; the
+                  // support buttons below already go to the system browser.
+                  <ExternalLinkAnchor
+                    className="min-w-0 flex-1 truncate font-mono text-[0.78rem] text-(--ui-text-secondary)"
+                    href={state.result.viewUrl}
+                    native
+                    title={state.result.viewUrl}
+                  >
+                    {state.result.viewUrl}
+                  </ExternalLinkAnchor>
+                ) : (
+                  <code className="min-w-0 flex-1 truncate text-[0.78rem] text-(--ui-text-secondary)">
+                    {copy.uploadIdFallback(state.result.uploadId ?? '')}
+                  </code>
+                )}
                 <CopyButton
                   appearance="inline"
+                  className="shrink-0"
                   label={copy.copyLink}
                   text={state.result.viewUrl ?? state.result.uploadId ?? ''}
                 />
@@ -117,12 +133,7 @@ export function SendDiagnosticsHost() {
             <div className="text-[0.8rem] text-(--ui-text-secondary)">{copy.handoffLead}</div>
             <div className="flex flex-wrap gap-1.5">
               {SUPPORT_LINKS.map(link => (
-                <Button
-                  key={link.key}
-                  onClick={() => openExternalLink(link.url)}
-                  size="sm"
-                  variant="outline"
-                >
+                <Button key={link.key} onClick={() => openExternalLink(link.url)} size="sm" variant="outline">
                   <ExternalLink className="size-3" />
                   {copy.links[link.key]}
                 </Button>

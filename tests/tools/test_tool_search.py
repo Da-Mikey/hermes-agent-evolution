@@ -161,6 +161,67 @@ class TestClassification:
         for name in BRIDGE_TOOL_NAMES:
             assert not is_deferrable_tool_name(name)
 
+    def test_gui_surface_tools_never_defer(self):
+        """Session-gated GUI tools stay direct and stay off the global core list."""
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import is_deferrable_tool_name
+        from toolsets import _HERMES_CORE_TOOLS
+
+        discover_builtin_tools()
+        for name in ("read_window_below", "apply_layout", "project_list"):
+            assert not is_deferrable_tool_name(name), name
+            assert name not in _HERMES_CORE_TOOLS
+
+    def test_gui_surface_alone_does_not_activate_the_bridge(self):
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        discover_builtin_tools()
+        names = {"read_window_below", "apply_layout", "project_list"}
+        assembled = assemble_tool_defs(
+            [_td(name, f"GUI {name}") for name in names],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        assert not assembled.activated
+        assert {td["function"]["name"] for td in assembled.tool_defs} == names
+
+    def test_gui_surface_stays_direct_when_mcp_activates_the_bridge(self):
+        """MCP/plugin tools turn Tool Search on; the session's GUI tools stay
+        in the model-facing array so HUD can still name read_window_below."""
+        from tools.registry import discover_builtin_tools, registry
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
+
+        discover_builtin_tools()
+        mcp_name = "mcp_gui_surface_probe"
+        registry.register(
+            name=mcp_name,
+            handler=lambda args, **kw: "{}",
+            schema=_td(mcp_name, "Deferred MCP capability")["function"],
+            toolset="mcp-gui-surface-probe",
+        )
+
+        assembled = assemble_tool_defs(
+            [
+                _td("read_window_below", "Identify the window below"),
+                _td("apply_layout", "Apply a layout preset"),
+                _td("computer_use", "Drive the OS"),
+                _td(mcp_name, "Deferred MCP capability"),
+            ],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        names = {td["function"]["name"] for td in assembled.tool_defs}
+
+        assert assembled.activated
+        assert mcp_name not in names
+        assert BRIDGE_TOOL_NAMES <= names
+        assert {"read_window_below", "apply_layout", "computer_use"} <= names
+
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must
         not be claimed as deferrable. This protects against the OpenClaw
@@ -348,12 +409,12 @@ class TestCoreToolsetDeferral:
         assert err is None and name == self._DEMO_TOOL
         described = json.loads(
             dispatch_tool_describe(
-                {"name": self._DEMO_TOOL},
+                {"names": [self._DEMO_TOOL]},
                 current_tool_defs=defs,
                 config=cfg,
             )
         )
-        assert "parameters" in described
+        assert "parameters" in described.get("tools", {}).get(self._DEMO_TOOL, {})
 
     def test_default_config_keeps_native_tool_direct(self):
         """The inverse of the round-trip: with no opt-in, the core tool stays
@@ -628,34 +689,25 @@ class TestAssembly:
 
 
 class TestBridgeDispatch:
-    def test_tool_search_requires_query(self):
+    def test_tool_search_requires_queries(self):
         from tools.tool_search import dispatch_tool_search
 
         result = dispatch_tool_search({}, current_tool_defs=[])
         assert "error" in json.loads(result)
 
-    def test_tool_describe_requires_name(self):
-        from tools.tool_search import dispatch_tool_describe
+    def test_tool_search_rejects_empty_and_overcap_queries(self):
+        import tools.tool_search as tool_search
 
-        result = dispatch_tool_describe({}, current_tool_defs=[])
-        assert "error" in json.loads(result)
-
-    def test_tool_describe_returns_schema_for_direct_tool(self):
-        """A directly-available (non-deferrable) tool in the active toolset
-        is described, not rejected: its schema is right there in
-        current_tool_defs (#107)."""
-        from tools.tool_search import dispatch_tool_describe
-
-        result = json.loads(
-            dispatch_tool_describe(
-                {"name": "terminal"},
-                current_tool_defs=[_td("terminal", "Run shell")],
-            )
-        )
-        assert "error" not in result
-        assert result["name"] == "terminal"
-        assert result["description"] == "Run shell"
-        assert "parameters" in result
+        cfg = tool_search.ToolSearchConfig.from_raw({})
+        assert "error" in json.loads(tool_search.dispatch_tool_search(
+            {"queries": []}, current_tool_defs=[], config=cfg))
+        assert "error" in json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["  ", ""]}, current_tool_defs=[], config=cfg))
+        over = ["q"] * (tool_search._MAX_QUERIES_PER_CALL + 1)
+        parsed = json.loads(tool_search.dispatch_tool_search(
+            {"queries": over}, current_tool_defs=[], config=cfg))
+        assert "error" in parsed
+        assert "too many queries" in parsed["error"]
 
     def test_empty_search_keeps_connected_sources_discoverable(self):
         from tools.registry import registry
@@ -671,17 +723,21 @@ class TestBridgeDispatch:
         )
 
         result = json.loads(dispatch_tool_search(
-            {"query": "unrelated vocabulary"},
+            {"queries": ["unrelated vocabulary"]},
             current_tool_defs=[tool_def],
         ))
 
-        assert result["matches"] == []
+        [group] = result["results"]
+        assert group["query"] == "unrelated vocabulary"
+        assert group["matches"] == []
+        assert result["tools"] == {}
         assert result["total_available"] == 1
-        assert result["available_sources"] == [
+        assert group["available_sources"] == [
             {"name": "recovery-catalog", "tool_count": 1},
         ]
-        assert "remain available" in result["hint"]
-        assert "before concluding" in result["hint"]
+        assert "remain available" in group["hint"]
+        assert "before concluding" in group["hint"]
+        assert "available_sources" not in result
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
@@ -797,7 +853,7 @@ class TestSearchStreakGuard:
 
         return json.loads(
             dispatch_tool_search(
-                {"query": "github"},
+                {"queries": ["github"]},
                 current_tool_defs=[_td("github_create_issue", "Create issue")],
                 config=self._cfg(threshold),
                 session_id=sid,
@@ -873,12 +929,12 @@ class TestHandleFunctionCallIntegration:
 
         result = model_tools.handle_function_call(
             function_name="tool_search",
-            function_args={"query": "nothing matches this"},
+            function_args={"queries": ["nothing matches this"]},
         )
         parsed = json.loads(result)
         # Without a real registry, the matches will be empty, but the
         # dispatch path completed without error.
-        assert "matches" in parsed or "error" in parsed
+        assert "results" in parsed or "error" in parsed
 
     def test_tool_search_emits_one_terminal_hook(self, monkeypatch):
         """Inline bridge results still complete the tool lifecycle."""
@@ -900,12 +956,12 @@ class TestHandleFunctionCallIntegration:
         monkeypatch.setattr(
             tool_search,
             "dispatch_tool_search",
-            lambda *args, **kwargs: json.dumps({"matches": []}),
+            lambda *args, **kwargs: json.dumps({"results": []}),
         )
 
         result = model_tools.handle_function_call(
             function_name="tool_search",
-            function_args={"query": "private-query"},
+            function_args={"queries": ["private-query"]},
             session_id="private-session",
             task_id="private-task",
             turn_id="private-turn",
@@ -913,7 +969,7 @@ class TestHandleFunctionCallIntegration:
             tool_call_id="private-call",
         )
 
-        assert json.loads(result) == {"matches": []}
+        assert json.loads(result) == {"results": []}
         assert len(events) == 1
         hook_name, payload = events[0]
         assert hook_name == "post_tool_call"
@@ -1019,7 +1075,7 @@ class TestRegression_ToolsetScoping:
         # out-of-scope plugin tool (or any of the host registry).
         result = model_tools.handle_function_call(
             function_name="tool_search",
-            function_args={"query": "mcp_scoped_gh", "limit": 5},
+            function_args={"queries": ["mcp_scoped_gh"], "limit": 5},
             enabled_toolsets=["mcp-scoped-gh"],
         )
         parsed = json.loads(result)
@@ -1027,7 +1083,8 @@ class TestRegression_ToolsetScoping:
             f"expected scoped catalog of 12, got {parsed['total_available']} "
             "— catalog leaked tools outside the session's toolsets"
         )
-        hit_names = {m["name"] for m in parsed["matches"]}
+        hit_names = set(parsed["tools"])
+        assert hit_names == {n for g in parsed["results"] for n in g["matches"]}
         assert "scoped_oos_plugin" not in hit_names
 
     def test_tool_call_rejects_out_of_scope_tool(self):
@@ -1109,134 +1166,6 @@ class TestRegression_ToolsetScoping:
 # ---------------------------------------------------------------------------
 # #1015 — tool_describe schema caching
 # ---------------------------------------------------------------------------
-
-
-class TestDescribeCache:
-    """#1015 — dispatch_tool_describe caches successful results keyed by
-    (name, toolset_signature) so repeated calls skip the full catalog scan."""
-
-    def test_cache_hit_returns_same_result(self):
-        from tools.tool_search import (
-            dispatch_tool_describe,
-            clear_describe_cache,
-            is_deferrable_tool_name,
-        )
-
-        clear_describe_cache()
-
-        # Register a deferrable tool so describe has something to find.
-        from tools.registry import registry
-
-        registry.register(
-            name="cache_test_tool",
-            toolset="mcp-cache-test",
-            schema={
-                "name": "cache_test_tool",
-                "description": "Test tool for caching.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            handler=lambda args, **kw: '{"ok": true}',
-        )
-        try:
-            # Use a toolset that will classify it as deferrable.
-            defs = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "cache_test_tool",
-                        "description": "Test tool for caching.",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ]
-            r1 = dispatch_tool_describe(
-                {"name": "cache_test_tool"}, current_tool_defs=defs
-            )
-            r2 = dispatch_tool_describe(
-                {"name": "cache_test_tool"}, current_tool_defs=defs
-            )
-            # Cache hit: same JSON string (identity check — not just equal).
-            assert r1 == r2
-            assert "cache_test_tool" in r1
-        finally:
-            clear_describe_cache()
-
-    def test_cache_invalidates_on_toolset_change(self):
-        from tools.tool_search import (
-            dispatch_tool_describe,
-            clear_describe_cache,
-        )
-
-        clear_describe_cache()
-
-        from tools.registry import registry
-
-        registry.register(
-            name="cache_sig_tool",
-            toolset="mcp-sig-test",
-            schema={
-                "name": "cache_sig_tool",
-                "description": "v1",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            handler=lambda args, **kw: '{"ok": true}',
-        )
-        try:
-            defs_v1 = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "cache_sig_tool",
-                        "description": "v1",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ]
-            defs_v2 = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "cache_sig_tool",
-                        "description": "v2 CHANGED",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "other_tool",
-                        "description": "other",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                },
-            ]
-            r1 = dispatch_tool_describe(
-                {"name": "cache_sig_tool"}, current_tool_defs=defs_v1
-            )
-            r2 = dispatch_tool_describe(
-                {"name": "cache_sig_tool"}, current_tool_defs=defs_v2
-            )
-            # Different signatures → cache miss → different result.
-            assert r1 != r2
-            assert "v2 CHANGED" in r2
-        finally:
-            clear_describe_cache()
-
-    def test_error_results_not_cached(self):
-        from tools.tool_search import (
-            dispatch_tool_describe,
-            clear_describe_cache,
-        )
-
-        clear_describe_cache()
-
-        defs: List[Dict[str, Any]] = []
-        r1 = dispatch_tool_describe({"name": "nonexistent"}, current_tool_defs=defs)
-        # Error response should not be cached — verify it's an error.
-        assert "error" in r1
-        # A second call should also return an error (not a stale cache hit).
-        r2 = dispatch_tool_describe({"name": "nonexistent"}, current_tool_defs=defs)
-        assert "error" in r2
 
 
 class TestCatalogListing:
@@ -1350,7 +1279,7 @@ class TestSearchStreakEmptySessionNowFires:
 
         return json.loads(
             dispatch_tool_search(
-                {"query": query},
+                {"queries": [query]},
                 current_tool_defs=self._tool_defs(),
                 config=self._cfg(threshold, describe_threshold),
                 session_id=sid,

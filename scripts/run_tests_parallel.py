@@ -46,6 +46,7 @@ import json
 import os
 import shutil
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -380,38 +381,23 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    # Give each per-file pytest subprocess its own --basetemp. Without this,
-    # every parallel subprocess falls back to the shared default
-    # ``/tmp/pytest-of-<user>/`` root, where pytest's "keep the last few
-    # numbered dirs" retention GC runs on session start and rmtree's OTHER
-    # live subprocesses' basetemp out from under them — a race that surfaces
-    # as flaky ``FileNotFoundError: .../pytest-of-<user>/pytest-N`` at fixture
-    # setup (e.g. the pytest_asyncio tmp_path fixture) with no relation to the
-    # code under test. A unique basetemp per subprocess removes the shared
-    # parent entirely, so no subprocess can delete another's temp dir.
-    # Respect an explicit user-supplied --basetemp (don't second-guess it).
     own_basetemp: str | None = None
     if not any(
         a == "--basetemp" or a.startswith("--basetemp=") for a in pytest_args
     ):
-        # Prefix deliberately avoids the substrings "hermes"/"gateway": this
-        # basetemp path is passed as a subprocess argument inside tests, and
-        # conftest.py's live-system guard blocks any subprocess whose command
-        # string contains "hermes"/"gateway" alongside a process-killer token
-        # (e.g. a test that greps for the literal "skill"). A neutral prefix
-        # keeps the injected path behaviourally identical to pytest's default
-        # ``pytest-of-<user>`` location.
         own_basetemp = tempfile.mkdtemp(prefix="pytest-rtp-")
     basetemp_args = ["--basetemp", own_basetemp] if own_basetemp else []
     cmd = [sys.executable, "-m", "pytest", str(file), *basetemp_args, *pytest_args]
 
     def _reclaim_basetemp() -> None:
-        # Idempotent (ignore_errors); safe to call on any exit path.
         if own_basetemp:
             shutil.rmtree(own_basetemp, ignore_errors=True)
 
+    env = os.environ.copy()
+    if own_basetemp:
+        env["PYTEST_DEBUG_TEMPROOT"] = own_basetemp
+
     subproc_start = time.monotonic()
-    # launch the pytest process
     try:
         proc = subprocess.Popen(
             cmd,
@@ -419,16 +405,12 @@ def _run_one_file_once(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            env=os.environ,
-            # POSIX: place the child at the head of its own process group so
-            # _kill_tree can SIGKILL the group atomically.
-            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-            # _kill_tree handles the Windows path via taskkill /F /T.
+            encoding="utf-8",
+            errors="replace",
+            env=env,
             start_new_session=True,
         )
     except BaseException:
-        # Popen failed before we have a process to manage — reclaim the
-        # basetemp we created above, then propagate.
         _reclaim_basetemp()
         raise
 
@@ -469,6 +451,11 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
+    finally:
+        # Delete the temp root for this attempt. Nothing reads it after the
+        # subprocess exits. More than 3000 of them fill the disk of the
+        # runner over one suite.
+        shutil.rmtree(temproot, ignore_errors=True)
 
     if rc == 4 and not _file_present(file):
         # Tripwire (#85): the file existed at plan time (its tests were
