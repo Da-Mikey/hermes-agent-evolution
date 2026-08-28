@@ -316,6 +316,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._breaker_open_until = 0.0
         self._breaker_lock = threading.Lock()
         self._sync_lock = threading.Lock()
+        self._sync_failures = 0  # consecutive sync failures (#117) — health signal
         self._prefetch_lock = threading.Lock()
         self._atexit_registered = False
 
@@ -584,14 +585,21 @@ class Mem0MemoryProvider(MemoryProvider):
             return
 
         def _sync():
+            # #117 recreate-on-failure: a closed/None SDK client (after atexit
+            # shutdown, a backend restart, or a stalled Qdrant connection)
+            # poisons every subsequent sync with "'NoneType' object has no
+            # attribute 'save_messages'" / "client has been closed". Detect the
+            # failure, rebuild the backend once, and retry a single time before
+            # surfacing — then expose the failure count as a health signal so
+            # silent memory-write loss never goes unnoticed.
             backend = self._backend
             if backend is None:
                 return
+            messages = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content},
+            ]
             try:
-                messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
-                ]
                 backend.add(
                     messages,
                     user_id=self._user_id,
@@ -600,9 +608,39 @@ class Mem0MemoryProvider(MemoryProvider):
                     metadata=self._write_metadata(),
                 )
                 self._record_success()
+                self._sync_failures = 0
             except Exception as e:
                 self._record_failure()
+                self._sync_failures += 1
                 logger.warning("Mem0 sync failed: %s", e)
+                if self._sync_failures <= 1:
+                    try:
+                        rebuilt = self._create_backend()
+                    except Exception:
+                        rebuilt = None
+                    if rebuilt is not None:
+                        self._backend = rebuilt
+                        try:
+                            self._backend.add(
+                                messages,
+                                user_id=self._user_id,
+                                agent_id=self._agent_id,
+                                infer=True,
+                                metadata=self._write_metadata(),
+                            )
+                            self._record_success()
+                            self._sync_failures = 0
+                            return
+                        except Exception as e2:
+                            self._record_failure()
+                            logger.warning(
+                                "Mem0 sync retry after backend rebuild failed: %s", e2
+                            )
+                logger.error(
+                    "Mem0 sync FAILED %d consecutive time(s) — memory writes are "
+                    "being dropped (health signal mem0_sync_failures=%d)",
+                    self._sync_failures, self._sync_failures,
+                )
 
         with self._sync_lock:
             if self._sync_thread and self._sync_thread.is_alive():
