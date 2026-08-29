@@ -1530,6 +1530,117 @@ def _tool_schema_payload(
     return None
 
 
+def _dispatch_tool_describe_inner(
+    args: Dict[str, Any],
+    name: str,
+    current_tool_defs: List[Dict[str, Any]],
+    config: "ToolSearchConfig",
+) -> str:
+    """Inner logic for dispatch_tool_describe, separated for caching."""
+    if not is_deferrable_tool_name(name, config):
+        # #107 — a directly-available (non-deferrable) tool's schema is in
+        # the active toolset. Return it instead of the "not a deferrable
+        # tool" error: the model asked for the schema and it is right here.
+        # This also covers mcp__*/plugin tools granted to the session whose
+        # registry entry is transiently missing at dispatch time — the def
+        # list is the session's truth.
+        payload = _tool_schema_payload(current_tool_defs, name)
+        if payload is not None:
+            return json.dumps(payload, ensure_ascii=False)
+        # #978 — fuzzy name matching even for non-deferrable names: the
+        # model may have slightly misspelled a deferrable tool. Suggest
+        # close matches from the current tool defs so it can self-correct
+        # without a separate tool_search round-trip.
+        _, deferrable = classify_tools(current_tool_defs, config)
+        available_names = [
+            (td.get("function") or {}).get("name", "") for td in deferrable
+        ]
+        suggestions = _fuzzy_tool_names(name, available_names)
+        if suggestions:
+            return json.dumps(
+                {
+                    "error": (
+                        f"'{name}' is not a deferrable tool. Did you mean one of: "
+                        f"{', '.join(suggestions)}? Use the exact name with "
+                        f"tool_describe or tool_call."
+                    ),
+                    "suggestions": suggestions,
+                    # #2309 — structured reason + recovery so the agent gets
+                    # a concrete path instead of an opaque "other" error.
+                    "reason": "not_deferrable",
+                    "recovery": (
+                        "This tool is not in the deferred set — it may already be in "
+                        "your active toolset (call it directly) or it may be misspelled. "
+                        "Use a suggested name with tool_describe or tool_call, or re-run "
+                        "tool_search to list available deferred tools."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "error": (
+                    f"'{name}' is not a deferrable tool. If you see it in the tools list "
+                    "already, call it directly; otherwise check the spelling against tool_search."
+                ),
+                "reason": "not_deferrable",
+                "recovery": (
+                    "This tool is not in the deferred set. If it is in your active "
+                    "toolset, call it directly. Otherwise re-run tool_search to find "
+                    "the correct name — do NOT retry tool_describe with the same name."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    _, deferrable = classify_tools(current_tool_defs, config)
+    for td in deferrable:
+        fn = td.get("function") or {}
+        if fn.get("name") == name:
+            return json.dumps(
+                {
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                },
+                ensure_ascii=False,
+            )
+    # #978 — fuzzy name matching: suggest closest matches so the agent can
+    # self-correct without a separate tool_search round-trip.
+    available_names = [(td.get("function") or {}).get("name", "") for td in deferrable]
+    suggestions = _fuzzy_tool_names(name, available_names)
+    if suggestions:
+        return json.dumps(
+            {
+                "error": (
+                    f"'{name}' is not currently available. Did you mean one of: "
+                    f"{', '.join(suggestions)}? Use the exact name with tool_describe "
+                    f"or tool_call."
+                ),
+                "suggestions": suggestions,
+                # #2309 — structured reason + recovery.
+                "reason": "not_available",
+                "recovery": (
+                    "The tool name is deferrable but not in the current toolset scope. "
+                    "Use a suggested name, or re-run tool_search to refresh the deferred "
+                    "catalog — do NOT retry tool_describe with the same name unchanged."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
+            "reason": "not_available",
+            "recovery": (
+                "The tool name is deferrable but not registered in the current session. "
+                "Re-run tool_search to refresh the deferred catalog, then use the exact "
+                "name returned — do NOT retry tool_describe with the same name."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 def dispatch_tool_describe(
     args: Dict[str, Any],
     *,
@@ -1538,18 +1649,71 @@ def dispatch_tool_describe(
 ) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string.
 
-    Accepts ``names: [str, ...]`` and returns a map keyed by tool name::
+    Two request shapes, two response contracts:
 
-        {
-          "tools": {"<name>": {"description": ..., "parameters": {...}}, ...},
-          "not_found": ["<name>", ...],   # only when some names missed
-          "errors": {"<name>": "..."}     # only for non-deferrable names
-        }
+    - ``{"names": [str, ...]}`` — batched (upstream) contract. Returns a map
+      keyed by tool name::
 
-    Unknown/unregistered names and registered deferrable names absent from the
-    current assembly land in ``not_found`` instead of failing the whole call.
-    Registered non-deferrable names keep their per-name message in ``errors``.
-    Duplicates are deduped silently.
+          {
+            "tools": {"<name>": {"description": ..., "parameters": {...}}, ...},
+            "not_found": ["<name>", ...],   # only when some names missed
+            "errors": {"<name>": "..."}     # only for non-deferrable names
+          }
+
+      Unknown/unregistered names and registered deferrable names absent from
+      the current assembly land in ``not_found`` instead of failing the whole
+      call. Registered non-deferrable names keep their per-name message in
+      ``errors``. Duplicates are deduped silently.
+
+    - ``{"name": str}`` — singular (fork) contract (#107/#978/#2309/#1015).
+      Returns the schema flat — ``{"name", "description", "parameters"}`` —
+      including for directly-available (non-deferrable) tools whose def is
+      already in the active toolset, or a structured ``{"error", "reason",
+      "recovery"[, "suggestions"]}`` on a miss. Successful results are cached
+      per (name, toolset signature) (#1015).
+    """
+    if args.get("names") is not None:
+        return _dispatch_tool_describe_batched(
+            args, current_tool_defs=current_tool_defs, config=config
+        )
+    if config is None:
+        config = load_config()
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return json.dumps({"error": "name is required"}, ensure_ascii=False)
+
+    # #1015 — check the describe cache first. Repeated calls for the same
+    # tool name (common when the model forgets the schema between turns)
+    # hit the cache and skip the full catalog scan, eliminating the
+    # re-classification overhead that was a top failure source.
+    sig = _toolset_signature(current_tool_defs)
+    cache_key = (name, sig)
+    cached = _describe_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = _dispatch_tool_describe_inner(args, name, current_tool_defs, config)
+    # Cache successful results (not error responses — those may change as
+    # tools are added/removed).
+    if '"error"' not in result:
+        if len(_describe_cache) >= _DESCRIBE_CACHE_MAX:
+            # Evict oldest entries (dict preserves insertion order in 3.7+).
+            _oldest_key = next(iter(_describe_cache))
+            del _describe_cache[_oldest_key]
+        _describe_cache[cache_key] = result
+    return result
+
+
+def _dispatch_tool_describe_batched(
+    args: Dict[str, Any],
+    *,
+    current_tool_defs: List[Dict[str, Any]],
+    config: Optional[ToolSearchConfig] = None,
+) -> str:
+    """Batched (upstream) ``tool_describe`` path — ``{"names": [...]}``.
+
+    Kept verbatim from the v2026.8.27 upstream sync so the batched contract
+    (map + not_found + errors) stays byte-compatible with upstream tests.
     """
     if config is None:
         config = load_config_readonly()
@@ -1585,53 +1749,20 @@ def dispatch_tool_describe(
     tools: Dict[str, Dict[str, Any]] = {}
     not_found: List[str] = []
     errors: Dict[str, str] = {}
-    result_suggestions: Dict[str, List[str]] = {}
     for name in names:
         fn = by_name.get(name)
-        direct_payload = _tool_schema_payload(current_tool_defs, name)
         if fn is not None:
             tools[name] = {
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
             }
-        elif direct_payload is not None:
-            # #107 — a directly-available (non-deferrable) tool's schema is
-            # in the active toolset the caller handed us. Return it instead
-            # of the "not a deferrable tool" error: the model asked for the
-            # schema and it is right here. Exact-match only, so typos and
-            # genuinely absent names keep their #978/#2309 error paths.
-            # This also covers mcp__*/plugin tools granted to the session
-            # whose registry entry is transiently missing at dispatch time —
-            # the def list is the session's truth.
-            direct_payload.pop("name", None)
-            tools[name] = direct_payload
         elif _describe_classification(name, config) == "not_deferrable":
-            # #978 — fuzzy name matching even for non-deferrable names: the
-            # model may have slightly misspelled a deferrable tool. Suggest
-            # close matches from the current tool defs so it can self-correct
-            # without a separate tool_search round-trip.
-            suggestions = _fuzzy_tool_names(name, list(by_name))
-            if suggestions:
-                errors[name] = (
-                    f"'{name}' is not a deferrable tool. Did you mean one of: "
-                    f"{', '.join(suggestions)}? Use the exact name with "
-                    f"tool_describe or tool_call."
-                )
-                result_suggestions[name] = suggestions
-            else:
-                errors[name] = (
-                    f"'{name}' is not a deferrable tool. If you see it in the tools list "
-                    "already, call it directly; otherwise check the spelling against tool_search."
-                )
+            errors[name] = (
+                f"'{name}' is not a deferrable tool. If you see it in the tools list "
+                "already, call it directly; otherwise check the spelling against tool_search."
+            )
         else:
-            # #978 — a deferrable-but-absent name may just be misspelled;
-            # suggest close matches from the current deferrable set.
-            suggestions = _fuzzy_tool_names(name, list(by_name))
-            if suggestions:
-                not_found.append(name)
-                result_suggestions[name] = suggestions
-            else:
-                not_found.append(name)
+            not_found.append(name)
 
     result: Dict[str, Any] = {"tools": tools}
     if not_found:
@@ -1639,8 +1770,6 @@ def dispatch_tool_describe(
         result["hint"] = "Names in not_found are not currently available. Re-run tool_search to refresh."
     if errors:
         result["errors"] = errors
-    if result_suggestions:
-        result["suggestions"] = result_suggestions
     return json.dumps(result, ensure_ascii=False)
 
 

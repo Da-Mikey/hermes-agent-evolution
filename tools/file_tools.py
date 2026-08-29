@@ -1190,6 +1190,125 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
         for rp in resolved_paths:
             task_failures.pop(rp, None)
 
+# ── #1703 — empty-old_string loop guard ────────────────────────────────────
+# When the model calls the patch tool in replace mode with an EMPTY (falsy)
+# old_string, no valid replace can ever match — it is a usage error, not a
+# match failure. The old "is None" guard at the top of patch_tool let an empty
+# string fall through to patch_replace, which returned a generic error the
+# model then retried 5-8 times (#1703). We return a targeted, actionable
+# diagnostic at the tool boundary, and track consecutive identical failures
+# per task+path so the second one escalates to a hard STOP — breaking the
+# spiral at 2 instead of 8.
+_empty_old_string_lock = threading.Lock()
+_empty_old_string_tracker: dict = {}  # {task_id: {path: count}}
+
+
+def _record_empty_old_string(task_id: str, path: str) -> int:
+    """Increment and return the consecutive empty-old_string count for a path."""
+    with _empty_old_string_lock:
+        per_task = _empty_old_string_tracker.setdefault(task_id, {})
+        if len(per_task) >= 64 and path not in per_task:
+            try:
+                first_key = next(iter(per_task))
+                del per_task[first_key]
+            except StopIteration:
+                pass
+        per_task[path] = per_task.get(path, 0) + 1
+        return per_task[path]
+
+
+def _reset_empty_old_string(task_id: str, path: str) -> None:
+    """Clear the empty-old_string counter for a path — called when the model
+    supplies a non-empty old_string (it has moved past the empty shape) or
+    when a patch to that path succeeds."""
+    if not path:
+        return
+    with _empty_old_string_lock:
+        per_task = _empty_old_string_tracker.get(task_id)
+        if per_task:
+            per_task.pop(path, None)
+
+
+def _empty_old_string_error(path: str, task_id: str) -> str:
+    """Non-retryable diagnostic for replace-mode with an empty old_string."""
+    count = _record_empty_old_string(task_id, path)
+    msg = (
+        "replace mode requires a non-empty old_string. The old_string is the "
+        "exact text to find and replace in the file; an empty string cannot be "
+        "matched. Either supply the text to replace, or use mode=patch (V4A "
+        "format) for insertions."
+    )
+    if count >= 2:
+        suffix = {2: "nd", 3: "rd"}.get(count % 10, "th")
+        msg += (
+            f" STOP: this is the {count}{suffix} consecutive replace-mode call with an "
+            f"empty old_string on {path!r}. Do not retry this shape — re-read the "
+            f"file to see the exact text, then supply a real old_string, or use "
+            f"mode=patch / write_file instead."
+        )
+    return tool_error(msg)
+
+
+# #3238 — patch preflight counter: every replace-mode call blocked for an
+# empty/short/ambiguous old_string increments this per-task counter.  It is
+# surfaced in the structured error so the spiral guard can act on it.
+_patch_preflight_blocked_lock = threading.Lock()
+_patch_preflight_blocked_counter: dict[str, int] = {}
+
+
+def _record_patch_preflight_blocked(task_id: str) -> int:
+    """Increment and return the per-task patch-preflight block count."""
+    with _patch_preflight_blocked_lock:
+        _patch_preflight_blocked_counter[task_id] = (
+            _patch_preflight_blocked_counter.get(task_id, 0) + 1
+        )
+        return _patch_preflight_blocked_counter[task_id]
+
+
+def _patch_preflight_blocked_structured(
+    path: str, reason: str, task_id: str, extra_message: str = ""
+) -> str:
+    """Return a structured re_read_file instruction for a blocked patch.
+
+    The payload is a non-retryable correction request that tells the model to
+    re-read the target file and try again with a more precise old_string.
+    """
+    count = _record_empty_old_string(task_id, path)
+    preflight_count = _record_patch_preflight_blocked(task_id)
+    msg = (
+        "replace mode requires a non-empty old_string. The old_string is the "
+        "exact text to find and replace in the file; an empty string cannot be "
+        "matched. Either supply the text to replace, or use mode=patch (V4A "
+        "format) for insertions."
+    )
+    if count >= 2:
+        suffix = {2: "nd", 3: "rd"}.get(count % 10, "th")
+        msg += (
+            f" STOP: this is the {count}{suffix} consecutive replace-mode call with an "
+            f"empty old_string on {path!r}. Do not retry this shape — re-read the "
+            f"file to see the exact text, then supply a real old_string, or use "
+            f"mode=patch / write_file instead."
+        )
+    message = (
+        f"Patch blocked by preflight: {reason}. "
+        f"Re-read {path!r} with read_file, copy the exact text you want to replace, "
+        f"and retry with a longer, unambiguous old_string."
+    )
+    if extra_message:
+        message += " " + extra_message
+    return json.dumps(
+        {
+            "error": msg,
+            "action": "re_read_file",
+            "path": path,
+            "reason": reason,
+            "message": message,
+            "patch_preflight_blocked": preflight_count,
+            "argument_shape_spiral": preflight_count >= 3,
+        },
+        ensure_ascii=False,
+    )
+
 # Per-task bounds for the containers inside each _read_tracker[task_id].
 # A CLI session uses one stable task_id for its lifetime; without these
 # caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
@@ -2453,7 +2572,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             if mode == "replace":
                 if not path:
                     return tool_error("path required")
-                if old_string is None or new_string is None:
+                # #1703/#3238 — Preflight: reject empty old_string before
+                # attempting the patch. Return a structured re_read_file
+                # instruction so the model fixes the shape instead of blind-retrying.
+                _old = (old_string or "").strip()
+                if not _old:
+                    return _patch_preflight_blocked_structured(
+                        path, "empty old_string", task_id
+                    )
+                _reset_empty_old_string(task_id, path)
+                if new_string is None:
                     return tool_error("old_string and new_string required")
                 # Pass the resolved ABSOLUTE path to the shell layer so it
                 # operates on the exact file the tool layer resolved — the
