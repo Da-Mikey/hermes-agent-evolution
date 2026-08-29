@@ -1585,20 +1585,53 @@ def dispatch_tool_describe(
     tools: Dict[str, Dict[str, Any]] = {}
     not_found: List[str] = []
     errors: Dict[str, str] = {}
+    result_suggestions: Dict[str, List[str]] = {}
     for name in names:
         fn = by_name.get(name)
+        direct_payload = _tool_schema_payload(current_tool_defs, name)
         if fn is not None:
             tools[name] = {
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
             }
+        elif direct_payload is not None:
+            # #107 — a directly-available (non-deferrable) tool's schema is
+            # in the active toolset the caller handed us. Return it instead
+            # of the "not a deferrable tool" error: the model asked for the
+            # schema and it is right here. Exact-match only, so typos and
+            # genuinely absent names keep their #978/#2309 error paths.
+            # This also covers mcp__*/plugin tools granted to the session
+            # whose registry entry is transiently missing at dispatch time —
+            # the def list is the session's truth.
+            direct_payload.pop("name", None)
+            tools[name] = direct_payload
         elif _describe_classification(name, config) == "not_deferrable":
-            errors[name] = (
-                f"'{name}' is not a deferrable tool. If you see it in the tools list "
-                "already, call it directly; otherwise check the spelling against tool_search."
-            )
+            # #978 — fuzzy name matching even for non-deferrable names: the
+            # model may have slightly misspelled a deferrable tool. Suggest
+            # close matches from the current tool defs so it can self-correct
+            # without a separate tool_search round-trip.
+            suggestions = _fuzzy_tool_names(name, list(by_name))
+            if suggestions:
+                errors[name] = (
+                    f"'{name}' is not a deferrable tool. Did you mean one of: "
+                    f"{', '.join(suggestions)}? Use the exact name with "
+                    f"tool_describe or tool_call."
+                )
+                result_suggestions[name] = suggestions
+            else:
+                errors[name] = (
+                    f"'{name}' is not a deferrable tool. If you see it in the tools list "
+                    "already, call it directly; otherwise check the spelling against tool_search."
+                )
         else:
-            not_found.append(name)
+            # #978 — a deferrable-but-absent name may just be misspelled;
+            # suggest close matches from the current deferrable set.
+            suggestions = _fuzzy_tool_names(name, list(by_name))
+            if suggestions:
+                not_found.append(name)
+                result_suggestions[name] = suggestions
+            else:
+                not_found.append(name)
 
     result: Dict[str, Any] = {"tools": tools}
     if not_found:
@@ -1606,6 +1639,8 @@ def dispatch_tool_describe(
         result["hint"] = "Names in not_found are not currently available. Re-run tool_search to refresh."
     if errors:
         result["errors"] = errors
+    if result_suggestions:
+        result["suggestions"] = result_suggestions
     return json.dumps(result, ensure_ascii=False)
 
 
