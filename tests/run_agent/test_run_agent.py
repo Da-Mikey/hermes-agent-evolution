@@ -147,6 +147,10 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self, timeout: float = 5.0) -> bool:
+            """Barrier DB stub: token flush is a no-op for the test fixture."""
+            return True
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -2453,6 +2457,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("setup_mcp", {"server": "linear", "action": "install"}),
         ("tour", {"action": "stop"}),
         ("delegate_task", {"goal": "Check the child path"}),
+        ("compact_context", {}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -2505,6 +2510,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         )
         monkeypatch.setattr(
             "tools.read_window_tool.read_window_below_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.compact_context_tool.compact_context_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
@@ -3122,7 +3131,7 @@ class TestRunConversation:
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
+                side_effect=lambda request_id, *, outcome, **kwargs: logical_completions.append(
                     (request_id, outcome)
                 ),
             ),
@@ -3139,8 +3148,15 @@ class TestRunConversation:
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
-        assert logical_completions == [
-            (hook_events[0]["api_request_id"], "success")
+        # The auxiliary lane (e.g. background title generation) also closes
+        # its relay call through complete_logical_call with an 'aux-*'
+        # request id. Only the main logical call's completion is under test.
+        _main_request_id = hook_events[0]["api_request_id"]
+        _main_call_completions = [
+            entry for entry in logical_completions if entry[0] == _main_request_id
+        ]
+        assert _main_call_completions == [
+            (_main_request_id, "success")
         ]
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
@@ -3637,7 +3653,7 @@ class TestRunConversation:
 
         fallback_called = {"called": False}
 
-        def _mock_fallback():
+        def _mock_fallback(*args, **kwargs):
             fallback_called["called"] = True
             # Simulate what _try_activate_fallback does: just advance the
             # index and set the flag (the client is already mocked).
@@ -3674,7 +3690,7 @@ class TestRunConversation:
             empty_resp, empty_resp, empty_resp, empty_resp,  # fallback exhausted
         ]
 
-        def _mock_fallback():
+        def _mock_fallback(*args, **kwargs):
             if agent._fallback_index >= len(agent._fallback_chain):
                 return False
             agent._fallback_index += 1
@@ -5037,6 +5053,14 @@ class TestRetryExhaustion:
         agent._use_prompt_caching = False
         agent.compression_enabled = False
         agent.save_trajectories = False
+        # The fast-time mock jumps time.time() forward by 500s per call to
+        # collapse backoff waits. The retry wall-clock budget (#3113,
+        # agent.api_retry_wall_clock_seconds, default 300s) would trip on the
+        # second such jump and abort with retry_wall_clock_exceeded before
+        # any API call is made — raise the deadline out of the way so these
+        # tests exercise retry exhaustion, not the wall-clock guard.
+        agent._api_retry_wall_clock_seconds = 10**9
+        agent._cron_api_retry_wall_clock_seconds = 10**9
 
     @staticmethod
     def _make_fast_time_mock():
@@ -5109,7 +5133,7 @@ class TestRetryExhaustion:
             patch("agent.relay_llm.execute", side_effect=execute),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
+                side_effect=lambda request_id, *, outcome, **kwargs: logical_completions.append(
                     (request_id, outcome)
                 ),
             ),
@@ -5126,7 +5150,14 @@ class TestRetryExhaustion:
             attempt["metadata"]["api_request_id"] for attempt in relay_attempts
         }
         assert len(request_ids) == 1
-        assert logical_completions == [(request_ids.pop(), "success")]
+        main_request_id = request_ids.pop()
+        # The auxiliary lane (e.g. background title generation) also closes
+        # its relay call through complete_logical_call with an 'aux-*'
+        # request id. Only the main logical call's completion is under test.
+        main_call_completions = [
+            entry for entry in logical_completions if entry[0] == main_request_id
+        ]
+        assert main_call_completions == [(main_request_id, "success")]
 
     def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into

@@ -1190,6 +1190,125 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
         for rp in resolved_paths:
             task_failures.pop(rp, None)
 
+# ── #1703 — empty-old_string loop guard ────────────────────────────────────
+# When the model calls the patch tool in replace mode with an EMPTY (falsy)
+# old_string, no valid replace can ever match — it is a usage error, not a
+# match failure. The old "is None" guard at the top of patch_tool let an empty
+# string fall through to patch_replace, which returned a generic error the
+# model then retried 5-8 times (#1703). We return a targeted, actionable
+# diagnostic at the tool boundary, and track consecutive identical failures
+# per task+path so the second one escalates to a hard STOP — breaking the
+# spiral at 2 instead of 8.
+_empty_old_string_lock = threading.Lock()
+_empty_old_string_tracker: dict = {}  # {task_id: {path: count}}
+
+
+def _record_empty_old_string(task_id: str, path: str) -> int:
+    """Increment and return the consecutive empty-old_string count for a path."""
+    with _empty_old_string_lock:
+        per_task = _empty_old_string_tracker.setdefault(task_id, {})
+        if len(per_task) >= 64 and path not in per_task:
+            try:
+                first_key = next(iter(per_task))
+                del per_task[first_key]
+            except StopIteration:
+                pass
+        per_task[path] = per_task.get(path, 0) + 1
+        return per_task[path]
+
+
+def _reset_empty_old_string(task_id: str, path: str) -> None:
+    """Clear the empty-old_string counter for a path — called when the model
+    supplies a non-empty old_string (it has moved past the empty shape) or
+    when a patch to that path succeeds."""
+    if not path:
+        return
+    with _empty_old_string_lock:
+        per_task = _empty_old_string_tracker.get(task_id)
+        if per_task:
+            per_task.pop(path, None)
+
+
+def _empty_old_string_error(path: str, task_id: str) -> str:
+    """Non-retryable diagnostic for replace-mode with an empty old_string."""
+    count = _record_empty_old_string(task_id, path)
+    msg = (
+        "replace mode requires a non-empty old_string. The old_string is the "
+        "exact text to find and replace in the file; an empty string cannot be "
+        "matched. Either supply the text to replace, or use mode=patch (V4A "
+        "format) for insertions."
+    )
+    if count >= 2:
+        suffix = {2: "nd", 3: "rd"}.get(count % 10, "th")
+        msg += (
+            f" STOP: this is the {count}{suffix} consecutive replace-mode call with an "
+            f"empty old_string on {path!r}. Do not retry this shape — re-read the "
+            f"file to see the exact text, then supply a real old_string, or use "
+            f"mode=patch / write_file instead."
+        )
+    return tool_error(msg)
+
+
+# #3238 — patch preflight counter: every replace-mode call blocked for an
+# empty/short/ambiguous old_string increments this per-task counter.  It is
+# surfaced in the structured error so the spiral guard can act on it.
+_patch_preflight_blocked_lock = threading.Lock()
+_patch_preflight_blocked_counter: dict[str, int] = {}
+
+
+def _record_patch_preflight_blocked(task_id: str) -> int:
+    """Increment and return the per-task patch-preflight block count."""
+    with _patch_preflight_blocked_lock:
+        _patch_preflight_blocked_counter[task_id] = (
+            _patch_preflight_blocked_counter.get(task_id, 0) + 1
+        )
+        return _patch_preflight_blocked_counter[task_id]
+
+
+def _patch_preflight_blocked_structured(
+    path: str, reason: str, task_id: str, extra_message: str = ""
+) -> str:
+    """Return a structured re_read_file instruction for a blocked patch.
+
+    The payload is a non-retryable correction request that tells the model to
+    re-read the target file and try again with a more precise old_string.
+    """
+    count = _record_empty_old_string(task_id, path)
+    preflight_count = _record_patch_preflight_blocked(task_id)
+    msg = (
+        "replace mode requires a non-empty old_string. The old_string is the "
+        "exact text to find and replace in the file; an empty string cannot be "
+        "matched. Either supply the text to replace, or use mode=patch (V4A "
+        "format) for insertions."
+    )
+    if count >= 2:
+        suffix = {2: "nd", 3: "rd"}.get(count % 10, "th")
+        msg += (
+            f" STOP: this is the {count}{suffix} consecutive replace-mode call with an "
+            f"empty old_string on {path!r}. Do not retry this shape — re-read the "
+            f"file to see the exact text, then supply a real old_string, or use "
+            f"mode=patch / write_file instead."
+        )
+    message = (
+        f"Patch blocked by preflight: {reason}. "
+        f"Re-read {path!r} with read_file, copy the exact text you want to replace, "
+        f"and retry with a longer, unambiguous old_string."
+    )
+    if extra_message:
+        message += " " + extra_message
+    return json.dumps(
+        {
+            "error": msg,
+            "action": "re_read_file",
+            "path": path,
+            "reason": reason,
+            "message": message,
+            "patch_preflight_blocked": preflight_count,
+            "argument_shape_spiral": preflight_count >= 3,
+        },
+        ensure_ascii=False,
+    )
+
 # Per-task bounds for the containers inside each _read_tracker[task_id].
 # A CLI session uses one stable task_id for its lifetime; without these
 # caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
@@ -2323,6 +2442,76 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
+
+def _build_no_match_hint(
+    path: str,
+    pattern: str,
+    target: str,
+    resolved_path: "Path | PurePosixPath | None",
+) -> "str | None":
+    """Build a hint for the agent when search_files finds zero matches.
+
+    Lists what *does* exist in the search directory so the agent can correct
+    its pattern or verify the path instead of blind-retrying.  Returns None
+    when no useful hint can be constructed (e.g. the directory doesn't exist
+    or is empty), so the caller can skip adding an empty field.
+    """
+    search_dir = resolved_path if resolved_path else Path(path)
+
+    try:
+        search_dir = Path(os.path.expanduser(str(search_dir)))
+        if not search_dir.is_dir():
+            if search_dir.exists() and search_dir.is_file():
+                return (
+                    f"Pattern {pattern!r} matched nothing in {path!r}. "
+                    "The path is a single file — verify the pattern or "
+                    "read_file the file directly."
+                )
+            return None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+    try:
+        children = sorted(
+            search_dir.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
+        )
+    except (OSError, PermissionError):
+        return None
+
+    _max = 10
+    dirs = [c.name + "/" for c in children if c.is_dir() and not c.name.startswith(".")]
+    files_list = [c.name for c in children if c.is_file() and not c.name.startswith(".")]
+    entries = dirs[:_max]
+    remaining = _max - len(entries)
+    if remaining > 0:
+        entries.extend(files_list[:remaining])
+
+    if not entries:
+        return (
+            f"Pattern {pattern!r} matched nothing in {path!r}. "
+            "The directory exists but contains no visible entries. "
+            "Verify the path is correct."
+        )
+
+    mode_desc = "file search" if target == "files" else "content search"
+    listing = ", ".join(entries)
+    hint = (
+        f"Pattern {pattern!r} matched nothing in {path!r} ({mode_desc}). "
+        f"Entries that DO exist in this directory: {listing}"
+    )
+    if target == "files":
+        hint += (
+            ". Try a broader glob (e.g. '*.py' instead of a specific name), "
+            "or use target='content' to search inside files."
+        )
+    else:
+        hint += (
+            ". Try a different regex pattern, or use target='files' with a "
+            "glob like '*.py' to list files first."
+        )
+    return hint
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -2453,7 +2642,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             if mode == "replace":
                 if not path:
                     return tool_error("path required")
-                if old_string is None or new_string is None:
+                # #1703/#3238 — Preflight: reject empty old_string before
+                # attempting the patch. Return a structured re_read_file
+                # instruction so the model fixes the shape instead of blind-retrying.
+                _old = (old_string or "").strip()
+                if not _old:
+                    return _patch_preflight_blocked_structured(
+                        path, "empty old_string", task_id
+                    )
+                _reset_empty_old_string(task_id, path)
+                if new_string is None:
                     return tool_error("old_string and new_string required")
                 # Pass the resolved ABSOLUTE path to the shell layer so it
                 # operates on the exact file the tool layer resolved — the
@@ -2636,6 +2834,66 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 f"You have run this exact search {count} times consecutively. "
                 "The results have not changed. Use the information you already have."
             )
+
+        #1486 — when the pattern matches nothing the agent has no hint about
+        # what *does* exist, so it blind-retries or falls back to a terminal
+        # directory listing, burning extra turns (95 file-not-found events/7d,
+        # 27-deep spirals observed). The FIRST empty result is enriched with
+        # what actually exists in the search path.
+        #
+        # #1372/#1149/#1589 — the tool_guardrails spiral_failure_cap only
+        # counts errors, so diverse-query spirals (the agent reformulates each
+        # time and gets empty each time) slip through. Empty results are
+        # tracked per session; at 3 an advisory directive is injected, and at
+        # 6 it escalates to a real error key so classify_tool_failure sees the
+        # failure and the cross-turn spiral_failure_cap (search_files is in
+        # _SPIRAL_PRONE_TOOLS) can accumulate and halt. The advisory alone had
+        # no teeth — 31 sessions hit 11 consecutive empty searches.
+        _SEARCH_EMPTY_HARD_CAP = 6
+        if result_dict.get("total_count", 0) == 0 and not result_dict.get("error"):
+            with _read_tracker_lock:
+                td = _read_tracker.setdefault(
+                    task_id,
+                    {"last_key": None, "consecutive": 0, "read_history": set()},
+                )
+                td["empty_searches"] = td.get("empty_searches", 0) + 1
+                _es = td["empty_searches"]
+
+            # ── #1486: immediate no-match hint on the FIRST empty result ─
+            # List what *does* exist in the search directory so the agent can
+            # correct the pattern instead of blind-retrying.  Runs before the
+            # spiral directive so even the first miss gets actionable info.
+            if _es == 1:
+                _hint = _build_no_match_hint(path, pattern, target, resolved_path)
+                if _hint:
+                    result_dict["_no_match_hint"] = _hint
+
+            if _es >= _SEARCH_EMPTY_HARD_CAP:
+                result_dict["error"] = (
+                    f"search_files has returned 0 results {_es} times. Your "
+                    "queries are consistently not matching anything — this is a "
+                    "deterministic dead end. STOP searching and switch strategy: "
+                    "(a) use search_files target='files' with a glob like '*.py', "
+                    "(b) call repo_map for a structural overview, or "
+                    "(c) read_file on a known path instead of searching."
+                )
+            elif _es >= 3:
+                result_dict.setdefault(
+                    "_search_directive",
+                    (
+                        f"search_files has returned 0 results {_es} times. "
+                        "Your queries are not matching anything. SWITCH STRATEGY: "
+                        "(a) use search_files target='files' with a glob like '*.py', "
+                        "(b) call repo_map for a structural overview, or "
+                        "(c) read_file on a known path instead of searching."
+                    ),
+                )
+        elif result_dict.get("total_count", 0) > 0:
+            # Successful search with results — reset the empty counter.
+            with _read_tracker_lock:
+                td = _read_tracker.get(task_id)
+                if td is not None:
+                    td["empty_searches"] = 0
 
         result_json = json.dumps(result_dict, ensure_ascii=False)
         # Hint when results were truncated — explicit next offset is clearer
