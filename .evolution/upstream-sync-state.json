@@ -11,7 +11,7 @@
     "last_version": "0.20.6",
     "integrated_via": "fork main fast-forwarded to lexus/main cc37e8466e \u2014 Lexus2016 PR #3274 already integrated v2026.8.27 (merged 2026-08-28); no fresh conflict resolution needed",
     "branch": "sync/upstream-release-v2026.8.27",
-    "pr": null,
+    "pr": 142,
     "superseded_prs": [83, 131],
     "synced_at": "2026-08-29"
   }
