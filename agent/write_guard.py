@@ -7,11 +7,29 @@ Classifies tools into risk categories:
 - DESTRUCTIVE: permanent removal or hazardous modifications.
 
 Enforces per-session allow/deny/require_confirmation rules with subagent inheritance.
+
+#3300 increments:
+- Destructive operations default to DENY when the guard is enabled, unless
+  explicitly listed in ``allow``.
+- ``require_confirmation`` entries deny with an ask-the-user instruction.
+- Every write/destructive decision (allow or deny) is appended to
+  ``~/.hermes/logs/write-guard-audit.jsonl`` (fail-open).
+
+Config (config.yaml → policy_interceptors.policies[].options for the
+``write_guard`` policy)::
+
+    mode: enforce | audit | off
+    allow: [tool names or globs]
+    deny: [tool names or globs]
+    require_confirmation: [tool names or globs]
+    allow_read_only: true
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -152,6 +170,57 @@ def _matches_any_pattern(name: str, patterns: frozenset[str]) -> bool:
     return False
 
 
+# ── #3300 audit log ─────────────────────────────────────────────────────────
+# Every allowed and blocked write/destructive operation is appended to an
+# append-only JSONL file (mirrors agent.exec_evidence): tool name, arguments
+# summary, decision, reason, timestamp. Fail-open — a logging failure must
+# never change the gate's decision.
+_AUDIT_FILENAME = "logs/write-guard-audit.jsonl"
+
+
+def _audit_path():
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / _AUDIT_FILENAME
+
+
+def _summarize_args(args: Mapping[str, Any] | None, max_chars: int = 200) -> str:
+    try:
+        text = json.dumps(dict(args or {}), sort_keys=True, default=str)
+    except Exception:
+        text = str(args)
+    return text[:max_chars]
+
+
+def audit_write_operation(
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+    *,
+    decision: str,
+    reason: str,
+    risk: str = "",
+    path=None,
+) -> None:
+    """Append one write-guard decision to the audit log (fail-open)."""
+    try:
+        target = path or _audit_path()
+        if hasattr(target, "parent"):
+            target.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": int(time.time()),
+            "tool": tool_name,
+            "args": _summarize_args(args),
+            "decision": decision,  # allow | deny | confirm
+            "reason": reason,
+            "risk": risk,
+        }
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+
 @dataclass(frozen=True)
 class WriteGuardPolicy:
     """Policy rules governing mutating/destructive tool execution."""
@@ -199,7 +268,12 @@ class WriteGuardPolicy:
     def evaluate(
         self, tool_name: str, args: Mapping[str, Any] | None = None
     ) -> PolicyOutcome:
-        """Evaluate a tool call against the write guard policy."""
+        """Evaluate a tool call against the write guard policy.
+
+        #3300: every write/destructive decision is audited (tool, args
+        summary, decision, reason, timestamp) to
+        ``~/.hermes/logs/write-guard-audit.jsonl`` — fail-open.
+        """
         if not self.enabled:
             return PolicyOutcome.allow()
 
@@ -216,6 +290,52 @@ class WriteGuardPolicy:
                 f"Blocked {tool_name}: tool modification is prohibited by write-guard policy "
                 f"(matched deny rule in {self.mode} mode)."
             )
+            audit_write_operation(
+                tool_name, args, decision="deny", reason="deny rule", risk=risk
+            )
+            if self.mode == "audit":
+                return PolicyOutcome.allow()
+            return PolicyOutcome.deny(msg)
+
+        # #3300 — destructive operations default to DENY unless the policy
+        # explicitly allows them. Industry direction (Cloudflare WriteGuard,
+        # Okta Agent SSO): destructive MCP ops must never fail open.
+        if risk == WriteRisk.DESTRUCTIVE and not _matches_any_pattern(
+            tool_name, self.allow
+        ):
+            msg = (
+                f"Blocked {tool_name}: destructive operation denied by default. "
+                f"Add it to the write-guard 'allow' list to permit it "
+                f"({self.mode} mode)."
+            )
+            audit_write_operation(
+                tool_name,
+                args,
+                decision="deny",
+                reason="destructive default-deny",
+                risk=risk,
+            )
+            if self.mode == "audit":
+                return PolicyOutcome.allow()
+            return PolicyOutcome.deny(msg)
+
+        # #3300 — require_confirmation: the tool may run only after explicit
+        # human confirmation. The deterministic policy layer cannot collect a
+        # confirmation itself, so it denies with an instruction to ask the
+        # user — the approval flow then re-permits the call.
+        if _matches_any_pattern(tool_name, self.require_confirmation):
+            msg = (
+                f"Blocked {tool_name}: write-guard policy requires explicit human "
+                f"confirmation before this operation. Ask the user to confirm, "
+                f"then retry."
+            )
+            audit_write_operation(
+                tool_name,
+                args,
+                decision="confirm",
+                reason="require_confirmation",
+                risk=risk,
+            )
             if self.mode == "audit":
                 return PolicyOutcome.allow()
             return PolicyOutcome.deny(msg)
@@ -227,10 +347,21 @@ class WriteGuardPolicy:
                     f"Blocked {tool_name}: tool modification is not in write-guard allowlist "
                     f"({self.mode} mode)."
                 )
+                audit_write_operation(
+                    tool_name,
+                    args,
+                    decision="deny",
+                    reason="not in allowlist",
+                    risk=risk,
+                )
                 if self.mode == "audit":
                     return PolicyOutcome.allow()
                 return PolicyOutcome.deny(msg)
 
+        if risk != WriteRisk.READ_ONLY:
+            audit_write_operation(
+                tool_name, args, decision="allow", reason="policy pass", risk=risk
+            )
         return PolicyOutcome.allow()
 
 
