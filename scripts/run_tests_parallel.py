@@ -451,12 +451,6 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
-    finally:
-        # Delete the temp root for this attempt. Nothing reads it after the
-        # subprocess exits. More than 3000 of them fill the disk of the
-        # runner over one suite.
-        shutil.rmtree(temproot, ignore_errors=True)
-
     if rc == 4 and not _file_present(file):
         # Tripwire (#85): the file existed at plan time (its tests were
         # counted by the bulk --collect-only) but is genuinely gone now.
