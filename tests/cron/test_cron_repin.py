@@ -143,6 +143,10 @@ class TestCronRepin:
         args.monitor_url = None
         args.continuity = None
         args.pin = True
+        # Explicit None: a MagicMock auto-attribute would leak through
+        # getattr(args, "reasoning_effort", None) and be rejected by
+        # create_job's spelling validation as an invalid level.
+        args.reasoning_effort = None
 
         with cron_jobs.use_cron_store(tmp_path),              patch("cron.jobs._compute_provider_model_snapshots", return_value=("nous", "hermes-3-llama-3.1-405b")):
             code = cron_command(args)
