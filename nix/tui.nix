@@ -6,6 +6,8 @@ hermesNpmLib.buildNpmPackage {
     "apps/shared"
   ];
 
+  npmFlags = [ "--legacy-peer-deps" ];
+
   doCheck = false;
 
   buildPhase = ''
