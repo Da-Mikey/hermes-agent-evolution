@@ -6,6 +6,7 @@ checkpoint serialization, and kill-switch safety primitives.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -34,6 +35,8 @@ class HarnessPolicy:
     max_unproductive_turns: int = 10
     max_wall_time_seconds: float = 3600.0
     kill_on_unhandled_spiral: bool = True
+    max_tool_failures_before_recovery: int = 3
+    audit_file_path: Optional[str] = None
 
 
 @dataclass
@@ -75,11 +78,52 @@ class AgentRuntimeHarness:
             event_type=event_type, timestamp=time.time(), details=details
         )
         self.events.append(event)
+        if self.policy.audit_file_path:
+            try:
+                with open(self.policy.audit_file_path, "a", encoding="utf-8") as f:
+                    entry = {
+                        "timestamp": event.timestamp,
+                        "session_id": self.session_id,
+                        "event_type": event_type,
+                        "details": details,
+                    }
+                    f.write(json.dumps(entry) + "\n")
+            except Exception:
+                pass
         if self.on_event:
             try:
                 self.on_event(event)
             except Exception:
                 pass
+
+    def recover_tool_failure(
+        self,
+        tool_name: str,
+        error: str,
+        consecutive_failures: int = 1,
+    ) -> HarnessDecision:
+        """Trigger recovery policy on repeated tool failures."""
+        args_summary = f"{tool_name} failed ({consecutive_failures}x): {error[:100]}"
+        self._emit(
+            "harness.recover",
+            {
+                "tool_name": tool_name,
+                "args_summary": args_summary,
+                "reason": f"Repeated failure of {tool_name}",
+                "consecutive_failures": consecutive_failures,
+            },
+        )
+        if consecutive_failures >= self.policy.max_tool_failures_before_recovery:
+            return HarnessDecision(
+                action=HarnessAction.RECOVER,
+                reason=f"Exceeded failure threshold for {tool_name}; initiating fallback/recovery",
+                can_resume=True,
+            )
+        return HarnessDecision(
+            action=HarnessAction.PROCEED,
+            reason="Failure logged; within retry budget",
+            can_resume=True,
+        )
 
     def pause(self, reason: str = "user_pause") -> HarnessDecision:
         """Pause session execution safely."""
