@@ -472,6 +472,11 @@ class MemoryManager:
         # session_id) pairs logged during prefetch_all. Cleared after
         # outcomes are recorded in sync_all.
         self._pending_retrievals: List[tuple[str, str]] = []
+        # #137: per-process dedup set of (event_id, hash(observation)) pairs
+        # whose contradiction flag has already been surfaced. Bounded; an
+        # overflow clears toward MORE detection (fail-safe, never suppresses).
+        self._contradiction_seen: set[tuple[str, int]] = set()
+        self._contradiction_seen_cap = 8192
 
     # -- Registration --------------------------------------------------------
 
@@ -1043,6 +1048,20 @@ class MemoryManager:
             min_importance=min_importance,
         )
         for flag in flags:
+            # #137: over-fire suppression — the same stored-event x observation
+            # pair was re-flagging on every scored turn that repeated the
+            # observation (~1,188 warnings/day; 5,170 lines over the rotated
+            # error-log set). Surface each distinct pair once per process;
+            # genuinely new pairs still flag immediately. Detection semantics
+            # are unchanged: `flags` is returned in full to probe callers.
+            key = (flag.event_id, hash(observation))
+            if key in self._contradiction_seen:
+                continue
+            self._contradiction_seen.add(key)
+            if len(self._contradiction_seen) > self._contradiction_seen_cap:
+                # Fail-safe: bound the set; clearing re-enables re-surfacing
+                # (pre-#137 behavior) rather than ever suppressing detection.
+                self._contradiction_seen.clear()
             logger.warning(
                 "memory contradiction (conf=%.2f): %s — stored %s (%s) vs new "
                 "observation %r",
