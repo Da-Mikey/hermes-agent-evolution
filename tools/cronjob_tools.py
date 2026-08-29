@@ -1806,7 +1806,7 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
-            if _no_agent:
+            if no_agent:
                 if not script:
                     return tool_error(
                         "create with no_agent=True requires a script — "
@@ -1893,7 +1893,7 @@ def cronjob(
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
                     workdir=_normalize_optional_job_value(workdir),
-                    no_agent=_no_agent,
+                    no_agent=no_agent,
                     attach_to_session=attach_to_session,
                     approval_mode=approval_mode,
                     delivery_verbosity=delivery_verbosity,

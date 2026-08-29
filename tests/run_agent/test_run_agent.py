@@ -147,6 +147,10 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self, timeout: float = 5.0) -> bool:
+            """Barrier DB stub: token flush is a no-op for the test fixture."""
+            return True
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -3122,7 +3126,7 @@ class TestRunConversation:
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
+                side_effect=lambda request_id, *, outcome, **kwargs: logical_completions.append(
                     (request_id, outcome)
                 ),
             ),
@@ -5109,7 +5113,7 @@ class TestRetryExhaustion:
             patch("agent.relay_llm.execute", side_effect=execute),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
+                side_effect=lambda request_id, *, outcome, **kwargs: logical_completions.append(
                     (request_id, outcome)
                 ),
             ),
