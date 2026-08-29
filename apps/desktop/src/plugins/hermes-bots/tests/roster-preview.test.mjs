@@ -256,7 +256,11 @@ test('previewKind: a named profile keeps its own handle', () => {
   assert.equal(fromBotOf("Message from agent 'ops': deploy is green"), 'ops')
 })
 
-test('render: a remote gateway name is not squeezed out by its handle', () => {
+test('render: a remote gateway row truncates the display name, keeps the handle fixed', () => {
+  // Contract since the #3208 upstream sync: the row name span absorbs
+  // overflow (min-w-0 truncate — upstream bot-row.tsx renders the exact
+  // same classes) while the @handle span is shrink-0, so a long remote
+  // gateway label can never squeeze the handle out of the row.
   const r = renderRuntime()
   const tree = r.__BotRow({
     bot: {
@@ -266,17 +270,19 @@ test('render: a remote gateway name is not squeezed out by its handle', () => {
       name: 'default',
       remoteSource: true
     },
+    showHandle: true,
     onEdit: () => undefined
   })
   const name = findNode(tree, node => node.type === 'span' && textOf(node) === 'Studio over SSH')
   const handle = findNode(tree, node => node.type === 'span' && textOf(node) === '@default-studio-over-ssh')
 
   assert.ok(name)
-  assert.match(name.props.className, /shrink-0/)
+  assert.match(name.props.className, /min-w-0/)
+  assert.match(name.props.className, /truncate/)
+  assert.doesNotMatch(name.props.className, /shrink-0/)
   assert.ok(handle)
-  assert.match(handle.props.className, /min-w-0/)
-  assert.match(handle.props.className, /truncate/)
-  assert.doesNotMatch(handle.props.className, /shrink-0/)
+  assert.match(handle.props.className, /shrink-0/)
+  assert.doesNotMatch(handle.props.className, /truncate/)
 })
 
 test('render: BotRow previews the pinned canonical chat, not an unrelated latest session', () => {
