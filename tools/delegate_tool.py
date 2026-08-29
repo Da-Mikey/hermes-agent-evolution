@@ -38,6 +38,12 @@ from datetime import datetime, timezone
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from agent.runtime_harness import (
+    AgentRuntimeHarness,
+    HarnessAction,
+    HarnessPolicy,
+    HarnessStatus,
+)
 from tools.delegation_attribution import (
     attribution_prompt_block,
     build_attribution_stamp,
@@ -259,6 +265,11 @@ _active_subagents: Dict[str, Dict[str, Any]] = {}
 # delegation attribution even though the live registry entry is gone.
 _RECENT_SUBAGENTS_CAP = 200
 _recent_subagents: Dict[str, Dict[str, Any]] = {}
+
+# subagent_id -> AgentRuntimeHarness supervising that live child (#3303).
+# Created before dispatch in _run_single_child, removed in its finally block;
+# external stop producers (interrupt_subagent) record kill reasons here.
+_SUBAGENT_HARNESSES: Dict[str, "AgentRuntimeHarness"] = {}
 
 
 def get_subagent_attribution(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -3443,6 +3454,66 @@ def _run_single_child(
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
+    # ── Runtime-harness supervision (#3303, slice 1 of #3301) ──────────
+    # Wire a live AgentRuntimeHarness around every delegated child
+    # (runtime_harness.py landed as dead code in #3279). Supervision rides
+    # the child's per-tool-event progress channel; kill enforcement uses
+    # the same iteration-boundary hard interrupt the TUI stop path uses.
+    _harness_sid = getattr(child, "_subagent_id", None)
+    _harness_sid = _harness_sid if isinstance(_harness_sid, str) else None
+    harness = AgentRuntimeHarness(
+        session_id=_harness_sid or f"child-{task_index}",
+        policy=getattr(child, "_runtime_harness_policy", None) or HarnessPolicy(),
+    )
+    if _harness_sid:
+        _SUBAGENT_HARNESSES[_harness_sid] = harness
+
+    def _harness_kill_child(reason: str) -> None:
+        try:
+            request_hard_interrupt(child, reason)
+        except Exception:
+            logger.debug("harness kill dispatch failed: %s", reason, exc_info=True)
+
+    def _harness_progress_cb(event: str, *args, **kwargs):
+        # Supervise tool events; forward EVERY event unchanged so the
+        # parent/gateway display contract is preserved.
+        try:
+            if event == "tool.started" and args:
+                decision = harness.check_pre_execution(str(args[0]), {})
+                if decision.action is HarnessAction.KILL:
+                    _harness_kill_child(decision.reason)
+            elif event == "tool.completed":
+                _is_error = bool(kwargs.get("is_error", False))
+                decision = harness.record_turn_result(
+                    has_productive_output=not _is_error, failed=_is_error
+                )
+                if decision.action is HarnessAction.KILL:
+                    _harness_kill_child(decision.reason)
+        except Exception:
+            logger.debug("harness progress hook failed", exc_info=True)
+        if child_progress_cb is not None:
+            try:
+                return child_progress_cb(event, *args, **kwargs)
+            except Exception as e:
+                logger.debug("inner progress callback failed: %s", e)
+        return None
+
+    # Preserve the flush contract some consumers check via hasattr().
+    if child_progress_cb is not None and hasattr(child_progress_cb, "_flush"):
+        try:
+            _harness_progress_cb._flush = child_progress_cb._flush  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    # Rebind the child's tool-event channel through the supervisor. The
+    # local child_progress_cb still carries the ORIGINAL callback for
+    # delegation-lifecycle events, which must not advance harness counters.
+    if child is not None:
+        try:
+            child.tool_progress_callback = _harness_progress_cb
+        except Exception:
+            logger.debug("harness callback rebind failed", exc_info=True)
+
+
     # Restore parent tool names using the value saved before child construction
     # mutated the global. This is the correct parent toolset, not the child's.
     import model_tools
@@ -4261,6 +4332,20 @@ def _run_single_child(
         # only feeds the parent session rollup).
         # Inspired by: Perplexity Agent API result shape (idea-level).
         entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
+
+        # Harness supervision outcome (#3303): surface why a run was halted.
+        try:
+            if harness.status == HarnessStatus.KILLED:
+                _kills = [
+                    e.details.get("reason", "killed")
+                    for e in harness.events
+                    if e.event_type == "harness.kill"
+                ]
+                entry["harness_kill_reason"] = _kills[-1] if _kills else "killed"
+            elif harness.status == HarnessStatus.PAUSED:
+                entry["harness_kill_reason"] = "harness paused (limits reached)"
+        except Exception:
+            logger.debug("harness outcome annotation failed", exc_info=True)
         _cost_status = getattr(child, "session_cost_status", None)
         entry["cost_status"] = (
             _cost_status if isinstance(_cost_status, str) and _cost_status
@@ -4497,6 +4582,16 @@ def _run_single_child(
         return _error_entry
 
     finally:
+        # Harness bookkeeping (#3303): terminal status + registry cleanup so a
+        # recycled subagent_id can never inherit a stale harness.
+        try:
+            if harness.status == HarnessStatus.RUNNING:
+                harness.status = HarnessStatus.COMPLETED
+        except Exception:
+            logger.debug("harness finalize failed", exc_info=True)
+        if _harness_sid:
+            _SUBAGENT_HARNESSES.pop(_harness_sid, None)
+
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).  Guard the join: .start()
         # now lives inside the try block, so if it raised (OS thread
