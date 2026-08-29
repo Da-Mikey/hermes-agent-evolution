@@ -3,17 +3,16 @@
   "synced_through_tag": "v2026.6.5",
   "synced_through_date": "2026-06-05",
   "our_version": "0.16.0",
-  "synced_at": "2026-06-13",
+  "synced_at": "2026-08-29",
   "deferred": [],
-  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it \u2014 so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review.",
-  "catchup_in_progress": {
-    "branch": "sync/upstream-catchup",
-    "pr": 1641,
-    "issue": 1526,
-    "target_tag": "v2026.7.30",
-    "then": "v2026.8.3",
-    "phase_1": "complete \u2014 4665 files of non-conflicting upstream change",
-    "phase_2": "6 of 87 deferred files integrated",
-    "_warning": "A bulk catch-up is running on the branch above, walking upstream RELEASE TAGS. It is a different mechanism from this file's 25-commit cursor. Do not advance synced_through_commit from the incremental sync while this is open \u2014 the two would each think they had applied commits the other actually applied, and the cursor would claim coverage that main does not have. Resume the incremental sync only after PR #1641 merges, reseeding the cursor to the new merge-base."
+  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it \u2014 so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review. Since Aug 2026 the sync runs in RELEASE-TRACK mode: releases integrate by upstream release TAG (tracked in release_sync below); the incremental cursor is NOT advanced by release-track work.",
+  "release_sync": {
+    "last_tag": "v2026.8.27",
+    "last_version": "0.20.6",
+    "integrated_via": "fork main fast-forwarded to lexus/main cc37e8466e \u2014 Lexus2016 PR #3274 already integrated v2026.8.27 (merged 2026-08-28); no fresh conflict resolution needed",
+    "branch": "sync/upstream-release-v2026.8.27",
+    "pr": 142,
+    "superseded_prs": [83, 131],
+    "synced_at": "2026-08-29"
   }
 }
