@@ -10,6 +10,7 @@ import posixpath
 import re
 import sys
 import threading
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -24,12 +25,278 @@ from tools.file_operations import (
     normalize_search_pagination,
 )
 from tools import file_state
+from tools.path_validation import format_nearby_hint, suggest_nearby_paths
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+
+
+# Invisible / compatibility spaces that render like a normal space in a
+# terminal. Folding them (plus NFC) lets read_file recover a path the
+# model retyped visually-correctly but with the wrong bytes.
+_FILENAME_SPACE_FOLDS = (
+    "\u00a0",  # no-break space
+    "\u202f",  # narrow no-break space
+    "\u2007",  # figure space
+    "\u2009",  # thin space
+    "\u200a",  # hair space
+)
+
+
+def _fold_filename_for_unicode_match(name: str) -> str:
+    folded = unicodedata.normalize("NFC", name)
+    for src in _FILENAME_SPACE_FOLDS:
+        folded = folded.replace(src, " ")
+    return folded
+
+
+def _find_unicode_equivalent_path(requested: Path) -> Path | None:
+    """Return the single same-dir file that is a unicode-equivalent of *requested*.
+
+    Conservative: only NFC + invisible-space folding, and only when exactly
+    one sibling matches. Visible differences (straight vs curly quote,
+    missing accents) stay as not-found + similar_files.
+    """
+    try:
+        parent = requested.parent
+        if not parent.is_dir():
+            return None
+        target = _fold_filename_for_unicode_match(requested.name)
+        matches = [
+            entry
+            for entry in parent.iterdir()
+            if entry.is_file()
+            and _fold_filename_for_unicode_match(entry.name) == target
+        ]
+    except OSError:
+        return None
+    if len(matches) == 1 and matches[0].name != requested.name:
+        return matches[0]
+    return None
+
+
+def _find_auto_repaired_path(
+    requested: Path,
+    raw_path: str,
+    task_id: str = "default",
+) -> tuple[Path | None, str | None]:
+    """Find a single unambiguous valid path candidate when *requested* does not exist (#2411).
+
+    Strategies evaluated in priority order:
+      1. Unicode normalization (NFC + invisible-space folding via _find_unicode_equivalent_path)
+      2. Case-insensitive match in the requested parent directory (e.g. readme.md -> README.md)
+      3. Case-insensitive component-wise path traversal (e.g. Tools/file_tools.py -> tools/file_tools.py)
+      4. Workspace-root fallback (if relative path failed against cwd)
+      5. Extraneous prefix stripping (e.g. hermes-agent/tools/foo.py -> tools/foo.py)
+      6. Unique filename in workspace tree (for non-generic filenames >3 chars)
+
+    Returns (repaired_path, explanation_hint) or (None, None) if ambiguous or none found.
+    """
+    # 1. Unicode normalization
+    unicode_hit = _find_unicode_equivalent_path(requested)
+    if unicode_hit is not None and unicode_hit.is_file():
+        return (
+            unicode_hit,
+            f"Opened unicode-equivalent filename {unicode_hit.name!r} instead of {requested.name!r}.",
+        )
+
+    # 2. Case-insensitive match in parent directory
+    try:
+        parent = requested.parent
+        if parent.is_dir():
+            target_lower = requested.name.lower()
+            ci_matches = [
+                entry
+                for entry in parent.iterdir()
+                if entry.is_file() and entry.name.lower() == target_lower
+            ]
+            if len(ci_matches) == 1 and ci_matches[0].name != requested.name:
+                return (
+                    ci_matches[0],
+                    f"Opened case-corrected filename {ci_matches[0].name!r} instead of {requested.name!r}.",
+                )
+    except OSError:
+        pass
+
+    # 3. Case-insensitive component-wise path traversal
+    try:
+        curr_dir = requested.parent
+        unresolved_parts = [requested.name]
+        while not curr_dir.exists() and curr_dir.parent != curr_dir:
+            unresolved_parts.insert(0, curr_dir.name)
+            curr_dir = curr_dir.parent
+        if (
+            curr_dir.exists()
+            and curr_dir.is_dir()
+            and unresolved_parts != [requested.name]
+        ):
+            matched_all = True
+            for part in unresolved_parts:
+                if not curr_dir.is_dir():
+                    matched_all = False
+                    break
+                part_lower = part.lower()
+                matches = [
+                    e for e in curr_dir.iterdir() if e.name.lower() == part_lower
+                ]
+                if len(matches) == 1:
+                    curr_dir = matches[0]
+                else:
+                    matched_all = False
+                    break
+            if matched_all and curr_dir.is_file() and curr_dir != requested:
+                return (
+                    curr_dir,
+                    f"Opened case-corrected path '{curr_dir}' instead of '{raw_path}'.",
+                )
+    except OSError:
+        pass
+
+    # 4. Workspace / Project root vs CWD fallback
+    ws_root = None
+    base_dir = None
+    try:
+        ws_root = _authoritative_workspace_root(task_id)
+        base_dir = str(_resolve_base_dir(task_id, container_paths=False))
+        if not Path(raw_path).is_absolute():
+            # Check explicit workspace root
+            if ws_root and ws_root != base_dir:
+                ws_candidate = (Path(ws_root) / raw_path).resolve()
+                if ws_candidate.is_file() and ws_candidate != requested:
+                    return (
+                        ws_candidate,
+                        f"Resolved path relative to workspace root '{ws_root}' instead of working directory.",
+                    )
+            # Check project root by walking up to find .git, pyproject.toml, package.json, config.yaml
+            start_dir = Path(base_dir if base_dir else os.getcwd())
+            proj_root = start_dir
+            while proj_root.parent != proj_root:
+                if (
+                    (proj_root / ".git").exists()
+                    or (proj_root / "pyproject.toml").exists()
+                    or (proj_root / "package.json").exists()
+                    or (proj_root / "config.yaml").exists()
+                ):
+                    break
+                proj_root = proj_root.parent
+            if proj_root != start_dir:
+                proj_cand = (proj_root / raw_path).resolve()
+                if proj_cand.is_file() and proj_cand != requested:
+                    return (
+                        proj_cand,
+                        f"Resolved path relative to project root '{proj_root}' instead of working directory.",
+                    )
+            if base_dir:
+                cwd_candidate = (Path(base_dir) / raw_path).resolve()
+                if cwd_candidate.is_file() and cwd_candidate != requested:
+                    return (
+                        cwd_candidate,
+                        f"Resolved path relative to working directory '{base_dir}'.",
+                    )
+    except Exception:
+        pass
+
+    # 5. Extraneous prefix stripping (e.g. repo name or /workspace/ or workspace/)
+    try:
+        raw_parts = Path(raw_path.lstrip("/\\")).parts
+        if len(raw_parts) > 1:
+            base_p = Path(base_dir if base_dir else os.getcwd())
+            ws_p = Path(ws_root) if ws_root else base_p
+            # Try stripping 1 leading component
+            stripped_1 = Path(*raw_parts[1:])
+            for anchor in (base_p, ws_p):
+                cand = (anchor / stripped_1).resolve()
+                if cand.is_file() and cand != requested:
+                    return (
+                        cand,
+                        f"Stripped leading directory prefix from '{raw_path}' to '{cand}'.",
+                    )
+            # If 2+ components and starts with common container/repo names, try stripping 2
+            if len(raw_parts) > 2 and raw_parts[0].lower() in {
+                "workspace",
+                "config",
+                "app",
+            }:
+                stripped_2 = Path(*raw_parts[2:])
+                for anchor in (base_p, ws_p):
+                    cand = (anchor / stripped_2).resolve()
+                    if cand.is_file() and cand != requested:
+                        return (
+                            cand,
+                            f"Stripped leading directory prefix from '{raw_path}' to '{cand}'.",
+                        )
+    except Exception:
+        pass
+
+    # 6. Unique matching file in workspace tree for non-generic filenames
+    _GENERIC_NAMES = frozenset({
+        "__init__.py",
+        "index.js",
+        "index.ts",
+        "index.html",
+        "setup.py",
+        "pyproject.toml",
+        "package.json",
+        "cargo.toml",
+        "main.py",
+        "app.py",
+        "readme.md",
+        "license",
+        "config.yaml",
+        "config.yml",
+        "config.json",
+        "conftest.py",
+        "makefile",
+        "dockerfile",
+    })
+    filename = requested.name
+    if filename.lower() not in _GENERIC_NAMES and len(filename) > 3:
+        try:
+            ws_root_path = Path(
+                ws_root if ws_root else (base_dir if base_dir else os.getcwd())
+            )
+            if ws_root_path.is_dir():
+                matches = []
+                target_name_lower = filename.lower()
+                for root_dir, dirs, files in os.walk(ws_root_path):
+                    dirs[:] = [
+                        d
+                        for d in dirs
+                        if d
+                        not in {
+                            ".git",
+                            ".venv",
+                            "venv",
+                            "node_modules",
+                            "__pycache__",
+                            ".pytest_cache",
+                            ".claude",
+                        }
+                    ]
+                    for f in files:
+                        if f.lower() == target_name_lower:
+                            matches.append(Path(root_dir) / f)
+                            if len(matches) > 1:
+                                break
+                    if len(matches) > 1:
+                        break
+                if (
+                    len(matches) == 1
+                    and matches[0].is_file()
+                    and matches[0] != requested
+                ):
+                    return (
+                        matches[0],
+                        f"Found unique matching file '{matches[0]}' in workspace for '{raw_path}'.",
+                    )
+        except Exception:
+            pass
+
+    return None, None
 
 
 def _expand_tilde(path: str) -> str:
@@ -1997,8 +2264,36 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # optimization; recording must stay side-effect-identical.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
-            _not_found_json = json.dumps(result_dict, ensure_ascii=False)
-            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
+            # #2411 — auto-repair: try to find an unambiguous valid path
+            # (unicode-equivalent, case-corrected, workspace-root fallback,
+            # prefix-stripped, or unique workspace file) before giving up.
+            repaired_path, repair_note = _find_auto_repaired_path(
+                Path(resolved_str), raw_path=path, task_id=task_id
+            )
+            if repaired_path is not None:
+                repaired = file_ops.read_file(str(repaired_path), offset, limit)
+                repaired_dict = repaired.to_dict()
+                if not repaired_dict.get("error"):
+                    existing_hint = repaired_dict.get("hint") or ""
+                    repaired_dict["hint"] = (
+                        f"{existing_hint} {repair_note}".strip()
+                        if existing_hint
+                        else repair_note
+                    )
+                    result = repaired
+                    result_dict = repaired_dict
+                    _err = ""
+            if isinstance(_err, str) and _err.startswith("File not found:"):
+                # #2293 — if the shell-based _suggest_similar_files found nothing
+                # (no similar_files), fall back to the shared pure-Python module
+                # so the agent still gets a nearby-files hint.
+                if not result_dict.get("similar_files"):
+                    _nearby = suggest_nearby_paths(str(_resolved))
+                    _hint = format_nearby_hint(str(_resolved), _nearby)
+                    if _hint:
+                        result_dict["error"] = _err + "\n\n" + _hint
+                _not_found_json = json.dumps(result_dict, ensure_ascii=False)
+                _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -2927,11 +3222,15 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images. The 'path' parameter can also be a list of paths to read multiple files in one call (batch mode, max 10 files).",
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+            "path": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Path to the file to read (absolute, relative, or ~/path), or a list of up to 10 paths for batch reading",
+            },
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
             "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
         },
@@ -3030,7 +3329,44 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    path = args.get("path", "")
+    # #757/#784 — batch mode: read multiple files in one tool call.
+    if isinstance(path, list):
+        return _handle_read_file_batch(path, args, tid)
+    return read_file_tool(path=path, offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+
+
+_BATCH_READ_MAX_FILES = 10
+
+
+def _handle_read_file_batch(paths: list, args: dict, tid: str) -> str:
+    """Read multiple files in one call. Returns JSON with per-file results."""
+    if len(paths) > _BATCH_READ_MAX_FILES:
+        return json.dumps({
+            "error": (
+                f"Batch read supports at most {_BATCH_READ_MAX_FILES} files per call; "
+                f"got {len(paths)}. Split into smaller batches."
+            ),
+        })
+    offset = args.get("offset", 1)
+    limit = args.get("limit", 500)
+    files = []
+    for p in paths:
+        if not isinstance(p, str):
+            files.append({"path": str(p), "error": "Invalid path type: expected string"})
+            continue
+        raw = read_file_tool(path=p, offset=offset, limit=limit, task_id=tid)
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            parsed = {"raw": raw}
+        entry = {"path": p}
+        if "error" in parsed:
+            entry["error"] = parsed["error"]
+        else:
+            entry.update(parsed)
+        files.append(entry)
+    return json.dumps({"batch": True, "files": files}, ensure_ascii=False)
 
 
 def _handle_write_file(args, **kw):
