@@ -36,7 +36,7 @@ import json
 import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, ClassVar
+from typing import Optional, List, Dict, Any, ClassVar, Tuple
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
 
@@ -201,6 +201,153 @@ def _is_write_denied(path: str) -> bool:
     return _shared_is_write_denied(path)
 
 
+def classify_file_error(
+    error: Optional[str],
+    similar_files: Optional[List[str]] = None,
+    structured_error: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """Classify file operation errors into structured error_class and recovery guidance (#216)."""
+    if not error:
+        return None
+
+    error_lower = error.lower()
+
+    # Promotion from structured_error if present
+    if structured_error:
+        struct_lower = structured_error.lower()
+        if "error type: indentation_mismatch" in struct_lower:
+            return (
+                "indentation_mismatch",
+                "Indentation mismatch detected. Inspect whitespace/indentation of old_string relative to the file content.",
+            )
+        if "error type: escape_drift" in struct_lower and ("escape" in error_lower or "something" in error_lower):
+            return (
+                "escape_drift",
+                "Escape-drift detected. Check for literal backslash sequences in old_string / new_string.",
+            )
+
+    # 1. Permission / protected path
+    if "write denied" in error_lower or "protected" in error_lower or "permission" in error_lower:
+        return (
+            "permission",
+            "Write denied for protected path. Check allowed path permissions or choose a valid workspace location.",
+        )
+
+    # 2. Directory
+    if "cannot read a directory" in error_lower or "cannot patch a directory" in error_lower or "is a directory" in error_lower:
+        return (
+            "directory",
+            "Target is a directory. Use search_files or list_dir instead.",
+        )
+
+    # 3. Not found / fuzzy match with similar files
+    if "file not found" in error_lower or "no such file" in error_lower or "failed to read file" in error_lower:
+        if similar_files:
+            sim_str = ", ".join(similar_files)
+            return (
+                "fuzzy_match",
+                f"File not found. Did you mean one of these similar files: {sim_str}?",
+            )
+        return (
+            "not_found",
+            "File does not exist. Use write_file to create new files or search_files to find existing ones.",
+        )
+
+    # 4. Binary / image
+    if "binary file" in error_lower or "cannot display as text" in error_lower:
+        return (
+            "binary",
+            "Binary file cannot be displayed or edited as text.",
+        )
+
+    # 5. Verification failure
+    if "verification failed" in error_lower:
+        return (
+            "verification",
+            "Post-write verification failed. Re-read the file to inspect the resulting content.",
+        )
+
+    # 6. Escape drift
+    if "escape-drift" in error_lower or "escape drift" in error_lower:
+        return (
+            "escape_drift",
+            "Escape drift detected in backslash sequences. Ensure exact escaping matches the target file.",
+        )
+
+    # 7. Old string empty
+    if "old_string cannot be empty" in error_lower or "old_string is empty" in error_lower:
+        return (
+            "old_string_empty",
+            "old_string must be non-empty. Provide the exact text to replace.",
+        )
+
+    # 8. Ambiguous match / replace all intent
+    if "found" in error_lower and "matches for old_string" in error_lower:
+        if "replace_all" in error_lower:
+            return (
+                "replace_all_intent",
+                "Multiple matches found. If you intended to replace all occurrences, set replace_all=True. Do NOT repeat ambiguous single replacements.",
+            )
+        return (
+            "ambiguous_match",
+            "Multiple matches found for old_string. Provide more surrounding context to disambiguate.",
+        )
+
+    # 9. Patch parse failure
+    if "failed to parse patch" in error_lower or "invalid patch" in error_lower:
+        return (
+            "patch_parse",
+            "Failed to parse patch format. Check patch syntax and unified diff headers.",
+        )
+
+    # 10. Fuzzy match / block no match
+    if (
+        "search block did not match" in error_lower
+        or "could not find a match" in error_lower
+        or "did not match the file content" in error_lower
+    ):
+        return (
+            "fuzzy_match",
+            "Re-read the file to get the EXACT lines including whitespace and line breaks before retrying.",
+        )
+
+    # Fallback to generic error
+    return (
+        "error",
+        "The operation failed with an unexpected error. Review the error message and CHANGE the call arguments.",
+    )
+
+
+def _enrich_search_parse_error(
+    error: str, pattern: str, file_glob: Optional[str] = None
+) -> str:
+    """Enrich regex parse errors with actionable hints (#1588)."""
+    error_lower = error.lower()
+    is_parse_error = (
+        "regex parse error" in error_lower
+        or "invalid regular expression" in error_lower
+        or "unclosed" in error_lower
+        or "repetition" in error_lower
+    )
+    if not is_parse_error:
+        if error.startswith("Search failed:"):
+            return error
+        return f"Search failed: {error}"
+
+    # Check if pattern looks like a glob (e.g. *.py, *.txt) and file_glob wasn't already specified
+    # Note: bare bracket like '[' is a regex bracket, not a glob.
+    is_glob_like = (
+        bool(re.match(r"^\*+\.[a-zA-Z0-9_-]+$", pattern.strip()))
+        or (pattern.startswith("*") and "[" not in pattern and "(" not in pattern and "?" not in pattern)
+    )
+    if is_glob_like and not file_glob:
+        hint = f"Pattern {pattern!r} looks like a file glob. Use target='files' to search for filenames by glob pattern."
+    else:
+        hint = f"Pattern {pattern!r} is not valid regex syntax. Fix the regex syntax or search with literal text."
+
+    return f"Search failed: {error}\n\nHint: {hint}"
+
+
 # =============================================================================
 # Result Data Classes
 # =============================================================================
@@ -222,7 +369,13 @@ class ReadResult:
     similar_files: List[str] = field(default_factory=list)
     
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
+        d = {k: v for k, v in self.__dict__.items() if v is not None and v != []}
+        if self.error:
+            classified = classify_file_error(self.error, similar_files=self.similar_files)
+            if classified:
+                d["error_class"] = classified[0]
+                d["recovery"] = classified[1]
+        return d
 
 
 @dataclass
@@ -258,6 +411,7 @@ class PatchResult:
     files_modified: List[str] = field(default_factory=list)
     files_created: List[str] = field(default_factory=list)
     files_deleted: List[str] = field(default_factory=list)
+    similar_files: List[str] = field(default_factory=list)
     lint: Optional[Dict[str, Any]] = None
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
@@ -282,12 +436,18 @@ class PatchResult:
             result["files_created"] = self.files_created
         if self.files_deleted:
             result["files_deleted"] = self.files_deleted
+        if self.similar_files:
+            result["similar_files"] = self.similar_files
         if self.lint:
             result["lint"] = self.lint
         if self.lsp_diagnostics:
             result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
             result["error"] = self.error
+            classified = classify_file_error(self.error, similar_files=self.similar_files)
+            if classified:
+                result["error_class"] = classified[0]
+                result["recovery"] = classified[1]
         return result
 
 
@@ -1541,8 +1701,9 @@ class ShellFileOperations(FileOperations):
                 )
                 result.hint = f"{note} {result.hint}" if result.hint else note
                 return result
-            # No equivalent spelling — suggest similar files
-            return self._suggest_similar_files(path)
+            # No equivalent spelling — diagnose failure (dir, perm, or similar files)
+            err, sims = self._diagnose_read_failure(path)
+            return ReadResult(error=err, similar_files=sims)
 
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         if stat_output.strip() == NOT_REGULAR_SENTINEL:
@@ -1799,6 +1960,23 @@ class ShellFileOperations(FileOperations):
             error=f"File not found: {path}",
             similar_files=similar
         )
+
+    def _diagnose_read_failure(self, path: str) -> Tuple[str, List[str]]:
+        """Diagnose a read failure by checking existence, directory, permissions, or suggesting similar files (#1488, #1587)."""
+        check_exists = self._exec(f"test -e {self._escape_shell_arg(path)}")
+        stdout_exists = (check_exists.stdout or "").strip().lower()
+        is_existing = check_exists.exit_code == 0 and "no" not in stdout_exists and ("yes" in stdout_exists or stdout_exists == "")
+        if is_existing:
+            check_dir = self._exec(f"test -d {self._escape_shell_arg(path)}")
+            stdout_dir = (check_dir.stdout or "").strip().lower()
+            is_dir = (check_dir.exit_code == 0 and "no" not in stdout_dir and ("yes" in stdout_dir or stdout_dir == ""))
+            if is_dir:
+                return f"Cannot read a directory: {path} is a directory, not a file.", []
+            return f"Permission denied: {path} exists but is not readable.", []
+
+        # File is genuinely missing — suggest similar files
+        res = self._suggest_similar_files(path)
+        return res.error or f"File not found: {path}", res.similar_files
     
     def read_file_raw(self, path: str) -> ReadResult:
         """Read the complete file content as a plain string.
@@ -1809,7 +1987,8 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
         stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
-            return self._suggest_similar_files(path)
+            err, sims = self._diagnose_read_failure(path)
+            return ReadResult(error=err, similar_files=sims)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         if stat_output.strip() == NOT_REGULAR_SENTINEL:
             return self._not_regular_error(path)
@@ -2260,7 +2439,11 @@ class ShellFileOperations(FileOperations):
         read_result = self._exec(read_cmd)
         
         if read_result.exit_code != 0:
-            return PatchResult(error=f"Failed to read file: {path}")
+            err, sims = self._diagnose_read_failure(path)
+            return PatchResult(
+                error=err,
+                similar_files=sims,
+            )
         
         content = read_result.stdout
         # Preserve raw content (including BOM) for write_file's pre_content
@@ -3291,7 +3474,10 @@ class ShellFileOperations(FileOperations):
         # usable match payload remains. Otherwise we keep the real matches.
         if result.exit_code == 2 and not payload.strip():
             error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-            return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
+            return SearchResult(
+                error=_enrich_search_parse_error(error_msg, pattern, file_glob),
+                total_count=0,
+            )
 
         # Parse the diagnostic-free payload so error text never becomes a match.
         stdout = payload
@@ -3506,7 +3692,10 @@ class ShellFileOperations(FileOperations):
         # usable match payload remains.
         if result.exit_code == 2 and not payload.strip():
             error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
-            return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
+            return SearchResult(
+                error=_enrich_search_parse_error(error_msg, pattern, file_glob),
+                total_count=0,
+            )
 
         stdout = payload
         if output_mode == "files_only":
