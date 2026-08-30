@@ -1267,6 +1267,100 @@ def _toolset_signature(tool_defs: List[Dict[str, Any]]) -> str:
     return "|".join(names)
 
 
+# #140 — signature-keyed search-catalog cache. dispatch_tool_search rebuilt the
+# full deferred catalog (classify + tokenize + stem + BM25 index) on EVERY
+# call; under load that per-call cost was the dominant contributor to the
+# tool_search timeout failures (~0.71/session). The catalog is a pure function
+# of the toolset signature + the deferral-relevant config, so cache it exactly
+# like _describe_cache above and let the key invalidate naturally when the tool
+# set or config changes. Names-keyed, same assumption as _describe_cache: two
+# tool sets with identical name sets produce the same catalog.
+_search_catalog_cache: dict[
+    tuple[str, str], tuple[List[Dict[str, Any]], List[CatalogEntry], _CorpusStats]
+] = {}
+_SEARCH_CATALOG_CACHE_MAX = 16
+
+
+def _search_catalog_key(
+    tool_defs: List[Dict[str, Any]], config: ToolSearchConfig
+) -> tuple[str, str]:
+    """Cache key for the search catalog: toolset signature + deferral config."""
+    sig = _toolset_signature(tool_defs)
+    cfg = "|".join(
+        str(getattr(config, f, ""))
+        for f in ("enabled", "threshold_pct", "defer_core_toolsets")
+    )
+    return (sig, cfg)
+
+
+def _build_search_catalog(
+    tool_defs: List[Dict[str, Any]], config: ToolSearchConfig
+) -> tuple[List[Dict[str, Any]], List[CatalogEntry], _CorpusStats]:
+    """classify + build_catalog with a signature-keyed cache (issue #140).
+
+    Returns ``(deferrable, catalog, corpus_stats)``. The deferrable list is
+    cached alongside the catalog because the streak-nudge response surfaces
+    the full deferrable tool list. Bounded like ``_describe_cache``: when the
+    cache exceeds ``_SEARCH_CATALOG_CACHE_MAX`` entries the whole cache is
+    dropped (a fresh toolset signature arrives at most on session/toolset
+    changes, so evicting all is simpler than LRU and never hot).
+    """
+    key = _search_catalog_key(tool_defs, config)
+    cached = _search_catalog_cache.get(key)
+    if cached is not None:
+        return cached
+    _, deferrable = classify_tools(tool_defs, config)
+    catalog = build_catalog(deferrable)
+    corpus_stats = _corpus_stats(catalog)
+    if len(_search_catalog_cache) >= _SEARCH_CATALOG_CACHE_MAX:
+        _search_catalog_cache.clear()
+    _search_catalog_cache[key] = (deferrable, catalog, corpus_stats)
+    return deferrable, catalog, corpus_stats
+
+
+def clear_search_catalog_cache() -> None:
+    """Drop the search-catalog cache (tests, and post-registry-change hooks)."""
+    _search_catalog_cache.clear()
+
+
+def _degraded_search_response(
+    queries: List[str],
+    tool_defs: List[Dict[str, Any]],
+    limit: int,
+    exc: BaseException,
+) -> str:
+    """Issue #140 — degraded-discovery response when the catalog build fails.
+
+    A catalog/index failure must never look like an empty catalog (the agent
+    would conclude the capability is missing and move on silently). Return a
+    valid tool_search payload listing every available tool name, substring-
+    matched per query, with an explicit ``degraded`` flag + reason so the
+    failure is visible and the tool list still surfaces.
+    """
+    names = sorted(
+        (td.get("function") or {}).get("name", "")
+        for td in tool_defs
+        if (td.get("function") or {}).get("name")
+        and (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES
+    )
+    results = []
+    for q in queries:
+        ql = q.lower()
+        matches = [n for n in names if ql in n.lower()][:limit]
+        results.append({"query": q, "matches": matches})
+    return json.dumps(
+        {
+            "queries": queries,
+            "total_available": len(names),
+            "results": results,
+            "tools": {},
+            "degraded": True,
+            "degraded_reason": f"catalog build failed: {exc!r}",
+        },
+        ensure_ascii=False,
+    )
+
+
 def _shared_tool_record(entry: CatalogEntry) -> Dict[str, Any]:
     """One record for the response's shared ``tools`` map.
 
@@ -1372,12 +1466,17 @@ def dispatch_tool_search(
             ),
         )
 
-    _, deferrable = classify_tools(current_tool_defs, config)
-    catalog = build_catalog(deferrable)
+    try:
+        deferrable, catalog, corpus_stats = _build_search_catalog(
+            current_tool_defs, config
+        )
+    except Exception as exc:  # pragma: no cover - defensive (pure local code)
+        # Issue #140 — degraded discovery: never fail silently. Surface the
+        # tool list with a diagnostic instead of an empty/error catalog.
+        return _degraded_search_response(queries, current_tool_defs, limit, exc)
 
     results: List[Dict[str, Any]] = []
     tools_map: Dict[str, Dict[str, Any]] = {}
-    corpus_stats = _corpus_stats(catalog)
     available_sources = _available_source_summary(catalog) if catalog else []
     all_hits: List[CatalogEntry] = []
     for query in queries:
