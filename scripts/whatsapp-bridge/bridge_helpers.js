@@ -595,6 +595,35 @@ export function createReconnectScheduler(startFn, {
 }
 
 /**
+ * Exponential backoff for reconnect flaps (issue #118).
+ *
+ * The close handler used to reconnect on a fixed 3s delay, so a persistent
+ * 428/503 cycle reconnected every 3s forever — burning gateway attention and
+ * flooding the log (7,985 pattern matches observed in bridge.log). This
+ * helper doubles the delay on every consecutive disconnect and caps it, so a
+ * flap backs off instead of hammering the WhatsApp servers, and a stable
+ * connection (open handler calls reset()) starts from the base delay again.
+ */
+export function createExponentialBackoff({
+  baseDelayMs = 3000,
+  factor = 2,
+  maxDelayMs = 300000,
+} = {}) {
+  let attempts = 0;
+  function next() {
+    attempts += 1;
+    return Math.min(Math.round(baseDelayMs * Math.pow(factor, attempts - 1)), maxDelayMs);
+  }
+  function reset() {
+    attempts = 0;
+  }
+  function getAttempts() {
+    return attempts;
+  }
+  return { next, reset, getAttempts };
+}
+
+/**
  * Version resolution guard. fetchLatestBaileysVersion() is a plain fetch to
  * raw.githubusercontent.com with no AbortSignal; a stalled connection can
  * pend forever and wedge the reconnect path (the scheduler above cannot

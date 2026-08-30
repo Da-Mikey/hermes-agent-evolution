@@ -16,12 +16,52 @@
 import { strict as assert } from 'node:assert';
 
 import {
+  createExponentialBackoff,
   createReconnectScheduler,
   createVersionResolver,
 } from './bridge_helpers.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// -- createExponentialBackoff ----------------------------------------------
+
+// Delays double per consecutive attempt and are capped at maxDelayMs.
+{
+  const backoff = createExponentialBackoff({ baseDelayMs: 3000, factor: 2, maxDelayMs: 24000 });
+  assert.deepEqual(
+    [backoff.next(), backoff.next(), backoff.next(), backoff.next()],
+    [3000, 6000, 12000, 24000],
+  );
+  // Capped: stays at max, never exceeds it.
+  assert.equal(backoff.next(), 24000);
+  assert.equal(backoff.next(), 24000);
+  assert.equal(backoff.getAttempts(), 6);
+}
+
+// reset() returns the sequence to the base delay (stable connection).
+{
+  const backoff = createExponentialBackoff({ baseDelayMs: 1000, maxDelayMs: 8000 });
+  backoff.next();
+  backoff.next();
+  assert.equal(backoff.getAttempts(), 2);
+  backoff.reset();
+  assert.equal(backoff.getAttempts(), 0);
+  assert.equal(backoff.next(), 1000);
+}
+
+// Defaults: 3s base, x2, 5-minute cap.
+{
+  const backoff = createExponentialBackoff();
+  assert.equal(backoff.next(), 3000);
+  assert.equal(backoff.next(), 6000);
+  assert.equal(backoff.next(), 12000);
+  // Reaches and clamps at the 5-minute cap after enough consecutive failures.
+  const sequence = [];
+  for (let i = 0; i < 8; i += 1) sequence.push(backoff.next());
+  assert.equal(sequence[sequence.length - 1], 300000);
+  assert.equal(backoff.next(), 300000); // stays clamped
+}
 
 // -- createReconnectScheduler ---------------------------------------------
 
