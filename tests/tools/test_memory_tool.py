@@ -5,6 +5,7 @@ import logging
 
 import pytest
 from pathlib import Path
+from typing import Any, Dict
 
 from tools.memory_tool import (
     BLOCKED_WARNINGS_FILE,
@@ -1490,6 +1491,89 @@ class TestAutoEvictOnFull:
         s = MemoryStore(memory_char_limit=100)
         assert s.auto_evict_on_full is True
         assert s.auto_evict_keep_min >= 1
+
+
+class TestAutoEvictionOnReplaceOverflow:
+    """Issue #129 — replace-overflow auto-eviction, twin of the #1283 add path.
+
+    The nightly dreaming pipeline's memory REPLACE writes at cap were
+    hard-rejected ('Replacement would put memory at N/M chars') while a bare
+    add auto-evicted — so consolidation died exactly when memory was fullest.
+    These pin the replace path to evict the OLDEST entries (never the entry
+    being replaced) until the replaced set fits, degrading to the pre-#129
+    hard-reject only when eviction can't fit it.
+    """
+
+    @staticmethod
+    def _store(tmp_path, monkeypatch, **kw):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        defaults: Dict[str, Any] = dict(memory_char_limit=80, user_char_limit=80)
+        defaults.update(kw)
+        s = MemoryStore(**defaults)
+        s.load_from_disk()
+        return s
+
+    def test_replace_overflow_evicts_oldest_others(self, tmp_path, monkeypatch):
+        # a,b,c = 9 chars with the "\n§\n" delimiter; limit 80.
+        s = self._store(tmp_path, monkeypatch)
+        for entry in ("a", "b", "c"):
+            s.add("memory", entry)
+        replacement = "x" * 75  # 83 chars total -> needs exactly one eviction
+        result = s.replace("memory", "c", replacement)
+        assert result["success"] is True
+        assert "evicted" in json.dumps(result)
+        assert "1 oldest entr" in json.dumps(result)
+        # Oldest OTHER entry ("a") went; the replacement and "b" survived.
+        assert s._entries_for("memory") == ["b", replacement]
+
+    def test_replace_overflow_never_evicts_the_replacement(self, tmp_path, monkeypatch):
+        # Replacing the OLDEST entry: the replacement must survive and the
+        # next-oldest goes instead.
+        s = self._store(tmp_path, monkeypatch)
+        for entry in ("a", "b", "c"):
+            s.add("memory", entry)
+        replacement = "x" * 75  # x\n§\nb\n§\nc = 83 > 80 -> evict "b"
+        result = s.replace("memory", "a", replacement)
+        assert result["success"] is True
+        assert s._entries_for("memory") == [replacement, "c"]
+
+    def test_replace_overflow_respects_safety_floor(self, tmp_path, monkeypatch):
+        # keep_min=2 with 3 entries: only one eviction is allowed, which is
+        # not enough to fit -> fall through to the consolidation failure.
+        s = self._store(
+            tmp_path, monkeypatch, memory_char_limit=60, auto_evict_keep_min=2
+        )
+        for entry in ("a", "b", "c"):
+            s.add("memory", entry)
+        result = s.replace("memory", "c", "x" * 58)  # 66 > 60; one evict -> 62 > 60
+        assert result["success"] is False
+        assert "current_entries" in result
+        assert "retry" in result["error"].lower()
+
+    def test_opt_out_restores_hard_reject(self, tmp_path, monkeypatch):
+        s = self._store(tmp_path, monkeypatch, auto_evict_on_full=False)
+        for entry in ("a", "b", "c"):
+            s.add("memory", entry)
+        result = s.replace("memory", "c", "x" * 75)
+        assert result["success"] is False
+        assert "evicted" not in json.dumps(result)
+        assert "current_entries" in result
+
+    def test_user_target_never_auto_evicts(self, tmp_path, monkeypatch):
+        # User profile facts are scarce/high-value: keep the manual path.
+        s = self._store(tmp_path, monkeypatch, memory_char_limit=80, user_char_limit=40)
+        s.add("user", "a")
+        result = s.replace("user", "a", "y" * 60)
+        assert result["success"] is False
+        assert "evicted" not in json.dumps(result)
+
+    def test_replacement_alone_over_limit_still_rejects(self, tmp_path, monkeypatch):
+        # The new entry itself exceeds the limit -> eviction cannot help.
+        s = self._store(tmp_path, monkeypatch, memory_char_limit=20)
+        s.add("memory", "a")
+        result = s.replace("memory", "a", "z" * 40)
+        assert result["success"] is False
+        assert "current_entries" in result
 
 
 class TestBomToleranceInMemoryFiles:

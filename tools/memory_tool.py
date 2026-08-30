@@ -736,6 +736,52 @@ class MemoryStore:
                 return None
             evicted.append(parse_provenance(working.pop(0))[0])
 
+    def _evict_replacement_to_fit(
+        self,
+        target: str,
+        entries: List[str],
+        new_text: str,
+        limit: int,
+    ) -> Optional[Tuple[List[str], List[str]]]:
+        """Evict OLDEST entries (never ``new_text``) until the list fits ``limit``.
+
+        Issue #129 — the replace-path twin of ``_evict_to_fit`` (#1283): the
+        add path auto-evicts on overflow but replace still hard-rejected, so
+        nightly consolidation (dreaming) writes at cap died with
+        'Replacement would put memory at N/M chars'. The caller passes the
+        working list ALREADY containing the replacement at its target index;
+        this evicts the oldest OTHER entries (matched by stored text so the
+        replacement itself is never a victim) until the list fits.
+
+        Returns ``(evicted_display_texts, surviving_entries)`` — oldest-first
+        texts plus the exact surviving list — or ``None`` when it still
+        doesn't fit (the replacement alone exceeds the limit, or the safety
+        floor ``auto_evict_keep_min`` was reached). Callers must treat
+        ``None`` as "give up and return the consolidation-failure response",
+        exactly like the add path. Only the ``memory`` target is eligible;
+        ``user`` facts are scarce/high-value and keep the manual path.
+        """
+        if not self.auto_evict_on_full or target != "memory":
+            return None
+
+        working = list(entries)
+        evicted: List[str] = []
+
+        while True:
+            if len(ENTRY_DELIMITER.join(working)) <= limit:
+                return evicted, working
+            # Can't evict further without breaching the safety floor.
+            if len(working) <= self.auto_evict_keep_min:
+                return None
+            # Oldest entry that is not the replacement itself.
+            victim = next(
+                (i for i, e in enumerate(working) if e != new_text),
+                None,
+            )
+            if victim is None:
+                return None
+            evicted.append(parse_provenance(working.pop(victim))[0])
+
     def _char_limit(self, target: str, dynamic_limit: Optional[int] = None) -> int:
         """Return the effective char limit for ``target``.
 
@@ -991,6 +1037,28 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(test_entries))
 
             if new_total > limit:
+                # Issue #129 — mirror the add-path auto-eviction (#1283) for
+                # replace-overflow: evict the OLDEST entries (never the entry
+                # being replaced) until the replaced set fits, instead of
+                # hard-rejecting the nightly consolidation (dreaming) writes
+                # that run at cap. ``None`` degrades to the pre-#129 response.
+                outcome = self._evict_replacement_to_fit(
+                    target, test_entries, stored_new, limit
+                )
+                if outcome is not None:
+                    evicted, surviving = outcome
+                    self._set_entries(target, surviving)
+                    self.save_to_disk(target)
+                    logger.info(
+                        "memory replace overflow: evicted %d old entr%s to fit",
+                        len(evicted),
+                        "y" if len(evicted) == 1 else "ies",
+                    )
+                    return self._success_response(
+                        target,
+                        "Entry replaced (evicted %d oldest entr%s to make room)."
+                        % (len(evicted), "y" if len(evicted) == 1 else "ies"),
+                    )
                 current = self._char_count(target)
                 return self._consolidation_failure({
                     "success": False,
