@@ -1709,6 +1709,47 @@ _GREP_OPTIONS_WITH_ARG = {
 _GREP_SHORT_OPTIONS_WITH_ARG = {"A", "B", "C", "D", "d", "e", "f", "m"}
 
 
+def _inside_quote_or_substitution(command: str, start: int) -> bool:
+    """Return True when *start* sits inside an enclosing quote or ``$(...)``.
+
+    Used to skip command words that lex mid-quote (e.g. a ``grep`` inside
+    ``"$(grep -n ...)"``): tokenizing from there sees the enclosing quote as
+    unbalanced and reports a malformed parse, which the hardline detector
+    treats as an unconditional block. Such a word is not the top-level
+    command whose quoted PCRE operands get masked, so skipping it is
+    fail-safe — raw detection still sees the full command.
+    """
+    quote: str | None = None
+    escaped = False
+    sub_depth = 0
+    backtick_open = False
+    i = 0
+    while i < start:
+        char = command[i]
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+            elif quote == '"' and char == "$" and i + 1 < start and command[i + 1] == "(":
+                sub_depth += 1
+            elif quote == '"' and char == "`":
+                backtick_open = True
+        else:
+            if char in {"'", '"'}:
+                quote = char
+            elif char == "$" and i + 1 < start and command[i + 1] == "(":
+                sub_depth += 1
+            elif char == "`":
+                backtick_open = True
+            elif char == ")" and sub_depth > 0:
+                sub_depth -= 1
+        i += 1
+    return quote is not None or sub_depth > 0 or backtick_open
+
+
 def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], bool]:
     """Structurally locate quoted grep PCRE operands.
 
@@ -1725,6 +1766,14 @@ def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], boo
             if os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower() not in {
                 "grep", "egrep",
             }:
+                continue
+            # #122 — a grep word inside an enclosing quote or $(...)
+            # substitution (e.g. `sed -n "$(grep -n ...)"`) cannot be
+            # tokenized from mid-quote: the lexer sees the outer quote as
+            # unbalanced, which previously hard-blocked benign compound
+            # read-only inspection commands as "malformed". Skipping it is
+            # fail-safe: raw detection still sees the full command.
+            if _inside_quote_or_substitution(segment, start):
                 continue
             tokens = _shell_tokens_with_spans(segment, start)
             if tokens is None:
