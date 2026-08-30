@@ -1989,6 +1989,36 @@ _SHELL_DEPENDENT_VERBS = frozenset({
     "check",
 })
 
+# Ambiguous verbs that routinely appear in file/web/gh goals and do not by
+# themselves prove a shell is required — e.g. "run the analysis stage",
+# "check the draft JSON", "test the parser output", "file the issues with gh".
+# Used to separate the AUTO-ADD decision (conservative, full verb set) from
+# the #2826 dispatch GATE (strict, hard verbs only): in sessions where the
+# parent cannot provide `terminal` at all (restricted cron sessions), gating
+# on soft mentions blocked purely file/gh-capable children and deadlocked the
+# evolution pipeline for 14 consecutive cycles (issue #150).
+_SHELL_AMBIGUOUS_VERBS = frozenset({
+    "gh",
+    "build",
+    "test",
+    "run",
+    "install",
+    "make",
+    "service",
+    "compile",
+    "deploy",
+    "lint",
+    "format",
+    "check",
+})
+
+# Verbs that unambiguously require a shell. Matching one of these in a goal
+# while no terminal is available means the dispatch is genuinely doomed, so
+# the #2826 gate still blocks on them.
+_SHELL_REQUIRED_VERBS = frozenset(
+    v for v in _SHELL_DEPENDENT_VERBS if v not in _SHELL_AMBIGUOUS_VERBS
+)
+
 # Verbs that strongly indicate the task requires filesystem access (#3093).
 _FILESYSTEM_DEPENDENT_VERBS = frozenset({
     "file",
@@ -2059,6 +2089,36 @@ def _goal_needs_terminal(goal: str, context: Optional[str] = None) -> bool:
     # Word-boundary match so "git" doesn't match "digit" / "fidget".
     pattern = re.compile(
         r"\b(" + "|".join(re.escape(v) for v in _SHELL_DEPENDENT_VERBS) + r")\b",
+        re.IGNORECASE,
+    )
+    return bool(pattern.search(text))
+
+
+def _goal_hard_requires_terminal(goal: str, context: Optional[str] = None) -> bool:
+    """Return True only for UNambiguous shell-required work (issue #150).
+
+    Same static word-boundary heuristic as ``_goal_needs_terminal`` but
+    matches only ``_SHELL_REQUIRED_VERBS`` — verbs that cannot be satisfied
+    without a shell (git, ssh, docker, pytest, systemctl, ...). Ambiguous
+    verbs (run/check/test/gh/make/...) do not count: they appear in purely
+    file/web/gh goals ("run the analysis stage", "check the draft"), and
+    gating on them blocked file-capable children in sessions where the parent
+    cannot provision `terminal` at all, deadlocking the evolution pipeline.
+
+    The #1369 auto-add keeps the conservative full-verb set — when the parent
+    CAN provide terminal it should always be added for shell-ish goals. This
+    strict variant is for the #2826 dispatch gate, which must not refuse a
+    dispatch the child could actually complete with its other tools.
+    """
+    import re
+
+    text = goal or ""
+    if context:
+        text = f"{text}\n{context}"
+    if not text:
+        return False
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(v) for v in _SHELL_REQUIRED_VERBS) + r")\b",
         re.IGNORECASE,
     )
     return bool(pattern.search(text))
@@ -3450,8 +3510,18 @@ def _child_blocked_no_terminal(task_index: int, goal: str, child) -> Optional[Di
     the task needs one). The _build_child_agent auto-add already widened the
     child when the parent could provide terminal; reaching here without it
     means dispatch would be doomed, so we block visibly instead.
+
+    Issue #150: the gate matches only UNAMBIGUOUS shell verbs
+    (_goal_hard_requires_terminal), not the conservative full set used by the
+    auto-add. In sessions where the parent itself has no `terminal` to give
+    (restricted cron sessions), goals that merely mention ambiguous verbs
+    ("run the analysis stage", "check the draft JSON", "file the issues with
+    gh") previously blocked purely file/gh-capable children, deadlocking the
+    evolution pipeline for 14 consecutive cycles. A dispatch the child can
+    complete with its other tools must not be refused; a bounded failed child
+    run is strictly better than a hard block that never retries.
     """
-    if not _goal_needs_terminal(goal):
+    if not _goal_hard_requires_terminal(goal):
         return None
     _child_ts = getattr(child, "enabled_toolsets", None)
     # Fail-open: only gate when the child declares a concrete toolset list.

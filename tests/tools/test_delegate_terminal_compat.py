@@ -9,7 +9,53 @@ Verifies that:
 
 from types import SimpleNamespace
 
-from tools.delegate_tool import _goal_needs_terminal, _strip_blocked_tools
+from tools.delegate_tool import (
+    _goal_hard_requires_terminal,
+    _goal_needs_terminal,
+    _strip_blocked_tools,
+)
+
+
+class TestGoalHardRequiresTerminal:
+    """#150: the dispatch gate's strict detector — only unambiguous shell
+    verbs count, so file/gh-capable children are not blocked on soft
+    mentions (run/check/test/gh/...)."""
+
+    def test_hard_verbs_detected(self):
+        for goal in [
+            "git status in the repo",
+            "ssh into the host",
+            "docker build the image",
+            "Run pytest on the new test file",
+            "restart the daemon with systemctl",
+            "pip install the dependency",
+            "curl the endpoint",
+        ]:
+            assert _goal_hard_requires_terminal(goal), f"Expected for: {goal!r}"
+
+    def test_soft_verbs_not_detected(self):
+        """Ambiguous verbs alone must NOT satisfy the strict detector."""
+        for goal in [
+            "run the analysis stage over the latest scan output",
+            "check the draft JSON in ~/.hermes/evolution",
+            "test the parser output against the template",
+            "file the drafted issues with gh",
+            "make the edits and format the file",
+        ]:
+            assert not _goal_hard_requires_terminal(goal), f"Unexpected for: {goal!r}"
+
+    def test_context_scanned_too(self):
+        assert _goal_hard_requires_terminal(
+            "Analyze the results",
+            context="ssh to the host first, then summarize.",
+        )
+
+    def test_empty_and_none_return_false(self):
+        assert not _goal_hard_requires_terminal("")
+        assert not _goal_hard_requires_terminal(None)
+
+    def test_word_boundary_no_false_positive(self):
+        assert not _goal_hard_requires_terminal("The digit count is fidget-driven")
 
 
 class TestGoalNeedsTerminal:
