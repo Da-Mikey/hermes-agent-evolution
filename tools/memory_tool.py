@@ -24,6 +24,7 @@ Design:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -77,6 +78,17 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Sidecar recording threat-blocked memory entries we have already warned about.
+# Keyed by "<filename>|<sha256(entry)>" so a poisoned-on-disk entry warns ONCE
+# per unique text, not once per session start (#138). The raw entry
+# intentionally stays on disk (live state keeps it visible and removable);
+# only the WARNING is deduped — the [BLOCKED:] snapshot replacement is
+# unaffected and still happens on every load.
+BLOCKED_WARNINGS_FILE = ".memory_blocked_warnings.json"
+# Bounded so a long-lived profile cannot grow the sidecar without bound.
+# Dropping an old fingerprint only ever costs one re-warning for that text.
+BLOCKED_WARNINGS_MAX = 512
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +372,10 @@ class MemoryStore:
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+        # Threat-blocked entries already warned about (issue #138). Loaded
+        # lazily from a sidecar under the memory dir so a poisoned entry warns
+        # ONCE across sessions instead of at every session start.
+        self._blocked_warned: Optional[set] = None
 
     def target_enabled(self, target: str) -> bool:
         """Return whether this session's selected built-in store is writable."""
@@ -422,12 +438,19 @@ class MemoryStore:
         # Sanitize entries for the system-prompt snapshot only.  Live state
         # (memory_entries / user_entries) keeps the raw text so the user
         # can see + remove poisoned entries via the memory tool.
+        # Threat-blocked warning dedup (issue #138): entries whose text we
+        # have already warned about are still replaced with the [BLOCKED:]
+        # placeholder — only the WARNING is suppressed, so a poisoned entry
+        # warns once per unique text instead of at every session start.
+        warned = self._load_blocked_warnings()
         sanitized_memory = self._sanitize_entries_for_snapshot(
-            self.memory_entries, "MEMORY.md"
+            self.memory_entries, "MEMORY.md", warned
         )
         sanitized_user = self._sanitize_entries_for_snapshot(
-            self.user_entries, "USER.md"
+            self.user_entries, "USER.md", warned
         )
+        if warned:
+            self._persist_blocked_warnings(warned)
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
@@ -436,7 +459,11 @@ class MemoryStore:
         }
 
     @staticmethod
-    def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
+    def _sanitize_entries_for_snapshot(
+        entries: List[str],
+        filename: str,
+        warned: Optional[set] = None,
+    ) -> List[str]:
         """Return ``entries`` with any threat-matching entry replaced by a placeholder.
 
         Each entry is scanned with the shared threat-pattern library at the
@@ -455,6 +482,7 @@ class MemoryStore:
         """
         from tools.threat_patterns import scan_for_threats
 
+        warned = warned if warned is not None else set()
         sanitized: List[str] = []
         for entry in entries:
             if not entry or entry.startswith("[BLOCKED:"):
@@ -462,11 +490,20 @@ class MemoryStore:
                 continue
             findings = scan_for_threats(entry, scope="strict")
             if findings:
-                logger.warning(
-                    "Memory entry from %s blocked at load time: %s",
-                    filename,
-                    ", ".join(findings),
-                )
+                # Warn ONCE per unique entry text (issue #138): the raw entry
+                # stays on disk by design (live state keeps it visible and
+                # removable), so without dedup the same poisoned entry would
+                # re-warn at every session start. The fingerprint changes when
+                # the entry text changes, so an edited entry that still matches
+                # re-warns — the suppression is per-text, not permanent.
+                fp = f"{filename}|{hashlib.sha256(entry.encode('utf-8')).hexdigest()}"
+                if fp not in warned:
+                    logger.warning(
+                        "Memory entry from %s blocked at load time: %s",
+                        filename,
+                        ", ".join(findings),
+                    )
+                    warned.add(fp)
                 sanitized.append(
                     f"[BLOCKED: {filename} entry contained threat pattern(s): "
                     f"{', '.join(findings)}. Removed from system prompt; "
@@ -478,6 +515,46 @@ class MemoryStore:
                 # untagged entries this is the entry verbatim.
                 sanitized.append(parse_provenance(entry)[0])
         return sanitized
+
+    def _load_blocked_warnings(self) -> set:
+        """Load the set of already-warned blocked-entry fingerprints.
+
+        Best-effort: any read/parse failure degrades to an empty set — the
+        only cost is one extra warning on the next load. Results are cached
+        on the instance so repeated loads in one session read the file once.
+        """
+        if self._blocked_warned is not None:
+            return self._blocked_warned
+        warned: set = set()
+        try:
+            path = get_memory_dir() / BLOCKED_WARNINGS_FILE
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    warned = {str(item) for item in data if isinstance(item, str)}
+        except (OSError, ValueError):
+            logger.debug("Could not read blocked-warning dedup file", exc_info=True)
+        self._blocked_warned = warned
+        return warned
+
+    def _persist_blocked_warnings(self, warned: set) -> None:
+        """Persist the warned-fingerprint set (bounded, best-effort)."""
+        try:
+            items = sorted(warned)
+            # Bounded: keep only the most recent BLOCKED_WARNINGS_MAX
+            # fingerprints so a long-lived profile cannot grow the sidecar
+            # without bound. Dropping an old fingerprint only ever costs one
+            # re-warning for that exact text.
+            if len(items) > BLOCKED_WARNINGS_MAX:
+                items = items[-BLOCKED_WARNINGS_MAX:]
+            get_memory_dir().mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                get_memory_dir() / BLOCKED_WARNINGS_FILE,
+                json.dumps(items, indent=2, sort_keys=True) + "\n",
+                tmp_prefix=".mem_",
+            )
+        except (OSError, ValueError, RuntimeError):
+            logger.debug("Could not persist blocked-warning dedup file", exc_info=True)
 
     # Max time to wait for a file lock before giving up with a clear error.
     _LOCK_TIMEOUT_SECONDS = 10.0
