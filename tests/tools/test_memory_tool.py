@@ -828,7 +828,7 @@ class TestMemoryToolDispatcher:
             memory_tool(action="add", target=42, content="via tool", store=store)
         )
         assert result["success"] is False
-        assert "Invalid target" in result["error"]
+        assert "Invalid memory target" in result["error"]
 
     def test_unknown_action(self, store):
         result = json.loads(memory_tool(action="unknown", store=store))
