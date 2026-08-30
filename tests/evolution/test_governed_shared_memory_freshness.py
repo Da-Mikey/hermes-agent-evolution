@@ -35,7 +35,9 @@ class ReadWithFreshnessTests(unittest.TestCase):
         store = GovernedSharedMemory()
         store.write(key="rule", value="keep logs 7d", author_id="a1")
         successor = store.write(
-            key="rule-v2", value="keep logs 30d", author_id="a2",
+            key="rule-v2",
+            value="keep logs 30d",
+            author_id="a2",
             supersedes_key="rule",
         )
         record, signal = store.read_with_freshness("rule")
@@ -49,8 +51,9 @@ class ReadWithFreshnessTests(unittest.TestCase):
         """The whole point of #3336: active_only read silently hides; freshness read flags."""
         store = GovernedSharedMemory()
         store.write(key="rule", value="old constraint", author_id="a1")
-        store.write(key="rule-v2", value="new constraint", author_id="a1",
-                    supersedes_key="rule")
+        store.write(
+            key="rule-v2", value="new constraint", author_id="a1", supersedes_key="rule"
+        )
         self.assertIsNone(store.read(key="rule", active_only=True))
         _, signal = store.read_with_freshness("rule")
         self.assertEqual(signal.status, "superseded")

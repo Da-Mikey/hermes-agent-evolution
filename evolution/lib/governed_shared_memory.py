@@ -155,9 +155,7 @@ class GovernedSharedMemory:
             return None, FreshnessSignal(status="unknown")
         if not record.is_active and record.superseded_by:
             successor = self._records.get(record.superseded_by)
-            superseded_at = (
-                successor.created_at_ms if successor is not None else None
-            )
+            superseded_at = successor.created_at_ms if successor is not None else None
             return record, FreshnessSignal(
                 status="superseded",
                 superseded_by=record.superseded_by,
