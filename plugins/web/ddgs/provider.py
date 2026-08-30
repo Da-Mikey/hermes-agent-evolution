@@ -368,12 +368,18 @@ class DDGSWebSearchProvider(WebSearchProvider):
             )
             from tools import web_tools
 
-            if web_tools._search_backend_fallback_chain():
+            # New design (8adef09be8): the dispatcher's one-shot keyless
+            # rescue fires on success=False when `_rescue_eligible` — the
+            # configured-fallback-chain check (`_search_backend_fallback_chain`)
+            # was superseded by the keyless rescue tier in the upstream sync.
+            if web_tools._rescue_eligible(self):
                 return {
                     "success": False,
                     "error": (
                         "DuckDuckGo returned no results. The provider is likely blocking "
-                        "automated queries. Falling back to next search_backend fallback in config.yaml."
+                        "automated queries; the dispatcher's fallback rescue tier will "
+                        "serve the next attempt. If this persists, configure a different "
+                        "search_backend (e.g. searxng) via `hermes tools` or config.yaml."
                     ),
                 }
 

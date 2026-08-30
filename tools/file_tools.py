@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -1977,7 +1978,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        # Pass the RESOLVED absolute path (not the raw user-supplied path):
+        # FileOperations runs shell commands (wc, sed, head) from the shell's
+        # own cwd, which may differ from the terminal env's tracked cwd — a
+        # raw relative path would not be found there (root cause of #1044;
+        # contract #1066).
+        result = file_ops.read_file(resolved_str, offset, limit)
         result_dict = result.to_dict()
 
         # ── Populate negative-result cache on not-found ───────────────
@@ -3065,13 +3071,256 @@ def _handle_patch(args, **kw):
     )
 
 
+def _looks_like_glob(pattern: str) -> bool:
+    """Heuristic: does *pattern* look like a shell glob rather than a regex?
+
+    Globs use ``*``, ``?``, and ``[...]`` as wildcards without regex escaping.
+    In a regex those same characters are metacharacters, but a bare ``*.py`` or
+    ``*config*`` is almost certainly a glob the model intended as a filename
+    pattern, not a regex. We flag it so the caller can auto-redirect.
+    """
+    if not pattern:
+        return False
+    # A real regex would escape these as \*, \?, \[ — so an unescaped
+    # wildcard is the signal.  ``**/`` (recursive glob) is also glob-only.
+    # Exception: ``.*`` and ``.+`` etc. are common regex idioms where the
+    # ``*``/``+`` quantifier follows a regex metacharacter — those should
+    # NOT be flagged as globs.  The distinguishing signal: in a glob, ``*``
+    # is typically preceded by a literal character (``*.py``, ``*config*``)
+    # or a ``/`` (``**/*.py``), not by a regex metacharacter like ``.``.
+    for i, ch in enumerate(pattern):
+        if ch == "*":
+            if i > 0 and pattern[i - 1] == "\\":
+                continue  # escaped — regex literal
+            if i > 0 and pattern[i - 1] in ".+?^$":
+                # ``.*``, ``+*`` (unusual but not a glob) — ``*`` is a
+                # regex quantifier following a metacharacter, not a glob.
+                # But ``?*`` is ambiguous — treat as regex here since
+                # ``?*`` as a glob is extremely rare.
+                continue
+            if i > 0 and pattern[i - 1] == "*" and i >= 2 and pattern[i - 2] == "*":
+                # ``**`` (recursive glob) — ``**/`` is glob-only
+                if i + 1 < len(pattern) and pattern[i + 1] == "/":
+                    return True
+                continue
+            return True
+        if ch == "?":
+            if i > 0 and pattern[i - 1] == "\\":
+                continue
+            # ``?`` in regex means "zero or one" — preceded by a
+            # metacharacter it's a quantifier, not a glob wildcard.
+            # ``(`` is included so lookarounds ``(?!…)``, ``(?<=…)``,
+            # ``(?:…)`` and other ``(?…)`` groups are NOT misclassified
+            # as glob ``?`` wildcards (#1484 — caused 59 retries/7d).
+            if i > 0 and pattern[i - 1] in ".+*^$[(":
+                continue
+            return True
+    return False
+
+
+def _is_valid_regex(pattern: str) -> bool:
+    """Return True if *pattern* compiles as a valid Python regex.
+
+    Used to short-circuit the glob-vs-regex heuristic in
+    :func:`_handle_search_files`: the guard's only purpose (#887) is to catch
+    patterns that would cause a ripgrep *regex parse error*, and a pattern that
+    compiles cannot cause one.  Treating such a pattern as a glob is a
+    false-positive redirect (e.g. ``"verdict":\\s*null`` — the heuristic sees
+    ``*`` preceded by ``s`` because it does not track the ``\\s`` escape span,
+    yet the pattern compiles and is exactly what the caller wanted to search for).
+    """
+    try:
+        re.compile(pattern)
+        return True
+    except re.error:
+        return False
+
+
+def _glob_to_regex(glob: str) -> str:
+    """Convert a shell glob pattern to an equivalent regex (#1788).
+
+    Translates ``*`` → ``.*``, ``?`` → ``.``, and passes ``[...]`` character
+    classes through (they share syntax between glob and regex).  All other
+    regex metacharacters (``.``, ``+``, ``(``, ``)``, ``{``, ``}``, ``|``,
+    ``^``, ``$``, ``\\``) are escaped so the result is a literal-matching
+    regex.  The output is **not anchored** — callers match substrings.
+    """
+    _REGEX_META = set(".^$+{}\\|()")
+    i = 0
+    n = len(glob)
+    out: list[str] = []
+    while i < n:
+        c = glob[i]
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        elif c == "[":
+            j = i + 1
+            if j < n and glob[j] == "!":
+                j += 1
+            if j < n and glob[j] == "]":
+                j += 1
+            while j < n and glob[j] != "]":
+                j += 1
+            if j < n:
+                out.append(glob[i : j + 1])
+                i = j
+            else:
+                out.append("\\[")
+        elif c in _REGEX_META:
+            out.append("\\" + c)
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _classify_regex_error(pattern: str, exc) -> tuple:
+    """#2308 — decompose a regex compile failure into a sub-cause + recovery.
+
+    The pre-validation in ``_handle_search_files`` catches patterns that fail
+    ``re.compile`` before ripgrep ever sees them, but the returned error was
+    a single generic bucket with no sub-cause and no recovery directive —
+    so the agent blind-retried with near-identical patterns (74/7d, 17-deep
+    spirals). This classifies the ``re.error`` message into a structured
+    reason with a corrected-pattern suggestion.
+
+    Returns ``(reason, recovery)`` where ``reason`` is one of:
+      - ``invalid_regex_syntax`` — malformed regex (unclosed bracket/group,
+        bad escape, dangling quantifier)
+      - ``glob_as_regex`` — a shell glob that slipped past the auto-convert
+        guard (e.g. a ``[!...]`` negation or a pattern the heuristic missed)
+      - ``unsupported_feature`` — a regex feature ripgrep/Python rejects
+      - ``other`` — unclassified compile failure
+    """
+    if exc is None:
+        return (
+            "other",
+            "The regex failed to compile. Read the error text, fix the "
+            "pattern, and re-run — do NOT retry the same pattern unchanged.",
+        )
+    low = str(exc).lower()
+    # #2308 — glob_as_regex is checked BEFORE invalid_regex_syntax because
+    # it is more specific: a pattern containing ``[!`` (glob negation
+    # syntax, which is invalid in Python regex) is almost certainly a
+    # shell glob the model intended as a filename pattern. We key on the
+    # pattern-level signal ``[!`` rather than the error message text,
+    # because "unterminated character set" fires for ANY unclosed ``[``,
+    # including plain malformed regex like ``[unclosed`` that has no glob
+    # intent.
+    if "[!" in pattern:
+        return (
+            "glob_as_regex",
+            "This looks like a shell glob (filename pattern) passed as a "
+            "regex — the '[!' glob negation syntax is not valid regex. Use "
+            "target='files' or move it to the file_glob parameter instead of "
+            "the regex pattern.",
+        )
+    # Unclosed character class / group / dangling quantifier — the classic
+    # malformed-regex family.
+    if any(tok in low for tok in (
+        "unterminated", "unclosed", "missing ), unterminated subpattern",
+        "nothing to repeat", "multiple repeat", "unexpected end of pattern",
+        "bad escape", "invalid escape", "trailing backslash",
+    )):
+        return (
+            "invalid_regex_syntax",
+            "The regex is malformed (unclosed bracket/group, bad escape, or "
+            "dangling quantifier). Fix the syntax — e.g. close the '[' or '(' "
+            "and escape literal metacharacters with '\\'. Do NOT retry the "
+            "same malformed pattern.",
+        )
+    # Lookbehind/lookahead or other engine-specific feature rejection.
+    if any(tok in low for tok in (
+        "look-behind", "lookbehind", "fixed-width", "variable-length",
+        "not supported", "unsupported", "invalid group",
+    )):
+        return (
+            "unsupported_feature",
+            "The regex uses a feature the search engine does not support "
+            "(e.g. variable-width lookbehind). Rewrite it with a supported "
+            "construct — do NOT retry the same pattern.",
+        )
+    return (
+        "other",
+        "The regex failed to compile for an unclassified reason. Read the "
+        "error text, fix the pattern, and re-run — do NOT retry the same "
+        "pattern unchanged.",
+    )
+
+
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
+    pattern = args.get("pattern", "")
+    # Issue #887 / #1788: when the model passes a glob pattern (e.g. ``*.py``)
+    # as the regex ``pattern`` in content-search mode, ripgrep fails with a
+    # regex parse error.  Instead of returning an error and forcing a retry
+    # (#1788 — 227 failures / 300 sessions, 70% glob-as-regex), we now
+    # transparently convert the glob to an equivalent regex and proceed with
+    # the search.  This prevents the error entirely and saves a round-trip.
+    #
+    # The conversion is ONLY applied when the pattern would actually fail
+    # ``re.compile`` — a pattern that compiles is a legitimate regex, even if
+    # it contains glob-like metacharacters (see _is_valid_regex above for the
+    # false-positive rationale).
+    if (
+        target == "content"
+        and not args.get("file_glob")
+        and _looks_like_glob(pattern)
+        and not _is_valid_regex(pattern)
+    ):
+        pattern = _glob_to_regex(pattern)
+
+    # #1588 — when a pattern that does NOT look like a glob still fails to
+    # compile as a regex, ripgrep returns a bare parse error with no guidance,
+    # causing 59/week parse-error spirals. Pre-validate and surface the exact
+    # compile-failure reason plus a glob-vs-regex hint so the agent can fix
+    # the pattern instead of blind-retrying with a near-identical one.
+    # Guard ``file_glob``: when it is set, the caller is intentionally
+    # combining a filename filter with their pattern, so the pattern should
+    # pass through even if it happens to be a bare glob.
+    if (
+        target == "content"
+        and not args.get("file_glob")
+        and not _is_valid_regex(pattern)
+    ):
+        try:
+            re.compile(pattern)
+            compile_reason = ""
+            # Defensive default — this branch is only reached when the
+            # pattern fails _is_valid_regex, so compile always raises, but
+            # keep the classifier result bound for the type checker.
+            reason, recovery = _classify_regex_error(pattern, None)
+        except re.error as exc:
+            compile_reason = str(exc)
+            # #2308 — decompose the compile failure into a structured
+            # sub-cause + recovery directive so the agent fixes the pattern
+            # instead of blind-retrying with a near-identical one.
+            reason, recovery = _classify_regex_error(pattern, exc)
+        return json.dumps(
+            {
+                "error": (
+                    f"Invalid regex pattern {pattern!r}: {compile_reason}.\n\n"
+                    "To fix:\n"
+                    "  - If you meant a literal string, escape regex metacharacters "
+                    "(e.g. replace '[' with '\\[', '*' with '\\*').\n"
+                    "  - If you meant a filename pattern (like '*.py'), use target='files' "
+                    "or move it to the file_glob parameter instead of the regex pattern.\n"
+                    "  - Re-run search_files with a corrected regex pattern."
+                ),
+                # #2308 — structured reason + recovery.
+                "reason": reason,
+                "recovery": recovery,
+            },
+            ensure_ascii=False,
+        )
+
     return search_tool(
-        pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
+        pattern=pattern, target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
