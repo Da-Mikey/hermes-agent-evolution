@@ -43,6 +43,24 @@ class MemoryProvenance:
 
 
 @dataclass
+class FreshnessSignal:
+    """Retrieval-time freshness verdict for a memory key (#3336).
+
+    Attributes:
+        status: One of ``"current"`` (record exists and is active),
+            ``"superseded"`` (record exists but a newer record replaced it),
+            or ``"unknown"`` (no record under this key).
+        superseded_by: Key of the newer record, when ``status`` is
+            ``"superseded"``.
+        superseded_at_ms: Epoch-ms timestamp of the supersession, when known.
+    """
+
+    status: str
+    superseded_by: Optional[str] = None
+    superseded_at_ms: Optional[float] = None
+
+
+@dataclass
 class GovernedMemoryRecord:
     """A governed memory entry with scope, provenance, and supersession links."""
 
@@ -119,6 +137,33 @@ class GovernedSharedMemory:
         if active_only and not record.is_active:
             return None
         return record
+
+    def read_with_freshness(
+        self, key: str
+    ) -> tuple[Optional[GovernedMemoryRecord], FreshnessSignal]:
+        """Read a record together with its supersession freshness signal (#3336).
+
+        Unlike :meth:`read` with ``active_only=True`` — which silently hides a
+        superseded record — this always returns the record (when it exists) and
+        a :class:`FreshnessSignal` telling the caller whether the constraint it
+        is about to act on has been withdrawn by a newer authoritative record.
+        A superseded record is never silently served as if it were current:
+        the caller gets an explicit review signal instead.
+        """
+        record = self._records.get(key)
+        if record is None:
+            return None, FreshnessSignal(status="unknown")
+        if not record.is_active and record.superseded_by:
+            successor = self._records.get(record.superseded_by)
+            superseded_at = (
+                successor.created_at_ms if successor is not None else None
+            )
+            return record, FreshnessSignal(
+                status="superseded",
+                superseded_by=record.superseded_by,
+                superseded_at_ms=superseded_at,
+            )
+        return record, FreshnessSignal(status="current")
 
     def list_by_scope(
         self, scope: str, active_only: bool = True
