@@ -164,6 +164,82 @@ def test_batch_with_unknown_marker_still_rejected():
     assert "template" in result["error"].lower()
 
 
+# --- issue #139: single-word date markers + double-brace forms -------------
+
+
+def test_expand_substitutes_single_word_date_markers():
+    # The cron evolution jobs use {date}/{today} in goal templates; these
+    # single-word markers must be substituted, not left as residual (issue
+    # #139 — regression of the #95 fix).
+    expanded, substituted, residual = expand_template_markers(
+        "write EVOLUTION/research/{date}.md and tag {{today}}",
+        now_iso="2026-08-30T03:15:46Z",
+    )
+    assert "{date}" not in expanded
+    assert "{{today}}" not in expanded
+    assert expanded.count("2026-08-30") == 2
+    assert set(substituted) == {"{date}", "{{today}}"}
+    assert residual == []
+
+
+def test_expand_substitutes_double_brace_now():
+    expanded, substituted, residual = expand_template_markers(
+        "dispatch at {{now}} and <current_date>",
+        now_iso="2026-08-30T03:15:46Z",
+    )
+    assert "{{now}}" not in expanded
+    assert "<current_date>" not in expanded
+    assert "2026-08-30T03:15:46Z" in expanded
+    assert "2026-08-30" in expanded
+    assert residual == []
+
+
+def test_expand_single_word_code_braces_still_untouched():
+    # f-string safety preserved: {i}, {a,b}, generics and HTML tags are not
+    # template markers and must pass through byte-identical (issue #139).
+    text = "iterate {i} over Vec<T> in a <div> and pick {a,b}"
+    expanded, substituted, residual = expand_template_markers(
+        text, now_iso="2026-08-30T03:15:46Z"
+    )
+    assert expanded == text
+    assert substituted == []
+    assert residual == []
+
+
+def test_expand_unresolvable_double_brace_reported_residual():
+    # {{key}} is matched as a template shape but unresolvable — it stays in
+    # the expanded text and is reported residual for the caller to reject,
+    # exactly like <real citation>.
+    expanded, substituted, residual = expand_template_markers(
+        "emit {{key}} in the payload", now_iso="2026-08-30T03:15:46Z"
+    )
+    assert expanded == "emit {{key}} in the payload"
+    assert substituted == []
+    assert residual == ["{{key}}"]
+    # And the batch gate still rejects it loudly.
+    result = _call([{"goal": GOOD_A}, {"goal": "emit {{key}} in the payload"}])
+    assert "error" in result
+    assert "template" in result["error"].lower()
+
+
+def test_marker_token_strips_double_braces():
+    assert _marker_token("{{date}}") == "date"
+    assert _marker_token("{{current_date}}") == "current-date"
+    assert _marker_token("{date}") == "date"
+    assert _marker_token("{{now}}") == "now"
+
+
+def test_batch_with_date_marker_proceeds_after_substitution():
+    # The exact production shape that regressed: a goal carrying the cron
+    # {date} marker must be substituted and dispatched, not rejected.
+    goal = "write EVOLUTION/research/{date}.md from the gathered notes"
+    with patch("tools.delegate_tool._run_single_child") as mock_run:
+        mock_run.side_effect = [_completed(0), _completed(1)]
+        result = _call([{"goal": GOOD_A}, {"goal": goal}])
+    assert "error" not in result
+    assert len(result["results"]) == 2
+
+
 if __name__ == "__main__":
     import pytest
 

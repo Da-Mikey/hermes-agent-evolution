@@ -5106,8 +5106,16 @@ def _recover_tasks_from_json_string(
 # style (`{i}`) must never be rejected (post-merge audit of #81141).
 _PLACEHOLDER_GOAL_RE = re.compile(r"^(todo|task\s*\d+)$", re.IGNORECASE)
 _TEMPLATE_MARKER_RE = re.compile(
-    r"<[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+>"
+    # The double-brace form {{...}} is unambiguous template syntax (no
+    # legitimate code shape uses it), so it is matched at any word count —
+    # this is the shape LLM templates most often leave behind (issue #139).
+    # The single-word alternative matches only the exact known date keys
+    # below, so bare single-word brackets in legit code stay untouched.
+    r"\{\{[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)*\}\}"
+    r"|<[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+>"
     r"|\{[A-Za-z][A-Za-z0-9]*(?:[ _-][A-Za-z0-9]+)+\}"
+    r"|[<{](?:date|current_date|today)[>}]",
+    re.IGNORECASE,
 )
 _MIN_BATCH_GOAL_LEN = 10
 
@@ -5129,18 +5137,31 @@ _TIMESTAMP_MARKER_KEYS = frozenset(
         "now-iso",
         "generated-timestamp",
         "current-datetime",
-        "current-date",
+        "now",
     }
 )
+# Marker keys that resolve to the current UTC date (YYYY-MM-DD) — the shape
+# the evolution stage jobs use in output filenames
+# (research/{current_date}.md, issues/{date}.json, ...). The single-word
+# forms {date}/{today} (and {{...}} spellings) are matched by
+# _TEMPLATE_MARKER_RE (issue #139).
+_DATE_MARKER_KEYS = frozenset({"date", "current-date", "today"})
 # Marker keys that resolve to the originating session id.
 _SESSION_MARKER_KEYS = frozenset({"session-id"})
 
 
 def _marker_token(marker: str) -> str:
-    """Normalize a matched marker (e.g. ``<NOW-ISO>``) to a canonical key."""
+    """Normalize a matched marker (e.g. ``<NOW-ISO>``) to a canonical key.
+
+    Strips up to two bracket pairs so the double-brace template form
+    ``{{date}}`` normalizes to the same key as ``{date}`` (issue #139).
+    """
     inner = (marker or "").strip()
-    if len(inner) >= 2 and inner[0] in "<{" and inner[-1] in ">}":
-        inner = inner[1:-1]
+    for _ in range(2):
+        if len(inner) >= 2 and inner[0] in "<{" and inner[-1] in ">}":
+            inner = inner[1:-1]
+        else:
+            break
     return _MARKER_SEP_RE.sub("-", inner.strip().lower())
 
 
@@ -5164,7 +5185,11 @@ def expand_template_markers(
       remain in ``expanded`` (to be stripped or rejected by the caller).
     """
     now_iso = now_iso if now_iso is not None else _now_iso_utc()
+    # Date-only value (YYYY-MM-DD, UTC) for the date-shaped markers the
+    # evolution stage jobs use in output filenames (research/{current_date}.md).
+    today = now_iso[:10]
     values: Dict[str, str] = {key: now_iso for key in _TIMESTAMP_MARKER_KEYS}
+    values.update({key: today for key in _DATE_MARKER_KEYS})
     if session_id:
         values.update({key: session_id for key in _SESSION_MARKER_KEYS})
 
