@@ -63,6 +63,24 @@ fi
 
 if [ "$ok" = "1" ]; then
     echo "evolution access-gate: write access to $REPO confirmed — waking agent."
+    # #115 — evolution-introspection works from a pre-computed, ANONYMIZED
+    # digest of session problem-signals (scripts/introspection_extract.py,
+    # issue #89) instead of raw transcripts. Emit it BEFORE the wake-gate
+    # JSON (Hermes cron treats the LAST stdout line as the gate), so the
+    # agent gets the digest without re-deriving it every cycle. Fail-open:
+    # if the extractor is missing or errors, wake anyway — the digest is an
+    # optimization for the prompt, not a gate.
+    _gate_dir="$(cd "$(dirname "$0")" && pwd)"
+    if command -v python3 >/dev/null 2>&1 && [ -f "$_gate_dir/introspection_extract.py" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+            _digest="$(timeout 30 python3 "$_gate_dir/introspection_extract.py" 2>/dev/null)"
+        else
+            _digest="$(python3 "$_gate_dir/introspection_extract.py" 2>/dev/null)"
+        fi
+        if [ -n "$_digest" ]; then
+            printf '\n## Introspection Digest\n%s\n' "$_digest"
+        fi
+    fi
     echo '{"wakeAgent": true}'
 else
     echo "evolution access-gate: no WRITE access to $REPO — skipping agent to avoid burning LLM tokens / web-search quota on work that cannot be pushed (a reachable read-only account still cannot open branches/PRs). Grant the authenticated account push access on $REPO (or run as a writer), then 'gh auth login'."
