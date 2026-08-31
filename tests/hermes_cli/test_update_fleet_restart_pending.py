@@ -424,9 +424,12 @@ def test_startup_warn_silent_when_nothing_pending(capsys):
     assert captured.out == ""
 
 
-def test_main_startup_warning_call(capsys, monkeypatch):
+def test_main_startup_warning_call(capsys, monkeypatch, tmp_path):
     """Verify hermes_cli.main can invoke _warn_pending_fleet_restart_on_startup."""
-    update_cmd._write_fleet_restart_pending_marker()
+    marker_file = tmp_path / "fleet_restart_pending"
+    monkeypatch.setattr(update_cmd, "_fleet_restart_pending_marker_path", lambda: marker_file)
+    marker_file.write_text("pending\n", encoding="utf-8")
+
     # Call through the exported main module attribute
     hermes_main._warn_pending_fleet_restart_on_startup()
     err = capsys.readouterr().err

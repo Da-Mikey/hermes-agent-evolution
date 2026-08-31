@@ -4958,7 +4958,7 @@ def unified_search(query: str, sources: List[SkillSource],
     deduped = list(seen.values())
     deduped.sort(key=lambda r: -_TRUST_RANK.get(r.trust_level, 0))
 
-    _record_retrieval(query, deduped)
+    _record_retrieval(query, deduped[:limit])
 
     return deduped[:limit]
 

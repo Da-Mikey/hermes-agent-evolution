@@ -764,6 +764,33 @@ class TestInit:
             assert a.session_cache_read_tokens == 0
             assert a.session_cache_write_tokens == 0
 
+    def test_reset_session_state_clears_latency_and_output_history(self):
+        """reset_session_state must clear _api_latency_history and _api_output_history."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a._api_latency_history.append(1.5)
+            a._api_output_history.append(42.0)
+            a.session_total_tokens = 500
+            a.session_reasoning_tokens = 100
+
+            a.reset_session_state()
+
+            assert len(a._api_latency_history) == 0
+            assert len(a._api_output_history) == 0
+            assert a.session_total_tokens == 0
+            assert a.session_reasoning_tokens == 0
+            assert a.session_cost_source == "none"
+
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
         with (

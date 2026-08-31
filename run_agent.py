@@ -981,6 +981,12 @@ class AIAgent:
         # False for tool-loop follow-ups (#3040).
         self._is_user_initiated_turn = False
 
+        # API latency and output metrics history (cleared on session boundary)
+        if hasattr(self, "_api_latency_history") and hasattr(self._api_latency_history, "clear"):
+            self._api_latency_history.clear()
+        if hasattr(self, "_api_output_history") and hasattr(self._api_output_history, "clear"):
+            self._api_output_history.clear()
+
         # Context engine reset/transition (works for built-in compressor and plugins)
         self._transition_context_engine_session(
             old_session_id=old_session_id,
