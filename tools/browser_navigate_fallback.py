@@ -143,7 +143,7 @@ def web_extract_fallback(url: str) -> Tuple[Optional[str], Optional[str]]:
         except RuntimeError:
             pass  # no running loop — safe to use asyncio.run
         extracted = asyncio.run(
-            web_extract_tool([url], format="markdown", use_llm_processing=False)
+            web_extract_tool([url], format="markdown")
         )
         parsed = json.loads(extracted)
     except Exception as exc:

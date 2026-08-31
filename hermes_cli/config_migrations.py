@@ -387,8 +387,8 @@ def _migrate_to_23(results: Dict[str, Any], quiet: bool) -> None:
     get_hermes_home = _c.get_hermes_home
     DEFAULT_CONFIG = _c.DEFAULT_CONFIG
 
+    curator_dir = get_hermes_home() / "logs" / "curator"
     try:
-        curator_dir = get_hermes_home() / "logs" / "curator"
         curator_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         results["warnings"].append(f"Could not create {curator_dir}: {e}")

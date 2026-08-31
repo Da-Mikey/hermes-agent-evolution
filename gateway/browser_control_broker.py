@@ -485,8 +485,9 @@ class BrowserControlBroker:
                     self.detach(lane_scope, notify_controller=False)
                 continue
 
-            if existing_entry is not None:
-                existing_scope, existing = existing_entry
+            if existing_entry is None:
+                continue
+            existing_scope, existing = existing_entry
 
             with existing.send_lock:
                 with self._lock:

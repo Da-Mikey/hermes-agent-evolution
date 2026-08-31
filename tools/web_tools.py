@@ -1029,6 +1029,7 @@ async def web_extract_tool(
     urls: List[Any],
     format: str = None,
     char_limit: Optional[int] = None,
+    **kwargs: Any,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.

@@ -1816,13 +1816,15 @@ class AIAgent:
 
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
-        return base_url_host_matches(self._base_url_lower, "openrouter.ai")
+        base_url_lower = getattr(self, "_base_url_lower", "")
+        return base_url_host_matches(base_url_lower, "openrouter.ai")
 
     def _is_copilot_url(self) -> bool:
         """Return True when the base URL targets GitHub Copilot or GitHub Models."""
+        base_url_lower = getattr(self, "_base_url_lower", "")
         return (
-            base_url_host_matches(self._base_url_lower, "api.githubcopilot.com")
-            or base_url_host_matches(self._base_url_lower, "models.github.ai")
+            base_url_host_matches(base_url_lower, "api.githubcopilot.com")
+            or base_url_host_matches(base_url_lower, "models.github.ai")
         )
 
     def _is_copilot_provider(self) -> bool:
@@ -2037,7 +2039,8 @@ class AIAgent:
         provider_lower = (self.provider or "").lower()
         if "glm" not in model_lower and provider_lower != "zai":
             return False
-        if "ollama" in self._base_url_lower or ":11434" in self._base_url_lower:
+        base_url_lower = getattr(self, "_base_url_lower", "")
+        if "ollama" in base_url_lower or ":11434" in base_url_lower:
             return True
         return provider_lower == "ollama"
 
