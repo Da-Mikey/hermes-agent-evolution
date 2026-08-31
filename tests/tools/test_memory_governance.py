@@ -153,3 +153,52 @@ class TestGovernedSearch:
         assert r4["success"] is True
         assert len(r4["results"]) == 1
         assert r4["results"][0].get("superseded_at") is not None
+
+
+class TestMemGuardLifecycle:
+    """#3385: MemGuard lifecycle states and verifier signal encoding/parsing."""
+
+    def test_encode_and_parse_lifecycle_and_verifier(self):
+        from tools.memory_governance import (
+            encode_lifecycle_and_verifier,
+            parse_lifecycle_and_verifier,
+        )
+
+        raw = "learned fact about rust"
+        encoded = encode_lifecycle_and_verifier(
+            raw, lifecycle="provisional", confidence=0.85, verified_by="audit_agent"
+        )
+        assert "⟦lifecycle:provisional⟧" in encoded
+        assert "⟦verifier:confidence=0.85|verified_by=audit_agent⟧" in encoded
+
+        clean, lc, conf, v_by = parse_lifecycle_and_verifier(encoded)
+        assert clean == "learned fact about rust"
+        assert lc == "provisional"
+        assert conf == 0.85
+        assert v_by == "audit_agent"
+
+    def test_promote_provisional_entry(self):
+        from tools.memory_governance import (
+            encode_lifecycle_and_verifier,
+            parse_lifecycle_and_verifier,
+            promote_provisional_entry,
+        )
+
+        entries = [
+            encode_lifecycle_and_verifier(
+                "unverified claim", lifecycle="provisional", confidence=0.4
+            ),
+            "regular active fact",
+        ]
+        res = promote_provisional_entry(
+            entries, "unverified claim", confidence=0.98, verified_by="user"
+        )
+        assert res["success"] is True
+        assert res["promoted"] is True
+
+        clean, lc, conf, v_by = parse_lifecycle_and_verifier(entries[0])
+        assert clean == "unverified claim"
+        assert lc == "active"
+        assert conf == 0.98
+        assert v_by == "user"
+

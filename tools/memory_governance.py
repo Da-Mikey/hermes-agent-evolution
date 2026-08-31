@@ -46,6 +46,13 @@ _SUP_OPEN = "⟦sup:"
 _SUP_CLOSE = "⟧"
 _SUP_RE = re.compile(r"⟦sup:(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)⟧\s*$")
 
+# MemGuard verifier & lifecycle metadata (#3385)
+LIFECYCLE_STATES = ("provisional", "active", "archived")
+DEFAULT_LIFECYCLE = "active"
+_LIFECYCLE_RE = re.compile(r"⟦lifecycle:(provisional|active|archived)⟧\s*$")
+_VERIFIER_RE = re.compile(r"⟦verifier:confidence=([0-9.]+)(?:\|verified_by=([a-zA-Z0-9_-]+))?⟧\s*$")
+
+
 
 def _now_iso() -> str:
     """Current UTC timestamp in the canonical supersession format."""
@@ -139,3 +146,77 @@ def governed_search(
         min_trust=min_trust,
         include_superseded=include_superseded,
     )
+
+
+def encode_lifecycle_and_verifier(
+    text: str,
+    lifecycle: str = "active",
+    confidence: float = 1.0,
+    verified_by: Optional[str] = None,
+) -> str:
+    """Encode MemGuard lifecycle status and verification confidence trailer (#3385)."""
+    text = (text or "").strip()
+    lc = lifecycle if lifecycle in LIFECYCLE_STATES else DEFAULT_LIFECYCLE
+    conf = max(0.0, min(1.0, float(confidence)))
+    v_by = f"|verified_by={verified_by}" if verified_by else ""
+    return f"{text} ⟦verifier:confidence={conf:.2f}{v_by}⟧ ⟦lifecycle:{lc}⟧"
+
+
+def parse_lifecycle_and_verifier(
+    stored: str,
+) -> Tuple[str, str, float, Optional[str]]:
+    """Parse MemGuard lifecycle and verifier metadata from a stored memory entry.
+
+    Returns:
+        Tuple of (clean_text, lifecycle_state, confidence, verified_by)
+    """
+    s = (stored or "").rstrip()
+    lifecycle = DEFAULT_LIFECYCLE
+    m_lc = _LIFECYCLE_RE.search(s)
+    if m_lc:
+        lifecycle = m_lc.group(1)
+        s = s[: m_lc.start()].rstrip()
+
+    confidence = 1.0
+    verified_by = None
+    m_v = _VERIFIER_RE.search(s)
+    if m_v:
+        try:
+            confidence = float(m_v.group(1))
+        except ValueError:
+            confidence = 1.0
+        verified_by = m_v.group(2)
+        s = s[: m_v.start()].rstrip()
+
+    return s, lifecycle, confidence, verified_by
+
+
+def promote_provisional_entry(
+    entries: List[str],
+    match_text: str,
+    confidence: float = 1.0,
+    verified_by: str = "verifier",
+) -> Dict[str, Any]:
+    """Promote a provisional memory entry to active status after verification (#3385)."""
+    match_text = (match_text or "").strip()
+    if not match_text:
+        return {"success": False, "error": "match_text cannot be empty."}
+
+    for i, entry in enumerate(entries):
+        if match_text in entry:
+            clean_text, _, _, _ = parse_lifecycle_and_verifier(entry)
+            entries[i] = encode_lifecycle_and_verifier(
+                clean_text,
+                lifecycle="active",
+                confidence=confidence,
+                verified_by=verified_by,
+            )
+            return {
+                "success": True,
+                "promoted": True,
+                "confidence": confidence,
+                "verified_by": verified_by,
+            }
+
+    return {"success": False, "error": f"No entry matching '{match_text}' found."}
+
