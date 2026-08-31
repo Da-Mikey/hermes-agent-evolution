@@ -81,6 +81,54 @@ __all__ = [
 #: pre-truncation payload so a huge tool result is not held in memory twice.
 _MAX_RESULT_CHARS = 2000
 
+#: Bounded reasoning trace captured per tool call (issue #112). Reasoning can
+#: be long; the store only needs the diagnostic layer, not a full CoT dump.
+_MAX_REASONING_CHARS = 2000
+
+
+def _extract_reasoning(msg: Dict[str, Any]) -> str:
+    """Pull a compact reasoning trace out of an assistant message dict (issue #112).
+
+    Reasoning appears on the wire in three shapes, depending on provider:
+
+    * ``msg["reasoning"]`` — a plain string on some transports.
+    * ``msg["reasoning_content"]`` — the OpenAI chat wire's streaming field.
+    * content blocks: ``msg["content"]`` is a list containing
+      ``{"type": "reasoning", ...}`` entries (Responses API). Their payload
+      lives under ``summary`` (list of ``{"type": "summary_text", "text": ...}``
+      parts), ``content`` (string), or a nested ``reasoning`` object.
+
+    Returns a bounded string (``_MAX_REASONING_CHARS``) or ``""`` when the
+    message carries no reasoning. Never raises: a shape we do not recognise
+    is treated as "no reasoning", not an error — capture must not be able to
+    break the turn it is instrumenting.
+    """
+    if not isinstance(msg, dict):
+        return ""
+    for key in ("reasoning", "reasoning_content"):
+        raw = msg.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()[:_MAX_REASONING_CHARS]
+    content = msg.get("content")
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "reasoning":
+                continue
+            payload = block.get("reasoning") or block
+            summary = payload.get("summary") if isinstance(payload, dict) else None
+            if isinstance(summary, list):
+                for part in summary:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+            body = payload.get("content") if isinstance(payload, dict) else None
+            if isinstance(body, str):
+                parts.append(body)
+        joined = " ".join(p.strip() for p in parts if p and p.strip())
+        return joined[:_MAX_REASONING_CHARS]
+    return ""
+
+
 #: Opt-in. Default OFF.
 #
 # Even redacted, tool arguments carry paths containing usernames, SQL, code
@@ -205,6 +253,7 @@ def extract_tool_calls(
     for msg in messages:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
+        reasoning = _extract_reasoning(msg)
         for tc in msg.get("tool_calls") or []:
             if not isinstance(tc, dict):
                 continue
@@ -235,6 +284,7 @@ def extract_tool_calls(
                 "result": content,
                 "status": _result_status(content) if has_result else "pending",
                 "duration_ms": timings.get(cid) if cid else None,
+                "reasoning_summary": reasoning,
             })
     return calls
 
@@ -307,6 +357,7 @@ def build_trajectory_log(
             result=call["result"],
             status=call["status"],
             duration_ms=call.get("duration_ms"),
+            reasoning_summary=call.get("reasoning_summary", ""),
         )
     return log
 

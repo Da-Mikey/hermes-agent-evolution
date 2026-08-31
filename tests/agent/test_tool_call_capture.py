@@ -142,6 +142,109 @@ class TestExtractToolCalls:
         assert extract_tool_calls([{"role": "assistant", "content": "just text"}]) == []
 
 
+class TestReasoningCapture:
+    """Reasoning traces ride the same tool-call envelope (issue #112)."""
+
+    def test_captures_string_reasoning_field(self):
+        msg = _call("read_file", {"path": "a.py"}, "c1")
+        msg["reasoning"] = "checking imports first"
+        calls = extract_tool_calls([msg, _ok("c1")])
+        assert calls[0]["reasoning_summary"] == "checking imports first"
+
+    def test_captures_reasoning_content_field(self):
+        """OpenAI chat wire carries reasoning as `reasoning_content`."""
+        msg = _call("patch", {}, "c2")
+        msg["reasoning_content"] = "the hunk is off by one"
+        calls = extract_tool_calls([msg, _ok("c2")])
+        assert calls[0]["reasoning_summary"] == "the hunk is off by one"
+
+    def test_captures_responses_api_summary_blocks(self):
+        """Responses API emits reasoning as content blocks with summary parts."""
+        msg = _call("terminal", {"command": "ls"}, "c3")
+        msg["content"] = [
+            {
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "list the dir"},
+                    {"type": "summary_text", "text": "then grep"},
+                ],
+            },
+            {"type": "output_text", "text": "visible prose"},
+        ]
+        calls = extract_tool_calls([msg, _ok("c3")])
+        assert calls[0]["reasoning_summary"] == "list the dir then grep"
+
+    def test_captures_reasoning_content_block_string(self):
+        msg = _call("read_file", {"path": "x"}, "c4")
+        msg["content"] = [{"type": "reasoning", "content": "need the header"}]
+        calls = extract_tool_calls([msg, _ok("c4")])
+        assert calls[0]["reasoning_summary"] == "need the header"
+
+    def test_reasoning_attached_to_every_call_in_batch(self):
+        msg = {
+            "role": "assistant",
+            "reasoning": "batch reasoning",
+            "tool_calls": [
+                {
+                    "id": "a1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                },
+                {
+                    "id": "a2",
+                    "type": "function",
+                    "function": {"name": "patch", "arguments": "{}"},
+                },
+            ],
+        }
+        calls = extract_tool_calls([msg, _ok("a1"), _ok("a2")])
+        assert [c["reasoning_summary"] for c in calls] == [
+            "batch reasoning",
+            "batch reasoning",
+        ]
+
+    def test_reasoning_is_bounded(self):
+        msg = _call("read_file", {}, "c5")
+        msg["reasoning"] = "x" * 5000
+        calls = extract_tool_calls([msg, _ok("c5")])
+        assert len(calls[0]["reasoning_summary"]) == 2000
+
+    def test_no_reasoning_is_empty_string(self):
+        calls = extract_tool_calls([_call("read_file", {}, "c6"), _ok("c6")])
+        assert calls[0]["reasoning_summary"] == ""
+
+    def test_unknown_shapes_do_not_raise(self):
+        """A shape we do not recognise is 'no reasoning', not an error."""
+        for bad in (
+            {"role": "assistant", "reasoning": 42, "tool_calls": []},
+            {"role": "assistant", "reasoning": {"nested": True}, "tool_calls": []},
+            {"role": "assistant", "content": [{"type": "reasoning", "summary": "nope"}],
+             "tool_calls": []},
+            {"role": "assistant", "content": [42, None], "tool_calls": []},
+        ):
+            assert extract_tool_calls([bad]) == []
+
+    def test_build_trajectory_log_roundtrips_reasoning(self, tmp_path):
+        msg = _call("read_file", {"path": "a.py"}, "c7")
+        msg["reasoning"] = "checking imports first"
+        log = build_trajectory_log(
+            [msg, _ok("c7")], session_id="s1", trajectory_dir=tmp_path
+        )
+        assert log is not None
+        entry = log.to_dict()["entries"][0]
+        assert entry["reasoning_summary"] == "checking imports first"
+
+    def test_backcompat_no_reasoning_key_when_empty(self, tmp_path):
+        """Readers written against the pre-#112 shape see no new key."""
+        log = build_trajectory_log(
+            [_call("read_file", {"path": "a.py"}, "c8"), _ok("c8")],
+            session_id="s1",
+            trajectory_dir=tmp_path,
+        )
+        assert log is not None
+        assert "reasoning_summary" not in log.to_dict()["entries"][0]
+
+
 class TestBuildTrajectoryLog:
     def test_carries_outcome_and_pairing_key(self, tmp_path):
         msgs = [_call("read_file", {"path": "a.py"}, "c1"), _ok("c1")]

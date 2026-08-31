@@ -137,6 +137,7 @@ class TrajectoryEntry:
     result_summary: str = ""
     timestamp: str = ""
     duration_ms: Optional[int] = None
+    reasoning_summary: str = ""
 
     def __post_init__(self) -> None:
         if not self.timestamp:
@@ -152,6 +153,12 @@ class TrajectoryEntry:
         }
         if self.duration_ms is not None:
             d["duration_ms"] = self.duration_ms
+        # Emitted only when set (same back-compat pattern as `completed` /
+        # `task_key` on TrajectoryLog): readers written against the pre-reasoning
+        # shape see no new key on the cron-stage trajectories they already
+        # handle (issue #112).
+        if self.reasoning_summary:
+            d["reasoning_summary"] = self.reasoning_summary
         return d
 
     @classmethod
@@ -162,6 +169,7 @@ class TrajectoryEntry:
         result: Any = None,
         status: str = "success",
         duration_ms: Optional[int] = None,
+        reasoning_summary: str = "",
     ) -> "TrajectoryEntry":
         return cls(
             tool=tool,
@@ -169,6 +177,7 @@ class TrajectoryEntry:
             result_status=status,
             result_summary=summarize_result(result),
             duration_ms=duration_ms,
+            reasoning_summary=reasoning_summary,
         )
 
     @classmethod
@@ -241,9 +250,12 @@ class TrajectoryLog:
         result: Any = None,
         status: str = "success",
         duration_ms: Optional[int] = None,
+        reasoning_summary: str = "",
     ) -> None:
         self.add(
-            TrajectoryEntry.from_tool_call(tool, args, result, status, duration_ms)
+            TrajectoryEntry.from_tool_call(
+                tool, args, result, status, duration_ms, reasoning_summary
+            )
         )
 
     def to_dict(self) -> Dict[str, Any]:
