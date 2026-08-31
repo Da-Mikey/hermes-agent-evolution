@@ -21,7 +21,7 @@ from hermes_constants import (
     reset_hermes_home_override,
     set_hermes_home_override,
 )
-from typing import List, Optional
+from typing import Any, List, Optional, Set
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -636,6 +636,44 @@ TASK_COMPLETION_GUIDANCE = (
     "for results you couldn't actually produce. Reporting a blocker honestly "
     "is always better than inventing a result."
 )
+
+def build_nous_subscription_prompt(loaded_tool_names: Optional[Set[str]] = None, config: Any = None) -> str:
+    """Build guidance prompt regarding Nous subscription capabilities (#1647)."""
+    import tools.tool_backend_helpers as tbh
+    if not tbh.managed_nous_tools_enabled():
+        return ""
+
+    import hermes_cli.nous_subscription as ns
+    features = ns.get_nous_subscription_features(config=config)
+
+    if not features:
+        return ""
+
+    if features.subscribed:
+        # Active subscriber
+        active_parts = []
+        for feat_name, feat in (features.features or {}).items():
+            if getattr(feat, "managed_by_nous", False) and getattr(feat, "current_provider", ""):
+                active_parts.append(f"- {feat.label}: powered by {feat.current_provider}")
+            elif feat_name == "modal":
+                active_parts.append("- Modal execution is optional")
+        active_text = "\n".join(active_parts)
+        return (
+            "## Managed Services & Nous Subscription\n"
+            "You have access to managed integrations via your Nous Subscription:\n"
+            f"{active_text}\n"
+            "All required keys for active managed integrations are handled automatically — "
+            "do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys.\n"
+        )
+    else:
+        # Non-subscriber
+        return (
+            "## Optional Integrations & Upgrades\n"
+            "When a user asks for features requiring external paid APIs (e.g. image generation or scraping), "
+            "suggest Nous subscription as one option alongside direct API keys.\n"
+            "Do not mention subscription unless relevant to the requested capabilities.\n"
+        )
+
 
 # Scoped / restricted toolset guidance (#3093).
 # Injected when the session has tools loaded but lacks execution and file-write

@@ -120,7 +120,7 @@ def test_no_budget_stale_timeout_unchanged(monkeypatch, tmp_path):
 
 
 def test_active_budget_caps_implicit_reasoning_floor(monkeypatch, tmp_path):
-    """deepseek-v4-pro's 600s implicit floor yields to a tighter deadline cap.
+    """deepseek-r1's 600s implicit floor yields to a tighter deadline cap.
 
     900s budget, 800s elapsed -> remaining 100s -> cap = max(60, 50) = 60s.
     """
@@ -128,7 +128,7 @@ def test_active_budget_caps_implicit_reasoning_floor(monkeypatch, tmp_path):
     monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
     agent = _make_agent(
         tmp_path, monkeypatch,
-        model="deepseek/deepseek-v4-pro",
+        model="deepseek/deepseek-r1",
         run_budget_seconds=900,
     )
     # Sanity: implicit reasoning floor is 600s without a running clock.
@@ -145,7 +145,7 @@ def test_active_budget_cap_half_remaining(monkeypatch, tmp_path):
     monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
     agent = _make_agent(
         tmp_path, monkeypatch,
-        model="deepseek/deepseek-v4-pro",
+        model="deepseek/deepseek-r1",
         run_budget_seconds=900,
     )
     agent._run_budget_started_at = time.time() - 100  # remaining ~800 -> cap ~400
@@ -190,7 +190,7 @@ def test_budget_without_started_clock_is_inert(monkeypatch, tmp_path):
     monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
     agent = _make_agent(
         tmp_path, monkeypatch,
-        model="deepseek/deepseek-v4-pro",
+        model="deepseek/deepseek-r1",
         run_budget_seconds=900,
     )
     agent._run_budget_started_at = None

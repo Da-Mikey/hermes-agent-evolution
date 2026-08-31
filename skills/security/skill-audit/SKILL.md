@@ -1,6 +1,6 @@
 ---
 name: skill-audit
-description: Standing security review of the Hermes skill store — scan, triage, and propose patches for new, changed, or suspicious skills.
+description: "Standing security review of installed Hermes skills."
 version: 1.0.0
 author: Hermes Evolution
 license: MIT
@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [security, audit, skills, supply-chain, skilltrojan]
-    related_skills: [ai-safe-audit, skill-lifecycle-management, evolution-implementation]
+    related_skills: [ai-safe-audit, evolution-implementation]
 ---
 
 # Skill Audit — standing skill-store security review

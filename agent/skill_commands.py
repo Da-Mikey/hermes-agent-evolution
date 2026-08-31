@@ -428,7 +428,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform, _skill_commands_home
+    global _skill_commands, _colliding_skills, _skill_commands_platform, _skill_commands_home
     platform = _resolve_skill_commands_platform()
     home = _resolve_skill_commands_home()
     # Build into a local map and publish once, at the end. Writing straight
@@ -531,20 +531,21 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
 
         # Pass 2: Register namespaced commands for colliding skills
+        colliding: Dict[str, Dict[str, Any]] = {}
         for name, cmd_name, description, skill_md in pending_colliding:
             namespaced_key = f"/skill-{cmd_name}"
-            if namespaced_key in _skill_commands:
+            if namespaced_key in commands:
                 logger.warning(
                     "Skill %r collides with core command '/%s' and '%s' is already "
                     "claimed by %r; keeping the first and skipping this one.",
-                    name, cmd_name, namespaced_key, _skill_commands[namespaced_key]["name"],
+                    name, cmd_name, namespaced_key, commands[namespaced_key]["name"],
                 )
                 continue
-            if cmd_name in _colliding_skills:
+            if cmd_name in colliding:
                 logger.warning(
                     "Skill %r maps to colliding slug '%s' already claimed "
                     "by %r; keeping the first and skipping this one.",
-                    name, cmd_name, _colliding_skills[cmd_name]["name"],
+                    name, cmd_name, colliding[cmd_name]["name"],
                 )
                 continue
             logger.warning(
@@ -553,7 +554,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 "namespaced command '%s'. Use '%s' or '/skill %s' instead.",
                 name, cmd_name, namespaced_key, namespaced_key, name,
             )
-            _colliding_skills[cmd_name] = {
+            colliding[cmd_name] = {
                 "name": name,
                 "cmd_name": cmd_name,
                 "namespaced_key": namespaced_key,
@@ -561,7 +562,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 "skill_md_path": str(skill_md),
                 "skill_dir": str(skill_md.parent),
             }
-            _skill_commands[namespaced_key] = {
+            commands[namespaced_key] = {
                 "name": name,
                 "description": description or f"Invoke the {name} skill (namespaced due to collision with core /{cmd_name})",
                 "skill_md_path": str(skill_md),
@@ -579,6 +580,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     # the scan above (file I/O, deferred imports) stays outside it.
     with _publish_lock:
         _skill_commands = commands
+        _colliding_skills = colliding
         _skill_commands_platform = platform
         _skill_commands_home = home
     return commands

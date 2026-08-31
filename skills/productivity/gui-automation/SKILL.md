@@ -1,6 +1,10 @@
 ---
 name: gui-automation
-description: Safe, element-anchored cross-platform GUI automation and on-screen element understanding
+description: "Safe, element-anchored cross-platform GUI automation."
+version: 1.0.0
+author: Hermes Evolution
+license: MIT
+platforms: [linux, macos, windows]
 tags: [gui, automation, accessibility, desktop, ui]
 ---
 

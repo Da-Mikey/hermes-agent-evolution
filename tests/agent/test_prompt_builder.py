@@ -18,6 +18,7 @@ from agent.prompt_builder import (
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
     build_context_files_prompt,
+    build_nous_subscription_prompt,
     CONTEXT_FILE_MAX_CHARS,
     _dynamic_context_file_max_chars,
     _get_context_file_max_chars,
@@ -646,6 +647,7 @@ class TestBuildSkillsSystemPrompt:
 
 class TestBuildNousSubscriptionPrompt:
     def test_includes_active_subscription_features(self, monkeypatch):
+        from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
         monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
@@ -672,6 +674,7 @@ class TestBuildNousSubscriptionPrompt:
         assert "do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys" in prompt
 
     def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(self, monkeypatch):
+        from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
         monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",

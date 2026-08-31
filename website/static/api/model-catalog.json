@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-08-29T02:38:32Z",
+  "updated_at": "2026-08-31T14:21:48Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -178,6 +178,14 @@
           "description": "free"
         },
         {
+          "id": "stealth/ox-alpha",
+          "description": "free"
+        },
+        {
+          "id": "openrouter/elephant-alpha",
+          "description": "free"
+        },
+        {
           "id": "z-ai/glm-5.2:free",
           "description": "free"
         },
@@ -311,6 +319,9 @@
         },
         {
           "id": "sakana/fugu-ultra"
+        },
+        {
+          "id": "stealth/ox-alpha"
         }
       ]
     }

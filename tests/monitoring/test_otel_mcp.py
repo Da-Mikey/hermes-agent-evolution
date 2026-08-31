@@ -46,7 +46,7 @@ def test_live_tool_call_emits_execute_tool_event_with_mcp_method_name(monkeypatc
         agent._tool_worker_threads = set()
         agent._tool_worker_threads_lock = threading.Lock()
         agent._invoke_tool = MagicMock(return_value="ok")
-        agent._append_guardrail_observation = lambda name, args, result, failed: result
+        agent._append_guardrail_observation = lambda name, args, result, failed=False, **kw: result
         agent._tool_result_content_for_active_model = lambda name, result: result
         agent._subdirectory_hints = MagicMock()
         agent._subdirectory_hints.check_tool_call.return_value = []

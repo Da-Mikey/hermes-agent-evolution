@@ -202,7 +202,7 @@ def _truncate_mcp_text_result(text: str, max_chars: int = _MCP_HARD_RESULT_CAP_C
     omitted = len(text) - max_chars
     return (
         f"{text[:head_len]}\n\n"
-        f"[{omitted:,} characters omitted — single MCP text result exceeded "
+        f"[TRUNCATED: {omitted:,} characters omitted (total {len(text):,} chars) — single MCP text result exceeded "
         f"{max_chars:,} char ceiling]\n\n"
         f"{text[-tail_len:]}"
     )

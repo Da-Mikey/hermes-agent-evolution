@@ -2296,6 +2296,21 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 _not_found_json = json.dumps(result_dict, ensure_ascii=False)
                 _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
+        if result_dict.get("error"):
+            with _read_tracker_lock:
+                task_data = _read_tracker.setdefault(task_id, {
+                    "consecutive": 0,
+                    "last_key": None,
+                    "read_history": set(),
+                })
+                task_data["total_failures"] = task_data.get("total_failures", 0) + 1
+                fail_count = task_data["total_failures"]
+                if fail_count >= 4:
+                    result_dict["_rate_directive"] = (
+                        f"read_file has failed {fail_count} times in this session. "
+                        "Stop guessing file paths. Use search_files or repo_map to find existing files."
+                    )
+
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
         # the best proxy we have.  If the read produced an unreasonable
@@ -3028,33 +3043,46 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # retries with stale content instead of re-reading the file.
         # Suppressed when patch_replace already attached a rich "Did you mean?"
         # snippet (which is strictly more useful than the generic hint).
-        if result_dict.get("error") and "Could not find" in str(result_dict["error"]):
-            # Track per-file consecutive failures for replace mode.  The
-            # ``path`` arg only exists for replace mode; for V4A patches
-            # we'd need to walk the headers, but in practice V4A failures
-            # are far rarer and the existing _hint covers them adequately.
+        if result_dict.get("error"):
+            # Track per-file consecutive failures for replace mode.
             failure_count = 0
             if mode == "replace" and path:
                 resolved = _path_to_resolved.get(path) or path
                 failure_count = _record_patch_failure(task_id, resolved)
 
-            if failure_count >= 3:
-                # Escalating hint after multiple consecutive failures on the
-                # same path.  Most common cause is a stale view of the file —
-                # the model is retrying with the same old_string against
-                # content that has since changed.  Surface the failure count
-                # so the model recognises it's in a loop and breaks out by
-                # re-reading or falling back to write_file.
+            if failure_count > 3:
+                # 4th failure onwards: Hard stop / PATCH REFUSED (#1037)
+                from tools.fuzzy_match import suggest_closest_match
+                content = ""
+                try:
+                    file_ops = _get_file_ops(task_id)
+                    read_res = file_ops.read_file_raw(str(resolved))
+                    content = read_res.content or ""
+                except Exception:
+                    pass
+                closest = suggest_closest_match(old_string, content) if (content and old_string) else ""
+                refusal_msg = f"PATCH REFUSED: 3 consecutive patch attempts failed on {path}."
+                if closest:
+                    refusal_msg += f" Closest matching content in file:\n{closest}"
+                refusal_msg += " Use read_file to view the current file content, or write_file to overwrite."
+                result_dict["error"] = refusal_msg
+                result_dict["_hint"] = "PATCH REFUSED. Stop retrying; switch to write_file or re-read the file."
+            elif failure_count == 3:
+                # 3rd consecutive failure: PERMANENT FAILURE escalation (#507)
                 result_dict["_hint"] = (
-                    f"This is failure #{failure_count} patching {path!r}. "
+                    f"This is failure #3 (PERMANENT FAILURE) patching {path!r}. "
                     "Stop retrying with variations of the same old_string. "
-                    "Either: (1) re-read the file fresh to verify current "
-                    "content, (2) use a longer / more unique old_string with "
-                    "surrounding context lines, or (3) use write_file to "
-                    "replace the entire file if the targeted region is hard "
-                    "to anchor."
+                    "Either: (1) re-read the file fresh to verify current content, "
+                    "(2) use a longer / more unique old_string with surrounding context lines, "
+                    "or (3) use write_file to replace the entire file if the targeted region is hard to anchor."
                 )
-            elif "Did you mean one of these sections?" not in str(result_dict["error"]):
+            elif failure_count == 2:
+                # 2nd consecutive failure: softer write_file nudge (#1537)
+                result_dict["_hint"] = (
+                    f"This is failure #2 patching {path!r}. "
+                    "Consider switching to write_file if the exact snippet cannot be located."
+                )
+            elif "Did you mean one of these sections?" not in str(result_dict.get("error", "")) and "Could not find" in str(result_dict.get("error", "")):
                 result_dict["_hint"] = (
                     "old_string not found. Use read_file to verify the current "
                     "content, or search_files to locate the text."

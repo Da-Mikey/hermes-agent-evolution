@@ -1903,51 +1903,60 @@ class ShellFileOperations(FileOperations):
         return None
 
     def _suggest_similar_files(self, path: str) -> ReadResult:
-        """Suggest similar files when the requested file is not found."""
+        """Suggest similar files when the requested file is not found (#886, #1587)."""
         dir_path = os.path.dirname(path) or "."
         filename = os.path.basename(path)
         basename_no_ext = os.path.splitext(filename)[0]
         ext = os.path.splitext(filename)[1].lower()
         lower_name = filename.lower()
 
-        # List files in the target directory
-        ls_cmd = f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50"
-        ls_result = self._exec(ls_cmd)
+        # Check if dir exists or walk up ancestors
+        dir_check = self._exec(f"test -d {self._escape_shell_arg(dir_path)}")
+        dir_exists = (dir_check.exit_code == 0 and "no" not in (dir_check.stdout or "").lower())
 
-        scored: list = []  # (score, filepath) — higher is better
-        if ls_result.exit_code == 0 and ls_result.stdout.strip():
-            for f in ls_result.stdout.strip().split('\n'):
-                if not f:
-                    continue
+        ancestor_note = ""
+        scored: list = []  # (score, filepath)
+        all_entries: list = []
+        if not dir_exists:
+            # Walk up to find closest existing ancestor directory
+            curr = dir_path
+            while curr and curr not in (".", "/"):
+                parent = os.path.dirname(curr) or "."
+                check = self._exec(f"test -d {self._escape_shell_arg(parent)}")
+                if check.exit_code == 0 and "no" not in (check.stdout or "").lower():
+                    ancestor_note = f" (directory '{dir_path}' does not exist; closest existing ancestor is '{parent}')"
+                    break
+                curr = parent
+            if not ancestor_note:
+                ancestor_note = f" (directory '{dir_path}' does not exist)"
+        else:
+            ls_cmd = f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50"
+            ls_result = self._exec(ls_cmd)
+            if ls_result.exit_code == 0 and ls_result.stdout.strip():
+                for f in ls_result.stdout.strip().split('\n'):
+                    if not f:
+                        continue
+                    all_entries.append(f)
                 lf = f.lower()
                 score = 0
 
-                # Exact match (shouldn't happen, but guard)
                 if lf == lower_name:
                     score = 100
-                # Same base name, different extension (e.g. config.yml vs config.yaml)
                 elif os.path.splitext(f)[0].lower() == basename_no_ext.lower():
                     score = 90
-                # Target is prefix of candidate or vice-versa
                 elif lf.startswith(lower_name) or lower_name.startswith(lf):
                     score = 70
-                # Substring match (candidate contains query)
                 elif lower_name in lf:
                     score = 60
-                # Reverse substring (query contains candidate name)
                 elif lf in lower_name and len(lf) > 2:
                     score = 40
-                # Same extension with some overlap
                 elif ext and os.path.splitext(f)[1].lower() == ext:
                     common = set(lower_name) & set(lf)
                     if len(common) >= max(len(lower_name), len(lf)) * 0.4:
                         score = 30
-                # Near-miss spelling (AGENT.md -> AGENTS.md): substring
-                # checks above find nothing, but a high sequence ratio
-                # catches 1-2 edit typos without a homegrown levenshtein.
                 if score == 0 and difflib.SequenceMatcher(
                     None, lower_name, lf
-                ).ratio() >= 0.8:
+                ).ratio() >= 0.6:
                     score = 50
 
                 if score > 0:
@@ -1956,8 +1965,20 @@ class ShellFileOperations(FileOperations):
         scored.sort(key=lambda x: -x[0])
         similar = [fp for _, fp in scored[:5]]
 
+        base_err = f"File not found: {path}"
+        if similar:
+            sim_names = ", ".join(os.path.basename(f) for f in similar)
+            err_msg = f"{base_err}. Did you mean: {sim_names}?"
+        elif ancestor_note:
+            err_msg = f"{base_err}{ancestor_note}"
+        elif all_entries:
+            avail = ", ".join(all_entries[:5])
+            err_msg = f"{base_err}. Available files in '{dir_path}': {avail}"
+        else:
+            err_msg = base_err
+
         return ReadResult(
-            error=f"File not found: {path}",
+            error=err_msg,
             similar_files=similar
         )
 
@@ -2472,14 +2493,20 @@ class ShellFileOperations(FileOperations):
             # burning turns on re-reads and re-patches.
             from tools.fuzzy_match import is_already_applied
             if is_already_applied(content, old_string, new_string):
+                if old_string == new_string:
+                    note = (
+                        f"File already contains the target text — identical string replacement: "
+                        f"no changes made to {path}. No write performed; do not re-send this patch."
+                    )
+                else:
+                    note = (
+                        f"File already contains the target text — the edit appears to be already applied to {path}. "
+                        "No write performed; do not re-send this patch."
+                    )
                 return PatchResult(
                     success=True,
                     no_change=True,
-                    note=(
-                        f"File already contains the target text — the edit "
-                        f"appears to be already applied to {path}. No write "
-                        "performed; do not re-send this patch."
-                    ),
+                    note=note,
                 )
             err_msg = error or f"Could not find match for old_string in {path}"
             try:
@@ -3628,7 +3655,9 @@ class ShellFileOperations(FileOperations):
         # pipefail does not turn truncated results into false errors.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
         result = self._exec(cmd, timeout=60)
-        return self._parse_grep_search_output(result, output_mode, limit, offset, context)
+        return self._parse_grep_search_output(
+            result, output_mode, limit, offset, context, pattern=pattern, file_glob=file_glob
+        )
 
     def _search_with_grep_pruned(self, pattern: str, path: str, file_glob: Optional[str],
                                  limit: int, offset: int, output_mode: str, context: int,
@@ -3670,27 +3699,34 @@ class ShellFileOperations(FileOperations):
         fetch_limit = limit + offset + (200 if context > 0 else 0)
         cmd = (
             "set -o pipefail; " + " ".join(find_parts)
-            + f" 2>/dev/null | head -n {fetch_limit}"
+            + f" | head -n {fetch_limit}"
         )
         result = self._exec(cmd, timeout=60)
-        return self._parse_grep_search_output(result, output_mode, limit, offset, context)
+        return self._parse_grep_search_output(result, output_mode, limit, offset, context, pattern=pattern, file_glob=file_glob)
 
-    def _parse_grep_search_output(self, result, output_mode: str, limit: int,
-                                  offset: int, context: int) -> SearchResult:
-        """Shared grep output parsing for the plain and pruned variants."""
+    def _parse_grep_search_output(self, result: Any, output_mode: str,
+                                  limit: int, offset: int, context: int,
+                                  pattern: str = "", file_glob: Optional[str] = None) -> SearchResult:
+        """Parse grep command output into a SearchResult."""
         stdout, limit_reason = _search_stdout_and_limit(result)
 
-        # _exec merges stderr into stdout, so grep's diagnostic lines
-        # ("grep: <file>: <error>") are interleaved with matches. Split them
-        # out so they're never parsed as matches and so a hard error has a
-        # clean message.
+        # _exec merges stderr into stdout (stderr=subprocess.STDOUT), so grep
+        # diagnostic lines ("grep: trailing backslash", "grep: brackets [] not balanced")
+        # and non-match lines ("grep: <file>: <error>") are interleaved with matches.
+        # Split them out so they're never parsed as matches and so a hard error has a clean message.
         diagnostics, payload = _split_tool_diagnostics(stdout)
 
         # grep exit codes: 0=matches found, 1=no matches, 2=error. grep
         # returns 2 on partial errors (e.g. an unreadable file) even when
         # other files matched, so only surface an error when exit==2 AND no
-        # usable match payload remains.
-        if result.exit_code == 2 and not payload.strip():
+        # usable match payload remains. For find -exec grep, find returns 1
+        # on grep failure, so check diagnostics / error keywords as well.
+        has_error = (
+            result.exit_code == 2
+            or (result.exit_code != 0 and bool(diagnostics.strip()))
+            or (result.exit_code != 0 and any(w in (result.stdout or "").lower() for w in ("grep:", "invalid", "syntax error", "brackets [", "unclosed", "regular expression")))
+        )
+        if has_error and not payload.strip():
             error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
             return SearchResult(
                 error=_enrich_search_parse_error(error_msg, pattern, file_glob),
