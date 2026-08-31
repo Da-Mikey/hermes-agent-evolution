@@ -59,8 +59,10 @@ from agent.message_sanitization import (
     _sanitize_structure_surrogates,
     _sanitize_surrogates,
     _sanitize_tools_non_ascii,
+    _looks_like_image_content_rejection,
     _strip_images_from_messages,
     _strip_non_ascii,
+    serialized_messages_bytes,
 )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
@@ -5128,71 +5130,7 @@ def _run_conversation_impl(
                 except Exception:
                     pass
                 _err_status = getattr(api_error, "status_code", None)
-                _IMAGE_REJECTION_PHRASES = (
-                    "only 'text' content type is supported",
-                    "only text content type is supported",
-                    "image_url is not supported",
-                    "image content is not supported",
-                    "multimodal is not supported",
-                    "multimodal content is not supported",
-                    "multimodal input is not supported",
-                    "vision is not supported",
-                    "vision input is not supported",
-                    "does not support images",
-                    "does not support image input",
-                    "does not support multimodal",
-                    "does not support vision",
-                    "model does not support image",
-                    # ChatGPT-account Codex backend
-                    # (https://chatgpt.com/backend-api/codex) rejects
-                    # data:image/...base64 URLs in input_image fields
-                    # with HTTP 400 "Invalid 'input[N].content[K].image_url'.
-                    # Expected a valid URL, but got a value with an
-                    # invalid format." The OpenAI Responses API on the
-                    # public endpoint accepts data URLs, but the
-                    # ChatGPT-account variant does not. Without this
-                    # phrase the agent cascaded into compression /
-                    # context-too-large recovery instead of just
-                    # stripping the images. Match is narrow on
-                    # purpose — keyed on the field-path apostrophe so
-                    # we don't false-trip on other URL validation
-                    # errors. (issue #23570)
-                    "image_url'. expected",
-                    # ChatGPT-account Codex can also reject corrupt/unsupported
-                    # native image payloads with this wording. Treat it like a
-                    # provider image rejection so the loop strips images and
-                    # retries text-only instead of aborting the session.
-                    "image data you provided does not represent a valid image",
-                    # DeepSeek's OpenAI-compatible API reports text-only
-                    # request-body variants as:
-                    # "unknown variant `image_url`, expected `text`".
-                    "unknown variant `image_url`, expected `text`",
-                    "unknown variant image_url, expected text",
-                    # OpenRouter routes a request to upstream endpoints and,
-                    # when none of the candidate endpoints for the model accept
-                    # image input, returns HTTP 404 "No endpoints found that
-                    # support image input". Without this phrase the agent never
-                    # strips the images, the retry loop re-sends the same
-                    # rejected request until exhaustion, and the gateway leaves
-                    # every subsequent message queued behind the stuck turn —
-                    # the P1 in issue #21160. The 404 passes the 4xx gate below.
-                    "no endpoints found that support image input",
-                    # Kimi / Moonshot / other OpenAI-compatible Chinese
-                    # providers reject truncated or corrupt image bytes with
-                    # HTTP 400 "Invalid request: prepare image failed ...
-                    # failed to decode image: invalid or unsupported image
-                    # format". Like the Codex case above, the bad bytes are
-                    # baked into immutable conversation history and re-sent on
-                    # every retry, wedging the session. Strip the images so the
-                    # turn recovers instead of exhausting retries. (issue
-                    # #76884; complements the proactive full-decode validation
-                    # in tools/vision_tools._normalize_to_supported_image)
-                    "failed to decode image",
-                )
-                _err_lower = _err_body.lower()
-                _looks_like_image_rejection = any(
-                    p in _err_lower for p in _IMAGE_REJECTION_PHRASES
-                )
+                _looks_like_image_rejection = _looks_like_image_content_rejection(_err_body)
                 # 4xx-only gate: never interpret 5xx/timeout as "server
                 # said no to images" — those are transient and must
                 # route to the normal retry path.
@@ -6292,7 +6230,19 @@ def _run_conversation_impl(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
-                    original_tokens = estimate_messages_tokens_rough(messages)
+                    # A 413 is a BYTE-size error, so this branch scores
+                    # progress in BYTES of the serialized messages payload —
+                    # exact and free — never the token estimate.  The
+                    # estimator prices every image at a flat per-image token
+                    # cost (see estimate_messages_tokens_rough) so screenshots
+                    # don't trigger premature compaction; that deliberate
+                    # byte-blindness means compaction can free megabytes of
+                    # base64 (real case: two vision results = 96.6% of the
+                    # request body but ~3.7% of the estimate) while the token
+                    # delta stays under any threshold.  Token-scored progress
+                    # here burned all attempts on "no progress" and wedged
+                    # the session permanently. (#88960 / #47339)
+                    original_bytes = serialized_messages_bytes(messages)
                     _overflow_input = messages
                     # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
                     # true request (msgs + tools + system), not the tool-blind message count.
@@ -6317,18 +6267,30 @@ def _run_conversation_impl(
                         agent, messages, conversation_history
                     )
 
-                    # Re-estimate tokens after compression.  Same-message-count
+                    # Re-measure after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
                     # can materially reduce request size without reducing the
-                    # message array.  (#39550)
+                    # message array (#39550), and — the image-dominated case —
+                    # compaction's historical-media aging (#97160) can free
+                    # megabytes of base64 that the token estimate never
+                    # counted.  Bytes are the yardstick for a 413; tokens are
+                    # kept only for status display.
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
+                    new_bytes = serialized_messages_bytes(messages)
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
+                    made_progress = (
+                        len(messages) < original_len
+                        or (new_bytes > 0 and new_bytes < original_bytes * 0.95)
+                    )
+                    if made_progress:
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
-                            agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            agent._buffer_status(
+                                f"🗜️ Compressed {original_bytes:,} → {new_bytes:,} "
+                                f"payload bytes, retrying..."
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break

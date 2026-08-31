@@ -6137,6 +6137,55 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+@contextlib.contextmanager
+def _session_profile_runtime_scope(session: dict):
+    """Bind model resolution to the session's profile config and secrets."""
+    profile_home = session.get("profile_home")
+    if not profile_home:
+        yield
+        return
+    home_token = set_hermes_home_override(profile_home)
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _restart_completed_failed_agent_build(
+    sid: str, session: dict, failed_ready: threading.Event | None
+) -> bool:
+    """Replace one completed failed build generation and start its retry."""
+    if failed_ready is None:
+        return False
+    build_lock = session.setdefault("agent_build_lock", threading.Lock())
+    with build_lock:
+        if (
+            session.get("agent") is not None
+            or session.get("agent_error") is None
+            or session.get("agent_ready") is not failed_ready
+            or not failed_ready.is_set()
+        ):
+            return False
+        model_override = session.get("model_override")
+        resume_overrides = session.get("resume_runtime_overrides")
+        if isinstance(model_override, dict) and isinstance(resume_overrides, dict):
+            resume_overrides = dict(resume_overrides)
+            resume_overrides["model_override"] = model_override
+            if provider := model_override.get("provider"):
+                resume_overrides["provider_override"] = provider
+            else:
+                resume_overrides.pop("provider_override", None)
+            session["resume_runtime_overrides"] = resume_overrides
+        session["agent_error"] = None
+        session["agent_ready"] = threading.Event()
+        session.pop("agent_build_started", None)
+        session.pop("_agent_build_thread", None)
+    _start_agent_build(sid, session)
+    return True
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -13772,7 +13821,33 @@ def _(rid, params: dict) -> dict:
                     )
                 parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
-                if session.get("agent") is None and not explicit_provider.strip():
+                failed_agent_init = (
+                    session.get("agent") is None
+                    and session.get("agent_error") is not None
+                )
+                failed_ready = session.get("agent_ready") if failed_agent_init else None
+                if failed_agent_init:
+                    if failed_ready is None:
+                        return _err(
+                            rid,
+                            5032,
+                            session.get("agent_error")
+                            or "agent initialization failed",
+                        )
+                    if not failed_ready.wait(timeout=30.0):
+                        return _err(rid, 5032, "agent initialization timed out")
+                failed_agent_init = (
+                    failed_agent_init
+                    and session.get("agent") is None
+                    and session.get("agent_error") is not None
+                    and session.get("agent_ready") is failed_ready
+                    and failed_ready.is_set()
+                )
+                if (
+                    session.get("agent") is None
+                    and not explicit_provider.strip()
+                    and not failed_agent_init
+                ):
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
                     init_err = _wait_agent(session, rid)
@@ -13780,15 +13855,27 @@ def _(rid, params: dict) -> dict:
                         return init_err
                     if session.get("agent") is None:
                         return _err(rid, 5032, "agent initialization failed")
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    parsed_flags=parsed_flags,
-                )
+                with _session_profile_runtime_scope(session):
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
+                if failed_agent_init and not result.get("confirm_required"):
+                    _restart_completed_failed_agent_build(
+                        params.get("session_id", ""), session, failed_ready
+                    )
+                    init_err = _wait_agent(session, rid)
+                    if init_err:
+                        return init_err
+                    if session.get("agent") is None:
+                        return _err(rid, 5032, "agent initialization failed")
+                    with _session_profile_runtime_scope(session):
+                        _persist_live_session_runtime(session)
             else:
                 result = _apply_model_switch(
                     "",

@@ -6310,8 +6310,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]:
         """Load routing entries for *scope* as {session_key: entry_json}."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_ctx() as conn:
+            rows = conn.execute(
                 "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?",
                 (scope,),
             ).fetchall()
@@ -6356,8 +6356,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         user intent to keep the row around.
         """
         cutoff = time.time() - (float(older_than_days) * 86400.0)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_ctx() as conn:
+            rows = conn.execute(
                 """
                 SELECT s.id, s.session_key, s.source, s.chat_id,
                        s.chat_type, s.user_id, s.started_at
@@ -6393,8 +6393,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_ids:
             return 0
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_ctx() as conn:
+            rows = conn.execute(
                 "SELECT scope, session_key, entry_json FROM gateway_routing"
             ).fetchall()
         doomed: List[Tuple[str, str]] = []
@@ -6486,8 +6486,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if active_only:
             query += " AND ended_at IS NULL"
         query += " ORDER BY last_active DESC"
-        with self._lock:
-            rows = self._conn.execute(query, params).fetchall()
+        with self._read_ctx() as conn:
+            rows = conn.execute(query, params).fetchall()
         return [self._session_row_dict(r) for r in rows]
 
     def find_session_by_origin(
@@ -6520,8 +6520,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             query += " AND COALESCE(thread_id, '') = ?"
             params.append(str(thread_id))
         query += " ORDER BY started_at DESC"
-        with self._lock:
-            rows = [dict(r) for r in self._conn.execute(query, params).fetchall()]
+        with self._read_ctx() as conn:
+            rows = [dict(r) for r in conn.execute(query, params).fetchall()]
         if not rows:
             return None
         if user_id:
@@ -6582,8 +6582,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_key:
             return None
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 f"""
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
@@ -6619,7 +6619,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # tuple so we never cross chats/threads/users.
             if chat_id is None or chat_type is None:
                 return None
-            row = self._conn.execute(
+            row = conn.execute(
                 f"""
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
@@ -6705,8 +6705,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         records: List[Dict[str, Any]] = []
 
-        with self._lock:
-            orphans = self._conn.execute(
+        with self._read_ctx() as conn:
+            orphans = conn.execute(
                 f"""
                 SELECT o.id, o.source, o.user_id, o.started_at,
                        o.parent_session_id,
@@ -6733,7 +6733,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
                 if orphan["parent_session_id"]:
                     evidence = "lineage"
-                    donor = self._conn.execute(
+                    donor = conn.execute(
                         f"""
                         SELECT {donor_columns}
                         FROM sessions d
@@ -6750,7 +6750,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         )
                 else:
                     evidence = "contiguity"
-                    candidates = self._conn.execute(
+                    candidates = conn.execute(
                         f"""
                         SELECT {donor_columns}, {donor_active} AS last_active
                         FROM sessions d
@@ -6917,8 +6917,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not parent_session_id:
             return None
-        with self._lock:
-            parent = self._conn.execute(
+        with self._read_ctx() as conn:
+            parent = conn.execute(
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
                 (parent_session_id,),
             ).fetchone()
@@ -6928,7 +6928,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 or parent["end_reason"] != "compression"
             ):
                 return None
-            rows = self._conn.execute(
+            rows = conn.execute(
                 """
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
@@ -7456,8 +7456,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return None
         now = time.time()
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 "SELECT compression_failure_cooldown_until, compression_failure_error "
                 "FROM sessions WHERE id = ?",
                 (session_id,),
@@ -7498,8 +7498,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_id:
             return {"session_exists": False, "cooldown_until": None, "error": None}
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 "SELECT compression_failure_cooldown_until, compression_failure_error "
                 "FROM sessions WHERE id = ?",
                 (session_id,),
@@ -7595,8 +7595,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Return the persisted deterministic-fallback streak."""
         if not session_id:
             return 0
-        with self._lock:
-            conn = self._conn
+        with self._read_ctx() as conn:
             if conn is None:
                 return 0
             row = conn.execute(
@@ -7676,8 +7675,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_id:
             return 0
-        with self._lock:
-            conn = self._conn
+        with self._read_ctx() as conn:
             if conn is None:
                 return 0
             row = conn.execute(
@@ -9563,8 +9561,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return exact["id"]
 
         escaped = _escape_like(session_id_or_prefix)
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
                 (f"{escaped}%",),
             )
@@ -9839,8 +9837,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT title FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
@@ -9848,8 +9846,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def get_session_title_source(self, session_id: str) -> Optional[str]:
         """Get the provenance of a session's title, or None when untitled."""
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT title, title_source FROM sessions WHERE id = ?",
                 (session_id,),
             )
@@ -10263,8 +10261,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
         escaped = _escape_like(base)
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
                 (base, f"{escaped} #%"),
             )
@@ -10308,8 +10306,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
-            with self._lock:
-                cursor = self._conn.execute(
+            with self._read_ctx() as conn:
+                cursor = conn.execute(
                     f"""
                     SELECT child.id
                     FROM sessions parent
@@ -11259,17 +11257,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
+            from agent.transcript_repair import resolve_and_repair_transcript_batch
+
+            inserted_rows = resolve_and_repair_transcript_batch(
+                conn,
+                session_id,
+                messages,
+                encode_content_fn=self._encode_content,
+                decode_content_fn=self._decode_content,
             )
-            # One aggregated counter update for the whole batch.
+            inserted = 0
+            tool_calls_total = 0
+            if inserted_rows:
+                inserted, tool_calls_total = self._insert_message_rows(
+                    conn, session_id, inserted_rows
+                )
+
+            # One aggregated counter update for the newly inserted rows.
             if tool_calls_total > 0:
                 conn.execute(
                     """UPDATE sessions SET message_count = message_count + ?,
                        tool_call_count = tool_call_count + ? WHERE id = ?""",
                     (inserted, tool_calls_total, session_id),
                 )
-            else:
+            elif inserted > 0:
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
@@ -11390,8 +11401,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id or message_row_id is None:
             return []
 
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?",
                 (message_row_id, session_id),
             ).fetchone()
@@ -11488,8 +11499,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "AND content IS NOT NULL AND TRIM(content) != '' " if require_text else ""
         )
 
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 "SELECT id FROM messages WHERE session_id = ? AND role = ? "
                 f"AND active = 1 {text_filter}ORDER BY id DESC LIMIT 1 OFFSET ?",
                 (session_id, role, int(offset)),
@@ -11515,8 +11526,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return None
 
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 "SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1",
                 (int(row_id), session_id),
             ).fetchone()
@@ -11725,8 +11736,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         unconditionally — a probe can fail open or race a concurrent
         ``archive_and_compact``, #80216); kept for tests and diagnostics.
         """
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT 1 FROM messages WHERE session_id = ? AND active = 0 LIMIT 1",
                 (session_id,),
             )
@@ -12241,7 +12252,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if tip and tip != session_id:
             session_id = tip
 
-        with self._lock:
+        with self._read_ctx() as conn:
             current = session_id
             seen = {current}
             best = None  # tracks the last (deepest) node with messages
@@ -12249,7 +12260,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             for _ in range(32):
                 # Check if the current node has messages.
                 try:
-                    row = self._conn.execute(
+                    row = conn.execute(
                         "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
                         (current,),
                     ).fetchone()
@@ -12268,7 +12279,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # the resume target to an unrelated session (e.g. a subagent
                 # run). This mirrors the child-exclusion in ``get_compression_tip``.
                 try:
-                    child_row = self._conn.execute(
+                    child_row = conn.execute(
                         "SELECT id FROM sessions AS child "
                         "WHERE child.parent_session_id = ? "
                         "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
@@ -13173,8 +13184,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             params.extend(ws_params)
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         params.extend([limit, offset])
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 f"{select_with_last_active}"
                 f"{where_sql} "
                 "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
@@ -13243,8 +13254,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-        with self._lock:
-            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
+        with self._read_ctx() as conn:
+            cursor = conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
 
     def session_count_ge(self, n: int = 1) -> bool:
@@ -13258,8 +13269,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Use this instead of ``session_count() >= n`` when the exact count
         is irrelevant.
         """
-        with self._lock:
-            cursor = self._conn.execute("SELECT 1 FROM sessions LIMIT ?", (n,))
+        with self._read_ctx() as conn:
+            cursor = conn.execute("SELECT 1 FROM sessions LIMIT ?", (n,))
             rows = cursor.fetchall()
         return len(rows) >= n
 
@@ -13296,10 +13307,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-        with self._lock:
+        with self._read_ctx() as conn:
             if self._conn is None:
                 raise RuntimeError("SessionDB connection is closed")
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, COUNT(*) AS count "
                 f"FROM sessions s{where_sql} "
                 "GROUP BY COALESCE(NULLIF(s.source, ''), 'cli') "
@@ -13310,13 +13321,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
-        with self._lock:
+        with self._read_ctx() as conn:
             if session_id:
-                cursor = self._conn.execute(
+                cursor = conn.execute(
                     "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
                 )
             else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
+                cursor = conn.execute("SELECT COUNT(*) FROM messages")
             return cursor.fetchone()[0]
 
     def has_platform_message_id(
@@ -13329,8 +13340,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         to skip re-persisting a user message that was already saved on a
         prior retry of the same inbound platform message.
         """
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT 1 FROM messages "
                 "WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
                 (session_id, platform_message_id),
@@ -13397,8 +13408,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         seen = {root["id"]}
         current = root
         while current.get("end_reason") == "compression":
-            with self._lock:
-                rows = self._conn.execute(
+            with self._read_ctx() as conn:
+                rows = conn.execute(
                     """
                     SELECT * FROM sessions
                     WHERE parent_session_id = ?
@@ -13470,8 +13481,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         included because deletion preserves them by orphaning their parent
         reference.
         """
-        with self._lock:
-            exists = self._conn.execute(
+        with self._read_ctx() as conn:
+            exists = conn.execute(
                 "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
             ).fetchone()
             if not exists:
@@ -13705,8 +13716,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         to clean up, and pre-populate the confirm dialog with the actual
         count.
         """
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 f"SELECT COUNT(*) FROM sessions WHERE {self._EMPTY_SESSION_WHERE}"
             )
             return cursor.fetchone()[0]
@@ -13958,8 +13969,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 f"""SELECT s.id, s.source, s.title, s.model, s.started_at,
                            COALESCE(
                                (SELECT MAX(m.timestamp) FROM messages m
@@ -13987,8 +13998,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 f"SELECT COUNT(*) FROM sessions s WHERE {where}", params
             )
             return int(cursor.fetchone()[0])
@@ -14012,8 +14023,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not where.startswith(ended_guard):
             raise RuntimeError("prune filter lost its ended-session safety guard")
         open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params
             )
             return int(cursor.fetchone()[0])
@@ -14073,8 +14084,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return 0
         cutoff = time.time() - float(idle_days) * 86400.0
         pin_clause = "AND s.pinned = 0" if exclude_pinned else ""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_ctx() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT s.id FROM sessions s
                 WHERE s.archived = 0
@@ -14360,8 +14371,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not prefix:
             return []
         escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_ctx() as conn:
+            rows = conn.execute(
                 "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'",
                 (escaped + "%",),
             ).fetchall()
@@ -14551,9 +14562,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> bool:
         """Return whether Telegram DM topic mode is enabled for this chat/user."""
-        with self._lock:
+        with self._read_ctx() as conn:
             try:
-                row = self._conn.execute(
+                row = conn.execute(
                     """
                     SELECT enabled FROM telegram_dm_topic_mode
                     WHERE chat_id = ? AND user_id = ?
@@ -14574,9 +14585,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         thread_id: str,
     ) -> Optional[Dict[str, Any]]:
         """Return the session binding for a Telegram DM topic, if present."""
-        with self._lock:
+        with self._read_ctx() as conn:
             try:
-                row = self._conn.execute(
+                row = conn.execute(
                     """
                     SELECT * FROM telegram_dm_topic_bindings
                     WHERE chat_id = ? AND thread_id = ?
@@ -14597,9 +14608,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Read-only; returns [] if the bindings table doesn't exist yet
         (does not trigger the topic-mode migration).
         """
-        with self._lock:
+        with self._read_ctx() as conn:
             try:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     "SELECT * FROM telegram_dm_topic_bindings "
                     "WHERE chat_id = ? ORDER BY updated_at DESC",
                     (str(chat_id),),
@@ -14619,9 +14630,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         efficient reverse lookup. Returns None when the session has no binding or
         the table does not exist yet.
         """
-        with self._lock:
+        with self._read_ctx() as conn:
             try:
-                row = self._conn.execute(
+                row = conn.execute(
                     """
                     SELECT * FROM telegram_dm_topic_bindings
                     WHERE session_id = ?
@@ -14781,9 +14792,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``/topic`` in this profile), the session is by definition unbound
         and we return False.
         """
-        with self._lock:
+        with self._read_ctx() as conn:
             try:
-                row = self._conn.execute(
+                row = conn.execute(
                     """
                     SELECT 1 FROM telegram_dm_topic_bindings
                     WHERE session_id = ?
@@ -14809,9 +14820,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         just returns this user's Telegram sessions — there can't be any
         bindings yet.
         """
-        with self._lock:
+        with self._read_ctx() as conn:
             try:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT s.*,
                         COALESCE(sp.prompt, s.system_prompt)
@@ -14842,7 +14853,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError:
                 # telegram_dm_topic_bindings doesn't exist yet — no bindings
                 # means every telegram session for this user is "unlinked".
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT s.*,
                         COALESCE(sp.prompt, s.system_prompt)
@@ -14900,11 +14911,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns None if the pragmas cannot be read.
         """
         try:
-            with self._lock:
+            with self._read_ctx() as conn:
                 if self._conn is None:
                     return None
-                page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
-                page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+                page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+                page_size = conn.execute("PRAGMA page_size").fetchone()[0]
             return int(page_count) * int(page_size)
         except Exception as exc:
             logger.debug("Could not read logical DB size: %s", exc)
@@ -15223,6 +15234,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+    def reclaim_stale_running_handoffs(self, error: str) -> List[str]:
+        """Fail every handoff stuck in ``running``. Returns the ids reclaimed.
+
+        Only the gateway's watcher ever sets ``running``, and it does so for
+        the duration of a single in-process dispatch. So any row still in
+        ``running`` when a watcher starts up belongs to a PREVIOUS gateway
+        that died mid-dispatch (crash, kill, machine reboot).
+
+        Such a row is unrecoverable *and* poisonous: ``request_handoff`` only
+        accepts a new request when the state is NULL/``completed``/``failed``,
+        so a stranded ``running`` row makes that session permanently unable to
+        hand off again — with no error surfaced anywhere.
+
+        Failing (rather than re-queueing as ``pending``) is deliberate: the
+        dead gateway may have already switched the session key and dispatched
+        the synthetic turn before dying, so a blind retry risks double
+        delivery. The user's CLI has long since timed out; the right outcome
+        is a clean terminal state they can retry from explicitly.
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "SELECT id FROM sessions WHERE handoff_state = 'running'"
+            )
+            ids = [r[0] for r in cur.fetchall()]
+            if ids:
+                conn.execute(
+                    "UPDATE sessions SET handoff_state = 'failed', "
+                    "handoff_error = ? WHERE handoff_state = 'running'",
+                    (error[:500],),
+                )
+            return ids
+        try:
+            return self._execute_write(_do) or []
+        except Exception:
+            # Swallow but never silently: a persistently failing reclaim
+            # leaves poisonous 'running' rows in place (sessions that can
+            # never hand off again), so the operator needs a trace of it.
+            logger.warning(
+                "reclaim_stale_running_handoffs failed; stranded 'running' "
+                "handoff rows (if any) were left in place", exc_info=True,
+            )
+            return []
 
 
 class AsyncSessionDB:

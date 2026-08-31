@@ -1142,7 +1142,7 @@ class ProcessRegistry:
                 # cat, honoring any pager the user already exported.
                 pty_env.setdefault("GIT_PAGER", "cat")
                 pty_env.setdefault("PAGER", "cat")
-                pty_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+                pty_argv = [user_shell, "-lc", f"set +m; {safe_command}"]
 
                 # Cgroup isolation for PTY mode (#70716, reviewer gap #1):
                 # Wrap the PTY command in a systemd scope so interactive
@@ -3302,12 +3302,16 @@ from tools.registry import registry, tool_error
 
 PROCESS_SCHEMA = {
     "name": "process",
+    # Dieted (#95681): the action enum names the verbs; the description
+    # keeps only non-obvious semantics. write-vs-submit is the tool's one
+    # real trap (a lone \n on a Windows PTY is not a line terminator) —
+    # that teaching gains emphasis rather than losing it.
     "description": (
         "Manage background processes started with terminal(background=true). "
-        "Actions: 'list' (show all), 'poll' (check status + new output), "
-        "'log' (full output with pagination), 'wait' (block until done or timeout), "
-        "'kill' (terminate), 'stop' (alias for kill), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "poll: status + new output. log: full output, paged. wait: block "
+        "until exit or timeout (partial output on timeout). write vs "
+        "submit: submit appends Enter — use it to answer prompts; write "
+        "sends raw bytes, no newline. close: EOF stdin. kill: terminate."
     ),
     "parameters": {
         "type": "object",
@@ -3319,24 +3323,24 @@ PROCESS_SCHEMA = {
             },
             "session_id": {
                 "type": "string",
-                "description": "Process session ID (from terminal background output). Required for all actions except 'list'. A unique ID prefix works too (e.g. 'proc_4dae' or just '4dae' for proc_4dae56ca81f6)."
+                "description": "From terminal background output; any unique prefix works ('4dae' for proc_4dae56ca81f6). Required except for 'list'."
             },
             "data": {
                 "type": "string",
-                "description": "Text to send to process stdin (for 'write' and 'submit' actions)"
+                "description": "Stdin text for write/submit."
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": "Max seconds for 'wait'.",
                 "minimum": 1
             },
             "offset": {
                 "type": "integer",
-                "description": "Line offset for 'log' action (default: last 200 lines)"
+                "description": "Log line offset (default: last 200)."
             },
             "limit": {
                 "type": "integer",
-                "description": "Max lines to return for 'log' action",
+                "description": "Max log lines.",
                 "minimum": 1
             }
         },
