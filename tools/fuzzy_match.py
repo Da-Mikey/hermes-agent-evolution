@@ -92,19 +92,25 @@ def is_already_applied(content: str, old_string: str, new_string: str) -> bool:
     the model moves on instead of re-reading and re-patching.
 
     Deliberately conservative:
-    - new_string must be non-trivial (>= 8 chars stripped) — a tiny target
+    - the heuristic branch (old_string gone + new_string present) requires
+      new_string to be non-trivial (>= 8 chars stripped) — a tiny target
       matching by coincidence must not mask a genuine typo'd edit;
     - new_string must appear EXACTLY in the content (no fuzzy matching —
       approximate presence is not proof the edit landed);
     - when old_string differs from new_string, old_string must be GONE
       (still-present old text means the edit is at best half-applied).
+
+    Exception: when old_string == new_string the intent is unambiguous
+    ("make the file contain this text"), so exact presence of new_string
+    is sufficient at ANY length — the length guard would only mask an
+    already-landed tiny edit (e.g. "world" -> "world").
     """
+    if old_string and old_string == new_string:
+        return new_string in content
     if not new_string or len(new_string.strip()) < 8:
         return False
     if new_string not in content:
         return False
-    if old_string == new_string:
-        return True
     return old_string not in content
 
 

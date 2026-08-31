@@ -357,10 +357,11 @@ class DDGSWebSearchProvider(WebSearchProvider):
             return {"success": False, "error": f"DuckDuckGo search failed: {exc}"}
 
         # Empty result set can mean the provider is rate-limiting / blocking
-        # automated queries (#467). If a fallback chain is configured we surface
-        # a failure so the dispatcher tries the next backend; otherwise we keep
-        # success=True because a healthy provider returning no hits is a valid
-        # outcome (and the regression test expects success=True for an empty
+        # automated queries (#467). If the dispatcher's fallback rescue tier
+        # is available we surface a failure so the dispatcher serves the next
+        # attempt (one-shot keyless rescue); otherwise we keep success=True
+        # because a healthy provider returning no hits is a valid outcome
+        # (and the regression test expects success=True for an empty
         # mocked primary).
         if not web_results:
             logger.warning(
@@ -368,10 +369,11 @@ class DDGSWebSearchProvider(WebSearchProvider):
             )
             from tools import web_tools
 
-            # New design (8adef09be8): the dispatcher's one-shot keyless
-            # rescue fires on success=False when `_rescue_eligible` — the
+            # The v2026.8.3 upstream sync (2cb73632ac) superseded the
             # configured-fallback-chain check (`_search_backend_fallback_chain`)
-            # was superseded by the keyless rescue tier in the upstream sync.
+            # with the one-shot keyless rescue tier: a success=False from an
+            # eligible non-ring provider triggers `_rescue_search` in the
+            # dispatcher, which walks the keyless ring for this call only.
             if web_tools._rescue_eligible(self):
                 return {
                     "success": False,

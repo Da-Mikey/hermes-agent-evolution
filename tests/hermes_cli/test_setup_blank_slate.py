@@ -67,9 +67,10 @@ class TestBlankSlateMinimalToolsets:
         names = sorted(
             {(d.get("function") or {}).get("name") or d.get("name") for d in defs}
         )
-        assert names == ["patch", "process", "read_file", "search_files",
+        assert names == ["patch", "process", "read_file", "repo_map", "search_files",
                          "skill_manage", "skill_view", "skills_list",
-                         "terminal", "vision_analyze", "write_file"]
+                         "terminal", "tool_call", "tool_describe", "tool_search",
+                         "vision_analyze", "write_file"]
 
 
 class TestBlankSlateMinimizeConfig:

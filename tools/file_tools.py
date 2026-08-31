@@ -2244,13 +2244,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
+        # Pass the RESOLVED path (str(_resolved)) to FileOperations.read_file
+        # so the shell commands inside (wc -c, sed, head) use the fully-
+        # qualified absolute path.  Passing the raw *path* here means a
+        # relative path is resolved by the shell's cwd, which may differ
+        # from the terminal env's tracked cwd — the root cause of the
+        # read_file file-not-found spiral (#1044, #886, #970).
         file_ops = _get_file_ops(task_id)
-        # Pass the RESOLVED absolute path (not the raw user-supplied path):
-        # FileOperations runs shell commands (wc, sed, head) from the shell's
-        # own cwd, which may differ from the terminal env's tracked cwd — a
-        # raw relative path would not be found there (root cause of #1044;
-        # contract #1066).
-        result = file_ops.read_file(resolved_str, offset, limit)
+        result = file_ops.read_file(str(_resolved), offset, limit)
         result_dict = result.to_dict()
 
         # ── Populate negative-result cache on not-found ───────────────
@@ -2268,7 +2269,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             # (unicode-equivalent, case-corrected, workspace-root fallback,
             # prefix-stripped, or unique workspace file) before giving up.
             repaired_path, repair_note = _find_auto_repaired_path(
-                Path(resolved_str), raw_path=path, task_id=task_id
+                Path(str(_resolved)), raw_path=path, task_id=task_id
             )
             if repaired_path is not None:
                 repaired = file_ops.read_file(str(repaired_path), offset, limit)
@@ -2977,6 +2978,26 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            # #2242 Slice B — when the patch targets a non-existent file,
+            # surface nearby paths (mirrors read_file #2293 / search_files).
+            # Covers both replace-mode ("File not found:") and V4A-mode
+            # ("file not found") errors; suppressed when the impl already
+            # attached similar_files (shell-based suggestion found something).
+            _patch_nf_err = result_dict.get("error") or ""
+            if (
+                isinstance(_patch_nf_err, str)
+                and "not found" in _patch_nf_err.lower()
+                and not result_dict.get("similar_files")
+            ):
+                _nf_path = path or ""
+                if mode != "replace" and _paths_to_check:
+                    _nf_path = _paths_to_check[0]
+                _nf_resolved = _path_to_resolved.get(_nf_path) or _nf_path or ""
+                if _nf_resolved:
+                    _nearby = suggest_nearby_paths(_nf_resolved)
+                    _hint = format_nearby_hint(_nf_resolved, _nearby)
+                    if _hint:
+                        result_dict["error"] = _patch_nf_err + "\n\n" + _hint
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
@@ -3127,6 +3148,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # flowing through the consecutive-search bookkeeping below.
         _search_err = result_dict.get("error") or ""
         if isinstance(_search_err, str) and _search_err.startswith("Path not found:"):
+            # #2242 Slice B — mirror read_file's nearby-hint fallback: when
+            # the search root doesn't exist, surface nearby paths so the
+            # agent can correct itself instead of blind-retrying. The hint
+            # is APPENDED (not replacing the error) so the "Path not found:"
+            # prefix the negative cache keys on stays intact.
+            _nearby = suggest_nearby_paths(resolved_search_path)
+            _hint = format_nearby_hint(resolved_search_path, _nearby)
+            if _hint:
+                result_dict["error"] = _search_err + "\n\n" + _hint
             _search_nf_json = json.dumps(result_dict, ensure_ascii=False)
             _record_not_found("search", resolved_search_path, task_id, _search_nf_json)
 

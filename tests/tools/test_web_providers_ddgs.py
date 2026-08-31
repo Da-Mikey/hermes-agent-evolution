@@ -200,8 +200,8 @@ class TestDDGSProviderSearch:
         result = DDGSWebSearchProvider().search("nothing", limit=5)
         assert result["success"] is True
 
-        # With the fallback rescue tier enabled: success=False so the
-        # dispatcher rescues / switches provider.
+        # With the fallback rescue tier available: success=False so the
+        # dispatcher's one-shot keyless rescue can serve the next attempt.
         monkeypatch.setattr(web_tools, "_keyless_rescue_enabled", lambda: True)
         result = DDGSWebSearchProvider().search("nothing", limit=5)
         assert result["success"] is False
@@ -328,7 +328,7 @@ class TestDDGSProviderSearch:
         from tools import web_tools
 
         _force_inprocess_search(monkeypatch, prov)
-        # Deterministic: rescue disabled → empty is a valid outcome.
+        # Deterministic: rescue disabled → empty is a valid provider outcome.
         monkeypatch.setattr(web_tools, "_keyless_rescue_enabled", lambda: False)
 
         result = prov.DDGSWebSearchProvider().search("nothing", limit=5)
