@@ -34,7 +34,12 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_importance import EpisodicMemoryStore, MemoryEvent, score_importance
+from agent.memory_importance import (
+    REVOCATION_REASON_CONTRADICTION,
+    EpisodicMemoryStore,
+    MemoryEvent,
+    score_importance,
+)
 from agent.memory_contradiction import ContradictionFlag, detect_contradictions
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -156,7 +161,8 @@ def inject_memory_provider_tools(agent: Any) -> int:
         # return 0 here made #81014 undiagnosable: the provider looked
         # "half on" with no clue which config key suppressed its tools.
         _providers = [
-            p for p in (getattr(memory_manager, "providers", None) or [])
+            p
+            for p in (getattr(memory_manager, "providers", None) or [])
             if getattr(p, "name", "") != "builtin"
         ]
         if _providers:
@@ -1009,7 +1015,12 @@ class MemoryManager:
         # Non-fatal and bounded: flags are logged with both timestamps, never
         # silently overwriting or deleting the stored event.
         if user_content and user_content.strip():
-            self.check_contradictions(user_content)
+            flags = self.check_contradictions(user_content)
+            # TEPA (#154): contradictory evidence revokes the stored event —
+            # explicit validity state, superseding id, reason — instead of
+            # leaving both at full weight. Non-fatal: a revocation failure
+            # must never fail the turn sync.
+            self._revoke_contradicted(flags, by_event_id=event.event_id)
         self.episodic_store.add(event)
         logger.debug(
             "score_memories: recorded turn (importance=%.3f, signals=%s)",
@@ -1042,7 +1053,7 @@ class MemoryManager:
         if not observation or not observation.strip():
             return []
         flags = detect_contradictions(
-            self.episodic_store.events.values(),
+            self.episodic_store.active_events(),
             observation,
             limit=limit,
             min_importance=min_importance,
@@ -1072,6 +1083,47 @@ class MemoryManager:
                 observation[:200],
             )
         return flags
+
+    def _revoke_contradicted(
+        self,
+        flags: List[ContradictionFlag],
+        *,
+        by_event_id: str = "",
+    ) -> int:
+        """Revoke stored events contradicted by new evidence (TEPA, #154).
+
+        Runs on the memory write path after :meth:`check_contradictions`:
+        each flagged stored event is *revoked* — marked with explicit
+        validity state and the superseding event id — rather than
+        overwritten or left at full weight. Non-fatal by design: a failed
+        revocation is logged and skipped so a turn sync never fails
+        because of a storage hiccup.
+
+        Returns the number of events revoked.
+        """
+        revoked = 0
+        for flag in flags:
+            try:
+                if self.episodic_store.revoke(
+                    flag.event_id,
+                    by_event_id=by_event_id,
+                    reason=REVOCATION_REASON_CONTRADICTION,
+                ):
+                    revoked += 1
+                    logger.info(
+                        "memory revocation (#154): stored %s (%s) revoked by %s — %s",
+                        flag.event_id,
+                        flag.stored_when,
+                        by_event_id or "(unknown)",
+                        flag.reason,
+                    )
+            except Exception:
+                logger.debug(
+                    "memory revocation failed (non-fatal): %s",
+                    flag.event_id,
+                    exc_info=True,
+                )
+        return revoked
 
     def sync_all(
         self,
