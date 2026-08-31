@@ -392,6 +392,7 @@ class TestDDGSBackendWiring:
             "EXA_API_KEY",
             "SEARXNG_URL",
             "BRAVE_SEARCH_API_KEY",
+            "KEENABLE_API_KEY",
         ):
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
