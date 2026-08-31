@@ -1976,6 +1976,31 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
 
+        # Retry-spiral circuit breaker check (#3391)
+        try:
+            from tools.tool_circuit_breaker import TOOL_CIRCUIT_BREAKER
+            _eff_sid = getattr(agent, "session_id", None) or effective_task_id or "default"
+            _st = "error" if is_error else "success"
+            _err_msg = _multimodal_text_summary(function_result) if is_error else None
+            _breaker_event = TOOL_CIRCUIT_BREAKER.record_result(
+                session_id=_eff_sid,
+                tool_name=name,
+                status=_st,
+                error_message=_err_msg,
+            )
+            if _breaker_event and _breaker_event.get("circuit_breaker_tripped"):
+                if isinstance(function_result, str) and "[CIRCUIT_BREAKER]" not in function_result:
+                    _diag = (
+                        f"\n\n[CIRCUIT_BREAKER] Tool '{name}' has failed "
+                        f"{_breaker_event['consecutive_failures']} consecutive times "
+                        f"(budget: {_breaker_event['budget']}). "
+                        f"Class: {_breaker_event['failure_class']}. "
+                        f"Recommendation: {_breaker_event['strategy_recommendation']}"
+                    )
+                    function_result += _diag
+        except Exception:
+            pass
+
         agent._current_tool = None
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
@@ -2901,6 +2926,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
+
+        # Retry-spiral circuit breaker check (#3391)
+        try:
+            from tools.tool_circuit_breaker import TOOL_CIRCUIT_BREAKER
+            _eff_sid = getattr(agent, "session_id", None) or effective_task_id or "default"
+            _st = "error" if _is_error_result else "success"
+            _err_msg = _multimodal_text_summary(function_result) if _is_error_result else None
+            _breaker_event = TOOL_CIRCUIT_BREAKER.record_result(
+                session_id=_eff_sid,
+                tool_name=function_name,
+                status=_st,
+                error_message=_err_msg,
+            )
+            if _breaker_event and _breaker_event.get("circuit_breaker_tripped"):
+                if isinstance(function_result, str) and "[CIRCUIT_BREAKER]" not in function_result:
+                    _diag = (
+                        f"\n\n[CIRCUIT_BREAKER] Tool '{function_name}' has failed "
+                        f"{_breaker_event['consecutive_failures']} consecutive times "
+                        f"(budget: {_breaker_event['budget']}). "
+                        f"Class: {_breaker_event['failure_class']}. "
+                        f"Recommendation: {_breaker_event['strategy_recommendation']}"
+                    )
+                    function_result += _diag
+        except Exception:
+            pass
 
         display_function_result = function_result
         function_result = maybe_persist_tool_result(

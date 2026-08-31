@@ -2023,6 +2023,8 @@ def _special_file_kind(path) -> str | None:
 def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        if not path or not isinstance(path, str) or not path.strip():
+            return tool_error("Invalid path: path must be a non-empty string.")
         offset, limit = normalize_read_pagination(offset, limit)
 
         # ── Device path guard ─────────────────────────────────────────
