@@ -23,6 +23,7 @@ from tools.file_operations import (
     normalize_search_pagination,
 )
 from tools import file_state
+from tools.path_validation import format_nearby_hint, suggest_nearby_paths
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -1991,6 +1992,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # optimization; recording must stay side-effect-identical.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
+            # #2293 — if the shell-based _suggest_similar_files found nothing
+            # (no similar_files), fall back to the shared pure-Python module
+            # so the agent still gets a nearby-files hint. This exercises the
+            # reusable path-validation layer in a real call site (Slice B
+            # extends it to terminal/search_files/patch).
+            if not result_dict.get("similar_files"):
+                _nearby = suggest_nearby_paths(str(_resolved))
+                _hint = format_nearby_hint(str(_resolved), _nearby)
+                if _hint:
+                    result_dict["error"] = _err + "\n\n" + _hint
             _not_found_json = json.dumps(result_dict, ensure_ascii=False)
             _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
@@ -2676,6 +2687,26 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            # #2242 Slice B — when the patch targets a non-existent file,
+            # surface nearby paths (mirrors read_file #2293 / search_files).
+            # Covers both replace-mode ("File not found:") and V4A-mode
+            # ("file not found") errors; suppressed when the impl already
+            # attached similar_files (shell-based suggestion found something).
+            _patch_nf_err = result_dict.get("error") or ""
+            if (
+                isinstance(_patch_nf_err, str)
+                and "not found" in _patch_nf_err.lower()
+                and not result_dict.get("similar_files")
+            ):
+                _nf_path = path or ""
+                if mode != "replace" and _paths_to_check:
+                    _nf_path = _paths_to_check[0]
+                _nf_resolved = _path_to_resolved.get(_nf_path) or _nf_path or ""
+                if _nf_resolved:
+                    _nearby = suggest_nearby_paths(_nf_resolved)
+                    _hint = format_nearby_hint(_nf_resolved, _nearby)
+                    if _hint:
+                        result_dict["error"] = _patch_nf_err + "\n\n" + _hint
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
@@ -2826,6 +2857,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # flowing through the consecutive-search bookkeeping below.
         _search_err = result_dict.get("error") or ""
         if isinstance(_search_err, str) and _search_err.startswith("Path not found:"):
+            # #2242 Slice B — mirror read_file's nearby-hint fallback: when
+            # the search root doesn't exist, surface nearby paths so the
+            # agent can correct itself instead of blind-retrying. The hint
+            # is APPENDED (not replacing the error) so the "Path not found:"
+            # prefix the negative cache keys on stays intact.
+            _nearby = suggest_nearby_paths(resolved_search_path)
+            _hint = format_nearby_hint(resolved_search_path, _nearby)
+            if _hint:
+                result_dict["error"] = _search_err + "\n\n" + _hint
             _search_nf_json = json.dumps(result_dict, ensure_ascii=False)
             _record_not_found("search", resolved_search_path, task_id, _search_nf_json)
 
