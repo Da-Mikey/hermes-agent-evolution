@@ -4957,10 +4957,11 @@ def unified_search(query: str, sources: List[SkillSource],
     # flood the merged list. Insertion order is preserved within each rank.
     deduped = list(seen.values())
     deduped.sort(key=lambda r: -_TRUST_RANK.get(r.trust_level, 0))
+    sliced = deduped[:limit]
 
-    _record_retrieval(query, deduped[:limit])
+    _record_retrieval(query, sliced)
 
-    return deduped[:limit]
+    return sliced
 
 
 def _record_retrieval(query: str, results: List[SkillMeta]) -> None:

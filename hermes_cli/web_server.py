@@ -9,8 +9,6 @@ Usage:
     python -m hermes_cli.main web --port 8080
 """
 
-from __future__ import annotations
-
 import contextlib
 from contextlib import asynccontextmanager, contextmanager
 
@@ -53,11 +51,7 @@ from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_fla
 from hermes_cli.install_identity import get_install_id as _shared_get_install_id
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import uvicorn
-    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 
@@ -13661,7 +13655,7 @@ from hermes_cli.web_routers.mcp import (  # noqa: E402,F401 — legacy re-export
 
 _MCP_DASHBOARD_OAUTH_TTL = 15 * 60
 _MAX_PENDING_MCP_OAUTH_FLOWS = 8
-_mcp_oauth_flows: dict[str, DashboardOAuthFlow] = {}
+_mcp_oauth_flows: Dict[str, Any] = {}
 _mcp_oauth_flows_lock = threading.Lock()
 _mcp_oauth_transactions: dict[tuple[str, str], threading.Lock] = {}
 _mcp_oauth_transactions_lock = threading.Lock()
@@ -19233,7 +19227,7 @@ async def a2a_rpc(request: Request):
 mount_spa(app)
 
 
-def _read_bound_port(server: uvicorn.Server, fallback: int) -> int:
+def _read_bound_port(server: Any, fallback: int) -> int:
     """Read the OS-assigned port from a live uvicorn server socket.
 
     After ``server.startup()`` the socket is bound.  Returns the actual

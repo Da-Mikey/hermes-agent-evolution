@@ -133,3 +133,25 @@ def test_web_extract_fallback_calls_real_web_extract_tool_signature(monkeypatch)
     assert err is None
     mock_extract.assert_called_once_with(["https://example.com/test"], format="markdown")
 
+
+def test_web_extract_fallback_handles_error_responses(monkeypatch):
+    """Verify web_extract_fallback gracefully handles error responses from web_extract_tool."""
+    import json
+    from unittest.mock import create_autospec
+    from tools.browser_navigate_fallback import web_extract_fallback
+    import tools.web_tools as wt
+
+    # Case 1: error returned in payload
+    mock_extract = create_autospec(wt.web_extract_tool, spec_set=True)
+    mock_extract.return_value = json.dumps({"success": False, "error": "Failed to fetch webpage"})
+    monkeypatch.setattr(wt, "web_extract_tool", mock_extract)
+    content, err = web_extract_fallback("https://example.com/fail")
+    assert content is None
+    assert "Failed to fetch webpage" in err
+
+    # Case 2: exception raised
+    mock_extract.side_effect = RuntimeError("network down")
+    content, err = web_extract_fallback("https://example.com/fail2")
+    assert content is None
+    assert "network down" in err
+

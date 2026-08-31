@@ -449,6 +449,7 @@ class AIAgent:
     _base_url: str = ""
     _base_url_lower: str = ""
     _base_url_hostname: str = ""
+    _rate_limit_state: Optional[Any] = None
 
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
@@ -1622,9 +1623,7 @@ class AIAgent:
         if base_url is not None:
             hostname = base_url_hostname(base_url)
         else:
-            hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
-                getattr(self, "_base_url_lower", "")
-            )
+            hostname = self._base_url_hostname or base_url_hostname(self._base_url_lower)
         return hostname == "api.openai.com"
 
     def _is_azure_openai_url(self, base_url: str = None) -> bool:
@@ -1640,7 +1639,7 @@ class AIAgent:
         if base_url is not None:
             url = str(base_url).lower()
         else:
-            url = getattr(self, "_base_url_lower", "") or ""
+            url = self._base_url_lower
         return base_url_host_matches(url, "openai.azure.com")
 
     def _is_github_copilot_url(self, base_url: str = None) -> bool:
@@ -1648,9 +1647,7 @@ class AIAgent:
         if base_url is not None:
             hostname = base_url_hostname(base_url)
         else:
-            hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
-                getattr(self, "_base_url_lower", "")
-            )
+            hostname = self._base_url_hostname or base_url_hostname(self._base_url_lower)
         if not hostname:
             return False
         return hostname == "api.githubcopilot.com" or hostname.endswith(
@@ -1851,8 +1848,8 @@ class AIAgent:
         """Return True for the ChatGPT OAuth Codex Responses backend."""
         return (
             getattr(self, "api_mode", None) == "codex_responses"
-            and getattr(self, "_base_url_hostname", "") == "chatgpt.com"
-            and "/backend-api/codex" in (getattr(self, "_base_url_lower", "") or "")
+            and self._base_url_hostname == "chatgpt.com"
+            and "/backend-api/codex" in self._base_url_lower
         )
 
     def _anthropic_prompt_cache_policy(
@@ -8665,7 +8662,7 @@ class AIAgent:
         key = (
             self.provider,
             self.model,
-            getattr(self, "_base_url_lower", self.base_url),
+            self._base_url_lower,
         )
         cached = getattr(self, "_thinking_pad_cache", None)
         if cached is not None and cached[0] == key:

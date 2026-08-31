@@ -1640,4 +1640,17 @@ def test_load_on_disk_store_fallback_on_config_error(monkeypatch, tmp_path):
     assert store.memory_char_limit == DEFAULT_MEMORY_CHAR_LIMIT
     assert store.user_char_limit == DEFAULT_USER_CHAR_LIMIT
     assert store.memory_enabled is True
+    assert store.user_profile_enabled is True
+
+
+def test_memory_defaults_match_config_defaults():
+    """Invariance: tools.memory_tool default constants must match config_defaults.DEFAULT_CONFIG."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from tools.memory_tool import DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT
+
+    mem_cfg = DEFAULT_CONFIG.get("memory", {})
+    assert DEFAULT_MEMORY_CHAR_LIMIT == 2200
+    assert DEFAULT_USER_CHAR_LIMIT == 1375
+    assert mem_cfg.get("memory_char_limit") == DEFAULT_MEMORY_CHAR_LIMIT
+    assert mem_cfg.get("user_char_limit") == DEFAULT_USER_CHAR_LIMIT
 

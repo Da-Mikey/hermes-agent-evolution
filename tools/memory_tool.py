@@ -315,11 +315,8 @@ def _read_failed_error(path: "Path") -> Dict[str, Any]:
     }
 
 
-from hermes_cli.config_defaults import DEFAULT_CONFIG
-
-_mem_defaults = DEFAULT_CONFIG.get("memory", {})
-DEFAULT_MEMORY_CHAR_LIMIT: int = int(_mem_defaults.get("memory_char_limit", 2200))
-DEFAULT_USER_CHAR_LIMIT: int = int(_mem_defaults.get("user_char_limit", 1375))
+DEFAULT_MEMORY_CHAR_LIMIT = 2200
+DEFAULT_USER_CHAR_LIMIT = 1375
 
 
 class MemoryStore:

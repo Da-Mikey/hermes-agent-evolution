@@ -4253,7 +4253,7 @@ class HeartbeatManager:
         """Background coroutine: send RUNNING heartbeat every 2s.
         30s without renewal -> send FINISH and exit.
         """
-        cancelled = False
+        cancelled = True
         try:
             await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
 
