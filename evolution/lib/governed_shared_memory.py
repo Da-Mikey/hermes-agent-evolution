@@ -6,6 +6,7 @@ Mitigates multi-agent shared memory failure modes:
 2. Stale propagation (temporal supersession tracking)
 3. Contradiction persistence (explicit supersedes relations)
 4. Provenance collapse (full author/tool provenance tracing)
+5. Cross-class leakage (reader-class authorization enforced before retrieval)
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ class GovernedMemoryRecord:
     supersedes_key: Optional[str] = None
     superseded_by: Optional[str] = None
     is_active: bool = True
+    reader_class: Optional[str] = None
     created_at_ms: float = field(default_factory=lambda: time.time() * 1000.0)
     updated_at_ms: float = field(default_factory=lambda: time.time() * 1000.0)
 
@@ -78,8 +80,21 @@ class GovernedSharedMemory:
         sources: Optional[List[str]] = None,
         supersedes_key: Optional[str] = None,
         confidence: float = 1.0,
+        reader_class: Optional[str] = None,
     ) -> GovernedMemoryRecord:
-        """Write a new governed memory record with provenance and handle supersession."""
+        """Write a new governed memory record with provenance and handle supersession.
+
+        ``reader_class`` tags the record with a hard authorization class (e.g.
+        "orchestrator" vs "stage-agent"); only readers presenting the same class
+        may retrieve it (see ``read``). ``None`` (default) means unrestricted,
+        preserving legacy behavior.
+
+        Restrictions propagate through derivations: a record that supersedes a
+        restricted record inherits that restriction, so a summary cannot launder
+        a source it was derived from. An explicit ``reader_class`` only applies
+        when the superseded record is unrestricted — otherwise the superseded
+        record's restriction wins (most-restricted-source rule).
+        """
         now_ms = time.time() * 1000.0
         prov = MemoryProvenance(
             author_subagent_id=author_id,
@@ -90,11 +105,14 @@ class GovernedSharedMemory:
         )
 
         # Handle supersession of existing record
+        inherited_reader_class = reader_class
         if supersedes_key and supersedes_key in self._records:
             old_record = self._records[supersedes_key]
             old_record.is_active = False
             old_record.superseded_by = key
             old_record.updated_at_ms = now_ms
+            if old_record.reader_class is not None:
+                inherited_reader_class = old_record.reader_class
 
         record = GovernedMemoryRecord(
             key=key,
@@ -103,6 +121,7 @@ class GovernedSharedMemory:
             provenance=prov,
             supersedes_key=supersedes_key,
             is_active=True,
+            reader_class=inherited_reader_class,
             created_at_ms=now_ms,
             updated_at_ms=now_ms,
         )
@@ -110,39 +129,68 @@ class GovernedSharedMemory:
         return record
 
     def read(
-        self, key: str, active_only: bool = True
+        self, key: str, active_only: bool = True, reader_class: Optional[str] = None
     ) -> Optional[GovernedMemoryRecord]:
-        """Read memory record by key, optionally filtering for active records."""
+        """Read memory record by key, optionally filtering for active records.
+
+        Authorization is enforced BEFORE returning: a record tagged with a
+        ``reader_class`` is only returned when the caller presents the matching
+        class. Unrestricted records remain readable by any caller, preserving
+        legacy behavior.
+        """
         record = self._records.get(key)
         if record is None:
             return None
         if active_only and not record.is_active:
             return None
+        if not self._can_read(record, reader_class):
+            logger.info(
+                "Refusing read of %r: requires reader_class=%r, caller presented %r",
+                key,
+                record.reader_class,
+                reader_class,
+            )
+            return None
         return record
 
     def list_by_scope(
-        self, scope: str, active_only: bool = True
+        self, scope: str, active_only: bool = True, reader_class: Optional[str] = None
     ) -> List[GovernedMemoryRecord]:
-        """List all memory records belonging to a particular scope."""
+        """List all memory records belonging to a particular scope.
+
+        Records the caller is not authorized for are excluded — listing must not
+        bypass the authorization boundary.
+        """
         scope_str = scope.lower()
         results = [
             rec
             for rec in self._records.values()
-            if rec.scope == scope_str and (not active_only or rec.is_active)
+            if rec.scope == scope_str
+            and (not active_only or rec.is_active)
+            and self._can_read(rec, reader_class)
         ]
         return results
 
     def list_by_author(
-        self, author_id: str, active_only: bool = True
+        self,
+        author_id: str,
+        active_only: bool = True,
+        reader_class: Optional[str] = None,
     ) -> List[GovernedMemoryRecord]:
-        """List memory records authored by a specific subagent."""
+        """List memory records authored by a specific subagent (authorization enforced)."""
         results = [
             rec
             for rec in self._records.values()
             if rec.provenance.author_subagent_id == author_id
             and (not active_only or rec.is_active)
+            and self._can_read(rec, reader_class)
         ]
         return results
+
+    @staticmethod
+    def _can_read(record: GovernedMemoryRecord, reader_class: Optional[str]) -> bool:
+        """Return True when ``reader_class`` may read ``record`` (fail-closed)."""
+        return record.reader_class is None or reader_class == record.reader_class
 
     def redistribute(
         self,
