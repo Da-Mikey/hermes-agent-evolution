@@ -13,6 +13,11 @@ A self-contained module (stdlib only) that:
 4. Deduplicates events via Jaccard similarity on tokenized text, merging
    groups while keeping the highest-importance event and combining tags.
 5. Persists the whole store to / loads it from a JSON file.
+6. Tracks explicit validity state (TEPA, #154): a stored event
+   contradicted by fresh evidence is *revoked* — marked with validity
+   state, superseding id and reason — rather than overwritten, and
+   revoked entries are excluded from normal retrieval while staying
+   queryable for audits.
 
 Import-safe: importing this module has no side effects and requires no
 third-party packages.  Designed to be unit-testable with only stdlib +
@@ -40,6 +45,9 @@ __all__ = [
     "DEFAULT_HALF_LIFE_DAYS",
     "DEFAULT_SIGNAL_WEIGHTS",
     "SIGNAL_WEIGHTS",
+    "VALIDITY_ACTIVE",
+    "VALIDITY_REVOKED",
+    "REVOCATION_REASON_CONTRADICTION",
 ]
 
 # ---------------------------------------------------------------------------
@@ -62,6 +70,17 @@ DEFAULT_SIGNAL_WEIGHTS: dict[str, float] = {
 
 #: Public alias matching the task spec wording.
 SIGNAL_WEIGHTS: dict[str, float] = DEFAULT_SIGNAL_WEIGHTS
+
+#: Explicit validity state (TEPA, #154): an active precedent is *revoked*
+#: when fresh evidence contradicts it, rather than overwritten or left to
+#: age out. Revocation is recorded state, not deletion — the entry stays
+#: queryable through revocation audits.
+VALIDITY_ACTIVE: str = "active"
+VALIDITY_REVOKED: str = "revoked"
+
+#: Default reason recorded when a stored event is revoked by newer,
+#: contradictory evidence on the memory write path.
+REVOCATION_REASON_CONTRADICTION: str = "contradicted_by_new_evidence"
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
@@ -240,6 +259,10 @@ class MemoryEvent:
     tags: list[str] = field(default_factory=list)
     context_refs: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    validity: str = VALIDITY_ACTIVE  # VALIDITY_ACTIVE | VALIDITY_REVOKED (#154)
+    revoked_at: str = ""  # ISO timestamp of revocation; "" while active
+    revoked_by: str = ""  # event_id of the superseding evidence, if any
+    revocation_reason: str = ""  # why it was revoked (e.g. contradicted)
 
     def __post_init__(self) -> None:
         # Coerce common alternate types so the dataclass is forgiving.
@@ -254,6 +277,19 @@ class MemoryEvent:
         self.tags = list(self.tags) if self.tags else []
         self.context_refs = list(self.context_refs) if self.context_refs else []
         self.metadata = dict(self.metadata) if self.metadata else {}
+        # Normalize explicit validity state (TEPA, #154): anything that is
+        # not the literal revoked marker is treated as active, and the
+        # revocation trace fields are strings (legacy data lacks them).
+        if self.validity != VALIDITY_REVOKED:
+            self.validity = VALIDITY_ACTIVE
+        self.revoked_at = self.revoked_at or ""
+        self.revoked_by = self.revoked_by or ""
+        self.revocation_reason = self.revocation_reason or ""
+
+    @property
+    def is_revoked(self) -> bool:
+        """True when this event has been revoked (TEPA, #154)."""
+        return self.validity == VALIDITY_REVOKED
 
     # -- scoring -----------------------------------------------------------
 
@@ -310,6 +346,10 @@ class MemoryEvent:
             "tags": list(self.tags),
             "context_refs": list(self.context_refs),
             "metadata": dict(self.metadata),
+            "validity": self.validity,
+            "revoked_at": self.revoked_at,
+            "revoked_by": self.revoked_by,
+            "revocation_reason": self.revocation_reason,
         }
 
     @classmethod
@@ -330,6 +370,10 @@ class MemoryEvent:
             "tags",
             "context_refs",
             "metadata",
+            "validity",
+            "revoked_at",
+            "revoked_by",
+            "revocation_reason",
         }
         kwargs = {k: v for k, v in data.items() if k in known}
         return cls(**kwargs)
@@ -387,8 +431,65 @@ class EpisodicMemoryStore:
         return event_id in self.events
 
     def all(self) -> list[MemoryEvent]:
-        """Return all events in insertion order."""
+        """Return all events in insertion order, revoked included.
+
+        This is the raw audit view; normal retrieval methods exclude
+        revoked events by default (see :meth:`_events`).
+        """
         return list(self.events.values())
+
+    def _events(self, include_revoked: bool = False) -> Iterable[MemoryEvent]:
+        """Yield events, skipping revoked ones unless ``include_revoked``.
+
+        Retrieval defaults to active-only so a revoked claim never
+        resurfaces in later prompts (TEPA, #154); audits pass
+        ``include_revoked=True`` to see the full history.
+        """
+        for ev in self.events.values():
+            if include_revoked or ev.validity == VALIDITY_ACTIVE:
+                yield ev
+
+    def active_events(self) -> list[MemoryEvent]:
+        """All active (non-revoked) events in insertion order."""
+        return [ev for ev in self.events.values() if ev.validity == VALIDITY_ACTIVE]
+
+    def revoke(
+        self,
+        event_id: str,
+        *,
+        by_event_id: str = "",
+        reason: str = REVOCATION_REASON_CONTRADICTION,
+    ) -> bool:
+        """Mark an event revoked without deleting it (TEPA, #154).
+
+        Sets explicit validity state — ``validity`` becomes ``revoked``
+        with a timestamp, the superseding evidence id (``by_event_id``)
+        and a ``reason`` — so the entry stays queryable through
+        :meth:`revoked_events` and is excluded from normal retrieval.
+        Returns False when the event does not exist or is already revoked.
+        """
+        ev = self.events.get(event_id)
+        if ev is None or ev.validity == VALIDITY_REVOKED:
+            return False
+        ev.validity = VALIDITY_REVOKED
+        ev.revoked_at = _now_iso()
+        ev.revoked_by = by_event_id
+        ev.revocation_reason = reason
+        return True
+
+    def revoked_events(self) -> list[MemoryEvent]:
+        """All revoked events, newest revocation first (revocation audit).
+
+        Each entry carries ``revoked_at`` / ``revoked_by`` /
+        ``revocation_reason`` so a memory audit can answer *why we believed
+        X earlier and what replaced it* (TEPA, #154).
+        """
+        out = [ev for ev in self.events.values() if ev.validity == VALIDITY_REVOKED]
+        out.sort(
+            key=lambda e: (_parse_iso(e.revoked_at or e.when), e.event_id),
+            reverse=True,
+        )
+        return out
 
     # -- retrieval ---------------------------------------------------------
 
@@ -409,12 +510,16 @@ class EpisodicMemoryStore:
         end: str | datetime | None = None,
         *,
         inclusive: bool = True,
+        include_revoked: bool = False,
     ) -> list[MemoryEvent]:
-        """Return events with ``when`` in ``[start, end]`` (open-ended if None)."""
+        """Return events with ``when`` in ``[start, end]`` (open-ended if None).
+
+        Revoked events are excluded unless ``include_revoked`` is True.
+        """
         s = _parse_iso(start) if start is not None else None
         e = _parse_iso(end) if end is not None else None
         out: list[MemoryEvent] = []
-        for ev in self.events.values():
+        for ev in self._events(include_revoked):
             t = _parse_iso(ev.when)
             if s is not None:
                 if inclusive and t < s:
@@ -430,12 +535,16 @@ class EpisodicMemoryStore:
         return self._ordered(out)
 
     def retrieve_by_category(
-        self, category: str | None = None, *, tags: Iterable[str] | None = None
+        self,
+        category: str | None = None,
+        *,
+        tags: Iterable[str] | None = None,
+        include_revoked: bool = False,
     ) -> list[MemoryEvent]:
         """Return events matching a category and/or any of the given tags."""
         tag_set = set(tags) if tags is not None else None
         out: list[MemoryEvent] = []
-        for ev in self.events.values():
+        for ev in self._events(include_revoked):
             if category is not None and ev.category != category:
                 continue
             if tag_set is not None:
@@ -450,10 +559,11 @@ class EpisodicMemoryStore:
         *,
         decayed: bool = False,
         reference_time: str | datetime | None = None,
+        include_revoked: bool = False,
     ) -> list[MemoryEvent]:
         """Return events with importance >= ``threshold`` (descending)."""
         out: list[MemoryEvent] = []
-        for ev in self.events.values():
+        for ev in self._events(include_revoked):
             score = (
                 ev.decayed_importance(
                     reference_time=reference_time,
@@ -468,13 +578,20 @@ class EpisodicMemoryStore:
         out.sort(key=lambda e: e.importance, reverse=True)
         return out
 
-    def text_search(self, query: str, *, min_score: float = 0.0) -> list[MemoryEvent]:
+    def text_search(
+        self,
+        query: str,
+        *,
+        min_score: float = 0.0,
+        include_revoked: bool = False,
+    ) -> list[MemoryEvent]:
         """Bag-of-words TF-IDF-like search over event text.
 
         Each event's token bag is built from ``what`` + ``outcome`` + ``tags``.
         IDF is computed over the store corpus; the query is scored by summed
         ``tf * idf`` over query tokens present in each event, normalized by
         event token count.  Results are returned in descending score order.
+        Revoked events are excluded unless ``include_revoked`` is True.
         """
         if not query.strip():
             return []
@@ -482,7 +599,7 @@ class EpisodicMemoryStore:
         if not q_tokens:
             return []
 
-        corpus = [ev.tokens() for ev in self.events.values()]
+        corpus = [ev.tokens() for ev in self._events(include_revoked)]
         n_docs = len(corpus)
         # document frequency per token
         df: dict[str, int] = {}
@@ -493,7 +610,7 @@ class EpisodicMemoryStore:
             return []
 
         scored: list[tuple[float, MemoryEvent]] = []
-        for ev, toks in zip(self.events.values(), corpus):
+        for ev, toks in zip(self._events(include_revoked), corpus):
             if not toks:
                 continue
             tf: dict[str, int] = {}
@@ -518,6 +635,7 @@ class EpisodicMemoryStore:
         *,
         limit: int = 10,
         max_window_days: float | None = None,
+        include_revoked: bool = False,
     ) -> list[MemoryEvent]:
         """Return the ``limit`` events closest in time to ``reference``.
 
@@ -526,7 +644,7 @@ class EpisodicMemoryStore:
         """
         ref = _parse_iso(reference)
         scored: list[tuple[float, MemoryEvent]] = []
-        for ev in self.events.values():
+        for ev in self._events(include_revoked):
             delta = abs((_parse_iso(ev.when) - ref).total_seconds()) / 86400.0
             if max_window_days is not None and delta > max_window_days:
                 continue
@@ -554,7 +672,9 @@ class EpisodicMemoryStore:
         set; when False the store is untouched and only the merged list is
         returned.
         """
-        events = list(self.events.values())
+        # Only active events participate: a revoked event must never be
+        # merged back into an active one (TEPA, #154).
+        events = list(self._events(include_revoked=False))
         # Deterministic grouping: sort by when so earlier events seed groups.
         events.sort(key=lambda e: (_parse_iso(e.when), e.event_id))
         groups: list[list[MemoryEvent]] = []
