@@ -955,6 +955,7 @@ class AIAgent:
         self.session_api_calls = 0
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
+        self.session_cost_source = "none"
         # The rendered experience block is stable within one conversation,
         # but a reused agent must read the bank again for the next session.
         if hasattr(self, "_experience_block"):

@@ -738,6 +738,32 @@ class TestInit:
         missing = init_params - aiagent_params
         assert not missing, f"AIAgent.__init__ is missing parameters accepted by init_agent: {missing}"
 
+    def test_aiagent_init_initializes_session_token_and_cost_attributes(self):
+        """AIAgent must initialize session token counters and cost fields required by turn_finalizer."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a.session_reasoning_tokens == 0
+            assert a.session_estimated_cost_usd == 0.0
+            assert a.session_cost_status == "unknown"
+            assert a.session_cost_source == "none"
+            assert a.session_prompt_tokens == 0
+            assert a.session_completion_tokens == 0
+            assert a.session_total_tokens == 0
+            assert a.session_input_tokens == 0
+            assert a.session_output_tokens == 0
+            assert a.session_cache_read_tokens == 0
+            assert a.session_cache_write_tokens == 0
+
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
         with (

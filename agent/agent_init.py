@@ -3342,6 +3342,10 @@ def init_agent(
     agent.session_output_tokens = 0
     agent.session_cache_read_tokens = 0
     agent.session_cache_write_tokens = 0
+    agent.session_reasoning_tokens = 0
+    agent.session_estimated_cost_usd = 0.0
+    agent.session_cost_status = "unknown"
+    agent.session_cost_source = "none"
     # Rolling history for status-bar avg latency / velocity (last 10 calls).
     # Stored on the agent so both conversation_loop and codex_runtime share it
     # and the CLI snapshot can read it without extra IPC.
