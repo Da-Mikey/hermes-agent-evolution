@@ -427,3 +427,53 @@ class TestTodayUtc:
         fresh_keys = set(hydra._check_pool(Path("/nonexistent/evolution-dir")).keys())
         assert "integration→upstream-sync" not in fresh_keys
         assert "implementation→integration" in fresh_keys
+
+
+class TestTimeTriggerResilience3380:
+    """#3380: time triggers must not perpetually wake when a canonical stage output
+    exists for today with a backdated mtime or has already been dispatched today."""
+
+    def test_backdated_mtime_today_output_does_not_fire_overdue(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """research/{today}.md exists with 48h-old mtime — must NOT fire 'research overdue'."""
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        # Create output for all stages
+        for stage in (
+            "research",
+            "issues",
+            "introspection",
+            "analysis",
+            "implementation",
+            "integration",
+            "upstream-sync",
+        ):
+            d = tmp_path / stage
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / f"{hydra._today()}.md"
+            f.write_text("{}", encoding="utf-8")
+            # Backdate research output to 48 hours ago
+            if stage == "research":
+                old_ts = time.time() - (48 * 3600)
+                os.utime(f, (old_ts, old_ts))
+
+        with patch.object(
+            hydra, "_check_github_write_access", return_value=(True, "ok")
+        ):
+            rc = hydra.main()
+            out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "research overdue" not in out
+        assert json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": False}
+
+    def test_suffixed_today_output_recognized(self, tmp_path):
+        """Suffixed files like {today}-tick2.md must be included in _today_paths."""
+        d = tmp_path / "research"
+        d.mkdir(parents=True, exist_ok=True)
+        f_tick2 = d / f"{hydra._today()}-tick2.md"
+        f_tick2.write_text("{}", encoding="utf-8")
+
+        paths = hydra._today_paths(tmp_path, "research")
+        assert f_tick2 in paths
+

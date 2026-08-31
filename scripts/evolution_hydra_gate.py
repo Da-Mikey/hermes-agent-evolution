@@ -62,19 +62,32 @@ def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def _today_paths(evo_dir: Path, stage: str, ext: str = ".json") -> Tuple[Path, Path]:
-    """Return (stage_today, stage_alt) — paths for today's output in json and
-    possible markdown format."""
-    return (
-        evo_dir / stage / f"{_today()}{ext}",
-        evo_dir / stage / f"{_today()}.md",
-    )
+def _today_paths(evo_dir: Path, stage: str, ext: str = ".json") -> Tuple[Path, ...]:
+    """Return paths for today's output in json and markdown format (including suffixed variants)."""
+    today_str = _today()
+    stage_dir = evo_dir / stage
+    standard = [
+        stage_dir / f"{today_str}{ext}",
+        stage_dir / f"{today_str}.md",
+    ]
+    if stage_dir.is_dir():
+        try:
+            for p in stage_dir.iterdir():
+                if p.is_file() and p.name.startswith(today_str) and (
+                    p.suffix in {".json", ".md", ".fresh"} or "-tick" in p.name or "-supplement" in p.name
+                ):
+                    if p not in standard:
+                        standard.append(p)
+        except OSError:
+            pass
+    return tuple(sorted(standard))
 
 
 def _latest_output(evo_dir: Path, stage: str) -> float:
     """Return the latest mtime of any output file for this stage (today)."""
-    json_path, md_path = _today_paths(evo_dir, stage)
-    return max(_mtime(json_path), _mtime(md_path))
+    paths = _today_paths(evo_dir, stage)
+    mtimes = [_mtime(p) for p in paths]
+    return max(mtimes) if mtimes else 0.0
 
 
 def _stage_content_hash(evo_dir: Path, stage: str) -> str:
@@ -415,6 +428,25 @@ def _has_work(evo_dir: Path) -> Tuple[bool, str]:
         "upstream-sync": 28,  # daily fork sync (slightly wider window)
     }
     for stage, max_interval_h in time_triggers.items():
+        # Suffix / mtime resilience (#3380): if today's output exists on disk
+        # (regardless of backdated mtime) or was already dispatched today in
+        # the ledger, this stage has already run for today.
+        stage_has_today_file = any(
+            p.exists() and p.is_file() for p in _today_paths(evo_dir, stage)
+        )
+        outgoing_edges = [edge for edge, up in edge_upstream.items() if up == stage]
+        dispatched_today = bool(outgoing_edges) and all(
+            _already_dispatched_today(
+                evo_dir,
+                edge,
+                _latest_output(evo_dir, stage),
+                _stage_content_hash(evo_dir, stage),
+            )
+            for edge in outgoing_edges
+        )
+        if stage_has_today_file or dispatched_today:
+            continue
+
         last_mtime = _latest_output(evo_dir, stage)
         if last_mtime > 0:
             age_hours = (now_ts - last_mtime) / 3600
@@ -438,11 +470,15 @@ def _has_work(evo_dir: Path) -> Tuple[bool, str]:
         "integration",
         "upstream-sync",
     ]
-    latest_any = max(_latest_output(evo_dir, s) for s in stages)
-    if latest_any > 0:
-        age_hours = (now_ts - latest_any) / 3600
-        if age_hours >= 12:
-            return True, f"safety wake: {age_hours:.0f}h since last output"
+    if any(any(p.exists() and p.is_file() for p in _today_paths(evo_dir, s)) for s in stages):
+        # At least one stage has produced output today — not stuck.
+        pass
+    else:
+        latest_any = max(_latest_output(evo_dir, s) for s in stages)
+        if latest_any > 0:
+            age_hours = (now_ts - latest_any) / 3600
+            if age_hours >= 12:
+                return True, f"safety wake: {age_hours:.0f}h since last output"
 
     if suppressed:
         return False, (
