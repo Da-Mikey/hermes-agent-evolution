@@ -315,6 +315,10 @@ def _read_failed_error(path: "Path") -> Dict[str, Any]:
     }
 
 
+DEFAULT_MEMORY_CHAR_LIMIT = 4000
+DEFAULT_USER_CHAR_LIMIT = 1375
+
+
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -334,8 +338,8 @@ class MemoryStore:
 
     def __init__(
         self,
-        memory_char_limit: int = 2200,
-        user_char_limit: int = 1375,
+        memory_char_limit: int = DEFAULT_MEMORY_CHAR_LIMIT,
+        user_char_limit: int = DEFAULT_USER_CHAR_LIMIT,
         *,
         guard: Optional[object] = None,
         allow_batch_override: bool = False,
@@ -1751,8 +1755,8 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
-    memory_char_limit = 4000
-    user_char_limit = 1375
+    memory_char_limit = DEFAULT_MEMORY_CHAR_LIMIT
+    user_char_limit = DEFAULT_USER_CHAR_LIMIT
     memory_enabled = True
     user_profile_enabled = True
     allow_batch_override = False

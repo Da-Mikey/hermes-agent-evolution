@@ -58,11 +58,9 @@ def _default_memory_sink():
     recurrence reset only.
     """
     try:
-        from tools.memory_tool import MemoryStore
+        from tools.memory_tool import load_on_disk_store
 
-        store = MemoryStore()
-        store.load_from_disk()
-        return store
+        return load_on_disk_store()
     except Exception:
         return None
 

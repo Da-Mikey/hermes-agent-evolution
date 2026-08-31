@@ -1616,13 +1616,29 @@ class TestBomToleranceInMemoryFiles:
 
 def test_load_on_disk_store_initialization_defaults(monkeypatch, tmp_path):
     """Regression: load_on_disk_store must define defaults before config loading."""
-    from tools.memory_tool import load_on_disk_store
+    from tools.memory_tool import DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, load_on_disk_store
 
     monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
     store = load_on_disk_store()
-    assert store.memory_char_limit == 4000
-    assert store.user_char_limit == 1375
+    assert store.memory_char_limit == DEFAULT_MEMORY_CHAR_LIMIT
+    assert store.user_char_limit == DEFAULT_USER_CHAR_LIMIT
     assert store.memory_enabled is True
     assert store.user_profile_enabled is True
+
+
+def test_load_on_disk_store_fallback_on_config_error(monkeypatch, tmp_path):
+    """load_on_disk_store must fall back to default constants when load_config raises."""
+    from tools.memory_tool import DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, load_on_disk_store
+
+    monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+    def _raising_load_config():
+        raise OSError("unreadable config file")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _raising_load_config)
+    store = load_on_disk_store()
+    assert store.memory_char_limit == DEFAULT_MEMORY_CHAR_LIMIT
+    assert store.user_char_limit == DEFAULT_USER_CHAR_LIMIT
+    assert store.memory_enabled is True
 

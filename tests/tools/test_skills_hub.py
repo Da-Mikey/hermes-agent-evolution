@@ -2021,13 +2021,13 @@ class TestUrlSourceFetchMissingReferencedFile:
 
 
 def test_search_skills_deduped_sorting():
-    """Verify unified_search correctly converts seen dict to deduped list and sorts by trust."""
+    """Verify unified_search converts seen dict to list and sorts by trust before truncating to limit."""
     from tools.skills_hub import SkillMeta, unified_search
 
+    # Lower trust entry arrives first; sorting must move builtin to index 0 before limit cut
     results = [
-        SkillMeta(name="s1", description="s1 desc", source="community", identifier="owner/repo/s1", trust_level="community"),
+        SkillMeta(name="s2", description="s2 desc", source="community", identifier="owner/repo/s2", trust_level="community"),
         SkillMeta(name="s1", description="s1 desc", source="builtin", identifier="owner/repo/s1", trust_level="builtin"),
-        SkillMeta(name="s2", description="s2 desc", source="trusted", identifier="owner/repo/s2", trust_level="trusted"),
     ]
 
     with (

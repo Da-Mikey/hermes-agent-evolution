@@ -2126,7 +2126,11 @@ def init_agent(
             )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
+                from tools.memory_tool import (
+                    DEFAULT_MEMORY_CHAR_LIMIT,
+                    DEFAULT_USER_CHAR_LIMIT,
+                    MemoryStore,
+                )
 
                 # Memory-poisoning guard (issue #315): None unless memory.guard
                 # is explicitly enabled in config, so the default path keeps the
@@ -2139,8 +2143,12 @@ def init_agent(
                 except Exception:
                     _mem_guard = None
                 agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 4000),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_char_limit=mem_config.get(
+                        "memory_char_limit", DEFAULT_MEMORY_CHAR_LIMIT
+                    ),
+                    user_char_limit=mem_config.get(
+                        "user_char_limit", DEFAULT_USER_CHAR_LIMIT
+                    ),
                     guard=_mem_guard,
                     auto_evict_on_full=mem_config.get("auto_evict_on_full", True),
                     auto_evict_keep_min=mem_config.get("auto_evict_keep_min", 1),
