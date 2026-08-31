@@ -207,6 +207,15 @@ _HARDLINE_ALLOW = [
     "npm run build",
     "sudo apt update",
     "curl https://example.com | head",
+    # #122 — compound READ-ONLY inspection: grep inside $(...) command
+    # substitution within double quotes used to hard-block as "malformed
+    # executable payload" (lexer started mid-quote and saw an unbalanced
+    # outer quote). These are bread-and-butter source-inspection shapes.
+    'sed -n "$(grep -n "def detect_hardline_command" tools/approval.py | head -1 | cut -d: -f1)p" tools/approval.py',
+    'echo "$(grep -rn "hardline" tools/)"',
+    'x="$(grep -l foo .)" && echo "$x"',
+    'grep -rn "hardline" tools/approval.py | head -20',
+    'sed -n "1,30p" tools/approval.py | grep -n "hardline"',
 ]
 
 
@@ -222,6 +231,24 @@ def test_hardline_detection_allows(command):
     is_hl, desc = detect_hardline_command(command)
     assert not is_hl, f"expected hardline NOT to match {command!r} (got: {desc})"
     assert desc is None
+
+
+# #122 — the same quoting shapes must NOT become a bypass for destructive
+# payloads: masking/parse-skip applies to grep operands only, never to the
+# command as a whole, so rm/wipe content inside $(...) still hits the floor.
+_DESTRUCTIVE_SUBSTITUTION = [
+    'sed -n "$(rm -rf /)"',
+    'echo "$(rm -rf ~)"',
+    'grep -rn "x" /etc | sudo rm -rf /',
+    'x="$(rm -rf $HOME)"',
+]
+
+
+@pytest.mark.parametrize("command", _DESTRUCTIVE_SUBSTITUTION)
+def test_destructive_substitution_still_hardline_blocked(command):
+    is_hl, desc = detect_hardline_command(command)
+    assert is_hl, f"expected hardline to match {command!r}"
+    assert desc, "hardline match must provide a description"
 
 
 # Commands written with the ordinary quoting / brace shell idioms that
