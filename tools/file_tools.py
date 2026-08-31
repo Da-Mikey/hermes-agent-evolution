@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import posixpath
+import re
 import sys
 import threading
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -30,6 +32,271 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+
+
+# Invisible / compatibility spaces that render like a normal space in a
+# terminal. Folding them (plus NFC) lets read_file recover a path the
+# model retyped visually-correctly but with the wrong bytes.
+_FILENAME_SPACE_FOLDS = (
+    "\u00a0",  # no-break space
+    "\u202f",  # narrow no-break space
+    "\u2007",  # figure space
+    "\u2009",  # thin space
+    "\u200a",  # hair space
+)
+
+
+def _fold_filename_for_unicode_match(name: str) -> str:
+    folded = unicodedata.normalize("NFC", name)
+    for src in _FILENAME_SPACE_FOLDS:
+        folded = folded.replace(src, " ")
+    return folded
+
+
+def _find_unicode_equivalent_path(requested: Path) -> Path | None:
+    """Return the single same-dir file that is a unicode-equivalent of *requested*.
+
+    Conservative: only NFC + invisible-space folding, and only when exactly
+    one sibling matches. Visible differences (straight vs curly quote,
+    missing accents) stay as not-found + similar_files.
+    """
+    try:
+        parent = requested.parent
+        if not parent.is_dir():
+            return None
+        target = _fold_filename_for_unicode_match(requested.name)
+        matches = [
+            entry
+            for entry in parent.iterdir()
+            if entry.is_file()
+            and _fold_filename_for_unicode_match(entry.name) == target
+        ]
+    except OSError:
+        return None
+    if len(matches) == 1 and matches[0].name != requested.name:
+        return matches[0]
+    return None
+
+
+def _find_auto_repaired_path(
+    requested: Path,
+    raw_path: str,
+    task_id: str = "default",
+) -> tuple[Path | None, str | None]:
+    """Find a single unambiguous valid path candidate when *requested* does not exist (#2411).
+
+    Strategies evaluated in priority order:
+      1. Unicode normalization (NFC + invisible-space folding via _find_unicode_equivalent_path)
+      2. Case-insensitive match in the requested parent directory (e.g. readme.md -> README.md)
+      3. Case-insensitive component-wise path traversal (e.g. Tools/file_tools.py -> tools/file_tools.py)
+      4. Workspace-root fallback (if relative path failed against cwd)
+      5. Extraneous prefix stripping (e.g. hermes-agent/tools/foo.py -> tools/foo.py)
+      6. Unique filename in workspace tree (for non-generic filenames >3 chars)
+
+    Returns (repaired_path, explanation_hint) or (None, None) if ambiguous or none found.
+    """
+    # 1. Unicode normalization
+    unicode_hit = _find_unicode_equivalent_path(requested)
+    if unicode_hit is not None and unicode_hit.is_file():
+        return (
+            unicode_hit,
+            f"Opened unicode-equivalent filename {unicode_hit.name!r} instead of {requested.name!r}.",
+        )
+
+    # 2. Case-insensitive match in parent directory
+    try:
+        parent = requested.parent
+        if parent.is_dir():
+            target_lower = requested.name.lower()
+            ci_matches = [
+                entry
+                for entry in parent.iterdir()
+                if entry.is_file() and entry.name.lower() == target_lower
+            ]
+            if len(ci_matches) == 1 and ci_matches[0].name != requested.name:
+                return (
+                    ci_matches[0],
+                    f"Opened case-corrected filename {ci_matches[0].name!r} instead of {requested.name!r}.",
+                )
+    except OSError:
+        pass
+
+    # 3. Case-insensitive component-wise path traversal
+    try:
+        curr_dir = requested.parent
+        unresolved_parts = [requested.name]
+        while not curr_dir.exists() and curr_dir.parent != curr_dir:
+            unresolved_parts.insert(0, curr_dir.name)
+            curr_dir = curr_dir.parent
+        if (
+            curr_dir.exists()
+            and curr_dir.is_dir()
+            and unresolved_parts != [requested.name]
+        ):
+            matched_all = True
+            for part in unresolved_parts:
+                if not curr_dir.is_dir():
+                    matched_all = False
+                    break
+                part_lower = part.lower()
+                matches = [
+                    e for e in curr_dir.iterdir() if e.name.lower() == part_lower
+                ]
+                if len(matches) == 1:
+                    curr_dir = matches[0]
+                else:
+                    matched_all = False
+                    break
+            if matched_all and curr_dir.is_file() and curr_dir != requested:
+                return (
+                    curr_dir,
+                    f"Opened case-corrected path '{curr_dir}' instead of '{raw_path}'.",
+                )
+    except OSError:
+        pass
+
+    # 4. Workspace / Project root vs CWD fallback
+    ws_root = None
+    base_dir = None
+    try:
+        ws_root = _authoritative_workspace_root(task_id)
+        base_dir = str(_resolve_base_dir(task_id, container_paths=False))
+        if not Path(raw_path).is_absolute():
+            # Check explicit workspace root
+            if ws_root and ws_root != base_dir:
+                ws_candidate = (Path(ws_root) / raw_path).resolve()
+                if ws_candidate.is_file() and ws_candidate != requested:
+                    return (
+                        ws_candidate,
+                        f"Resolved path relative to workspace root '{ws_root}' instead of working directory.",
+                    )
+            # Check project root by walking up to find .git, pyproject.toml, package.json, config.yaml
+            start_dir = Path(base_dir if base_dir else os.getcwd())
+            proj_root = start_dir
+            while proj_root.parent != proj_root:
+                if (
+                    (proj_root / ".git").exists()
+                    or (proj_root / "pyproject.toml").exists()
+                    or (proj_root / "package.json").exists()
+                    or (proj_root / "config.yaml").exists()
+                ):
+                    break
+                proj_root = proj_root.parent
+            if proj_root != start_dir:
+                proj_cand = (proj_root / raw_path).resolve()
+                if proj_cand.is_file() and proj_cand != requested:
+                    return (
+                        proj_cand,
+                        f"Resolved path relative to project root '{proj_root}' instead of working directory.",
+                    )
+            if base_dir:
+                cwd_candidate = (Path(base_dir) / raw_path).resolve()
+                if cwd_candidate.is_file() and cwd_candidate != requested:
+                    return (
+                        cwd_candidate,
+                        f"Resolved path relative to working directory '{base_dir}'.",
+                    )
+    except Exception:
+        pass
+
+    # 5. Extraneous prefix stripping (e.g. repo name or /workspace/ or workspace/)
+    try:
+        raw_parts = Path(raw_path.lstrip("/\\")).parts
+        if len(raw_parts) > 1:
+            base_p = Path(base_dir if base_dir else os.getcwd())
+            ws_p = Path(ws_root) if ws_root else base_p
+            # Try stripping 1 leading component
+            stripped_1 = Path(*raw_parts[1:])
+            for anchor in (base_p, ws_p):
+                cand = (anchor / stripped_1).resolve()
+                if cand.is_file() and cand != requested:
+                    return (
+                        cand,
+                        f"Stripped leading directory prefix from '{raw_path}' to '{cand}'.",
+                    )
+            # If 2+ components and starts with common container/repo names, try stripping 2
+            if len(raw_parts) > 2 and raw_parts[0].lower() in {
+                "workspace",
+                "config",
+                "app",
+            }:
+                stripped_2 = Path(*raw_parts[2:])
+                for anchor in (base_p, ws_p):
+                    cand = (anchor / stripped_2).resolve()
+                    if cand.is_file() and cand != requested:
+                        return (
+                            cand,
+                            f"Stripped leading directory prefix from '{raw_path}' to '{cand}'.",
+                        )
+    except Exception:
+        pass
+
+    # 6. Unique matching file in workspace tree for non-generic filenames
+    _GENERIC_NAMES = frozenset({
+        "__init__.py",
+        "index.js",
+        "index.ts",
+        "index.html",
+        "setup.py",
+        "pyproject.toml",
+        "package.json",
+        "cargo.toml",
+        "main.py",
+        "app.py",
+        "readme.md",
+        "license",
+        "config.yaml",
+        "config.yml",
+        "config.json",
+        "conftest.py",
+        "makefile",
+        "dockerfile",
+    })
+    filename = requested.name
+    if filename.lower() not in _GENERIC_NAMES and len(filename) > 3:
+        try:
+            ws_root_path = Path(
+                ws_root if ws_root else (base_dir if base_dir else os.getcwd())
+            )
+            if ws_root_path.is_dir():
+                matches = []
+                target_name_lower = filename.lower()
+                for root_dir, dirs, files in os.walk(ws_root_path):
+                    dirs[:] = [
+                        d
+                        for d in dirs
+                        if d
+                        not in {
+                            ".git",
+                            ".venv",
+                            "venv",
+                            "node_modules",
+                            "__pycache__",
+                            ".pytest_cache",
+                            ".claude",
+                        }
+                    ]
+                    for f in files:
+                        if f.lower() == target_name_lower:
+                            matches.append(Path(root_dir) / f)
+                            if len(matches) > 1:
+                                break
+                    if len(matches) > 1:
+                        break
+                if (
+                    len(matches) == 1
+                    and matches[0].is_file()
+                    and matches[0] != requested
+                ):
+                    return (
+                        matches[0],
+                        f"Found unique matching file '{matches[0]}' in workspace for '{raw_path}'.",
+                    )
+        except Exception:
+            pass
+
+    return None, None
 
 
 def _expand_tilde(path: str) -> str:
@@ -1998,18 +2265,36 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # optimization; recording must stay side-effect-identical.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
-            # #2293 — if the shell-based _suggest_similar_files found nothing
-            # (no similar_files), fall back to the shared pure-Python module
-            # so the agent still gets a nearby-files hint. This exercises the
-            # reusable path-validation layer in a real call site (Slice B
-            # extends it to terminal/search_files/patch).
-            if not result_dict.get("similar_files"):
-                _nearby = suggest_nearby_paths(str(_resolved))
-                _hint = format_nearby_hint(str(_resolved), _nearby)
-                if _hint:
-                    result_dict["error"] = _err + "\n\n" + _hint
-            _not_found_json = json.dumps(result_dict, ensure_ascii=False)
-            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
+            # #2411 — auto-repair: try to find an unambiguous valid path
+            # (unicode-equivalent, case-corrected, workspace-root fallback,
+            # prefix-stripped, or unique workspace file) before giving up.
+            repaired_path, repair_note = _find_auto_repaired_path(
+                Path(str(_resolved)), raw_path=path, task_id=task_id
+            )
+            if repaired_path is not None:
+                repaired = file_ops.read_file(str(repaired_path), offset, limit)
+                repaired_dict = repaired.to_dict()
+                if not repaired_dict.get("error"):
+                    existing_hint = repaired_dict.get("hint") or ""
+                    repaired_dict["hint"] = (
+                        f"{existing_hint} {repair_note}".strip()
+                        if existing_hint
+                        else repair_note
+                    )
+                    result = repaired
+                    result_dict = repaired_dict
+                    _err = ""
+            if isinstance(_err, str) and _err.startswith("File not found:"):
+                # #2293 — if the shell-based _suggest_similar_files found nothing
+                # (no similar_files), fall back to the shared pure-Python module
+                # so the agent still gets a nearby-files hint.
+                if not result_dict.get("similar_files"):
+                    _nearby = suggest_nearby_paths(str(_resolved))
+                    _hint = format_nearby_hint(str(_resolved), _nearby)
+                    if _hint:
+                        result_dict["error"] = _err + "\n\n" + _hint
+                _not_found_json = json.dumps(result_dict, ensure_ascii=False)
+                _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -2967,11 +3252,15 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images. The 'path' parameter can also be a list of paths to read multiple files in one call (batch mode, max 10 files).",
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+            "path": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Path to the file to read (absolute, relative, or ~/path), or a list of up to 10 paths for batch reading",
+            },
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
             "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
         },
@@ -3070,7 +3359,44 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    path = args.get("path", "")
+    # #757/#784 — batch mode: read multiple files in one tool call.
+    if isinstance(path, list):
+        return _handle_read_file_batch(path, args, tid)
+    return read_file_tool(path=path, offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+
+
+_BATCH_READ_MAX_FILES = 10
+
+
+def _handle_read_file_batch(paths: list, args: dict, tid: str) -> str:
+    """Read multiple files in one call. Returns JSON with per-file results."""
+    if len(paths) > _BATCH_READ_MAX_FILES:
+        return json.dumps({
+            "error": (
+                f"Batch read supports at most {_BATCH_READ_MAX_FILES} files per call; "
+                f"got {len(paths)}. Split into smaller batches."
+            ),
+        })
+    offset = args.get("offset", 1)
+    limit = args.get("limit", 500)
+    files = []
+    for p in paths:
+        if not isinstance(p, str):
+            files.append({"path": str(p), "error": "Invalid path type: expected string"})
+            continue
+        raw = read_file_tool(path=p, offset=offset, limit=limit, task_id=tid)
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            parsed = {"raw": raw}
+        entry = {"path": p}
+        if "error" in parsed:
+            entry["error"] = parsed["error"]
+        else:
+            entry.update(parsed)
+        files.append(entry)
+    return json.dumps({"batch": True, "files": files}, ensure_ascii=False)
 
 
 def _handle_write_file(args, **kw):
@@ -3111,13 +3437,256 @@ def _handle_patch(args, **kw):
     )
 
 
+def _looks_like_glob(pattern: str) -> bool:
+    """Heuristic: does *pattern* look like a shell glob rather than a regex?
+
+    Globs use ``*``, ``?``, and ``[...]`` as wildcards without regex escaping.
+    In a regex those same characters are metacharacters, but a bare ``*.py`` or
+    ``*config*`` is almost certainly a glob the model intended as a filename
+    pattern, not a regex. We flag it so the caller can auto-redirect.
+    """
+    if not pattern:
+        return False
+    # A real regex would escape these as \*, \?, \[ — so an unescaped
+    # wildcard is the signal.  ``**/`` (recursive glob) is also glob-only.
+    # Exception: ``.*`` and ``.+`` etc. are common regex idioms where the
+    # ``*``/``+`` quantifier follows a regex metacharacter — those should
+    # NOT be flagged as globs.  The distinguishing signal: in a glob, ``*``
+    # is typically preceded by a literal character (``*.py``, ``*config*``)
+    # or a ``/`` (``**/*.py``), not by a regex metacharacter like ``.``.
+    for i, ch in enumerate(pattern):
+        if ch == "*":
+            if i > 0 and pattern[i - 1] == "\\":
+                continue  # escaped — regex literal
+            if i > 0 and pattern[i - 1] in ".+?^$":
+                # ``.*``, ``+*`` (unusual but not a glob) — ``*`` is a
+                # regex quantifier following a metacharacter, not a glob.
+                # But ``?*`` is ambiguous — treat as regex here since
+                # ``?*`` as a glob is extremely rare.
+                continue
+            if i > 0 and pattern[i - 1] == "*" and i >= 2 and pattern[i - 2] == "*":
+                # ``**`` (recursive glob) — ``**/`` is glob-only
+                if i + 1 < len(pattern) and pattern[i + 1] == "/":
+                    return True
+                continue
+            return True
+        if ch == "?":
+            if i > 0 and pattern[i - 1] == "\\":
+                continue
+            # ``?`` in regex means "zero or one" — preceded by a
+            # metacharacter it's a quantifier, not a glob wildcard.
+            # ``(`` is included so lookarounds ``(?!…)``, ``(?<=…)``,
+            # ``(?:…)`` and other ``(?…)`` groups are NOT misclassified
+            # as glob ``?`` wildcards (#1484 — caused 59 retries/7d).
+            if i > 0 and pattern[i - 1] in ".+*^$[(":
+                continue
+            return True
+    return False
+
+
+def _is_valid_regex(pattern: str) -> bool:
+    """Return True if *pattern* compiles as a valid Python regex.
+
+    Used to short-circuit the glob-vs-regex heuristic in
+    :func:`_handle_search_files`: the guard's only purpose (#887) is to catch
+    patterns that would cause a ripgrep *regex parse error*, and a pattern that
+    compiles cannot cause one.  Treating such a pattern as a glob is a
+    false-positive redirect (e.g. ``"verdict":\\s*null`` — the heuristic sees
+    ``*`` preceded by ``s`` because it does not track the ``\\s`` escape span,
+    yet the pattern compiles and is exactly what the caller wanted to search for).
+    """
+    try:
+        re.compile(pattern)
+        return True
+    except re.error:
+        return False
+
+
+def _glob_to_regex(glob: str) -> str:
+    """Convert a shell glob pattern to an equivalent regex (#1788).
+
+    Translates ``*`` → ``.*``, ``?`` → ``.``, and passes ``[...]`` character
+    classes through (they share syntax between glob and regex).  All other
+    regex metacharacters (``.``, ``+``, ``(``, ``)``, ``{``, ``}``, ``|``,
+    ``^``, ``$``, ``\\``) are escaped so the result is a literal-matching
+    regex.  The output is **not anchored** — callers match substrings.
+    """
+    _REGEX_META = set(".^$+{}\\|()")
+    i = 0
+    n = len(glob)
+    out: list[str] = []
+    while i < n:
+        c = glob[i]
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        elif c == "[":
+            j = i + 1
+            if j < n and glob[j] == "!":
+                j += 1
+            if j < n and glob[j] == "]":
+                j += 1
+            while j < n and glob[j] != "]":
+                j += 1
+            if j < n:
+                out.append(glob[i : j + 1])
+                i = j
+            else:
+                out.append("\\[")
+        elif c in _REGEX_META:
+            out.append("\\" + c)
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _classify_regex_error(pattern: str, exc) -> tuple:
+    """#2308 — decompose a regex compile failure into a sub-cause + recovery.
+
+    The pre-validation in ``_handle_search_files`` catches patterns that fail
+    ``re.compile`` before ripgrep ever sees them, but the returned error was
+    a single generic bucket with no sub-cause and no recovery directive —
+    so the agent blind-retried with near-identical patterns (74/7d, 17-deep
+    spirals). This classifies the ``re.error`` message into a structured
+    reason with a corrected-pattern suggestion.
+
+    Returns ``(reason, recovery)`` where ``reason`` is one of:
+      - ``invalid_regex_syntax`` — malformed regex (unclosed bracket/group,
+        bad escape, dangling quantifier)
+      - ``glob_as_regex`` — a shell glob that slipped past the auto-convert
+        guard (e.g. a ``[!...]`` negation or a pattern the heuristic missed)
+      - ``unsupported_feature`` — a regex feature ripgrep/Python rejects
+      - ``other`` — unclassified compile failure
+    """
+    if exc is None:
+        return (
+            "other",
+            "The regex failed to compile. Read the error text, fix the "
+            "pattern, and re-run — do NOT retry the same pattern unchanged.",
+        )
+    low = str(exc).lower()
+    # #2308 — glob_as_regex is checked BEFORE invalid_regex_syntax because
+    # it is more specific: a pattern containing ``[!`` (glob negation
+    # syntax, which is invalid in Python regex) is almost certainly a
+    # shell glob the model intended as a filename pattern. We key on the
+    # pattern-level signal ``[!`` rather than the error message text,
+    # because "unterminated character set" fires for ANY unclosed ``[``,
+    # including plain malformed regex like ``[unclosed`` that has no glob
+    # intent.
+    if "[!" in pattern:
+        return (
+            "glob_as_regex",
+            "This looks like a shell glob (filename pattern) passed as a "
+            "regex — the '[!' glob negation syntax is not valid regex. Use "
+            "target='files' or move it to the file_glob parameter instead of "
+            "the regex pattern.",
+        )
+    # Unclosed character class / group / dangling quantifier — the classic
+    # malformed-regex family.
+    if any(tok in low for tok in (
+        "unterminated", "unclosed", "missing ), unterminated subpattern",
+        "nothing to repeat", "multiple repeat", "unexpected end of pattern",
+        "bad escape", "invalid escape", "trailing backslash",
+    )):
+        return (
+            "invalid_regex_syntax",
+            "The regex is malformed (unclosed bracket/group, bad escape, or "
+            "dangling quantifier). Fix the syntax — e.g. close the '[' or '(' "
+            "and escape literal metacharacters with '\\'. Do NOT retry the "
+            "same malformed pattern.",
+        )
+    # Lookbehind/lookahead or other engine-specific feature rejection.
+    if any(tok in low for tok in (
+        "look-behind", "lookbehind", "fixed-width", "variable-length",
+        "not supported", "unsupported", "invalid group",
+    )):
+        return (
+            "unsupported_feature",
+            "The regex uses a feature the search engine does not support "
+            "(e.g. variable-width lookbehind). Rewrite it with a supported "
+            "construct — do NOT retry the same pattern.",
+        )
+    return (
+        "other",
+        "The regex failed to compile for an unclassified reason. Read the "
+        "error text, fix the pattern, and re-run — do NOT retry the same "
+        "pattern unchanged.",
+    )
+
+
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
+    pattern = args.get("pattern", "")
+    # Issue #887 / #1788: when the model passes a glob pattern (e.g. ``*.py``)
+    # as the regex ``pattern`` in content-search mode, ripgrep fails with a
+    # regex parse error.  Instead of returning an error and forcing a retry
+    # (#1788 — 227 failures / 300 sessions, 70% glob-as-regex), we now
+    # transparently convert the glob to an equivalent regex and proceed with
+    # the search.  This prevents the error entirely and saves a round-trip.
+    #
+    # The conversion is ONLY applied when the pattern would actually fail
+    # ``re.compile`` — a pattern that compiles is a legitimate regex, even if
+    # it contains glob-like metacharacters (see _is_valid_regex above for the
+    # false-positive rationale).
+    if (
+        target == "content"
+        and not args.get("file_glob")
+        and _looks_like_glob(pattern)
+        and not _is_valid_regex(pattern)
+    ):
+        pattern = _glob_to_regex(pattern)
+
+    # #1588 — when a pattern that does NOT look like a glob still fails to
+    # compile as a regex, ripgrep returns a bare parse error with no guidance,
+    # causing 59/week parse-error spirals. Pre-validate and surface the exact
+    # compile-failure reason plus a glob-vs-regex hint so the agent can fix
+    # the pattern instead of blind-retrying with a near-identical one.
+    # Guard ``file_glob``: when it is set, the caller is intentionally
+    # combining a filename filter with their pattern, so the pattern should
+    # pass through even if it happens to be a bare glob.
+    if (
+        target == "content"
+        and not args.get("file_glob")
+        and not _is_valid_regex(pattern)
+    ):
+        try:
+            re.compile(pattern)
+            compile_reason = ""
+            # Defensive default — this branch is only reached when the
+            # pattern fails _is_valid_regex, so compile always raises, but
+            # keep the classifier result bound for the type checker.
+            reason, recovery = _classify_regex_error(pattern, None)
+        except re.error as exc:
+            compile_reason = str(exc)
+            # #2308 — decompose the compile failure into a structured
+            # sub-cause + recovery directive so the agent fixes the pattern
+            # instead of blind-retrying with a near-identical one.
+            reason, recovery = _classify_regex_error(pattern, exc)
+        return json.dumps(
+            {
+                "error": (
+                    f"Invalid regex pattern {pattern!r}: {compile_reason}.\n\n"
+                    "To fix:\n"
+                    "  - If you meant a literal string, escape regex metacharacters "
+                    "(e.g. replace '[' with '\\[', '*' with '\\*').\n"
+                    "  - If you meant a filename pattern (like '*.py'), use target='files' "
+                    "or move it to the file_glob parameter instead of the regex pattern.\n"
+                    "  - Re-run search_files with a corrected regex pattern."
+                ),
+                # #2308 — structured reason + recovery.
+                "reason": reason,
+                "recovery": recovery,
+            },
+            ensure_ascii=False,
+        )
+
     return search_tool(
-        pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
+        pattern=pattern, target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
