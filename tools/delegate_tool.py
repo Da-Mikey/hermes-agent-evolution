@@ -4454,6 +4454,8 @@ def _run_single_child(
                         exit_reason = _rf_outcome["exit_reason"]
                         result = _refusal_result  # noqa: F841 — update for downstream
 
+        _empty_sentinel = bool(summary and summary.strip() == "(empty)")
+
         if interrupted:
             status = "interrupted"
         elif result.get("failed") or result.get("error"):
@@ -4576,6 +4578,7 @@ def _run_single_child(
                     status = _retry_outcome["status"]
                     tool_trace = _retry_outcome["tool_trace"]
                     exit_reason = _retry_outcome["exit_reason"]
+                    _empty_sentinel = bool(summary and summary.strip() == "(empty)")
                     logger.info(
                         "Subagent %d recovered on shallow auto-retry %d "
                         "(%d tool call(s))",
