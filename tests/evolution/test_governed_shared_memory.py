@@ -111,6 +111,77 @@ class TestGovernedSharedMemory:
         author_recs = mem.list_by_author("replacement_worker")
         assert len(author_recs) == 2
 
+    def test_reader_class_authorization(self):
+        mem = GovernedSharedMemory()
+        mem.write(
+            "orchestrator_secret",
+            "s1",
+            author_id="boss",
+            reader_class="orchestrator",
+        )
+
+        # Matching class can read
+        assert mem.read("orchestrator_secret", reader_class="orchestrator") is not None
+        # Wrong class refused
+        assert mem.read("orchestrator_secret", reader_class="stage") is None
+        # No class refused (fail-closed)
+        assert mem.read("orchestrator_secret") is None
+
+    def test_legacy_records_unrestricted(self):
+        mem = GovernedSharedMemory()
+        mem.write("plain", "v", author_id="a1")
+        assert mem.read("plain") is not None
+        assert mem.read("plain", reader_class="orchestrator") is not None
+        assert mem.read("plain", reader_class="stage") is not None
+
+    def test_restriction_propagates_through_supersession(self):
+        mem = GovernedSharedMemory()
+        mem.write("doc_v1", "initial", author_id="boss", reader_class="orchestrator")
+        # Superseding WITHOUT declaring a class must not launder the restriction
+        v2 = mem.write(
+            "doc_v2", "summary", author_id="summarizer", supersedes_key="doc_v1"
+        )
+        assert v2.reader_class == "orchestrator"
+        assert mem.read("doc_v2", reader_class="stage") is None
+        assert mem.read("doc_v2", reader_class="orchestrator") is not None
+        # Explicit class cannot widen a restricted source
+        v3 = mem.write(
+            "doc_v3",
+            "re",
+            author_id="x",
+            supersedes_key="doc_v2",
+            reader_class="stage",
+        )
+        assert v3.reader_class == "orchestrator"
+
+    def test_list_paths_respect_reader_class(self):
+        mem = GovernedSharedMemory()
+        mem.write(
+            "k1",
+            1,
+            author_id="w1",
+            scope=MemoryScope.TASK.value,
+            reader_class="orchestrator",
+        )
+        mem.write("k2", 2, author_id="w1", scope=MemoryScope.TASK.value)
+        # Restricted record hidden from unauthenticated listing
+        assert len(mem.list_by_scope(MemoryScope.TASK.value)) == 1
+        assert (
+            len(mem.list_by_scope(MemoryScope.TASK.value, reader_class="orchestrator"))
+            == 2
+        )
+        assert len(mem.list_by_author("w1")) == 1
+        assert len(mem.list_by_author("w1", reader_class="orchestrator")) == 2
+
+    def test_redistribute_preserves_reader_class(self):
+        mem = GovernedSharedMemory()
+        mem.write("task_a", "state", author_id="old_worker", reader_class="stage")
+        mem.redistribute("old_worker", "new_worker")
+        rec = mem.read("task_a", reader_class="stage")
+        assert rec is not None
+        assert rec.reader_class == "stage"
+        assert mem.read("task_a", reader_class="orchestrator") is None
+
 
 class TestAIAgentGovernedMemoryIntegration:
     def test_agent_governed_memory_methods(self):
@@ -145,4 +216,30 @@ class TestAIAgentGovernedMemoryIntegration:
         assert (
             agent.read_governed_memory("sub_work").provenance.author_subagent_id
             == "sub_new"
+        )
+
+    def test_agent_governed_memory_reader_class(self):
+        agent = AIAgent(
+            api_key="mock-key",
+            base_url="http://localhost:8080/v1",
+            model="test-model",
+            quiet_mode=True,
+            session_id="test_agent_gov_sess_rc",
+        )
+
+        agent.write_governed_memory(
+            key="restricted_finding",
+            value="secret",
+            scope="task",
+            reader_class="orchestrator",
+        )
+        assert (
+            agent.read_governed_memory(
+                "restricted_finding", reader_class="orchestrator"
+            )
+            is not None
+        )
+        assert (
+            agent.read_governed_memory("restricted_finding", reader_class="stage")
+            is None
         )

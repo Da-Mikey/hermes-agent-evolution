@@ -9874,6 +9874,7 @@ class AIAgent:
         source_tool: str = "",
         sources: Optional[list] = None,
         supersedes_key: Optional[str] = None,
+        reader_class: Optional[str] = None,
     ) -> Any:
         """Write governed memory with provenance and supersession links."""
         eff_author = author_id or getattr(self, "session_id", "agent_main")
@@ -9885,11 +9886,16 @@ class AIAgent:
             source_tool=source_tool,
             sources=sources,
             supersedes_key=supersedes_key,
+            reader_class=reader_class,
         )
 
-    def read_governed_memory(self, key: str, active_only: bool = True) -> Any:
-        """Read a governed memory record."""
-        return self.governed_memory.read(key=key, active_only=active_only)
+    def read_governed_memory(
+        self, key: str, active_only: bool = True, reader_class: Optional[str] = None
+    ) -> Any:
+        """Read a governed memory record (reader-class authorization enforced)."""
+        return self.governed_memory.read(
+            key=key, active_only=active_only, reader_class=reader_class
+        )
 
     def read_governed_memory_with_freshness(
         self, key: str
