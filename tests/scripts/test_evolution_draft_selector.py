@@ -13,6 +13,7 @@ from evolution_draft_selector import (  # noqa: E402  # fmt: skip
     build_draft_tasks,
     route_cost_tier,
     select_best_draft,
+    check_shuffle_order_stability,
     main,
 )
 
@@ -170,3 +171,33 @@ def test_route_cli_positional(capsys):
 
 def test_route_cli_missing_complexity(capsys):
     assert main(["x", "route"]) == 2
+
+
+def test_shuffle_order_stability():
+    """#3337: selection stability across random permutations."""
+    out = {
+        "results": [
+            {"task_index": 0, "status": "completed", "summary": "Short snippet."},
+            {"task_index": 1, "status": "completed", "summary": "## High quality\n\n```python\nx = 1\n```\n\nhttps://example.com\n" * 4},
+            {"task_index": 2, "status": "completed", "summary": "Another small note."},
+        ]
+    }
+    stab = check_shuffle_order_stability(out, n_shuffles=5)
+    assert stab["is_stable"] is True
+    assert stab["baseline_winner"] == 1
+    assert stab["stability_ratio"] == 1.0
+
+
+def test_stability_cli(capsys, monkeypatch):
+    payload = json.dumps({
+        "results": [
+            {"task_index": 0, "status": "completed", "summary": "Short."},
+            {"task_index": 1, "status": "completed", "summary": "## H\nhttps://x.com\n" * 3},
+        ]
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    assert main(["x", "stability"]) == 0
+    res = json.loads(capsys.readouterr().out)
+    assert res["is_stable"] is True
+    assert res["baseline_winner"] == 1
+

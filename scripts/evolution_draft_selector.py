@@ -218,6 +218,51 @@ def select_best_draft(delegate_output: Any) -> Tuple[int, float, List[Dict[str, 
     return bi, bs, drafts
 
 
+def check_shuffle_order_stability(
+    delegate_output: Any, n_shuffles: int = 5
+) -> Dict[str, Any]:
+    """Test candidate selection stability across random shuffle orderings (#3337).
+
+    Evaluates whether the winning candidate selection is invariant to the presentation
+    order of the candidate pool, preventing hidden order bias from corrupting triage.
+    """
+    import random
+
+    results = (
+        delegate_output.get("results", [])
+        if isinstance(delegate_output, dict)
+        else (delegate_output if isinstance(delegate_output, list) else [])
+    )
+    if not results or len(results) <= 1:
+        bi, _, _ = select_best_draft(delegate_output)
+        return {
+            "is_stable": True,
+            "baseline_winner": bi,
+            "winners_by_shuffle": [bi] * n_shuffles,
+            "stability_ratio": 1.0,
+        }
+
+    baseline_winner, _, _ = select_best_draft(delegate_output)
+    winners = []
+    shuffled_pool = list(results)
+
+    for i in range(n_shuffles):
+        rng = random.Random(42 + i)
+        perm = list(shuffled_pool)
+        rng.shuffle(perm)
+        w, _, _ = select_best_draft({"results": perm})
+        winners.append(w)
+
+    stable_count = sum(1 for w in winners if w == baseline_winner)
+    ratio = round(stable_count / max(n_shuffles, 1), 2)
+    return {
+        "is_stable": ratio >= 0.8,
+        "baseline_winner": baseline_winner,
+        "winners_by_shuffle": winners,
+        "stability_ratio": ratio,
+    }
+
+
 def _load_json(path: Optional[str]) -> Tuple[Any, Optional[str]]:
     try:
         raw = Path(path).read_text(encoding="utf-8") if path else sys.stdin.read()
@@ -237,7 +282,7 @@ def _flag(args: List[str], name: str) -> Optional[str]:
 def main(argv: List[str]) -> int:
     if len(argv) < 2 or argv[1] in ("-h", "--help"):
         print(
-            "usage: evolution_draft_selector.py {build,select,route} ...",
+            "usage: evolution_draft_selector.py {build,select,route,stability} ...",
             file=sys.stderr,
         )
         return 2
@@ -290,6 +335,14 @@ def main(argv: List[str]) -> int:
             )
             return 2
         print(json.dumps(route_cost_tier(complexity), ensure_ascii=False))
+        return 0
+    if cmd == "stability":
+        path = args[0] if args and not args[0].startswith("-") else None
+        data, err = _load_json(path)
+        if err:
+            return 2
+        stability_info = check_shuffle_order_stability(data)
+        print(json.dumps(stability_info, ensure_ascii=False))
         return 0
     return 2
 
