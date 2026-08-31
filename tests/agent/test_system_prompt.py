@@ -76,6 +76,23 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def test_deliberate_work_only_on_cron(monkeypatch):
+    import agent.system_prompt as system_prompt
+
+    monkeypatch.setattr(system_prompt, "DELIBERATE_WORK_GUIDANCE", "DELIBERATE_WORK")
+    monkeypatch.setattr(system_prompt, "ATTENTION_RESET_GUIDANCE", "ATTENTION_RESET")
+    monkeypatch.setattr(system_prompt, "UNTRUSTED_CONTENT_GUIDANCE", "UNTRUSTED")
+    monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "")
+    monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "")
+    monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS", "")
+    monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "")
+    monkeypatch.setattr(system_prompt, "RECOVERY_BEFORE_REFUSAL_GUIDANCE", "")
+    chat = _stable_prompt(_make_agent(platform="cli", valid_tool_names=["terminal"]))
+    assert "DELIBERATE_WORK" not in chat
+    cron = _stable_prompt(_make_agent(platform="cron", valid_tool_names=["terminal"]))
+    assert "DELIBERATE_WORK" in cron
+
+
 def _prompt_parts(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
@@ -296,6 +313,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     # not about the wording of paragraphs this test does not own.
     monkeypatch.setattr(system_prompt, "ATTENTION_RESET_GUIDANCE", "ATTENTION_RESET")
     monkeypatch.setattr(system_prompt, "DELIBERATE_WORK_GUIDANCE", "DELIBERATE_WORK")
+    # Interactive default no longer injects this block (council 2026-08-31).
     monkeypatch.setattr(
         system_prompt, "RECOVERY_BEFORE_REFUSAL_GUIDANCE", "RECOVERY_BEFORE_REFUSAL"
     )
@@ -317,7 +335,6 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "IDENTITY",
         "HELP",
         "ATTENTION_RESET",
-        "DELIBERATE_WORK",
         "UNTRUSTED_CONTENT",
         "RECOVERY_BEFORE_REFUSAL",
         "STEER",

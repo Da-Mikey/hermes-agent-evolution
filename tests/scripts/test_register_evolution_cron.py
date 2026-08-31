@@ -16,6 +16,9 @@ def _import_module():
     mod = importlib.util.module_from_spec(spec)
     sys.modules["register_evolution_cron"] = mod
     spec.loader.exec_module(mod)
+    # Existing tests exercise YAML reconcile, not the GitHub write gate.
+    # Class-A jobs skip/pause when write is denied.
+    mod._classify_write_access = lambda: "write"
     return mod
 
 
@@ -291,11 +294,10 @@ class TestReconcileExistingJob:
 
         assert rc == 0
         assert calls["job_id"] == "job-123"
-        assert calls["updates"] == {
-            "schedule": "0 8 * * 1,3,5",
-            "model_snapshot": None,
-            "provider_snapshot": None,
-        }
+        assert calls["updates"]["schedule"] == "0 8 * * 1,3,5"
+        assert calls["updates"]["model_snapshot"] is None
+        assert calls["updates"]["provider_snapshot"] is None
+        assert calls["updates"].get("script") == "evolution_access_gate.sh"
 
     def test_unchanged_job_clears_inference_snapshots(self, tmp_path, monkeypatch):
         mod = _import_module()
@@ -310,10 +312,9 @@ class TestReconcileExistingJob:
         rc = mod.main(["register_evolution_cron.py", str(src_dir)])
 
         assert rc == 0
-        assert calls["updates"] == {
-            "model_snapshot": None,
-            "provider_snapshot": None,
-        }
+        assert calls["updates"]["model_snapshot"] is None
+        assert calls["updates"]["provider_snapshot"] is None
+        assert calls["updates"].get("script") == "evolution_access_gate.sh"
 
     def test_unchanged_legacy_job_keeps_dynamic_inference(
         self, tmp_path, monkeypatch
@@ -332,7 +333,9 @@ class TestReconcileExistingJob:
         rc = mod.main(["register_evolution_cron.py", str(src_dir)])
 
         assert rc == 0
-        assert calls == {}
+        # Class-A jobs without a YAML script get the write-access wake-gate
+        # attached on reconcile; inference snapshots stay unset.
+        assert calls["updates"] == {"script": "evolution_access_gate.sh"}
 
     def _write_agent_yaml_no_skills(self, src_dir, schedule):
         # An agent job whose YAML omits skills:/toolsets: entirely — the
@@ -415,13 +418,11 @@ class TestReconcileExistingJob:
         rc = mod.main(["register_evolution_cron.py", str(src_dir)])
 
         assert rc == 0  # did NOT crash on list(None)
-        # Only the schedule reconciles; the registered skills/toolsets must be
-        # preserved (not clobbered to []) when the YAML omits them.
-        assert calls["updates"] == {
-            "schedule": "0 8 * * 1,3,5",
-            "model_snapshot": None,
-            "provider_snapshot": None,
-        }
+        # Schedule reconciles; registered skills/toolsets stay (YAML omitted them).
+        assert calls["updates"]["schedule"] == "0 8 * * 1,3,5"
+        assert "skills" not in calls["updates"]
+        assert "enabled_toolsets" not in calls["updates"]
+        assert calls["updates"].get("script") == "evolution_access_gate.sh"
 
 
 class TestDynamicInferenceRouting:
@@ -833,3 +834,168 @@ class TestSkillToolsetPreflightRegistration:
         rc, created = self._run(tmp_path, monkeypatch, "")
         assert rc == 0
         assert len(created) == 1
+
+
+class TestCadenceAndWriteGate:
+    def test_pick_schedule_chat_safe_vs_dense(self):
+        mod = _import_module()
+        spec = {
+            "schedule": "30 9 * * 1",
+            "schedule_dense": "30 9 * * *",
+        }
+        assert mod._pick_schedule(spec, "chat-safe", "evolution-hydra", 7) == "30 9 * * 1"
+        assert mod._pick_schedule(spec, "dense", "evolution-hydra", 7) == "30 9 * * *"
+
+    def test_pick_schedule_research_interval_override(self):
+        mod = _import_module()
+        spec = {"schedule": "30 9 * * 1"}
+        assert mod._pick_schedule(spec, "chat-safe", "evolution-research", 5) == "every 5d"
+        assert mod._pick_schedule(spec, "dense", "evolution-research", 5) == "30 9 * * 1"
+
+    def test_denied_skips_new_class_a_job(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        mod._classify_write_access = lambda: "denied"
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        (src_dir / "research.yaml").write_text(
+            "name: evolution-research\n"
+            'schedule: "30 9 * * 1"\n'
+            'prompt: "research"\n'
+            "skills:\n  - evolution/research\n"
+            "toolsets:\n  - web\n  - file\n"
+        )
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        created = []
+
+        import cron.jobs as jobs_mod
+
+        monkeypatch.setattr(
+            jobs_mod,
+            "create_job",
+            lambda **kw: created.append(kw) or {"id": "x", "name": kw["name"]},
+        )
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [])
+        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
+        assert rc == 0
+        assert created == []
+
+    def test_denied_pauses_existing_class_a(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        mod._classify_write_access = lambda: "denied"
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        (src_dir / "research.yaml").write_text(
+            "name: evolution-research\n"
+            'schedule: "30 9 * * 1"\n'
+            'prompt: "research"\n'
+            "skills:\n  - evolution/research\n"
+            "toolsets:\n  - web\n  - file\n"
+        )
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        paused = []
+
+        import cron.jobs as jobs_mod
+
+        existing = {
+            "id": "res-1",
+            "name": "evolution-research",
+            "schedule": jobs_mod.parse_schedule("30 9 * * 1"),
+            "prompt": "research",
+        }
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [existing])
+        monkeypatch.setattr(
+            jobs_mod,
+            "pause_job",
+            lambda job_id, reason=None: paused.append((job_id, reason)),
+        )
+        monkeypatch.setattr(
+            jobs_mod,
+            "create_job",
+            lambda **kw: (_ for _ in ()).throw(AssertionError("must not create")),
+        )
+        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
+        assert rc == 0
+        assert paused == [("res-1", mod.PAUSE_REASON_NO_WRITE)]
+
+    def test_inconclusive_does_not_pause_existing(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        mod._classify_write_access = lambda: "inconclusive"
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        (src_dir / "research.yaml").write_text(
+            "name: evolution-research\n"
+            'schedule: "30 9 * * 1"\n'
+            'prompt: "research"\n'
+            "skills:\n  - evolution/research\n"
+            "toolsets:\n  - web\n  - file\n"
+        )
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        paused = []
+        updates = []
+
+        import cron.jobs as jobs_mod
+
+        sched = jobs_mod.parse_schedule("30 9 * * 1")
+        existing = {
+            "id": "res-1",
+            "name": "evolution-research",
+            "schedule": sched,
+            "schedule_display": sched.get("display"),
+            "prompt": "research",
+            "skills": mod._normalize_skills(["evolution/research"]),
+            "enabled_toolsets": mod._normalize_toolsets(["web", "file"]),
+        }
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [existing])
+        monkeypatch.setattr(
+            jobs_mod,
+            "pause_job",
+            lambda job_id, reason=None: paused.append((job_id, reason)),
+        )
+        monkeypatch.setattr(
+            jobs_mod,
+            "update_job",
+            lambda job_id, updates_dict: updates.append((job_id, updates_dict)),
+        )
+        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
+        assert rc == 0
+        assert paused == []
+        # May reconcile snapshots; must not disable the job.
+        assert all("enabled" not in (u or {}) for _, u in updates)
+
+    def test_watchdog_still_registers_when_write_denied(self, tmp_path, monkeypatch):
+        mod = _import_module()
+        mod._classify_write_access = lambda: "denied"
+        src_dir = tmp_path / "cron-src"
+        src_dir.mkdir()
+        (src_dir / "watchdog.yaml").write_text(
+            "name: evolution-watchdog\n"
+            'schedule: "47 7 * * *"\n'
+            "enabled: true\n"
+            "no_agent: true\n"
+            "script: evolution_watchdog.py\n"
+            "deliver: all\n"
+            'prompt: "health check"\n'
+        )
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        created = []
+
+        import cron.jobs as jobs_mod
+
+        monkeypatch.setattr(
+            jobs_mod,
+            "create_job",
+            lambda **kw: created.append(kw) or {"id": "wd", "name": kw["name"]},
+        )
+        monkeypatch.setattr(jobs_mod, "load_jobs", lambda: [])
+        rc = mod.main(["register_evolution_cron.py", str(src_dir)])
+        assert rc == 0
+        assert len(created) == 1
+        assert created[0]["name"] == "evolution-watchdog"

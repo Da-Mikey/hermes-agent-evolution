@@ -114,6 +114,17 @@ _SPIRAL_PRONE_TOOLS = frozenset({
 # a sustained run means a single interspersed success does not drain the
 # streak, so fail/succeed/fail climbs +1 per cycle toward the cap.
 _SUCCESSES_TO_DECAY = 2
+# Read-only exploration tools: a single successful diagnostic (re-read,
+# a search that hits) should drain the streak. Mutating tools keep 2 so
+# fail → pwd/ls → fail still climbs (council 2026-08-31).
+_READ_ONLY_SUCCESSES_TO_DECAY = 1
+_READ_ONLY_DECAY_TOOLS = frozenset({"read_file", "search_files"})
+
+
+def _successes_needed_to_decay(tool_name: str) -> int:
+    if tool_name in _READ_ONLY_DECAY_TOOLS:
+        return _READ_ONLY_SUCCESSES_TO_DECAY
+    return _SUCCESSES_TO_DECAY
 
 # Tools that are legitimately re-invoked with identical arguments and may
 # legitimately return an unchanged result while waiting on external progress —
@@ -201,7 +212,13 @@ class ToolCallGuardrailConfig:
     # a high false-retry rate (161 failures/7d, 11-deep spirals) and should
     # be capped at a lower threshold (3) so the session-hard-stop fires sooner.
     # Keys are tool names; values override spiral_failure_cap for that tool.
-    per_tool_failure_caps: dict[str, int] = field(default_factory=lambda: {"memory": 3})
+    per_tool_failure_caps: dict[str, int] = field(
+        default_factory=lambda: {
+            "memory": 3,
+            "read_file": 10,
+            "search_files": 10,
+        }
+    )
     spiral_prone_tools: frozenset[str] = field(
         default_factory=lambda: _SPIRAL_PRONE_TOOLS
     )
@@ -950,7 +967,7 @@ class ToolCallGuardrailController:
                 pass  # no decay — session stop is irreversible
             elif is_spiral_prone:
                 succ = self._cross_turn_success_streaks.get(tool_name, 0) + 1
-                if succ >= _SUCCESSES_TO_DECAY:
+                if succ >= _successes_needed_to_decay(tool_name):
                     # Sustained recovery — drain the failure streak by 1.
                     if current <= 1:
                         self._cross_turn_tool_failure_counts.pop(tool_name, None)

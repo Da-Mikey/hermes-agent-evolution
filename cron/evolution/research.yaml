@@ -1,5 +1,6 @@
 name: evolution-research
-schedule: "30 9 * * *"  # Daily at 9:30 AM (offset from :00 so this LLM stage never collides with hydra/analysis in the same minute — issue #1673).
+schedule: "30 9 * * 1"  # chat-safe: weekly Monday 09:30 (council: internet research ≤ once / 7 days).
+schedule_dense: "30 9 * * *"  # owner-bot: daily 09:30
 enabled: true
 mode: PUBLIC
 

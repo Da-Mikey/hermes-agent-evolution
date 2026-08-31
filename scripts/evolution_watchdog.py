@@ -42,14 +42,17 @@ from typing import Callable, Dict, List, Tuple
 STAGES: Dict[str, Tuple[int, str]] = {
     "research": (9, "md"),
     "introspection": (20, "json"),
-    # analysis/implementation/integration run every 4h (processing throughput);
-    # the slot here is the FIRST daily slot — the watchdog only needs "a report
-    # for today exists by then", and reports are date-keyed (overwritten each
-    # run). Mirrors cron/evolution/*.yaml first hour (locked by the mirror test).
-    "analysis": (1, "json"),
-    "implementation": (2, "md"),
-    "integration": (3, "json"),
+    # chat-safe default (council 2026-08-31): once-daily pipeline at evening
+    # hours. schedule_dense in the YAML keeps the old 4h owner-bot slots.
+    # The slot here is the FIRST hour of `schedule:` (not schedule_dense).
+    "analysis": (21, "json"),
+    "implementation": (22, "md"),
+    "integration": (23, "json"),
 }
+
+# Research/introspection are weekly in chat-safe cadence — a missing *today*
+# report is not a death if a report from this week exists.
+WEEKLY_STAGES = frozenset({"research", "introspection"})
 
 GRACE_HOURS = 2
 MIN_REPORT_BYTES = 50
@@ -172,6 +175,21 @@ def check_stage_reports(
     for stage, (slot_hour, ext) in STAGES.items():
         date = expected_report_date(now, slot_hour)
         report = evolution_dir / stage / f"{date}.{ext}"
+        if not report.exists() and stage in WEEKLY_STAGES:
+            # Accept any report from the last 8 days (weekly cadence).
+            folder = evolution_dir / stage
+            recent = False
+            if folder.is_dir():
+                cutoff = now.timestamp() - WEEKLY_STALE_HOURS * 3600
+                for cand in folder.glob(f"*.{ext}"):
+                    try:
+                        if cand.stat().st_mtime >= cutoff and cand.stat().st_size >= MIN_REPORT_BYTES:
+                            recent = True
+                            break
+                    except OSError:
+                        continue
+            if recent:
+                continue
         if not report.exists():
             clean_job = _stage_clean_job_for_slot(jobs, stage, date, slot_hour)
             if clean_job is not None:

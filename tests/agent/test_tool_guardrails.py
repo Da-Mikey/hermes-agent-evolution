@@ -850,11 +850,12 @@ def test_spiral_cap_halts_execute_code_after_threshold():
 
 
 def test_spiral_cap_halts_read_file_after_threshold():
-    """read_file failures hit the spiral cap and halt (#970: 26 failures,
-    10 sessions with ≥5 consecutive reads)."""
+    """read_file failures hit the per-tool exploration cap (default 10)."""
     controller = ToolCallGuardrailController()
+    cap = controller._effective_cap_for("read_file")
+    assert cap == 10
     decisions = []
-    for i in range(6):
+    for i in range(cap + 1):
         decisions.append(
             controller.after_call(
                 "read_file",
@@ -863,11 +864,27 @@ def test_spiral_cap_halts_read_file_after_threshold():
                 failed=True,
             )
         )
-    halt = decisions[4]
+    halt = decisions[cap - 1]
     assert halt.action == "halt"
     assert halt.code == "spiral_prone_tool_failure_cap"
     assert halt.tool_name == "read_file"
     assert halt.fallback_directive != ""
+
+
+def test_read_file_single_success_decays_streak():
+    """Read-only tools decay the failure streak after one success."""
+    controller = ToolCallGuardrailController()
+    cap = controller._effective_cap_for("read_file")
+    for _ in range(3):
+        controller.after_call(
+            "read_file", {"path": "/x"}, '{"error":"missing"}', failed=True
+        )
+    assert controller._cross_turn_tool_failure_counts.get("read_file") == 3
+    controller.after_call(
+        "read_file", {"path": "/x"}, '{"content":"ok"}', failed=False
+    )
+    assert controller._cross_turn_tool_failure_counts.get("read_file") == 2
+    assert cap == 10
 
 
 def test_spiral_cap_does_not_fire_before_threshold():
@@ -1152,7 +1169,9 @@ def test_cross_turn_search_files_spiral_cap_fires():
     search_files failure streak should trigger the spiral-prone cap,
     not run uncapped as it did when 27 consecutive / 224 sessions regressed."""
     controller = ToolCallGuardrailController()
-    for _ in range(5):
+    cap = controller._effective_cap_for("search_files")
+    assert cap == 10
+    for _ in range(cap):
         controller.after_call(
             "search_files",
             {"pattern": "*.py", "target": "content"},

@@ -109,22 +109,18 @@ class TestSearchFilesEmptySpiral:
 
 
 class TestSearchFilesEmptySpiralEscalation:
-    """#1589 — at 6+ cumulative empty searches, escalate from advisory
-    _search_directive to a real 'error' key so classify_tool_failure
-    counts it as a failure and the spiral_failure_cap can halt."""
+    """Council 2026-08-31: a well-formed empty search is not a failure.
+    Six empties stay advisory (_search_directive) and must NOT grow an
+    ``error`` key that would trip spiral_failure_cap."""
 
-    def test_error_key_at_hard_cap(self):
-        """After 6 cumulative empty searches, the result must carry a real
-        'error' key (not just _search_directive) so it's classified as
-        a failure."""
+    def test_error_key_not_set_at_former_hard_cap(self):
+        """After 6 cumulative empty searches the result is still not an error."""
         for i in range(5):
             _search_empty(pattern=_SEARCH_PATTERN + str(i), task_id="test-1589")
         result = _search_empty(pattern=_SEARCH_PATTERN + "cap", task_id="test-1589")
-        assert "error" in result, (
-            "Expected 'error' key at 6+ empties so the spiral cap can fire"
-        )
-        assert "6 times" in result["error"]
-        assert "deterministic" in result["error"].lower()
+        assert "error" not in result
+        assert "_search_directive" in result
+        assert "6 times" in result["_search_directive"]
 
     def test_directive_still_present_below_cap(self):
         """At 3-5 empties (below the hard cap), only the advisory directive

@@ -1,7 +1,10 @@
 name: evolution-introspection
-schedule: "50 20 * * *"  # Daily at 8:50 PM — before analysis (21:15) so findings feed it. Minute offset (:50) so this LLM stage never collides with hydra in the same minute — issue #1673.
+schedule: "50 20 * * 3"  # chat-safe: weekly Wednesday 20:50 (3–7 day local introspection). Local-signal gate skips if digest empty/unchanged. No GitHub write required.
+schedule_dense: "50 20 * * *"  # owner-bot: daily 20:50
 enabled: true
 mode: PUBLIC
+
+script: evolution_local_gate.sh
 
 prompt: |
   You are Hermes Evolution Introspection.

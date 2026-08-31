@@ -527,10 +527,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # model avoid repeating failed approaches.
     stable_parts.append(ATTENTION_RESET_GUIDANCE)
 
-    # Deliberate work + self-review on the USER'S tasks: judge necessity before
-    # acting, audit and rate your own work after. Always on — static text, scoped
-    # to non-trivial work, so it raises quality without slowing simple replies.
-    stable_parts.append(DELIBERATE_WORK_GUIDANCE)
+    # Deliberate work + self-review: keep the "rate 1–10 until 10" ritual
+    # for unattended evolution/cron sessions only. Interactive chat pays extra
+    # turns for it (council 2026-08-31). Static text, so cron prompts stay
+    # cache-stable for the life of that session.
+    if getattr(agent, "platform", None) == "cron":
+        stable_parts.append(DELIBERATE_WORK_GUIDANCE)
 
     # Universal untrusted-content boundary (#98). Always on — static text in
     # the cached stable tier. Teaches the agent to treat everything read back

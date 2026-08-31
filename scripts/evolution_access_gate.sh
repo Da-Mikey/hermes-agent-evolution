@@ -61,28 +61,28 @@ if [ "$ok" = "0" ] && [ -n "${GITHUB_PRIVATE_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
     unset _tok
 fi
 
+# Prefer the shared Python classifier (same states the registrar uses) when
+# it is installed next to this script. Fall back to the inline check above
+# if Python is missing so an incomplete copy still fail-closes.
+_gate_dir="$(cd "$(dirname "$0")" && pwd)"
+if command -v python3 >/dev/null 2>&1 && [ -f "$_gate_dir/evolution_github_access.py" ]; then
+    _state="$(python3 "$_gate_dir/evolution_github_access.py" 2>/dev/null | tail -1 | tr -d '[:space:]')"
+    case "$_state" in
+        write) ok=1 ;;
+        denied) ok=0 ;;
+        *)
+            # Inconclusive: do not spend LLM tokens on a cycle that may have
+            # no outlet. Registration (not this wake-gate) is what preserves
+            # already-scheduled jobs across an offline `hermes update`.
+            ok=0
+            ;;
+    esac
+fi
+
 if [ "$ok" = "1" ]; then
-    echo "evolution access-gate: write access to $REPO confirmed — waking agent."
-    # #115 — evolution-introspection works from a pre-computed, ANONYMIZED
-    # digest of session problem-signals (scripts/introspection_extract.py,
-    # issue #89) instead of raw transcripts. Emit it BEFORE the wake-gate
-    # JSON (Hermes cron treats the LAST stdout line as the gate), so the
-    # agent gets the digest without re-deriving it every cycle. Fail-open:
-    # if the extractor is missing or errors, wake anyway — the digest is an
-    # optimization for the prompt, not a gate.
-    _gate_dir="$(cd "$(dirname "$0")" && pwd)"
-    if command -v python3 >/dev/null 2>&1 && [ -f "$_gate_dir/introspection_extract.py" ]; then
-        if command -v timeout >/dev/null 2>&1; then
-            _digest="$(timeout 30 python3 "$_gate_dir/introspection_extract.py" 2>/dev/null)"
-        else
-            _digest="$(python3 "$_gate_dir/introspection_extract.py" 2>/dev/null)"
-        fi
-        if [ -n "$_digest" ]; then
-            printf '\n## Introspection Digest\n%s\n' "$_digest"
-        fi
-    fi
+    echo "evolution access-gate: write access to $REPO confirmed — waking agent." >&2
     echo '{"wakeAgent": true}'
 else
-    echo "evolution access-gate: no WRITE access to $REPO — skipping agent to avoid burning LLM tokens / web-search quota on work that cannot be pushed (a reachable read-only account still cannot open branches/PRs). Grant the authenticated account push access on $REPO (or run as a writer), then 'gh auth login'."
+    echo "evolution access-gate: no WRITE access to $REPO — skipping agent to avoid burning LLM tokens / web-search quota on work that cannot be pushed (a reachable read-only account still cannot open branches/PRs). Grant the authenticated account push access on $REPO (or run as a writer), then 'gh auth login'." >&2
     echo '{"wakeAgent": false}'
 fi

@@ -3,7 +3,8 @@ name: evolution-experience-harvest
 # (research/analysis/implementation) so the deterministic harvest never
 # competes with an expensive stage for the scheduler tick. Runs the
 # experience-bank harvest AND inline distillation (one job, not two).
-schedule: "53 1,5,9,13,17,21 * * *"
+schedule: "53 21 * * *"  # chat-safe: once daily 21:53
+schedule_dense: "53 1,5,9,13,17,21 * * *"  # owner-bot: every 4h
 enabled: true
 mode: PRIVATE
 

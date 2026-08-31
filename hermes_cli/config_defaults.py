@@ -2691,6 +2691,13 @@ DEFAULT_CONFIG = {
         "allow_lazy_installs": True,
     },
 
+    # Hermes Evolution pipeline (fork-only). Chat-safe by default: internet
+    # research at most weekly, dense hydra/4h cadence only when explicitly
+    # opted in. A GITHUB_PRIVATE_TOKEN on a laptop does NOT select dense.
+    "evolution": {
+        "cadence": "chat-safe",  # "chat-safe" | "dense"
+        "research_interval_days": 7,  # clamped 5–10; used when cadence is chat-safe
+    },
     "cron": {
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"

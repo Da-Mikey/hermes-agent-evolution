@@ -7,7 +7,8 @@ name: evolution-hydra
 # collides with the other hourly :00 LLM stages (analysis/implementation/
 # integration/research) in the same wall-clock minute — issue #1673 (HTTP 429
 # rate-limit stampedes from overlapping cron fires).
-schedule: "5,35 * * * *"
+schedule: "35 8 * * *"  # chat-safe: once daily 08:35. Hydra's own gate still skips LLM when idle.
+schedule_dense: "5,35 * * * *"  # owner-bot: every 30 minutes
 enabled: true
 mode: PRIVATE
 

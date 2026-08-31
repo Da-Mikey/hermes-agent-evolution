@@ -1,5 +1,6 @@
 name: evolution-analysis
-schedule: "15 1,5,9,13,17,21 * * *"  # Every 4h at :15 (was daily 21:00; was :00). Minute offset (:15) so this LLM stage never fires in the same minute as hydra (:05/:35) or implementation (:20) — issue #1673 (HTTP 429 stampedes). Hour slots unchanged; 21:00 slot still follows introspection (20:50). Watchdog STAGES mirrors the FIRST slot hour (1).
+schedule: "15 21 * * *"  # chat-safe: once daily 21:15 (after Wednesday introspection 20:50).
+schedule_dense: "15 1,5,9,13,17,21 * * *"  # owner-bot: every 4h
 enabled: true
 mode: PRIVATE
 

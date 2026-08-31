@@ -1,7 +1,10 @@
 name: evolution-issues
-schedule: "45 12 * * *"  # Daily at 12:45 PM (offset from :00 so this LLM stage never collides with hydra in the same minute — issue #1673).
+schedule: "45 12 * * 1"  # chat-safe: weekly Monday 12:45, after research; gate skips if no fresh batch.
+schedule_dense: "45 12 * * *"  # owner-bot: daily 12:45
 enabled: true
 mode: PUBLIC
+
+script: evolution_issues_batch_gate.sh
 
 prompt: |
   You are Hermes Evolution Issue Creator.

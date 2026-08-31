@@ -487,6 +487,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # Respect user's disabled skills config
                     if name in disabled:
                         continue
+                    # Evolution pipeline skills stay out of the chat slash
+                    # catalog; cron jobs still load them by explicit name.
+                    from agent.evolution_skills import (
+                        evolution_skills_visible_in_catalog,
+                        is_evolution_pipeline_skill,
+                    )
+                    if is_evolution_pipeline_skill(name, frontmatter) and not evolution_skills_visible_in_catalog():
+                        continue
                     description = frontmatter.get('description', '')
                     if not description:
                         for line in body.strip().split('\n'):

@@ -214,6 +214,129 @@ def _install_access_gate(repo_root: Path) -> str | None:
     return _install_script(repo_root, "evolution_access_gate.sh")
 
 
+def _install_local_gate(repo_root: Path) -> str | None:
+    """Class-B local-signal wake-gate (introspection). No GitHub call."""
+    return _install_script(repo_root, "evolution_local_gate.sh")
+
+
+def _install_issues_gate(repo_root: Path) -> str | None:
+    """Class-A issues gate: write access AND a fresh research batch."""
+    return _install_script(repo_root, "evolution_issues_batch_gate.sh")
+
+
+# Jobs that produce GitHub artifacts (issues/PRs/merges) or need repo write.
+# Registrar pauses these when write is confirmed absent; wake-gates skip LLM.
+CLASS_A_JOBS = frozenset({
+    "evolution-research",
+    "evolution-issues",
+    "evolution-analysis",
+    "evolution-implementation",
+    "evolution-integration",
+    "evolution-hydra",
+    "evolution-upstream-sync",
+    "evolution-ci-diagnosis",
+    "evolution-pr-reflection",
+    "evolution-postmortem-miner",
+    "evolution-meta-analysis",
+})
+
+# Local jobs: no GitHub write required. Watchdog is no_agent and always ticks.
+CLASS_B_JOBS = frozenset({
+    "evolution-watchdog",
+    "evolution-introspection",
+    "evolution-memory-poison-scan",
+    "evolution-config-mutation-scan",
+    "evolution-dream-contradiction-scan",
+    "evolution-utility-audit",
+    "evolution-experience-harvest",
+    "evolution-proceed-hold-calibration",
+    "evolution-harness-gate",
+    "evolution-rubric-judge",
+    "evolution-funnel",
+})
+
+PAUSE_REASON_NO_WRITE = "evolution: no GitHub write access"
+
+_DEFAULT_EVOLUTION_CONFIG = {
+    "cadence": "chat-safe",
+    "research_interval_days": 7,
+}
+
+
+def _is_class_a(name: str, spec: dict | None = None) -> bool:
+    if name in CLASS_B_JOBS:
+        return False
+    if name in CLASS_A_JOBS:
+        return True
+    spec = spec or {}
+    # A job that declares a GitHub outlet is class A even if newly named.
+    return bool(spec.get("github"))
+
+
+def _load_evolution_config() -> dict:
+    """Read ``evolution:`` from config.yaml; chat-safe defaults otherwise."""
+    out = dict(_DEFAULT_EVOLUTION_CONFIG)
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "config.yaml"
+        if not path.is_file():
+            return out
+        raw = _load_yaml(path)
+        section = raw.get("evolution") if isinstance(raw, dict) else None
+        if not isinstance(section, dict):
+            return out
+        cadence = str(section.get("cadence") or out["cadence"]).strip().lower()
+        if cadence in ("chat-safe", "dense"):
+            out["cadence"] = cadence
+        try:
+            days = int(section.get("research_interval_days", out["research_interval_days"]))
+        except (TypeError, ValueError):
+            days = out["research_interval_days"]
+        out["research_interval_days"] = max(5, min(10, days))
+    except Exception:
+        return out
+    return out
+
+
+def _pick_schedule(spec: dict, cadence: str, name: str, research_interval_days: int) -> str:
+    """YAML ``schedule`` is chat-safe; ``schedule_dense`` is the owner-bot overlay."""
+    chat = str(spec.get("schedule") or "").strip()
+    dense = str(spec.get("schedule_dense") or "").strip()
+    chosen = dense if cadence == "dense" and dense else chat
+    if name == "evolution-research" and cadence != "dense":
+        days = int(research_interval_days or 7)
+        if days != 7:
+            return f"every {days}d"
+    return chosen
+
+
+def _classify_write_access() -> str:
+    """``write`` / ``denied`` / ``inconclusive`` — never raises."""
+    try:
+        script_dir = Path(__file__).resolve().parent
+        sys.path.insert(0, str(script_dir))
+        from evolution_github_access import classify as _classify
+
+        return _classify()
+    except Exception:
+        return "inconclusive"
+
+
+def _resume_paused_no_write(job: dict, update_job, resume_job) -> bool:
+    """Resume a class-A job we previously paused for missing write access."""
+    if (job.get("paused_reason") or "") != PAUSE_REASON_NO_WRITE:
+        return False
+    if job.get("enabled", True) and job.get("state") != "paused":
+        return False
+    try:
+        resume_job(job["id"])
+        return True
+    except Exception:
+        return False
+
+
+
 def _install_evolution_helpers(repo_root: Path) -> list[str]:
     """Install the whole ``evolution_*.py`` script family into HERMES_HOME/scripts.
 
@@ -349,14 +472,35 @@ def main(argv: list[str]) -> int:
     # Import the canonical Hermes cron API (writes ~/.hermes/cron/jobs.json).
     sys.path.insert(0, str(repo_root))
     try:
-        from cron.jobs import create_job, load_jobs, parse_schedule, update_job
+        from cron.jobs import (
+            create_job,
+            load_jobs,
+            parse_schedule,
+            pause_job,
+            resume_job,
+            update_job,
+        )
     except Exception as exc:  # pragma: no cover - environment dependent
         print(f"[evolution-cron] cannot import cron.jobs: {exc}", file=sys.stderr)
         return 1
 
-    # Install the GitHub-access wake-gate and attach it to every evolution job,
-    # so the expensive LLM agent only runs when GitHub is actually reachable.
+    evo_cfg = _load_evolution_config()
+    cadence = evo_cfg["cadence"]
+    research_days = evo_cfg["research_interval_days"]
+    write_state = "write" if dry_run else _classify_write_access()
+    print(
+        f"[evolution-cron] cadence={cadence} research_interval_days={research_days} "
+        f"github_write={write_state}"
+    )
+
+    # Install the GitHub-access wake-gate and attach it to class-A jobs
+    # so the expensive LLM agent only runs when GitHub write is confirmed.
     gate_script = None if dry_run else _install_access_gate(repo_root)
+    local_gate = None if dry_run else _install_local_gate(repo_root)
+    issues_gate = None if dry_run else _install_issues_gate(repo_root)
+    if not dry_run:
+        _install_script(repo_root, "evolution_github_access.py")
+        _install_script(repo_root, "introspection_extract.py")
 
     # Install the whole evolution_* helper family so no_agent scripts' sibling
     # imports (funnel -> metrics/realized_impact) resolve in HERMES_HOME/scripts.
@@ -395,6 +539,40 @@ def main(argv: list[str]) -> int:
             continue
 
         name = str(spec.get("name") or yaml_file.stem).strip()
+        class_a = _is_class_a(name, spec)
+
+        # Three-state GitHub write handling (council 2026-08-31):
+        # write        → register/reconcile class A
+        # denied       → do not create class A; pause (never delete) existing
+        # inconclusive → leave existing class A untouched; do not create new
+        existing = existing_jobs.get(name)
+        if class_a and write_state == "denied":
+            if existing and existing.get("id"):
+                if not dry_run:
+                    pause_job(existing["id"], reason=PAUSE_REASON_NO_WRITE)
+                skipped.append(name)
+                print(
+                    f"[evolution-cron] paused class-A job '{name}' "
+                    f"(no GitHub write access)"
+                )
+                continue
+            if existing is None:
+                skipped.append(name)
+                print(
+                    f"[evolution-cron] skip new class-A job '{name}' "
+                    f"(no GitHub write access)"
+                )
+                continue
+        if class_a and write_state == "inconclusive" and existing is None:
+            skipped.append(name)
+            print(
+                f"[evolution-cron] skip new class-A job '{name}' "
+                f"(GitHub write check inconclusive)"
+            )
+            continue
+        if class_a and write_state == "write" and existing and existing.get("id"):
+            if _resume_paused_no_write(existing, update_job, resume_job):
+                print(f"[evolution-cron] resumed class-A job '{name}' (write restored)")
 
         # Refresh any YAML-declared script on EVERY run — no_agent AND
         # per-job agent-gate scripts (Hydra's evolution_hydra_gate.py,
@@ -414,7 +592,7 @@ def main(argv: list[str]) -> int:
         if str(spec.get("script") or "").strip() and not dry_run:
             _install_script(repo_root, str(spec["script"]).strip())
 
-        schedule = str(spec.get("schedule") or "").strip()
+        schedule = _pick_schedule(spec, cadence, name, research_days)
         prompt = spec.get("prompt") or ""
         no_agent = bool(spec.get("no_agent"))
         if not schedule or (not str(prompt).strip() and not no_agent):
@@ -499,8 +677,16 @@ def main(argv: list[str]) -> int:
                 # Detect script changes (e.g. Hydra replacing access gate)
                 cur_script = str(cur.get("script") or "").strip()
                 yaml_script = str(spec.get("script") or "").strip()
-                if yaml_script and yaml_script != cur_script:
-                    changes["script"] = yaml_script
+                want_script = yaml_script
+                if not want_script:
+                    if name == "evolution-issues":
+                        want_script = issues_gate or ""
+                    elif name == "evolution-introspection":
+                        want_script = local_gate or ""
+                    elif class_a:
+                        want_script = gate_script or ""
+                if want_script and want_script != cur_script:
+                    changes["script"] = want_script
             if not changes:
                 skipped.append(name)
             elif dry_run:
@@ -558,14 +744,17 @@ def main(argv: list[str]) -> int:
             yaml_script = str(spec.get("script") or "").strip() if not no_agent else None
             if yaml_script and not dry_run:
                 _install_script(repo_root, yaml_script)
-            if gate_script and not yaml_script:
-                # Default access gate: skips the agent (no LLM/web spend) when
-                # GitHub is unreachable. Jobs with their own script (e.g. the
-                # Hydra gate) manage their own pre-checks.
-                create_kwargs["script"] = gate_script
-            elif yaml_script:
-                # Per-job gate script (Hydra, etc.) — installed and attached.
+            if yaml_script:
+                # Per-job gate script (Hydra, research web-gate, analysis, …)
                 create_kwargs["script"] = yaml_script
+            elif name == "evolution-issues" and issues_gate:
+                create_kwargs["script"] = issues_gate
+            elif name == "evolution-introspection" and local_gate:
+                create_kwargs["script"] = local_gate
+            elif class_a and gate_script:
+                # Default GitHub-write gate for class-A jobs without their own
+                # script. Class-B LLM jobs (introspection) use the local gate.
+                create_kwargs["script"] = gate_script
             job = create_job(**create_kwargs)
             update_job(
                 job["id"],

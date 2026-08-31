@@ -883,6 +883,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
                 if name in disabled:
                     continue
+                from agent.evolution_skills import (
+                    evolution_skills_visible_in_catalog,
+                    is_evolution_pipeline_skill,
+                )
+                if is_evolution_pipeline_skill(name, frontmatter) and not evolution_skills_visible_in_catalog():
+                    continue
 
                 description = frontmatter.get("description", "")
                 if not description:

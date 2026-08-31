@@ -2155,6 +2155,22 @@ def _skill_should_show(
     return True
 
 
+def _hide_evolution_pipeline_skill(
+    name: str,
+    session_platform: "str | None",
+    frontmatter: "dict | None" = None,
+) -> bool:
+    """True when an evolution-* skill should stay out of the chat catalog."""
+    from agent.evolution_skills import (
+        evolution_skills_visible_in_catalog,
+        is_evolution_pipeline_skill,
+    )
+
+    return is_evolution_pipeline_skill(
+        name, frontmatter
+    ) and not evolution_skills_visible_in_catalog(session_platform)
+
+
 def _current_session_platform_hint() -> str:
     """Return the active platform without importing the gateway package on CLI startup."""
     platform = os.environ.get("HERMES_PLATFORM") or os.environ.get("HERMES_SESSION_PLATFORM")
@@ -2286,6 +2302,12 @@ def _build_skills_system_prompt_inner(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if _hide_evolution_pipeline_skill(
+                frontmatter_name or skill_name,
+                _platform_hint or None,
+                {"category": entry.get("category")},
+            ):
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -2320,6 +2342,12 @@ def _build_skills_system_prompt_inner(
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
                 continue
+            if _hide_evolution_pipeline_skill(
+                entry["frontmatter_name"] or skill_name,
+                _platform_hint or None,
+                frontmatter,
+            ):
+                continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
                 available_tools,
@@ -2351,6 +2379,10 @@ def _build_skills_system_prompt_inner(
                     if fm_name in project_names:
                         continue
                     if fm_name in disabled or entry["skill_name"] in disabled:
+                        continue
+                    if _hide_evolution_pipeline_skill(
+                        fm_name, _platform_hint or None, frontmatter
+                    ):
                         continue
                     if not _skill_should_show(
                         extract_skill_conditions(frontmatter),
@@ -2451,6 +2483,12 @@ def _build_skills_system_prompt_inner(
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if _hide_evolution_pipeline_skill(
+                    frontmatter_name or skill_name,
+                    _platform_hint or None,
+                    frontmatter,
+                ):
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),

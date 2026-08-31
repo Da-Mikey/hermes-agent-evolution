@@ -82,13 +82,15 @@ Schedules below mirror `cron/evolution/*.yaml` (the source of truth).
 | Time | Stage | Mode |
 |------|-------|------|
 | 07:47 daily | Watchdog — deterministic pipeline health check (no LLM) | PUBLIC |
-| 08:00 Mon/Wed/Fri | Sync with upstream Hermes Agent | PRIVATE |
-| 09:00 daily | Research other agents and papers | PUBLIC |
-| 12:00 daily | Create issues/PRs from proposals | PUBLIC |
-| 20:00 daily | Introspection — self-observed weaknesses | PRIVATE |
-| 21:00 daily | Analyze and prioritize issues | PRIVATE |
-| 22:00 daily | Implement improvements (open PRs) | PRIVATE |
-| 23:00 daily | Integration — merge green PRs + self-update | PRIVATE |
+| 08:10 daily | Upstream release-sync check (no-op unless a new release landed) | PRIVATE |
+| Monday 09:30 | Research other agents and papers (weekly; skipped without GitHub write) | PUBLIC |
+| Monday 12:45 | Create issues from a fresh research batch (skipped if no batch / no write) | PUBLIC |
+| Wednesday 20:50 | Introspection — local session signals (weekly; no GitHub required) | PUBLIC |
+| 21:15 daily | Analyze and prioritize issues (chat-safe; dense cadence is opt-in) | PRIVATE |
+| 22:20 daily | Implement improvements (open PRs) | PRIVATE |
+| 23:40 daily | Integration — merge green PRs + self-update | PRIVATE |
+
+Chat-safe is the default (`evolution.cadence: chat-safe` in config.yaml). Owner-bots set `evolution.cadence: dense` for the previous every-30-min hydra / every-4h pipeline. Internet research never runs without push access to `Lexus2016/hermes-agent-evolution`.
 
 ## 🆚 Differences from the original Hermes Agent
 

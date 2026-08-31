@@ -3205,15 +3205,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # 27-deep spirals observed). The FIRST empty result is enriched with
         # what actually exists in the search path.
         #
-        # #1372/#1149/#1589 — the tool_guardrails spiral_failure_cap only
-        # counts errors, so diverse-query spirals (the agent reformulates each
-        # time and gets empty each time) slip through. Empty results are
-        # tracked per session; at 3 an advisory directive is injected, and at
-        # 6 it escalates to a real error key so classify_tool_failure sees the
-        # failure and the cross-turn spiral_failure_cap (search_files is in
-        # _SPIRAL_PRONE_TOOLS) can accumulate and halt. The advisory alone had
-        # no teeth — 31 sessions hit 11 consecutive empty searches.
-        _SEARCH_EMPTY_HARD_CAP = 6
+        # #1372/#1149 — empty results are tracked per session; at 3 an
+        # advisory directive is injected so the agent switches strategy.
+        # Council 2026-08-31: a well-formed search with zero hits is NOT a
+        # failure — do not escalate to an ``error`` key (that made
+        # spiral_failure_cap abort legitimate exploration). Advisory only.
         if result_dict.get("total_count", 0) == 0 and not result_dict.get("error"):
             with _read_tracker_lock:
                 td = _read_tracker.setdefault(
@@ -3232,16 +3228,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 if _hint:
                     result_dict["_no_match_hint"] = _hint
 
-            if _es >= _SEARCH_EMPTY_HARD_CAP:
-                result_dict["error"] = (
-                    f"search_files has returned 0 results {_es} times. Your "
-                    "queries are consistently not matching anything — this is a "
-                    "deterministic dead end. STOP searching and switch strategy: "
-                    "(a) use search_files target='files' with a glob like '*.py', "
-                    "(b) call repo_map for a structural overview, or "
-                    "(c) read_file on a known path instead of searching."
-                )
-            elif _es >= 3:
+            if _es >= 3:
                 result_dict.setdefault(
                     "_search_directive",
                     (
