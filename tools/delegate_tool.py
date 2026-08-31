@@ -4584,7 +4584,7 @@ def _run_single_child(
                         len(tool_trace),
                     )
                 # else: still shallow — loop again until budget exhausted.
-=======
+
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
@@ -4598,7 +4598,6 @@ def _run_single_child(
         else:
             # Genuine budget exhaustion: completed=False with no failure.
             exit_reason = "max_iterations"
->>>>>>> upstream/main
 
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
