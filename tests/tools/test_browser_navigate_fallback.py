@@ -107,3 +107,18 @@ class TestBuildNavigationFailure:
         assert r["nav_failures_for_url"] == bnf.MAX_NAV_FAILURES
         assert "cap" in r["recovery"].lower() and "STOP" in r["recovery"]
 
+
+def test_web_extract_fallback_calls_real_web_extract_tool_signature(monkeypatch):
+    """Verify web_extract_fallback passes valid arguments accepted by web_extract_tool."""
+    import json
+    from tools.browser_navigate_fallback import web_extract_fallback
+    import tools.web_tools as wt
+
+    async def _mock_extract(urls, format=None, char_limit=None):
+        return json.dumps({"success": True, "results": [{"content": "Extracted Content"}]})
+
+    monkeypatch.setattr(wt, "web_extract_tool", _mock_extract)
+    content, err = web_extract_fallback("https://example.com/test")
+    assert content == "Extracted Content"
+    assert err is None
+

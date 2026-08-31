@@ -315,7 +315,7 @@ def _read_failed_error(path: "Path") -> Dict[str, Any]:
     }
 
 
-DEFAULT_MEMORY_CHAR_LIMIT = 4000
+DEFAULT_MEMORY_CHAR_LIMIT = 2200
 DEFAULT_USER_CHAR_LIMIT = 1375
 
 

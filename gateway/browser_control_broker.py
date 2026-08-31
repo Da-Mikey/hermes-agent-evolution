@@ -485,8 +485,7 @@ class BrowserControlBroker:
                     self.detach(lane_scope, notify_controller=False)
                 continue
 
-            if existing_entry is None:
-                continue
+            assert existing_entry is not None, "unreachable: existing_entry cannot be None"
             existing_scope, existing = existing_entry
 
             with existing.send_lock:

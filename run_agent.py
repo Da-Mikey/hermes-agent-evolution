@@ -446,6 +446,9 @@ class AIAgent:
     # launch handle. Dedicated handles set this True at transfer; tests that
     # construct via __new__ must not AttributeError on the class.
     _owns_session_db = False
+    _base_url: Optional[str] = ""
+    _base_url_lower: str = ""
+    _base_url_hostname: str = ""
 
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "

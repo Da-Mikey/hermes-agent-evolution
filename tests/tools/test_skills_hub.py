@@ -2021,23 +2021,29 @@ class TestUrlSourceFetchMissingReferencedFile:
 
 
 def test_search_skills_deduped_sorting():
-    """Verify unified_search converts seen dict to list and sorts by trust before truncating to limit."""
+    """Verify unified_search dedupes entries and sorts by trust level before limit cut."""
     from tools.skills_hub import SkillMeta, unified_search
 
-    # Lower trust entry arrives first; sorting must move builtin to index 0 before limit cut
+    # s3 (community) arrives first, then s1 (community), then duplicate s1 (builtin upgrade), then s2 (trusted)
     results = [
-        SkillMeta(name="s2", description="s2 desc", source="community", identifier="owner/repo/s2", trust_level="community"),
+        SkillMeta(name="s3", description="s3 desc", source="community", identifier="owner/repo/s3", trust_level="community"),
+        SkillMeta(name="s1", description="s1 desc", source="community", identifier="owner/repo/s1", trust_level="community"),
         SkillMeta(name="s1", description="s1 desc", source="builtin", identifier="owner/repo/s1", trust_level="builtin"),
+        SkillMeta(name="s2", description="s2 desc", source="trusted", identifier="owner/repo/s2", trust_level="trusted"),
     ]
 
     with (
         patch("tools.skills_hub.parallel_search_sources", return_value=(results, {}, [])),
         patch("tools.skills_hub._record_retrieval") as mock_record,
     ):
-        out = unified_search("test", sources=[], limit=1)
+        out = unified_search("test", sources=[], limit=2)
         assert isinstance(out, list)
-        assert len(out) == 1
+        assert len(out) == 2
+        # s1 was deduped and upgraded to builtin, which sorts first
         assert out[0].identifier == "owner/repo/s1"
         assert out[0].trust_level == "builtin"
+        # s2 (trusted) sorts before s3 (community)
+        assert out[1].identifier == "owner/repo/s2"
+        assert out[1].trust_level == "trusted"
         mock_record.assert_called_once_with("test", out)
 
