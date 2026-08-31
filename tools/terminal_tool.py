@@ -4306,8 +4306,9 @@ def terminal_tool(
                             "exit_code": 124,
                             "error": (
                                 f"Command timed out after {effective_timeout} seconds. "
-                                "This command looks long-running — re-run with "
-                                "background=true and notify_on_complete=true."
+                                "The process may still be running or have produced "
+                                "partial output. This command looks long-running — "
+                                "re-run with background=true and notify_on_complete=true."
                             ),
                             "failure_class": classification.category.value,
                             "suggestion": classification.hint,
@@ -4318,6 +4319,25 @@ def terminal_tool(
                             "should_retry": False,
                             "terminal_streak": streak,
                         }
+                        # Retry-spiral detection (issue #3347): a timeout that
+                        # surfaces as an execute() exception was previously
+                        # returned early WITHOUT feeding the identical-failure
+                        # tracker, so repeated timeouts of the same command shape
+                        # never escalated. Mirror the normal-result path (#1022):
+                        # count the timeout as a failure and escalate to a
+                        # `retry_spiral` diagnostic once the same command times
+                        # out back-to-back beyond the budget. A changed command
+                        # resets the counter, so distinct commands never trip it.
+                        repeat = _note_terminal_failure(task_id, command, 124, "")
+                        budget = _get_max_command_repeats()
+                        if repeat > budget:
+                            diagnostic = spiral_break_diagnostic(
+                                command, repeat, budget
+                            )
+                            result_dict["error"] = diagnostic
+                            result_dict["suggestion"] = diagnostic
+                            result_dict["failure_class"] = "retry_spiral"
+                            result_dict["failure_repeat_count"] = repeat
                         rec = streak_recommendation(streak)
                         if rec:
                             result_dict["recommendation"] = rec

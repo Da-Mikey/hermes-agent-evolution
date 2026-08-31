@@ -249,3 +249,78 @@ class TestTerminalSpiralBreak:
             data = json.loads(terminal_tool.terminal_tool(cmd, task_id="spiral-test"))
             assert data["failure_class"] == "persistent_error"
         assert len(fake.calls) == 6
+
+
+# ---------------------------------------------------------------------------
+# Integration: execute()-exception timeouts feed the spiral guard (#3347)
+# ---------------------------------------------------------------------------
+#
+# A wall-clock timeout that surfaces as an execute() exception previously
+# returned early WITHOUT calling _note_terminal_failure, so re-running the
+# same long-running command foreground never escalated no matter how many
+# times it timed out.  These tests pin the fix: exception timeouts are now
+# counted like any other identical failure, and escalate to a retry_spiral
+# diagnostic beyond the budget.
+
+
+class TimingOutEnvironment:
+    """Environment double whose execute() raises a timeout every call."""
+
+    def __init__(self, message="Command 'cmd' timed out after 120 seconds"):
+        self._message = message
+        self.calls = []
+        self.env = {}
+        self.cwd = ""
+
+    def execute(self, command, **kwargs):
+        self.calls.append((command, kwargs))
+        raise TimeoutError(self._message)
+
+
+class TestExceptionTimeoutSpiral:
+    def test_exception_timeout_counted_and_escalates_after_budget(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        fake = TimingOutEnvironment()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"default": fake})
+
+        # Budget 3: the first three identical exception timeouts keep the
+        # normal timeout classification; the fourth escalates to retry_spiral.
+        for _ in range(3):
+            data = json.loads(
+                terminal_tool.terminal_tool("longjob", task_id="spiral-test")
+            )
+            assert data["exit_code"] == 124
+            assert data["failure_class"] != "retry_spiral"
+
+        data = json.loads(terminal_tool.terminal_tool("longjob", task_id="spiral-test"))
+        assert data["failure_class"] == "retry_spiral"
+        assert data["should_retry"] is False
+        assert data["failure_repeat_count"] == 4
+        assert len(fake.calls) == 4
+
+    def test_exception_timeout_first_run_reports_partial_output_warning(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        fake = TimingOutEnvironment()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"default": fake})
+
+        data = json.loads(terminal_tool.terminal_tool("longjob", task_id="spiral-test"))
+        assert data["exit_code"] == 124
+        # #3347 point (a): the warning about possibly-running/partial work.
+        assert "may still be running" in data["error"]
+        assert "partial output" in data["error"]
+        # #3347 point (b): the concrete background re-run directive.
+        assert "background=true" in data["error"]
+        assert "notify_on_complete=true" in data["error"]
+        assert terminal_tool.get_terminal_failure_repeat("spiral-test") == 1
+
+    def test_exception_timeout_different_command_does_not_escalate(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        fake = TimingOutEnvironment()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"default": fake})
+
+        for cmd in ("cmd_a", "cmd_b", "cmd_a", "cmd_b", "cmd_a", "cmd_b"):
+            data = json.loads(terminal_tool.terminal_tool(cmd, task_id="spiral-test"))
+            assert data["failure_class"] != "retry_spiral"
+        assert len(fake.calls) == 6
