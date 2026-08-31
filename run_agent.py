@@ -9891,6 +9891,21 @@ class AIAgent:
         """Read a governed memory record."""
         return self.governed_memory.read(key=key, active_only=active_only)
 
+    def read_governed_memory_with_freshness(
+        self, key: str
+    ) -> tuple[Any, "FreshnessSignal"]:
+        """Read a governed memory record plus its supersession freshness signal (#3336).
+
+        Before the agent acts on an inherited constraint, this surfaces whether
+        a newer record has withdrawn it — the review signal proposed by #3336
+        (stale-constraint retrieval failure mode). Returns
+        ``(record, FreshnessSignal)`` where ``signal.status`` is ``"current"``,
+        ``"superseded"``, or ``"unknown"``.
+        """
+        from evolution.lib.governed_shared_memory import FreshnessSignal
+
+        return self.governed_memory.read_with_freshness(key)
+
     def redistribute_subagent_memory(
         self, superseded_subagent_id: str, successor_subagent_id: str
     ) -> int:
