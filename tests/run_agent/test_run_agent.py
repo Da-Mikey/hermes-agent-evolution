@@ -711,6 +711,33 @@ class TestInit:
             # The value is discarded — nothing downstream reads it anymore.
             assert not hasattr(a, "tool_delay")
 
+    def test_pass_session_id_kwarg_accepted_and_forwarded(self):
+        """pass_session_id parameter is accepted by AIAgent and passed to agent."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                pass_session_id=True,
+                session_id="test-sess-123",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a.pass_session_id is True
+            assert a.session_id == "test-sess-123"
+
+    def test_aiagent_init_signature_matches_init_agent(self):
+        """AIAgent.__init__ must accept every parameter expected by init_agent."""
+        from agent.agent_init import init_agent
+        init_params = set(inspect.signature(init_agent).parameters.keys()) - {"agent"}
+        aiagent_params = set(inspect.signature(AIAgent.__init__).parameters.keys()) - {"self"}
+        missing = init_params - aiagent_params
+        assert not missing, f"AIAgent.__init__ is missing parameters accepted by init_agent: {missing}"
+
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
         with (
