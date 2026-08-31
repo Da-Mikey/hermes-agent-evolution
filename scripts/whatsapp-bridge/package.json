@@ -4,6 +4,9 @@
   "description": "WhatsApp bridge for Hermes Agent using Baileys",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node bridge.js"
   },

@@ -37,6 +37,7 @@ import {
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
+  createExponentialBackoff,
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
@@ -47,6 +48,20 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// Issue #118: Baileys 7 requires global webcrypto, which Node only ships
+// from v20. On older runtimes every startSocket() attempt crash-loops with
+// "Cannot destructure property subtle of globalThis.crypto as it is
+// undefined" (5,648 occurrences observed in bridge.log on Node v18.19.1).
+// Fail fast with a clear message instead of crash-looping forever.
+const NODE_MAJOR = Number(String(process.versions.node).split('.')[0] || 0);
+if (NODE_MAJOR < 20) {
+  console.error(
+    `[whatsapp-bridge] Node ${process.versions.node} is not supported: ` +
+      'Baileys 7 needs Node >= 20 (global webcrypto). Run the bridge with Node >= 20.',
+  );
+  process.exit(1);
+}
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -397,6 +412,9 @@ function emitPairEvent(event) {
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
+// Issue #118: back off the reconnect delay on consecutive disconnects so a
+// 428/503 flap stops hammering WhatsApp every 3s; reset on a stable 'open'.
+const reconnectBackoff = createExponentialBackoff();
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -451,13 +469,31 @@ async function startSocket() {
           if (reason === 515) {
             console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
           } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+            const delayMs = reconnectBackoff.next();
+            const attempts = reconnectBackoff.getAttempts();
+            if (attempts === 5) {
+              // Issue #118: one distinct alert per flap burst (not per
+              // reconnect) — a persistent 428/503 cycle used to log every
+              // 3s forever. A burst is usually a duplicate bridge instance
+              // or stale session state, not a transient network blip.
+              console.log(
+                '⚠️  WhatsApp reconnect flap detected (' +
+                  `${attempts} consecutive disconnects). ` +
+                  'Check for a duplicate bridge instance or stale session state.',
+              );
+            }
+            console.log(
+              `⚠️  Connection closed (reason: ${reason}). Reconnecting in ${Math.round(delayMs / 1000)}s...`,
+            );
+            scheduleReconnect(delayMs);
           }
+        } else {
+          scheduleReconnect(reason === 515 ? 1000 : reconnectBackoff.next());
         }
-        scheduleReconnect(reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectBackoff.reset();
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
