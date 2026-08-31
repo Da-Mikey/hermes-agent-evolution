@@ -434,3 +434,4 @@ def test_main_startup_warning_call(capsys, monkeypatch, tmp_path):
     hermes_main._warn_pending_fleet_restart_on_startup()
     err = capsys.readouterr().err
     assert "did not restart running gateways" in err
+    assert "hermes gateway restart" in err
