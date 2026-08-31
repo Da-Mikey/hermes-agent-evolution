@@ -779,7 +779,7 @@ class TestInit:
                 skip_memory=True,
             )
             a._api_latency_history.append(1.5)
-            a._api_output_history.append(42.0)
+            a._api_output_history.append(42)
             a.session_total_tokens = 500
             a.session_reasoning_tokens = 100
 

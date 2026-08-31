@@ -47,7 +47,7 @@ import time
 import threading
 import uuid
 import warnings
-from typing import List, Dict, Any, Optional, Callable, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Callable, Deque, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from evolution.lib.governed_shared_memory import FreshnessSignal
@@ -450,8 +450,8 @@ class AIAgent:
     _base_url_lower: str = ""
     _base_url_hostname: str = ""
     _rate_limit_state: Optional[Any] = None
-    _api_latency_history: Optional[Any] = None
-    _api_output_history: Optional[Any] = None
+    _api_latency_history: Optional[Deque[float]] = None
+    _api_output_history: Optional[Deque[int]] = None
 
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
@@ -459,7 +459,7 @@ class AIAgent:
     )
 
     @property
-    def base_url(self) -> str:
+    def base_url(self) -> Optional[str]:
         return self._base_url
 
     @base_url.setter
@@ -8340,7 +8340,7 @@ class AIAgent:
             "vertex",
         }:
             return True
-        base = (getattr(self, "base_url", "") or "").lower()
+        base = self._base_url_lower
         host = base_url_hostname(base)
         return (
             "dashscope" in host

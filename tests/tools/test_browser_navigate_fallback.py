@@ -110,20 +110,11 @@ class TestBuildNavigationFailure:
 
 def test_web_extract_fallback_calls_real_web_extract_tool_signature(monkeypatch):
     """Verify web_extract_fallback passes valid arguments accepted by web_extract_tool."""
-    import inspect
     import json
     from unittest.mock import create_autospec
     from tools.browser_navigate_fallback import web_extract_fallback
     import tools.web_tools as wt
 
-    # Verify call arguments bind cleanly to the real function signature
-    sig = inspect.signature(wt.web_extract_tool)
-    bound = sig.bind(["https://example.com/test"], format="markdown")
-    bound.apply_defaults()
-    assert bound.arguments["urls"] == ["https://example.com/test"]
-    assert bound.arguments["format"] == "markdown"
-
-    # Dynamically verify execution through strict autospec of real function
     mock_extract = create_autospec(wt.web_extract_tool, spec_set=True)
     mock_extract.return_value = json.dumps({"success": True, "results": [{"content": "Extracted Content"}]})
 
@@ -173,4 +164,10 @@ def test_web_extract_fallback_handles_error_responses(monkeypatch):
     content, err = web_extract_fallback("https://example.com/no-results")
     assert content is None
     assert err == "web_extract returned no results"
+
+    # Case 6: success is False with no error key provided
+    mock_extract.return_value = json.dumps({"success": False})
+    content, err = web_extract_fallback("https://example.com/default-err")
+    assert content is None
+    assert err == "web_extract returned an error"
 
