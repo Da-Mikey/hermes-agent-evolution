@@ -446,10 +446,12 @@ class AIAgent:
     # launch handle. Dedicated handles set this True at transfer; tests that
     # construct via __new__ must not AttributeError on the class.
     _owns_session_db = False
-    _base_url: str = ""
+    _base_url: Optional[str] = ""
     _base_url_lower: str = ""
     _base_url_hostname: str = ""
     _rate_limit_state: Optional[Any] = None
+    _api_latency_history: Optional[Any] = None
+    _api_output_history: Optional[Any] = None
 
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
@@ -987,9 +989,9 @@ class AIAgent:
         self._is_user_initiated_turn = False
 
         # API latency and output metrics history (cleared on session boundary)
-        if hasattr(self, "_api_latency_history"):
+        if self._api_latency_history is not None:
             self._api_latency_history.clear()
-        if hasattr(self, "_api_output_history"):
+        if self._api_output_history is not None:
             self._api_output_history.clear()
 
         # Context engine reset/transition (works for built-in compressor and plugins)
@@ -1726,7 +1728,7 @@ class AIAgent:
         :func:`agent.chat_completion_helpers.estimate_request_context_tokens`.
         """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
-        base_url = getattr(self, "_base_url", None) or self.base_url or ""
+        base_url = self._base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 

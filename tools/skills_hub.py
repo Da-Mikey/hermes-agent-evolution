@@ -4969,10 +4969,10 @@ def _record_retrieval(query: str, results: List[SkillMeta]) -> None:
 
     Issue #2918 (slice 1 of #2897): actual-use gating exists (#2286), but
     actual-use *precision* (used-when-retrieved rate) needs a log of which
-    skills were retrieved for which query — none exists. This writes one JSONL
-    line per retrieval so a later slice can compute retrieved∩used over pool
-    growth. Records the retrieved identifiers, not full descriptions, to keep
-    the sidecar small. Best-effort: a retrieval must never fail because
+    skills were returned to the caller for which query — none exists. This writes one JSONL
+    line per retrieval (recording the post-limit returned skills) so a later slice can compute
+    retrieved∩used over pool growth. Records the retrieved identifiers, not full descriptions,
+    to keep the sidecar small. Best-effort: a retrieval must never fail because
     logging did — IO/encode errors are swallowed.
     """
     if not query:

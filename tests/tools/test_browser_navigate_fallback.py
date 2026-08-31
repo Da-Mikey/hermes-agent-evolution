@@ -155,3 +155,22 @@ def test_web_extract_fallback_handles_error_responses(monkeypatch):
     assert content is None
     assert "network down" in err
 
+    # Case 3: results present with item-level error
+    mock_extract.side_effect = None
+    mock_extract.return_value = json.dumps({"success": True, "results": [{"content": "", "error": "item-level failure"}]})
+    content, err = web_extract_fallback("https://example.com/item-fail")
+    assert content is None
+    assert err == "item-level failure"
+
+    # Case 4: results present with empty content and no error
+    mock_extract.return_value = json.dumps({"success": True, "results": [{"content": ""}]})
+    content, err = web_extract_fallback("https://example.com/empty-item")
+    assert content is None
+    assert err == "web_extract returned empty content"
+
+    # Case 5: results is an empty list
+    mock_extract.return_value = json.dumps({"success": True, "results": []})
+    content, err = web_extract_fallback("https://example.com/no-results")
+    assert content is None
+    assert err == "web_extract returned no results"
+

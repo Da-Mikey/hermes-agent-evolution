@@ -1654,3 +1654,18 @@ def test_memory_defaults_match_config_defaults():
     assert mem_cfg.get("memory_char_limit") == DEFAULT_MEMORY_CHAR_LIMIT
     assert mem_cfg.get("user_char_limit") == DEFAULT_USER_CHAR_LIMIT
 
+
+def test_agent_init_passes_default_memory_char_limits_to_store(monkeypatch):
+    """Verify init_agent passes DEFAULT_MEMORY_CHAR_LIMIT / DEFAULT_USER_CHAR_LIMIT when keys absent."""
+    from agent.agent_init import init_agent
+    from run_agent import AIAgent
+    from tools.memory_tool import DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT
+
+    agent = AIAgent.__new__(AIAgent)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"memory": {"memory_enabled": True}})
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"memory": {"memory_enabled": True}})
+    init_agent(agent, base_url="https://api.openai.com/v1", api_key="sk-test", provider="openai", model="gpt-4o")
+    assert agent._memory_store is not None
+    assert agent._memory_store.memory_char_limit == DEFAULT_MEMORY_CHAR_LIMIT
+    assert agent._memory_store.user_char_limit == DEFAULT_USER_CHAR_LIMIT
+

@@ -4385,7 +4385,7 @@ def _run_single_child(
         status = _outcome["status"]
         tool_trace = _outcome["tool_trace"]
         exit_reason = _outcome["exit_reason"]
-        _empty_sentinel = _outcome.get("empty_sentinel", False)
+        _empty_sentinel = _outcome["empty_sentinel"]
 
         # ── Refusal-recovery nudge for subagent dispatch (#2292, child of #2240) ──
         # The main conversation loop wires maybe_refusal_nudge (loop_guard.py:1361)
@@ -4454,7 +4454,7 @@ def _run_single_child(
                         status = _rf_outcome["status"]
                         tool_trace = _rf_outcome["tool_trace"]
                         exit_reason = _rf_outcome["exit_reason"]
-                        _empty_sentinel = _rf_outcome.get("empty_sentinel", False)
+                        _empty_sentinel = _rf_outcome["empty_sentinel"]
                         result = _refusal_result  # noqa: F841 — update for downstream
 
         if interrupted:
@@ -4579,7 +4579,7 @@ def _run_single_child(
                     status = _retry_outcome["status"]
                     tool_trace = _retry_outcome["tool_trace"]
                     exit_reason = _retry_outcome["exit_reason"]
-                    _empty_sentinel = _retry_outcome.get("empty_sentinel", False)
+                    _empty_sentinel = _retry_outcome["empty_sentinel"]
                     logger.info(
                         "Subagent %d recovered on shallow auto-retry %d "
                         "(%d tool call(s))",

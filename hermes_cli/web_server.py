@@ -13655,7 +13655,7 @@ from hermes_cli.web_routers.mcp import (  # noqa: E402,F401 — legacy re-export
 
 _MCP_DASHBOARD_OAUTH_TTL = 15 * 60
 _MAX_PENDING_MCP_OAUTH_FLOWS = 8
-_mcp_oauth_flows: Dict[str, Any] = {}
+_mcp_oauth_flows: dict[str, Any] = {}
 _mcp_oauth_flows_lock = threading.Lock()
 _mcp_oauth_transactions: dict[tuple[str, str], threading.Lock] = {}
 _mcp_oauth_transactions_lock = threading.Lock()
