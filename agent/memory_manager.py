@@ -32,7 +32,11 @@ import re
 import inspect
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.memory_staleness import Note, StalenessReport
+    from agent.memory_conflicts import ConflictReport
 
 from agent.memory_importance import (
     REVOCATION_REASON_CONTRADICTION,

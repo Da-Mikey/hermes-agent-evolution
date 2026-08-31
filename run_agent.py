@@ -47,7 +47,10 @@ import time
 import threading
 import uuid
 import warnings
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from evolution.lib.governed_shared_memory import FreshnessSignal
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object

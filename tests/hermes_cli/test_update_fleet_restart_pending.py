@@ -422,3 +422,12 @@ def test_startup_warn_silent_when_nothing_pending(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+def test_main_startup_warning_call(capsys, monkeypatch):
+    """Verify hermes_cli.main can invoke _warn_pending_fleet_restart_on_startup."""
+    update_cmd._write_fleet_restart_pending_marker()
+    # Call through the exported main module attribute
+    hermes_main._warn_pending_fleet_restart_on_startup()
+    err = capsys.readouterr().err
+    assert "did not restart running gateways" in err

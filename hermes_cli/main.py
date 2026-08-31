@@ -13258,6 +13258,8 @@ def main():
     # update`` catch-up work. Skip when the user is already running update.
     try:
         if "update" not in sys.argv[1:]:
+            from hermes_cli.update_cmd import _warn_pending_fleet_restart_on_startup
+
             _warn_pending_fleet_restart_on_startup()
     except Exception:
         pass

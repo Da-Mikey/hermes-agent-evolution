@@ -14,11 +14,14 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import logging
 import sys
 
 from rich.markup import escape as _escape
 
 from utils import base_url_host_matches
+
+logger = logging.getLogger(__name__)
 
 
 class CLIAgentSetupMixin:

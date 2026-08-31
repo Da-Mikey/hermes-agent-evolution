@@ -1751,6 +1751,8 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
+    memory_char_limit = 2200
+    user_char_limit = 1375
     memory_enabled = True
     user_profile_enabled = True
     allow_batch_override = False

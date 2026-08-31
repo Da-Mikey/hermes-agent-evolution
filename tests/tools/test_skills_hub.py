@@ -2018,3 +2018,24 @@ class TestUrlSourceFetchMissingReferencedFile:
         assert bundle is not None
         assert bundle.name == "demo"
         assert "references/missing.md" not in bundle.files
+
+
+def test_search_skills_deduped_sorting(monkeypatch, tmp_path):
+    """Verify unified_search correctly converts seen dict to deduped list and sorts by trust."""
+    from tools.skills_hub import SkillMeta, unified_search
+
+    results = [
+        SkillMeta(name="s1", description="s1 desc", source="community", identifier="owner/repo/s1", trust_level="community"),
+        SkillMeta(name="s1", description="s1 desc", source="builtin", identifier="owner/repo/s1", trust_level="builtin"),
+        SkillMeta(name="s2", description="s2 desc", source="trusted", identifier="owner/repo/s2", trust_level="trusted"),
+    ]
+
+    with patch("tools.skills_hub.parallel_search_sources", return_value=(results, {}, [])):
+        out = unified_search("test", sources=[], limit=5)
+        assert isinstance(out, list)
+        assert len(out) == 2
+        assert out[0].identifier == "owner/repo/s1"
+        assert out[0].trust_level == "builtin"
+        assert out[1].identifier == "owner/repo/s2"
+        assert out[1].trust_level == "trusted"
+

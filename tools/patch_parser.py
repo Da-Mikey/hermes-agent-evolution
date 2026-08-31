@@ -32,8 +32,11 @@ import difflib
 import inspect
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any
 from enum import Enum
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tools.file_operations import PatchResult
 
 
 class OperationType(Enum):

@@ -8,6 +8,7 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sqlite3
 import threading
 import uuid
