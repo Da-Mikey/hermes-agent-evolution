@@ -1301,10 +1301,18 @@ _REFUSAL_PAT = re.compile(
         r"i can not\b",
         r"i cannot\b",
         r"i don'?t have (?:access|permission)",
+        r"i do not have (?:access|permission)",
         r"no access",
         r"i'?m unable to",
+        r"i am unable to",
+        r"i am not able to",
+        r"i lack the (?:tool|ability|capability|permission)",
         r"i don'?t have (?:a |the )?(?:tool|skill|feature|plugin|ability|capability)",
+        r"i do not have (?:a |the )?(?:tool|skill|feature|plugin|ability|capability)",
         r"not (?:able|allowed) to",
+        r"as an ai(?: language model)?",
+        r"sorry,? (?:but )?i (?:can'?t|cannot|am unable to)",
+        r"unable to (?:proceed|fulfill|perform)",
     ]),
     re.IGNORECASE,
 )
@@ -1338,9 +1346,8 @@ _REFUSAL_CATEGORIES = {
         r"permission|security|unauthorized|forbidden|access denied|403",
         "An access-denied or permission boundary was cited. Check if the "
         "action is achievable with alternative available tools (e.g. "
-        "`read_file` vs `terminal`, local commands vs remote APIs). If "
-        "essential access is missing, name the exact credential or "
-        "permission needed.",
+        "`read_file` vs `terminal`, local commands vs remote APIs, checking file system or using shell commands). "
+        "If essential access is missing, name the exact credential or permission needed.",
     ),
     "true_capability_gap": (
         r"don'?t have (?:a |the )?(?:tool|skill|plugin|feature|ability)|cannot (?:browse|run|execute|access the web)",

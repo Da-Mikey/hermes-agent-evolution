@@ -848,6 +848,23 @@ class TestMaybeRefusalNudge:
         # Should classify the first refusal
         assert "[loop-guard]" in nudge
 
+    def test_expanded_refusal_patterns_detected(self):
+        """#3348: expanded refusal patterns are classified properly."""
+        for pattern_text in (
+            "As an AI, I am not able to run this script.",
+            "Sorry, but I cannot modify that configuration file.",
+            "I lack the capability to interact with external databases.",
+            "I am unable to proceed with this task without elevated privileges.",
+        ):
+            msgs = [
+                {"role": "user", "content": "test"},
+                _asst_text(pattern_text),
+            ]
+            nudge = maybe_refusal_nudge(msgs)
+            assert nudge is not None, f"Failed to detect refusal in: {pattern_text}"
+            assert "[loop-guard]" in nudge
+
+
 
 class TestStructuralFailureDetection:
     """The guard must read the tool's own status field, not guess from prose.
