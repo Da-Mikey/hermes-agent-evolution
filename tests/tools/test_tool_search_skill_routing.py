@@ -39,8 +39,8 @@ def test_tool_search_default_off_preserves_bm25_order():
         out = dispatch_tool_search({"query": "read a file"}, current_tool_defs=[], config=cfg)
     import json
 
-    matches = json.loads(out)["matches"]
-    assert [m["name"] for m in matches] == ["send_email", "read_file"]
+    matches = json.loads(out)["results"][0]["matches"]
+    assert list(matches) == ["send_email", "read_file"]
 
 
 def test_tool_search_listwise_rerank_promotes_best_match():
@@ -53,11 +53,11 @@ def test_tool_search_listwise_rerank_promotes_best_match():
         out = dispatch_tool_search({"query": "read a file"}, current_tool_defs=[], config=cfg)
     import json
 
-    matches = json.loads(out)["matches"]
+    matches = json.loads(out)["results"][0]["matches"]
     # reranked: the strong lexical match rises to the top
-    assert matches[0]["name"] == "read_file"
+    assert matches[0] == "read_file"
     # strict reordering — same set of tools returned
-    assert {m["name"] for m in matches} == {"send_email", "read_file"}
+    assert set(matches) == {"send_email", "read_file"}
 
 
 def test_tool_search_rerank_failure_degrades_gracefully():
@@ -72,5 +72,5 @@ def test_tool_search_rerank_failure_degrades_gracefully():
     import json
 
     # the try/except in dispatch keeps the original hits on any rerank error
-    matches = json.loads(out)["matches"]
-    assert [m["name"] for m in matches] == ["send_email", "read_file"]
+    matches = json.loads(out)["results"][0]["matches"]
+    assert list(matches) == ["send_email", "read_file"]
