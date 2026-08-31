@@ -9,6 +9,8 @@ Usage:
     python -m hermes_cli.main web --port 8080
 """
 
+from __future__ import annotations
+
 import contextlib
 from contextlib import asynccontextmanager, contextmanager
 

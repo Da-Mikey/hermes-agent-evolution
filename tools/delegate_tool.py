@@ -3342,7 +3342,7 @@ def _derive_child_outcome(result: Dict[str, Any]) -> Dict[str, Any]:
     Pure function (no agent/IO) so it can be applied to BOTH the initial run
     and any shallow-retry re-run (issue #323) without duplicating the parsing
     logic. Returns a dict with: summary, completed, interrupted, api_calls,
-    status, tool_trace, exit_reason.
+    status, tool_trace, exit_reason, empty_sentinel.
     """
     summary = result.get("final_response") or ""
     completed = result.get("completed", False)

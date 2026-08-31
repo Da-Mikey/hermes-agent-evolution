@@ -2020,7 +2020,7 @@ class TestUrlSourceFetchMissingReferencedFile:
         assert "references/missing.md" not in bundle.files
 
 
-def test_search_skills_deduped_sorting(monkeypatch, tmp_path):
+def test_search_skills_deduped_sorting():
     """Verify unified_search correctly converts seen dict to deduped list and sorts by trust."""
     from tools.skills_hub import SkillMeta, unified_search
 

@@ -28,10 +28,10 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 if TYPE_CHECKING:
     from agent.rate_limit_tracker import RateLimitState
-from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget

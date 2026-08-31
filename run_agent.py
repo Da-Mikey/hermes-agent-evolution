@@ -934,6 +934,7 @@ class AIAgent:
         - API call count
         - Reasoning tokens
         - Estimated cost tracking
+        - API latency and output rate history
         - Session-scoped experience prompt cache
         - Context compressor internal counters
 

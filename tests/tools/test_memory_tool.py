@@ -1621,7 +1621,7 @@ def test_load_on_disk_store_initialization_defaults(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
     store = load_on_disk_store()
-    assert store.memory_char_limit == 2200
+    assert store.memory_char_limit == 4000
     assert store.user_char_limit == 1375
     assert store.memory_enabled is True
     assert store.user_profile_enabled is True
