@@ -180,10 +180,10 @@ class TestDDGSProviderSearch:
         assert "rate limited" in result["error"] or "failed" in result["error"].lower()
 
     def test_empty_results_return_provider_dead_error(self, monkeypatch):
-        """Issue #467: an empty DDGS result is treated as a provider failure only
-        when a fallback chain is configured, so the agent tries the next
-        backend instead of looping on "no results". Without a fallback chain
-        the empty result stays a successful response.
+        """Issue #467: an empty DDGS result is treated as a provider failure
+        only when the dispatcher's fallback rescue tier is available, so the
+        agent tries the rescue path instead of looping on "no results".
+        Without a rescue path the empty result stays a successful response.
         """
         monkeypatch.delitem(sys.modules, "plugins.web.ddgs.provider", raising=False)
         _install_fake_ddgs(monkeypatch, text_results=[])
@@ -195,17 +195,14 @@ class TestDDGSProviderSearch:
         # cannot see a fake ``ddgs`` installed in this interpreter.
         _force_inprocess_search(monkeypatch, _prov)
 
-        # With no fallback chain: success=True (regression coverage).
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
+        # With no rescue path: success=True (regression coverage).
+        monkeypatch.setattr(web_tools, "_keyless_rescue_enabled", lambda: False)
         result = DDGSWebSearchProvider().search("nothing", limit=5)
         assert result["success"] is True
 
-        # With a fallback chain: success=False so dispatcher switches provider.
-        monkeypatch.setattr(
-            web_tools,
-            "_load_web_config",
-            lambda: {"search_backend_fallback_chain": "brave-free"},
-        )
+        # With the fallback rescue tier available: success=False so the
+        # dispatcher's one-shot keyless rescue can serve the next attempt.
+        monkeypatch.setattr(web_tools, "_keyless_rescue_enabled", lambda: True)
         result = DDGSWebSearchProvider().search("nothing", limit=5)
         assert result["success"] is False
         assert "no results" in result["error"].lower()
@@ -328,8 +325,11 @@ class TestDDGSProviderSearch:
     def test_empty_results(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[])
         import plugins.web.ddgs.provider as prov
+        from tools import web_tools
 
         _force_inprocess_search(monkeypatch, prov)
+        # Deterministic: rescue disabled → empty is a valid provider outcome.
+        monkeypatch.setattr(web_tools, "_keyless_rescue_enabled", lambda: False)
 
         result = prov.DDGSWebSearchProvider().search("nothing", limit=5)
         assert result["success"] is True
