@@ -440,7 +440,8 @@ class TestRunJobScript:
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
         assert "encoding" not in captured["kwargs"]
-        assert "errors" not in captured["kwargs"]
+        # Lossy decode on every platform: one non-UTF-8 byte must not fail the run.
+        assert captured["kwargs"]["errors"] == "replace"
 
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script

@@ -51,7 +51,7 @@ from hermes_constants import get_hermes_home, hermes_home_key
 from cron.env_settings import cron_env_setting
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
-    load_config, load_config_readonly)
+    load_config, load_config_readonly, resolve_cron_model_drift_defaults)
 from hermes_cli.fallback_config import get_fallback_chain, scoped_fallback_chain
 from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt

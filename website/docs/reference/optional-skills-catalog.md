@@ -222,6 +222,12 @@ hermes skills uninstall <skill-name>
 | [**siyuan**](../user-guide/skills/optional/productivity/productivity-siyuan.md) | Query and edit a SiYuan knowledge base via its API. |
 | [**telephony**](../user-guide/skills/optional/productivity/productivity-telephony.md) | Provision Twilio numbers, SMS/MMS, and AI outbound calls. |
 
+## quality
+
+| Skill | Description |
+|-------|-------------|
+| [**self-critique**](../user-guide/skills/optional/quality/quality-self-critique.md) | Audit a finished task against the original request. |
+
 ## research
 
 | Skill | Description |

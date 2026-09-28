@@ -1040,7 +1040,7 @@ def nonretryable_client_error_result(
             classified=classified, summary=_nonretryable_summary, messages=messages,
             api_call_count=api_call_count, provider=provider, base_url=base_url, model=model,
         )
-    if classified.reason in _USER_ACTIONABLE_ABORT_REASONS:
+    if classified.reason in _USER_ACTIONABLE_ABORT_REASONS and not _welcome_hint:
         _actionable_guidance = _user_actionable_provider_guidance(
             classified.reason, provider=provider, model=model,
         )

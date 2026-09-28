@@ -71,6 +71,10 @@ from hermes_cli.cli_auto_maintenance import (  # noqa: F401,E402
     _run_checkpoint_auto_maintenance,
     _run_state_db_auto_maintenance,
 )
+from rich.console import Console
+from hermes_cli.fallback_config import get_fallback_chain
+from hermes_state_ids import new_session_id
+from utils import base_url_host_matches, base_url_hostname, is_truthy_value
 from hermes_cli.cli_render import (  # noqa: F401,E402
     ChatConsole,
     _ACCENT,
@@ -1487,7 +1491,15 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
                 logger.warning("plugin discovery failed during toolset validation", exc_info=True)
             # MCP server names only resolve after discover_mcp_tools runs; skip them here.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
-            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            # Plugin toolsets register on a background thread that may not have landed.
+            # Names it already declared are not typos (#71650).
+            try:
+                from hermes_cli.plugins import get_plugin_toolset_keys_nowait
+                plugin_ts_names = get_plugin_toolset_keys_nowait()
+            except Exception:
+                plugin_ts_names = set()
+            invalid = [t for t in toolsets
+                       if not validate_toolset(t) and t not in mcp_names and t not in plugin_ts_names]
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
 

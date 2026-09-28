@@ -72,12 +72,6 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "`hermes model` changes never touch it. Ignored when --model is given.")
     cron_create.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').")
-    cron_create.add_argument(
-        "--pin",
-        action="store_true",
-        default=False,
-        help="Pin the currently active global provider and model explicitly to this job",
-    )
     cron_create.add_argument("--reasoning-effort", dest="reasoning_effort",
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "

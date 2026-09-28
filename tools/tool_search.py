@@ -249,8 +249,7 @@ _DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "setup"})
 # ``defer`` list replaces this wholesale ([] = everything eager). ``clarify`` is deliberately
 # absent: A/B showed deferring it collapsed structured-clarify usage (18/18 -> 7/18) — the
 # ask-the-user affordance must be ambient, a stub is not enough.
-# ``setup_mcp`` stays deferred even if a config snapshot omits it (desktop fork surface).
-_DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"]) | frozenset({"setup_mcp"})
+_DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
 
 def _core_tools_in_toolsets(toolset_names: frozenset[str]) -> frozenset[str]:

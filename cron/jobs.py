@@ -1956,6 +1956,29 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
 }
 
 
+def _resolve_default_model_snapshot() -> Optional[str]:
+    """Default model resolved as the ticker's ``run_job`` does, so unpinned jobs can snapshot it and
+    keep running on it after a later swap. ``None`` on missing config or failure ("no snapshot")."""
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if not cfg_path.exists():
+            return None
+        cfg = load_user_config_effective(cfg_path)
+        cron_cfg = cfg.get("cron") or {}
+        if isinstance(cron_cfg, dict):
+            cron_model = cron_cfg.get("model")
+            if isinstance(cron_model, str) and cron_model.strip():
+                return cron_model.strip()
+        model_cfg = cfg.get("model") or {}
+        if isinstance(model_cfg, dict):
+            model_cfg = model_cfg.get("default") or model_cfg.get("model")
+        return model_cfg.strip() or None if isinstance(model_cfg, str) else None
+    except Exception:
+        return None
+
+
 def _compute_provider_model_snapshots(
     *, provider: Any, model: Any, base_url: Any, no_agent: Any,
 ) -> Tuple[Optional[str], Optional[str]]:

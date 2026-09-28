@@ -1977,7 +1977,10 @@ class AIAgent(
         args = (assistant_message, messages, effective_task_id, api_call_count)
         self._executing_tools = True  # allow _vprint during tool execution even with stream consumers
         self._live_turn_messages = list(messages) if messages is not None else []
-        self._emit_plan_before_tool_calls()
+        # getattr: test stubs built without the plan hook drive this method too.
+        emit_plan = getattr(self, "_emit_plan_before_tool_calls", None)
+        if emit_plan is not None:
+            emit_plan()
         try:
             with scoped_connection_surface(agent_connection_surface(self)):
                 if len(tool_calls) <= 1:
@@ -1995,7 +1998,10 @@ class AIAgent(
                         execute_tool_calls_segmented(self, *args, segments=segments)
         finally:
             self._executing_tools = False
-            self._check_step_divergence_after_tool_calls(messages)
+            # getattr: test stubs built without the divergence hook drive this method too.
+            check_divergence = getattr(self, "_check_step_divergence_after_tool_calls", None)
+            if check_divergence is not None:
+                check_divergence(messages)
         # getattr: test stubs built without _set_defaults drive this method too
         if getattr(self, "_trim_after_tool_batch", False):
             # Only on normal completion: every executor frame that held a >=1 MB raw result has

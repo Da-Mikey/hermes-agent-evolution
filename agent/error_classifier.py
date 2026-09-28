@@ -609,7 +609,14 @@ def is_reasoning_field_rejection(error_msg: str) -> bool:
     if token is None:
         return False
     near = msg[max(0, token.start() - 32):token.end() + 32]
-    return "unsupported" in near or any(m in msg for m in UNSUPPORTED_PARAM_MARKERS)
+    # "unknown parameter" / "invalid parameter" is a schema abort (surface it, do not retry).
+    # "unsupported" / "unrecognized request argument" is a reasoning-field rejection the
+    # loop may retry once without the disable.
+    retryable_markers = tuple(
+        m for m in UNSUPPORTED_PARAM_MARKERS
+        if m not in ("unknown parameter", "invalid parameter")
+    )
+    return "unsupported" in near or any(m in msg for m in retryable_markers)
 
 
 def _billing_hints(error_msg: str) -> Verdict:

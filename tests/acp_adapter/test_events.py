@@ -13,6 +13,7 @@ import acp
 from acp.schema import AgentPlanUpdate
 
 from acp_adapter.events import (
+    _build_plan_update_from_todo_result,
     _send_update,
     make_message_cb,
     make_step_cb,

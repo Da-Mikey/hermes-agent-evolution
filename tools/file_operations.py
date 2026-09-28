@@ -1476,6 +1476,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return PatchResult(error=denied)
         read_result = self._cat(path)
         if read_result.exit_code != 0:
+            # The wrapper's own ``cd`` failed: name that cwd, not a false "file not found".
+            if read_result.cwd_error:
+                return PatchResult(error=read_result.cwd_error)
             # #1326 — probe so not_found / directory / permission classify and
             # carry recovery hints. Fall back to the transport cwd error.
             err, sims = self._diagnose_read_failure(path)
