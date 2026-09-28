@@ -1210,7 +1210,7 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
                     f"it in this "
                     f"{'cron' if _is_cron else 'subagent'} context. "
                     f"Instead, write the output to a temp file "
-                    f"(e.g. `command > /tmp/out.txt`) and read it with "
+                    f"(e.g. `command > /tmp/out.txt`) and read it with "  # no-tmp: ok — example command in an error string
                     f"read_file, or use file/search tools to achieve "
                     f"the same goal without a shell pipe."
                 )

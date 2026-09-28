@@ -368,6 +368,7 @@ TQMEMORY_GUIDANCE = (
     "NOT shell out via subprocess to 'remember' something. "
     "(3) The config key is the top-level `mcp_servers`, never `mcp.servers`.\n"
     "Scope `index_paths` to FOCUSED Markdown roots (e.g. ./docs or one project "
+    # no-tmp: ok — the prompt names /tmp as a tree the model must not index
     "subdir), NEVER to huge or system trees like /root, /home, $HOME, /tmp, or a "
     "whole repo — indexing thousands of files bloats the vector index and crashes "
     "the MCP (observed on prod: ~10k chunks triggered a LanceDB re-sync crash and "

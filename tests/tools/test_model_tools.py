@@ -12,6 +12,7 @@ from model_tools import (
     get_toolset_for_tool,
     TOOL_TO_TOOLSET_MAP,
     _AGENT_LOOP_TOOLS,
+    _LEGACY_TOOLSET_MAP,
 )
 
 

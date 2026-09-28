@@ -47,7 +47,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _get_max_concurrent_children, _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled,
     _get_subagent_approval_callback, _get_worktree_isolation, _inherit_parent_capabilities, _load_config,
     _merge_request_overrides, _resolve_child_credential_pool, _resolve_child_runtime,
-    _resolve_delegation_credentials, _subagent_auto_approve, _subagent_auto_deny,
+    _resolve_delegation_credentials, _inherit_parent_base_url, _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch  # noqa: F401
 from tools.delegate_tool_progress import (  # noqa: F401
@@ -1288,7 +1288,7 @@ def delegate_task(
                     if _lt:
                         _refs.append(str(_lt))
                     elif live_deleg_id:
-                        _refs.append(f"/tmp/hermes/delegations/{live_deleg_id}/task-{_t_idx}.log")
+                        _refs.append(f"/tmp/hermes/delegations/{live_deleg_id}/task-{_t_idx}.log")  # no-tmp: ok — historical delegation log path
                     record_event(
                         event_type="delegation",
                         session_id=_sid,

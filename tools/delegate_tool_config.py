@@ -179,6 +179,26 @@ def _get_inherit_mcp_toolsets() -> bool:
 def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
+def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> Optional[str]:
+    """Base URL the parent is actually calling (live client), not a stale attribute.
+
+    ``parent_agent.base_url`` can lag the live client (old OpenRouter URL vs local
+    Ollama) and inheriting the stale one 401s with a dummy/local key.
+    """
+    surface_url = _normalized_runtime_url(fallback_base_url)
+    client_kwargs = getattr(parent_agent, "_client_kwargs", None)
+    client = getattr(parent_agent, "client", None)
+    live_candidates = (
+        client_kwargs.get("base_url") if isinstance(client_kwargs, dict) else None,
+        getattr(client, "base_url", "") if client is not None else None,
+    )
+    for raw in live_candidates:
+        url = _normalized_runtime_url(raw)
+        if url and url != surface_url and url.startswith(("http://", "https://")):
+            return url
+    return fallback_base_url or None
+
+
 def _inherit_parent_capabilities(parent_agent, override_provider, override_base_url) -> Optional[dict]:
     """Parent's endpoint-trust capability map for a child, or None. ``agent.capabilities`` is a trust decision scoped
     to one provider+endpoint: inherited ONLY when the child runs the parent's exact route; any provider or base_url

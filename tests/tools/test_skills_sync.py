@@ -19,6 +19,7 @@ from tools.skills_sync import (
     sync_skills,
 )
 from tools.skills_sync_bundled_ops import reset_bundled_skill
+from tools.skills_sync_optional import restore_official_optional_skill
 
 
 class TestReadWriteManifest:

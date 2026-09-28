@@ -10,13 +10,14 @@ from unittest.mock import MagicMock
 from tests.tools.file_ops_fakes import READ_SENTINEL_RE, compound_read_output
 from tools.environments.local import _find_bash, LocalEnvironment
 from agent.file_safety import is_write_denied as _is_write_denied
-from tools.file_operations_common import SearchMatch
+from tools.file_operations_common import LintResult, SearchMatch
 from tools.file_operations import (
     ReadResult,
     SearchResult,
     ShellFileOperations,
     MAX_LINE_LENGTH,
     normalize_read_pagination,
+    normalize_search_pagination,
 )
 
 
