@@ -3643,9 +3643,18 @@ class BasePlatformAdapter(ABC):
                 logger.warning("[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s", self.name,
                                attempt, max_retries, delay, error_str)
                 await asyncio.sleep(delay)
+                prior_raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+                prior_ids = [str(x) for x in (prior_raw.get("delivered_message_ids") or ())]
                 pending = undelivered_tail_after_partial(result, pending) or pending
                 result = await _send(pending)
                 if result.success:
+                    if prior_ids:
+                        new_raw = dict(result.raw_response) if isinstance(result.raw_response, dict) else {}
+                        new_ids = [str(x) for x in (new_raw.get("message_ids") or [])]
+                        if not new_ids and result.message_id:
+                            new_ids = [str(result.message_id)]
+                        new_raw["message_ids"] = prior_ids + new_ids
+                        result.raw_response = new_raw
                     logger.info("[%s] Send succeeded on retry %d%s", self.name, attempt,
                                 " (undelivered tail only)" if pending != content else "")
                     return result

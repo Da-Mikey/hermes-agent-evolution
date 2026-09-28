@@ -3641,6 +3641,8 @@ class TelegramAdapter(BasePlatformAdapter):
         raw.update({
             "partial_overflow": True, "delivered_chunks": delivered, "total_chunks": len(raw_chunks),
             "last_message_id": delivered_ids[-1], "delivered_prefix": prefix, "undelivered_tail": tail,
+            "delivered_message_ids": tuple(delivered_ids),
+            "undelivered_chunks": tuple(raw_chunks[delivered:]),
             "continuation_message_ids": tuple(delivered_ids[1:]),
         })
         logger.warning(
