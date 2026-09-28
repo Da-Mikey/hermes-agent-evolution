@@ -716,11 +716,7 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float, env: Mapping[str, 
     openai/codex#36793). ``process_group`` only changes which group the child belongs to; it does not detach
     the terminal or alter the fast path.
     """
-    if env is None:
-        env = {**noninteractive_git_env(), **NO_LAZY_FETCH_ENV}
-    else:
-        env = {**dict(env), **NO_LAZY_FETCH_ENV}
-    result = bounded_probe_run(argv, timeout=timeout, env=env)
+    result = bounded_probe_run(argv, timeout=timeout, env={**(env or noninteractive_git_env()), **NO_LAZY_FETCH_ENV})
     if result is None or result.returncode != 0:
         return ""
     return (result.stdout or "").strip()
