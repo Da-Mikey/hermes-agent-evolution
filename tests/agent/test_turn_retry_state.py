@@ -1,10 +1,4 @@
-"""Unit tests for TurnRetryState (god-file Phase 1b).
-
-The dataclass holds the inner-retry-loop's one-shot recovery guards + restart
-signals. These tests pin its shape and default semantics — the behavioral
-guarantee for the loop itself is the existing recovery-branch tests in
-tests/run_agent/ which now exercise these fields via `_retry.<flag>`.
-"""
+"""Copilot provider detection used by the turn-retry recovery gates."""
 
 from __future__ import annotations
 

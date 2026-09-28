@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
 
 if TYPE_CHECKING:  # avoid a circular import; policy_interceptors imports this module
     from agent.policy_interceptors import PolicyInterceptorRegistry
@@ -517,6 +517,13 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     if result is None:
         return False, ""
     if file_mutation_result_landed(tool_name, result):
+        return False, ""
+
+    # A harness REFUSAL of a redundant call (repeated identical read/search) carries
+    # ``"error"`` for the model's benefit -- exactly what the substring test below keys
+    # on -- but nothing failed; counting it lets the cheap refusal feed the streak that
+    # fires the next, harder one. Mirrored in ``agent.display._detect_tool_failure``.
+    if is_guardrail_refusal(result):
         return False, ""
 
     # Terminal and process: non-zero exit code is the canonical failure
