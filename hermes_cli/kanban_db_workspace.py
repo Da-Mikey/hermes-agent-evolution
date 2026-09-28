@@ -52,13 +52,10 @@ _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM ta
 def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
     """``git -C repo_root args``; never raises on a non-zero exit.
 
-    :func:`noninteractive_repo_git_env` (GHSA-7x36-8jrh-v4pw): the dispatcher runs ``worktree add``
-    unattended, which executes the repo's hooks, ``core.fsmonitor`` and smudge filters.
+    :func:`noninteractive_git_env` (GHSA-7x36-8jrh-v4pw): the dispatcher runs ``worktree add``
+    unattended, which executes the repo's hooks and ``core.fsmonitor``.
     """
-    from hermes_cli._subprocess_compat import noninteractive_repo_git_env
-    env = noninteractive_repo_git_env(repo_root)
-    if env is None:
-        return subprocess.CompletedProcess(["git", "-C", str(repo_root), *args], 1, "", "git filter discovery failed")
+    from hermes_cli._subprocess_compat import noninteractive_git_env
     return subprocess.run(
         ["git", "-C", str(repo_root), *args],
         capture_output=True,
@@ -66,7 +63,7 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
         timeout=timeout,
         check=False,
         stdin=subprocess.DEVNULL,
-        env=env,
+        env=noninteractive_git_env(),
     )
 
 

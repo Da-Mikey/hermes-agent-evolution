@@ -71,15 +71,11 @@ class ExternalTreeRecord:
 def _git(args: list, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess:
     """Run git, translating timeouts into returncode 124. Every verdict fails safe toward "keep"
     on nonzero, so a slow ``git cherry`` on a huge repo degrades to keep instead of aborting the
-    audit mid-list. :func:`noninteractive_repo_git_env` because ``status`` executes the repo's
-    ``core.fsmonitor`` and clean filters (GHSA-7x36-8jrh-v4pw)."""
-    from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
-    env = noninteractive_repo_git_env(cwd)
-    if env is None:
-        return subprocess.CompletedProcess(args=["git", *args], returncode=1, stdout="",
-                                           stderr=FILTER_DISCOVERY_FAILED)
+    audit mid-list. :func:`noninteractive_git_env` because ``status`` executes the repo's
+    ``core.fsmonitor`` (GHSA-7x36-8jrh-v4pw)."""
+    from hermes_cli._subprocess_compat import noninteractive_git_env
     try:
-        return _run(["git", *args], timeout, cwd, env=env)
+        return _run(["git", *args], timeout, cwd, env=noninteractive_git_env())
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args=["git", *args], returncode=124, stdout="",
                                            stderr=f"timeout after {timeout}s")
