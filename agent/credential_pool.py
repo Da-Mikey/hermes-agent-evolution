@@ -727,10 +727,11 @@ def credential_pool_matches_provider(
     attribute remain compatible; production pools are scoped.
     """
     raw_pool_provider = getattr(pool_or_provider, "provider", None)
-    if raw_pool_provider is None:
+    if not isinstance(raw_pool_provider, str):
         if not isinstance(pool_or_provider, str):
             # Lightweight/unscoped pool adapters (old plugins, tests) may
-            # expose only select()/has_credentials().
+            # expose only select()/has_credentials(). A MagicMock also grows a
+            # non-string ``provider`` on access; that is still unscoped.
             return True
         raw_pool_provider = pool_or_provider
     pool_provider = str(raw_pool_provider or "").strip().lower()

@@ -145,14 +145,17 @@ class TestDelegateRequirements(unittest.TestCase):
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
+        # The task is the child's first user turn, not a second copy in the
+        # system prompt (OAuth Anthropic rejects the same text in both roles).
+        from tools.delegate_tool_child_run import _build_child_goal_message
         prompt = _build_child_system_prompt("Fix the tests")
-        self.assertIn("Fix the tests", prompt)
-        self.assertIn("YOUR TASK", prompt)
+        self.assertNotIn("Fix the tests", prompt)
         self.assertNotIn("CONTEXT", prompt)
+        goal = _build_child_goal_message("Fix the tests", [], None)
+        self.assertIn("Fix the tests", goal if isinstance(goal, str) else str(goal))
 
     def test_goal_with_context(self):
         prompt = _build_child_system_prompt("Fix the tests", "Error: assertion failed in test_foo.py line 42")
-        self.assertIn("Fix the tests", prompt)
         self.assertIn("CONTEXT", prompt)
         self.assertIn("assertion failed", prompt)
 
@@ -2212,7 +2215,9 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["base_url"], "http://localhost:11434/v1")
-            self.assertEqual(kwargs["api_key"], "ollama")
+            # The live client's key travels with its URL. Pairing the localhost
+            # endpoint with the stale surface key ("ollama") 401s (#90009).
+            self.assertEqual(kwargs["api_key"], "no-key-required")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -3503,7 +3508,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             "Deep work", role="orchestrator",
             max_spawn_depth=3, child_depth=1,
         )
-        self.assertIn("can themselves be orchestrators", prompt)
+        self.assertIn("can themselves delegate", prompt)
 
     # ── Batch mode and intersection ─────────────────────────────────────
 
