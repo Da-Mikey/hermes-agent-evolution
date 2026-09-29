@@ -231,10 +231,28 @@ def user_config(base_url: str, version: int) -> str:
 
 
 def _base_config_version(leg: Leg) -> int:
-    """The N-1 schema version, as N-1's own code reports it (imported in the N-1 install's venv)."""
-    cp = leg.run("-c", "from hermes_cli.config_defaults import DEFAULT_CONFIG; print(DEFAULT_CONFIG['_config_version'])",
-                 argv0=leg.python)
-    assert cp.returncode == 0, "could not import the N-1 DEFAULT_CONFIG:\n" + H.describe(cp)
+    """The N-1 schema version, read from N-1's own ``config_defaults.py``.
+
+    A package import is not reliable in this sandbox. CPython takes
+    ``sys.executable`` from ``/proc/self/exe``, so uv's interpreter symlink
+    never sees ``install/venv/pyvenv.cfg`` and the editable finder stays
+    unloaded. ``python -c`` then binds ``hermes_cli`` to the first directory
+    on ``sys.path`` that has one, and ``tests/hermes_cli`` has no
+    ``config_defaults``. The module is pure data (no imports), so load that
+    file by path.
+    """
+    src = leg.install / "hermes_cli" / "config_defaults.py"
+    code = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('_n1_config_defaults', sys.argv[1])\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "loader = spec.loader\n"
+        "assert loader is not None\n"
+        "loader.exec_module(mod)\n"
+        "print(mod.DEFAULT_CONFIG['_config_version'])\n"
+    )
+    cp = leg.run("-P", "-c", code, str(src), argv0=leg.python)
+    assert cp.returncode == 0, "could not read the N-1 DEFAULT_CONFIG:\n" + H.describe(cp)
     return int(cp.stdout.strip().splitlines()[-1])
 
 
@@ -332,14 +350,18 @@ def _write_wrappers(leg_root: Path, install: Path, hermes_home: Path) -> Path:
     return wrap
 
 
-def _venv_site_bootstrap(root: Path, venv: Path) -> str:
-    """Directory whose ``sitecustomize`` adds the N-1 venv's site-packages.
+def _n1_pythonpath(root: Path, install: Path, venv: Path) -> str:
+    """``PYTHONPATH`` that imports the N-1 checkout without ``pyvenv.cfg``.
 
-    CPython 3.11 takes ``sys.executable`` from ``/proc/self/exe``. uv's
-    interpreter is a symlink, so inside bwrap's remounted ``/proc`` that path
-    is the managed interpreter and ``pyvenv.cfg`` is never read. The editable
-    install stays unloaded. ``site.addsitedir`` still processes its ``.pth``
-    files, and copying the binary would break ``$ORIGIN`` for libpython.
+    Inside bwrap, ``/proc/self/exe`` is the uv-managed interpreter, so
+    ``site.venv()`` never reads ``install/venv/pyvenv.cfg`` and the editable
+    finder stays unloaded. Later ``hermes`` commands still need the checkout
+    and its dependencies. The checkout directory answers ``hermes_cli``;
+    ``site-packages`` answers regular dependencies; a ``sitecustomize`` on the
+    front of the path ``addsitedir``s the venv so ``.pth`` packages load too.
+    Copying the interpreter would break ``$ORIGIN`` for libpython.
+    ``PYTHONSAFEPATH`` (set by the caller) keeps the sandbox cwd off
+    ``sys.path``, so ``tests/hermes_cli`` cannot shadow the checkout.
     """
     sites = sorted(p for p in (venv / "lib").glob("python3.*/site-packages") if p.is_dir())
     assert sites, f"N-1 venv has no site-packages under {venv / 'lib'}"
@@ -347,7 +369,7 @@ def _venv_site_bootstrap(root: Path, venv: Path) -> str:
     boot.mkdir(exist_ok=True)
     body = "import site\n" + "".join(f"site.addsitedir({str(p)!r})\n" for p in sites)
     (boot / "sitecustomize.py").write_text(body, encoding="utf-8")
-    return str(boot)
+    return os.pathsep.join([str(boot), str(install), *(str(p) for p in sites)])
 
 
 def make_leg(root: Path, template_home: Path | None) -> Leg:
@@ -377,7 +399,7 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
                          "--python", base_python], cwd=str(install),
                         env=uv_env, capture_output=True, text=True, timeout=1800)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
-    bootstrap = _venv_site_bootstrap(root, install / "venv")
+    pythonpath = _n1_pythonpath(root, install, install / "venv")
     env_probe = H.isolated_env(root)
     hermes_home = Path(env_probe["HERMES_HOME"])
     if template_home is not None:
@@ -385,8 +407,9 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
         shutil.copytree(template_home, hermes_home, symlinks=True)
     wrap = _write_wrappers(root, install, hermes_home)
     env = H.isolated_env(root, extra_path=[wrap])
-    # Prepended so a later test override still sees the venv bootstrap first.
-    env["PYTHONPATH"] = bootstrap if "PYTHONPATH" not in env else bootstrap + os.pathsep + env["PYTHONPATH"]
+    # Checkout + site-packages, not the sandbox cwd. See ``_n1_pythonpath``.
+    env["PYTHONPATH"] = pythonpath if "PYTHONPATH" not in env else pythonpath + os.pathsep + env["PYTHONPATH"]
+    env["PYTHONSAFEPATH"] = "1"
     return Leg(root=root, origin=origin, install=install, env=env, hermes_home=hermes_home, wrap_dir=wrap)
 
 

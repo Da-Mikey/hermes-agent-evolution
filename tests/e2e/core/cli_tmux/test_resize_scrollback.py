@@ -57,9 +57,30 @@ def test_resizes_keep_each_transcript_line_once_in_tmux_scrollback(tmp_path: Pat
     def resize(cols: int) -> None:
         tmux("resize-window", "-t", "p", "-x", str(cols), "-y", "24")
 
+    def prompt_tail(line: str) -> str | None:
+        body = line.strip()
+        idx = body.rfind("❯")
+        if idx < 0:
+            return None
+        return body[idx + 1:].strip()
+
     def ask(turn: int) -> None:
-        tmux("send-keys", "-t", "p", "-l", f"question zq{turn}q please")
-        time.sleep(0.5)  # typed text + Enter in one write is a paste, not a submit
+        # Welcome is printed before prompt_toolkit reads the PTY. Keys buffered
+        # in that window arrive as one burst, and Enter within 50ms of the last
+        # text change is a newline, not a submit (#10994). The empty composer
+        # shows a placeholder, so it is not a blank ❯ line. Type, wait until
+        # the composer shows this question (the app has consumed the keys and
+        # stamped the change), then wait past that window before Enter.
+        question = f"question zq{turn}q please"
+        tmux("send-keys", "-t", "p", "-l", question)
+        end = time.monotonic() + 30
+        while not any(
+            (tail := prompt_tail(line)) is not None and question in tail
+            for line in transcript().splitlines()
+        ):
+            assert time.monotonic() < end, f"prompt never showed {question!r}:\n{transcript()[-1500:]}"
+            time.sleep(0.05)
+        time.sleep(0.2)
         tmux("send-keys", "-t", "p", "Enter")
 
     def reply_done(turn: int) -> None:
