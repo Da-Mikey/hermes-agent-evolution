@@ -42,6 +42,7 @@ live gateway on the host.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import functools
 import hashlib
@@ -230,30 +231,37 @@ def user_config(base_url: str, version: int) -> str:
     )
 
 
-def _base_config_version(leg: Leg) -> int:
-    """The N-1 schema version, read from N-1's own ``config_defaults.py``.
+def _literal_config_version(source: str) -> int:
+    """The ``_config_version`` literal in a ``config_defaults`` module.
 
-    A package import is not reliable in this sandbox. CPython takes
-    ``sys.executable`` from ``/proc/self/exe``, so uv's interpreter symlink
-    never sees ``install/venv/pyvenv.cfg`` and the editable finder stays
-    unloaded. ``python -c`` then binds ``hermes_cli`` to the first directory
-    on ``sys.path`` that has one, and ``tests/hermes_cli`` has no
-    ``config_defaults``. The module is pure data (no imports), so load that
-    file by path.
+    The module is data. Parsing it avoids importing it: inside bwrap the
+    writable bind covers the leg root, the parent of the process cwd, and the
+    sandboxed interpreter then cannot open the checkout file.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, val in zip(node.keys, node.values):
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == "_config_version"
+                and isinstance(val, ast.Constant)
+                and isinstance(val.value, int)
+            ):
+                return val.value
+    raise AssertionError("config_defaults.py has no literal _config_version")
+
+
+def _base_config_version(leg: Leg) -> int:
+    """The N-1 schema version, read from the checkout on the host.
+
+    The sandboxed ``python -c`` open fails with ``FileNotFoundError`` for this
+    path even when the clone contains the file. The test process is outside
+    the sandbox and can read the checkout directly.
     """
     src = leg.install / "hermes_cli" / "config_defaults.py"
-    code = (
-        "import importlib.util, sys\n"
-        "spec = importlib.util.spec_from_file_location('_n1_config_defaults', sys.argv[1])\n"
-        "mod = importlib.util.module_from_spec(spec)\n"
-        "loader = spec.loader\n"
-        "assert loader is not None\n"
-        "loader.exec_module(mod)\n"
-        "print(mod.DEFAULT_CONFIG['_config_version'])\n"
-    )
-    cp = leg.run("-P", "-c", code, str(src), argv0=leg.python)
-    assert cp.returncode == 0, "could not read the N-1 DEFAULT_CONFIG:\n" + H.describe(cp)
-    return int(cp.stdout.strip().splitlines()[-1])
+    return _literal_config_version(src.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
