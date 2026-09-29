@@ -503,6 +503,31 @@ def migrate_oracle(leg: Leg, name: str, before: bytes) -> bytes:
     return (home / "config.yaml").read_bytes()
 
 
+def _without_tqmemory_server(raw: bytes) -> tuple[bytes, str | None]:
+    """Split off the tqmemory MCP entry ``hermes update`` registers.
+
+    The oracle is ``migrate_config`` only. The fork then calls
+    ``reconcile_tqmemory``, which appends one server block. Everything else
+    must still match the oracle byte for byte.
+    """
+    lines = raw.decode("utf-8").splitlines(keepends=True)
+    kept: list[str] = []
+    block: list[str] = []
+    skipping = False
+    for line in lines:
+        if not skipping and line.startswith("  tqmemory:"):
+            skipping = True
+            block.append(line)
+            continue
+        if skipping:
+            if line.strip() == "" or (len(line) - len(line.lstrip(" "))) > 2:
+                block.append(line)
+                continue
+            skipping = False
+        kept.append(line)
+    return "".join(kept).encode("utf-8"), ("".join(block) if block else None)
+
+
 def assert_healthy_at_head(leg: Leg, provider: FakeLLMServer, final: subprocess.CompletedProcess) -> None:
     before = leg.snapshot
     # 1. exit code matches reality
@@ -536,9 +561,14 @@ def assert_healthy_at_head(leg: Leg, provider: FakeLLMServer, final: subprocess.
         orig = before[name]["config"]
         after = (home / "config.yaml").read_bytes()
         expected = migrate_oracle(leg, name, orig)
-        assert after == expected, (
+        migrated, tqmemory = _without_tqmemory_server(after)
+        assert migrated == expected, (
             f"{name} config.yaml differs from HEAD's own migration of the pre-update file\n"
             f"--- after update ---\n{after.decode()}\n--- expected ---\n{expected.decode()}")
+        if tqmemory is not None:
+            assert "turbo-memory-mcp" in tqmemory, tqmemory
+            assert "TQMEMORY_MIGRATE_ON_STARTUP" in tqmemory, tqmemory
+            assert "enabled: true" in tqmemory, tqmemory
         # Independent of the oracle (a clobbering migration would be mirrored by it): the user's
         # values survive semantically and every comment line survives verbatim.
         o, a = yaml.safe_load(orig), yaml.safe_load(after)
