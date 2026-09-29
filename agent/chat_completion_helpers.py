@@ -3668,11 +3668,22 @@ class _StreamingCall(StreamingWaitMonitor):
         # connection, so shut down the killed attempt's own socket too — still
         # shutdown-only, never close (see the helper).
         _killed_response = self._attempt_stream_response
+        with self.stream_attempt_lock:
+            _attempt_id = int(self.stream_attempt_state["current"])
+        # One bump per stream attempt. The monitor keeps firing while a
+        # pre-header hang is still unwinding (the pool sweep can miss the
+        # socket, tcp_force_closed=0). Counting every tick tripped the
+        # cross-turn breaker inside a single provider_hang turn, so the
+        # probe was refused before it reached the provider.
+        _already_counted = _attempt_id != 0 and getattr(self, "_stale_kill_counted_attempt", None) == _attempt_id
         with contextlib.suppress(Exception):
             self._cancel_current_stream_attempt("stale_stream_kill")
             self.clients.close_once("stale_stream_kill")
         self._shutdown_stale_attempt_socket(_killed_response)
-        _bump_stale_streak(self.agent)  # circuit breaker, see ``_stale_streak()``
+        if not _already_counted:
+            _bump_stale_streak(self.agent)  # circuit breaker, see ``_stale_streak()``
+            if _attempt_id != 0:
+                self._stale_kill_counted_attempt = _attempt_id
         # Reset the timer so we don't kill repeatedly while the worker unwinds.
         self.last_chunk_time["t"] = time.time()
         self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")

@@ -51,6 +51,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -102,14 +103,16 @@ class _Refs(NamedTuple):
 def _refs() -> _Refs:
     """HEAD and release N-1, resolved on first use: collection (every CI shard) runs no git.
 
-    N-1 is ``git describe --tags --abbrev=0 HEAD~1``; HERMES_E2E_UPGRADE_BASE=<ref> starts from any
+    N-1 is the nearest CalVer release tag before HEAD; HERMES_E2E_UPGRADE_BASE=<ref> starts from any
     older ref instead (e.g. the pre-handoff v2026.9.14, or a patched base when proving a leg red
     against the N-1 side).
     """
     head = _git("rev-parse", "HEAD", cwd=H.WORKTREE)
     try:
-        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git("describe", "--tags", "--abbrev=0", "HEAD~1",
-                                                                  cwd=H.WORKTREE)
+        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git(
+            "describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0", "HEAD~1",
+            cwd=H.WORKTREE,
+        )
         return _Refs(head, tag, _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
     except AssertionError:  # shallow CI checkout without tags
         return _Refs(head, "", "")
@@ -340,15 +343,20 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     _git("remote", "set-url", "origin", OFFICIAL_URL, cwd=install)
     _git("config", f"url.{origin}.insteadOf", OFFICIAL_URL, cwd=install)
     uv = _real_uv()
-    py = H.WORKTREE / ".venv" / "bin" / "python"
-    base_python = str(Path(os.path.realpath(py))) if py.exists() else "python3"
+    assert uv is not None  # _upgrade_prerequisites checked the tool before staging.
+    with (install / "pyproject.toml").open("rb") as manifest:
+        base_python = tomllib.load(manifest)["project"]["requires-python"]
     # The installer's tier 0: N-1's own uv.lock (hash-pinned, `--extra all`) into install/venv, with the
-    # user's uv config hidden, so the N-1 venv is the one users of that release actually have.
+    # user's uv config hidden. Select a managed interpreter allowed by N-1's
+    # requires-python, not HEAD's venv. Reusing HEAD's interpreter imports through
+    # that venv's editable install and raises ModuleNotFoundError for
+    # hermes_cli.config_defaults on the Linux leg.
     no_cfg = root / "uv-config"
     no_cfg.mkdir()
     uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
-    cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--python", base_python], cwd=str(install),
+    cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--managed-python",
+                         "--python", base_python], cwd=str(install),
                         env=uv_env, capture_output=True, text=True, timeout=1800)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
     env_probe = H.isolated_env(root)
