@@ -109,9 +109,16 @@ def _refs() -> _Refs:
     against the N-1 side).
     """
     head = _git("rev-parse", "HEAD", cwd=H.WORKTREE)
+    # A pull_request checkout is a merge of the PR into the base branch, so
+    # HEAD~1 is that base. Its nearest tag is a release the PR has already
+    # left (v2026.9.14): the update then runs new callers against cached
+    # modules that lack scope_home and restore_interrupted_pull. The PR head
+    # is the second parent; a non-merge checkout has only HEAD~1.
+    second = _git("rev-parse", "--verify", "--quiet", "HEAD^2", cwd=H.WORKTREE, check=False)
+    before = "HEAD^2" if second else "HEAD~1"
     try:
         tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git(
-            "describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0", "HEAD~1",
+            "describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0", before,
             cwd=H.WORKTREE,
         )
         return _Refs(head, tag, _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
