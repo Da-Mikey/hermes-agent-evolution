@@ -1289,6 +1289,16 @@ class TestReadProcessCmdlinePsFallback:
 
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
+        # /proc is missing, then psutil, then ps. A live pid (873 is containerd
+        # on the Linux runner) answers from psutil and never reaches the ps mock.
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+        if psutil is not None:
+            def _denied(pid):
+                raise psutil.AccessDenied(pid)
+            monkeypatch.setattr(psutil, "Process", _denied)
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),

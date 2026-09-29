@@ -269,7 +269,7 @@ class Leg:
     def popen(self, *args: str) -> subprocess.Popen:
         log = open(self.root / f"popen-{int(time.monotonic() * 1000)}.log", "w")  # noqa: SIM115
         return subprocess.Popen(
-            H.sandbox_argv([*_KILLED_RUN_PREFIX, self.hermes, *args], writable=[self.root]),
+            H.sandbox_argv([*_KILLED_RUN_PREFIX, self.hermes, *args], writable=[self.root], cwd=self.install),
             env=self.env, cwd=str(self.install), stdin=subprocess.DEVNULL,
             stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True,
         )
@@ -332,6 +332,24 @@ def _write_wrappers(leg_root: Path, install: Path, hermes_home: Path) -> Path:
     return wrap
 
 
+def _venv_site_bootstrap(root: Path, venv: Path) -> str:
+    """Directory whose ``sitecustomize`` adds the N-1 venv's site-packages.
+
+    CPython 3.11 takes ``sys.executable`` from ``/proc/self/exe``. uv's
+    interpreter is a symlink, so inside bwrap's remounted ``/proc`` that path
+    is the managed interpreter and ``pyvenv.cfg`` is never read. The editable
+    install stays unloaded. ``site.addsitedir`` still processes its ``.pth``
+    files, and copying the binary would break ``$ORIGIN`` for libpython.
+    """
+    sites = sorted(p for p in (venv / "lib").glob("python3.*/site-packages") if p.is_dir())
+    assert sites, f"N-1 venv has no site-packages under {venv / 'lib'}"
+    boot = root / "venv-boot"
+    boot.mkdir(exist_ok=True)
+    body = "import site\n" + "".join(f"site.addsitedir({str(p)!r})\n" for p in sites)
+    (boot / "sitecustomize.py").write_text(body, encoding="utf-8")
+    return str(boot)
+
+
 def make_leg(root: Path, template_home: Path | None) -> Leg:
     root.mkdir(parents=True, exist_ok=True)
     origin = _make_origin(root)
@@ -359,6 +377,7 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
                          "--python", base_python], cwd=str(install),
                         env=uv_env, capture_output=True, text=True, timeout=1800)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
+    bootstrap = _venv_site_bootstrap(root, install / "venv")
     env_probe = H.isolated_env(root)
     hermes_home = Path(env_probe["HERMES_HOME"])
     if template_home is not None:
@@ -366,6 +385,8 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
         shutil.copytree(template_home, hermes_home, symlinks=True)
     wrap = _write_wrappers(root, install, hermes_home)
     env = H.isolated_env(root, extra_path=[wrap])
+    # Prepended so a later test override still sees the venv bootstrap first.
+    env["PYTHONPATH"] = bootstrap if "PYTHONPATH" not in env else bootstrap + os.pathsep + env["PYTHONPATH"]
     return Leg(root=root, origin=origin, install=install, env=env, hermes_home=hermes_home, wrap_dir=wrap)
 
 

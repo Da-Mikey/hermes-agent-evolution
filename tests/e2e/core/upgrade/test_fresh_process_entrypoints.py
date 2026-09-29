@@ -638,7 +638,7 @@ def _run_on_tty(argv: list[str], *, env: dict[str, str], cwd: Path, writable: li
     import time
 
     master, slave = pty.openpty()
-    proc = subprocess.Popen(sandbox_argv(argv, writable=writable), env=env, cwd=str(cwd),
+    proc = subprocess.Popen(sandbox_argv(argv, writable=writable, cwd=cwd), env=env, cwd=str(cwd),
                             stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
     os.close(slave)
     buf, last_eof, deadline = b"", 0.0, time.monotonic() + timeout
@@ -744,7 +744,7 @@ def test_serve_announces_ready_and_stops_cleanly_on_sigterm(tmp_path):
         write_hermes_home(Path(env["HERMES_HOME"]), srv.base_url)
         argv = [PY, str(reaper), str(report_path),
                 PY, "-m", "hermes_cli.main", "serve", "--host", "127.0.0.1", "--port", "0"]
-        proc = subprocess.Popen(sandbox_argv(argv, writable=[tmp_path]), env=env, cwd=str(WORKTREE),
+        proc = subprocess.Popen(sandbox_argv(argv, writable=[tmp_path], cwd=WORKTREE), env=env, cwd=str(WORKTREE),
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
 
         def _logs() -> str:

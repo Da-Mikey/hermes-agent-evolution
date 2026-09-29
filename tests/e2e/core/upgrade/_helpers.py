@@ -137,8 +137,15 @@ def isolated_env(
     return env
 
 
-def sandbox_argv(argv: Sequence[str], *, writable: Iterable[Path]) -> list[str]:
-    """Wrap ``argv`` in the bwrap sandbox (no-op when bubblewrap is unusable)."""
+def sandbox_argv(argv: Sequence[str], *, writable: Iterable[Path], cwd: Path | None = None) -> list[str]:
+    """Wrap ``argv`` in the bwrap sandbox (no-op when bubblewrap is unusable).
+
+    ``cwd`` is passed as ``--chdir``. Rebinding a writable parent of the
+    process cwd makes that directory unreachable, and bwrap then starts the
+    command at ``/``. ``python -c`` puts ``''`` (the cwd) first on ``sys.path``,
+    so the import resolves ``tests/hermes_cli`` (no ``config_defaults``) or
+    nothing at all.
+    """
     if not BWRAP_OK:
         return list(argv)
     cmd = ["bwrap", "--dev-bind", "/", "/"]
@@ -152,6 +159,8 @@ def sandbox_argv(argv: Sequence[str], *, writable: Iterable[Path]) -> list[str]:
     run_user = Path(f"/run/user/{UID}")
     if run_user.is_dir():
         cmd += ["--tmpfs", str(run_user)]
+    if cwd is not None:
+        cmd += ["--chdir", str(Path(cwd).resolve())]
     cmd += ["--unshare-pid", "--proc", "/proc", "--die-with-parent", "--"]
     return cmd + list(argv)
 
@@ -167,7 +176,7 @@ def run(
 ) -> subprocess.CompletedProcess:
     """Run one sandboxed process to completion; kills the whole sandbox on timeout."""
     proc = subprocess.Popen(
-        sandbox_argv(argv, writable=writable),
+        sandbox_argv(argv, writable=writable, cwd=cwd),
         env=env, cwd=str(cwd), text=True,
         stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
