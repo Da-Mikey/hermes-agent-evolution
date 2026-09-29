@@ -785,7 +785,10 @@ def dispatch_tool_search(
             queries, connector_search=connector_search)
     results: List[Dict[str, Any]] = []
     tools_map: Dict[str, Dict[str, Any]] = {}
-    available_sources = _available_source_summary(catalog) if catalog else []
+    # An empty lexical catalog still has declared-but-hidden MCP sources.
+    # Gating the summary on ``catalog`` dropped those rows and the empty-match
+    # hint never named the server the user had declared.
+    available_sources = _available_source_summary(catalog)
     all_hits: List[CatalogEntry] = []
     for position, query in enumerate(queries):
         corpus = catalog + remote_entries[position]
@@ -1189,7 +1192,14 @@ def resolve_underlying_call(
     raw_args = entries[0]["arguments"]
     defer_cfg = config if config is not None else load_config_readonly()
     if not is_deferrable_tool_name(name, config=defer_cfg):
-        return None, {}, _non_deferrable_error(name, config)
+        # Unknown names must not be told to "call it directly" — that is the
+        # opposite correction for a bare MCP suffix. Known core tools keep the
+        # enriched recovery when this session stripped them from the tool list.
+        from tools.tool_search_validation import not_deferrable_error
+        enriched = _non_deferrable_error(name, config)
+        if "not available" in enriched:
+            return None, {}, enriched
+        return None, {}, not_deferrable_error(name)
     return name, raw_args, None
 
 

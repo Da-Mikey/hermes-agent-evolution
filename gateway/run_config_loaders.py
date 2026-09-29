@@ -566,7 +566,10 @@ class GatewayConfigLoadersMixin:
         if agent is None:
             return
         new_chain = list(chain or [])
-        rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
+        # getattr's default is invisible on MagicMock. A missing or non-numeric
+        # cooldown is "not cooling" (0); a real timestamp still compares as a number.
+        raw_until = getattr(agent, "_rate_limited_until", 0)
+        rate_limited_until = raw_until if isinstance(raw_until, (int, float)) else 0
         if getattr(agent, "_fallback_activated", False) and rate_limited_until > time.monotonic():
             return
         old_chain = list(getattr(agent, "_fallback_chain", []) or [])

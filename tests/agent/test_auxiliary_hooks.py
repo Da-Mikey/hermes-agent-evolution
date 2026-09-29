@@ -18,9 +18,13 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 @pytest.fixture
 def manager(monkeypatch):
     mgr = PluginManager()
+    # Discovery would run on the first has_hook and is not what this file
+    # observes. Bundled is the trusted source: a user manifest with no path
+    # under HERMES_HOME/plugins is refused by the hook trust gate (#1389).
+    mgr._discovered = True
     monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
     monkeypatch.setattr(plugins_mod, "_plugin_managers_by_home", {})
-    return PluginContext(PluginManifest(name="aux-observer", source="user"), mgr)
+    return PluginContext(PluginManifest(name="aux-observer", source="bundled"), mgr)
 
 
 @pytest.fixture

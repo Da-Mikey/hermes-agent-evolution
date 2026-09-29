@@ -3782,6 +3782,9 @@ def set_config_value(key: str, value: str, force: bool = False):
     print(f"✓ Set {key} = {_display_value} in {config_path}")
     if _route_notice:
         print(_route_notice)
+    # Unpinned cron jobs stay on their creation snapshot (#59031, #44585).
+    # The helper no-ops unless this key is a model/provider assignment.
+    warn_unpinned_cron_jobs_after_model_config_change(key, value, user_config)
 
     # Post-write unknown-key notice (#34067): value IS saved, but tell the user the runtime may never read
     # it and suggest the likely-intended path.

@@ -39,6 +39,9 @@ EXPECTED_FIELDS = {
     # than by taking upstream's copy of this file, which has no counter fields
     # and no test_all_guards_default_false — both fork work (#704, #943, #1142).
     "restart_with_redirected_messages",
+    # Auto-recovery cycle counter (agent/turn_recovery_autorecover.py). An int,
+    # like the consecutive-hit counters — not a one-shot guard.
+    "auto_recovery_cycles_used",
 }
 
 
@@ -48,6 +51,7 @@ COUNTER_FIELDS = {
     "consecutive_rate_limit_hits",
     "consecutive_overload_hits",
     "consecutive_timeout_hits",
+    "auto_recovery_cycles_used",
 }
 
 

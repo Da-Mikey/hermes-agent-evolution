@@ -1532,6 +1532,31 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
     return (result or "") + suffix
 
 
+def append_non_retryable_notice(result: str, notice: str) -> str:
+    """Attach a non-retryable diagnostic without splitting a JSON tool result.
+
+    A trailing suffix after one JSON object is a second value: ``json.loads``
+    of the whole tool message raises Extra data, so previews and session rows
+    cannot read the refusal. Fold the notice into that object's ``error``
+    string. Plain-text results keep the trailing suffix.
+    """
+    if not isinstance(result, str) or not notice or "Non-retryable:" in result:
+        return result
+    text = result
+    stripped = text.strip()
+    payload = safe_json_loads(stripped) if stripped.startswith("{") else None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, str):
+            payload["error"] = f"{error}{notice}"
+        elif not error:
+            payload["error"] = notice.strip()
+        else:
+            payload["non_retryable"] = notice.strip()
+        return json.dumps(payload, ensure_ascii=False)
+    return text + notice
+
+
 def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
     """Action-oriented guidance for recovering from repeated tool failures."""
     common = (

@@ -601,7 +601,13 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
     else:
         enabled_toolsets = _composite_toolsets(toolset_names, platform, explicitly_configured)
 
-    _recover_platform_native_toolsets(enabled_toolsets, platform, skip=configurable_keys | plugin_ts_keys | platform_default_keys)
+    recover_skip = configurable_keys | plugin_ts_keys | platform_default_keys
+    if explicitly_configured:
+        # ``team`` is session-gated (HERMES_TEAM_ID), not a platform capability.
+        # Recovery would otherwise bolt it onto every explicit pin because its
+        # tools sit in the core bundle. A saved list must round-trip.
+        recover_skip = recover_skip | {"team"}
+    _recover_platform_native_toolsets(enabled_toolsets, platform, skip=recover_skip)
     if plugin_ts_keys:
         enabled_toolsets |= _enabled_plugin_toolsets(config, platform, toolset_names, plugin_ts_keys)
 

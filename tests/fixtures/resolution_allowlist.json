@@ -728,5 +728,50 @@
     "path": "tools/bot_desktop/runtime.py",
     "symbol": "installable",
     "kind": "bare_which"
+  },
+  {
+    "path": "hermes_cli/tqmemory_setup.py",
+    "symbol": "_find_uv",
+    "kind": "bare_which"
+  },
+  {
+    "path": "hermes_cli/tqmemory_setup.py",
+    "symbol": "resolve_binary",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/cronjob_tools.py",
+    "symbol": "_cron_preflight_check",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/delegate_tool.py",
+    "symbol": "_acp_binary_available",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/delegate_tool_config.py",
+    "symbol": "_resolve_child_runtime",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/mcp_tool.py",
+    "symbol": "_ensure_stdio_command_resolvable",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/python_install.py",
+    "symbol": "_uv_python_flag",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/python_install.py",
+    "symbol": "has_uv",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/terminal_tool.py",
+    "symbol": "_preflight_check",
+    "kind": "bare_which"
   }
 ]

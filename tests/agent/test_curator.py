@@ -480,8 +480,9 @@ def test_preseeded_never_used_builtin_is_reanchored_not_staled(curator_env, monk
     assert rec["state"] == "active" and rec["first_seen_at"] is not None
     assert datetime.fromisoformat(rec["created_at"]) > datetime.fromisoformat(super_old)
 
-    # One-shot: 15 days of continued non-use (past stale_after_days=14) → stale, not deferred forever.
-    counts = c.apply_automatic_transitions(now=t0 + timedelta(days=15))
+    # One-shot: one day past the configured stale window → stale, not deferred forever.
+    counts = c.apply_automatic_transitions(
+        now=t0 + timedelta(days=c.get_stale_after_days() + 1))
     assert counts["marked_stale"] == 1 and u.get_record("bundled-helper")["state"] == "stale"
 
 

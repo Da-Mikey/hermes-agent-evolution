@@ -1109,7 +1109,10 @@ class TestMemoryBatch:
         # Nothing applied — neither the add nor anything else.
         assert "should not persist" not in store.memory_entries
         assert "keep me" in store.memory_entries
-        assert "current_entries" in result
+        # Batch abort must not pay the store back (#97316). Single-op misses
+        # still echo current_entries; this path must not.
+        assert "current_entries" not in result
+        assert "keep me" not in json.dumps(result)
 
     def test_batch_final_budget_overflow_rejected(self, store):
         result = json.loads(

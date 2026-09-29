@@ -1119,6 +1119,10 @@ class MemoryStore:
                     "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to replace.",
                     "current_entries": entries,
                 })
+            # old_text only locates the entry. content is the COMPLETE new
+            # entry (#117952) — surface the full text that was overwritten so
+            # a whole-entry write is never silent.
+            overwritten = entries[idx]
             limit = self._char_limit(target)
 
             # Check that replacement doesn't blow the budget
@@ -1148,6 +1152,7 @@ class MemoryStore:
                         target,
                         "Entry replaced (evicted %d oldest entr%s to make room)."
                         % (len(evicted), "y" if len(evicted) == 1 else "ies"),
+                        replaced_entry=overwritten,
                     )
                 current = self._char_count(target)
                 return self._consolidation_failure({
@@ -1169,7 +1174,9 @@ class MemoryStore:
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry replaced.")
+        return self._success_response(
+            target, "Entry replaced.", replaced_entry=overwritten
+        )
 
     def remove(self, target: str, old_text: str, matched_entry: Optional[str] = None) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -1194,11 +1201,13 @@ class MemoryStore:
                     "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to remove.",
                     "current_entries": entries,
                 })
-            entries.pop(idx)
+            removed_entry = entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry removed.")
+        return self._success_response(
+            target, "Entry removed.", removed_entry=removed_entry
+        )
 
     def compact(
         self,
@@ -1246,10 +1255,13 @@ class MemoryStore:
             entries = self._entries_for(target)
             start_total = self._char_count(target)
             if start_total <= goal:
-                return self._success_response(
+                resp = self._success_response(
                     target,
                     message=f"Memory already fits ({start_total:,} chars ≤ {goal:,}). No compaction needed.",
                 )
+                resp["bytes_saved"] = 0
+                resp["entries_changed"] = 0
+                return resp
 
             # Resolve display text (strip provenance trailers) for trimming; we
             # re-encode provenance on the shortened entry so tags are preserved.
@@ -1274,9 +1286,10 @@ class MemoryStore:
                 text = working_text[idx]
                 if not text:
                     continue
-                # Trim the entry: keep at least one sentence/clause and up to
-                # half of the original text, removing from the end.
-                min_keep = max(20, len(text) // 2)
+                # Trim from the end. A half-length floor left a single 300-char
+                # entry at 150 when the caller asked for 50 — the result is
+                # supposed to fit. _shorten_text still stops on a word boundary.
+                min_keep = 1
                 room_to_trim = len(text) - min_keep
                 if room_to_trim <= 0:
                     continue
@@ -1596,13 +1609,19 @@ class MemoryStore:
     def _batch_error(
         self, target: str, message: str, limit: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Build a batch-abort error that reports live (uncommitted) state."""
+        """Batch-abort error without ``current_entries``.
+
+        The store did not change. Echoing it made each consolidation retry pay
+        the whole file back and grow the context the batch was meant to shrink
+        (#97316). Single-op misses still return ``current_entries`` — the model
+        has no other inventory on that path. Once the per-turn cap is hit,
+        ``_consolidation_failure`` drops every field except the terminal error.
+        """
         current = self._char_count(target)
         effective_limit = limit if limit is not None else self._char_limit(target)
         return self._consolidation_failure({
             "success": False,
             "error": message + " No operations were applied (batch is all-or-nothing).",
-            "current_entries": self._entries_for(target),
             "current_size": current,
             "max_size": effective_limit,
             "usage": f"{current:,}/{effective_limit:,}",

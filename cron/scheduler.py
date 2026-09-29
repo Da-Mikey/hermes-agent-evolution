@@ -2395,11 +2395,11 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
     from hermes_cli.auth import AuthError
 
     model = jc.model
+    # Unpinned jobs pass requested=None so resolve_runtime_provider reads the
+    # persisted global config itself. Copying model.provider into requested
+    # makes the first resolve look like a pin and the fallback walk asserts
+    # the concrete provider instead of None (#100437).
     requested = job.get("provider") or jc.cron_default_provider or None
-    if not requested:
-        global_provider = (
-            str(jc.model_cfg.get("provider") or "").strip() if isinstance(jc.model_cfg, dict) else "")
-        requested = global_provider or None
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
         # and resurrect stale providers for unpinned jobs.

@@ -514,6 +514,12 @@ _V_FORMAT_ERROR = _v(_R.format_error, **_ABORT_FALLBACK)
 # Account data-policy block: the model exists, fallback cannot help (same account
 # setting applies). Distinct from TLS, where another host's chain can.
 _V_POLICY_BLOCKED = _v(_R.provider_policy_blocked, retryable=False)
+# Upstream account ban (OpenAI policy violation relayed by an aggregator).
+# Rotating keys on the banned account only burns the pool; a different provider
+# can still serve the turn.
+_V_ACCOUNT_BAN = _v(
+    _R.provider_policy_blocked, retryable=False, should_fallback=True, should_rotate_credential=False,
+)
 # A different provider (direct instead of the aggregator; another host's TLS chain) can fix these.
 _V_SSL_CERT = _v(_R.ssl_cert_verification, **_ABORT_FALLBACK)
 _V_CONTEXT_OVERFLOW = _v(_R.context_overflow, should_compress=True)
@@ -885,7 +891,7 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
         return _V_CONTENT_BLOCKED
     # Status-agnostic: the stream-relayed ban has no status, and a 403 variant is not a bad key.
     if any(p in msg for p in _ACCOUNT_POLICY_BLOCK_PATTERNS):
-        return _V_POLICY_BLOCKED
+        return _V_ACCOUNT_BAN
     # ChatGPT Codex masks a rejected encrypted-reasoning replay behind the same bare
     # ``invalid_prompt: Request blocked.`` it uses for real blocks (#92353). Exact envelope
     # + provider only. The verdict keeps format_error's abort-and-fallback hints; the one
@@ -957,7 +963,14 @@ def _by_message(c: _Ctx) -> Optional[Verdict]:
     if head is not None:
         return head
     usage_limit = any(p in c.msg for p in _USAGE_LIMIT_PATTERNS)
-    return _classify_402(c.msg, dict) if usage_limit else _first_match(c.msg, _MESSAGE_TAIL_RULES)
+    if usage_limit:
+        return _classify_402(c.msg, dict)
+    tail = _first_match(c.msg, _MESSAGE_TAIL_RULES)
+    # Same disambiguation as _status_429: generic "temporarily unavailable"
+    # plus an explicit rate-limit phrase is a credential limit, not an outage.
+    if tail is _V_OVERLOADED and not _outage_not_rate_limit(c.msg):
+        return _V_RATE_LIMIT
+    return tail
 
 
 def _by_transport(c: _Ctx) -> Optional[Verdict]:
@@ -1149,6 +1162,23 @@ def _status_404(c: _Ctx) -> Verdict:
     return _V_MODEL_NOT_FOUND if _model_id_missing_known_prefix(c.model_slug, c.provider_slug) else _V_UNKNOWN
 
 
+def _outage_not_rate_limit(msg: str) -> bool:
+    """True when overload wording should win over a rate-limit reading.
+
+    Bare ``temporarily unavailable`` is the upstream-outage phrase. A sentence
+    that also names a rate limit ("because this account is rate limited") is
+    the credential's quota and must still rotate. A specific overload phrase
+    (``overloaded``, the CommandCode outage sentence, ``at capacity``) keeps
+    winning so a healthy key is not benched (#117111, #14038).
+    """
+    hits = [p for p in _OVERLOADED_PATTERNS if p in msg]
+    if not hits:
+        return False
+    if not any(p in msg for p in _RATE_LIMIT_PATTERNS):
+        return True
+    return any(p != "temporarily unavailable" for p in hits)
+
+
 def _status_429(c: _Ctx) -> Verdict:
     # A structured billing code is decisive: LiteLLM stamps
     # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
@@ -1157,7 +1187,7 @@ def _status_429(c: _Ctx) -> Verdict:
         return _V_BILLING
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
     # key instead of burning the pool (#14038).
-    if any(p in c.msg for p in _OVERLOADED_PATTERNS):
+    if _outage_not_rate_limit(c.msg):
         return _V_OVERLOADED
     # OpenRouter-wrapped upstream 429: the key is healthy — fall back, don't bench.
     if _is_openrouter_upstream_error(c.body, c.provider_slug):

@@ -362,10 +362,19 @@ def build_memory_context_block(raw_context: str) -> str:
     if not raw_context or not raw_context.strip():
         return ""
     sanitized = sanitize_context(raw_context)
-    if sanitized != raw_context:
+    # Compare against the stripped raw text. sanitize_context() always strip()s,
+    # so a provider block that merely ends in a newline is not a pre-wrapped
+    # payload — warning on that flagged every normal prefetch.
+    if sanitized != raw_context.strip():
         # Stays keyed on sanitization alone: a deduped bullet is routine, not a provider fault.
         logger.warning("memory provider returned pre-wrapped context; stripped")
     clean = _drop_repeated_recall_lines(sanitized)
+    # strip() drops the caller's trailing newline. Dedupe preserves one when it
+    # is given one; put back the terminator the provider actually wrote so the
+    # block round-trips (a missing newline re-parents nothing, but it fails
+    # byte-equality with the source and looks like a clipped continuation).
+    if raw_context.endswith("\n") and not clean.endswith("\n"):
+        clean += "\n"
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "

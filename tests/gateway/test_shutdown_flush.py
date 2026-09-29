@@ -123,7 +123,8 @@ def test_recover_payload_without_session_id_uses_resolver_and_deletes_file(
     assert count == 1
     resolver.assert_called_once_with("agent:main:whatsapp:dm:15551234567", not_after=ts)
     routed_db.append_message.assert_called_once_with(
-        session_id="sid-resolved", role="user", content="lost message", timestamp=ts
+        session_id="sid-resolved", role="user", content="lost message",
+        origin=None, timestamp=ts,
     )
     # The resolver's db is authoritative: the owned default store never sees a resolved payload.
     mock_db.append_message.assert_not_called()

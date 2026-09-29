@@ -189,8 +189,8 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
     well-known Node directories, everything else stays as-written for an honest spawn failure."""
     resolved_command = os.path.expanduser(str(command).strip())
     resolved_env = dict(env or {})
+    path_arg = resolved_env.get("PATH")
     if os.sep not in resolved_command:
-        path_arg = resolved_env.get("PATH")
         which_hit = shutil.which(resolved_command, path=path_arg) if path_arg is not None else None
         if which_hit is None and sys.platform == "win32" and resolved_env:
             which_hit = _which_with_config_pathext(resolved_command, path_arg, resolved_env)
@@ -201,8 +201,14 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
     command_dir = os.path.dirname(resolved_command)
     if command_dir:
         resolved_env = _prepend_path(resolved_env, command_dir)
+    # Absent or empty child PATH is the documented cwd-only miss: return the
+    # command as written. Preflighting it raises MissingMcpCommandError after
+    # shutil.which(path="") fails, which is the opposite of an honest miss.
+    # A non-empty PATH that still did not resolve (or an absolute launcher) is
+    # a real install error and keeps the preflight.
     from tools.mcp_tool_common import _core
-    _core._ensure_stdio_command_resolvable(resolved_command, resolved_env)
+    if path_arg or os.sep in resolved_command:
+        _core._ensure_stdio_command_resolvable(resolved_command, resolved_env)
     return resolved_command, resolved_env
 
 

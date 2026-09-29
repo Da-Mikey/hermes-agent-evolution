@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from tests.tools.file_ops_fakes import READ_SENTINEL_RE, compound_read_output
 from tools.file_operations import ShellFileOperations
+from tools.file_operations_common import ExecuteResult
 from tools.file_operations_search import _parse_search_context_line
 
 
@@ -209,11 +210,13 @@ class TestPaginationBounds:
 
         def fake_exec(command, *args, **kwargs):
             commands.append(command)
+            # ExecuteResult, not MagicMock: a MagicMock cwd_error is truthy and
+            # search() treats that as "the backend cd failed" before rg runs.
             if command.startswith("test -e"):
-                return MagicMock(exit_code=0, stdout="exists")
+                return ExecuteResult(stdout="exists")
             if "--files" in command:
-                return MagicMock(exit_code=0, stdout="a.py\n")
-            return MagicMock(exit_code=0, stdout="")
+                return ExecuteResult(stdout="a.py\n")
+            return ExecuteResult(stdout="")
 
         with patch.object(ops, "_has_command", side_effect=lambda cmd: cmd == "rg"), \
              patch.object(ops, "_exec", side_effect=fake_exec):

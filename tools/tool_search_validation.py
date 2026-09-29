@@ -228,7 +228,7 @@ def not_deferrable_error(name: str) -> str:
     the second group 'call it directly' is the opposite of what they must do."""
     from tools.tool_search import _core_tool_names  # late: tool_search imports this module
     if name in _core_tool_names() or _registry_entry(name) is not None:
-        return (f"'{name}' is a directly-listed tool, not a deferred one. "
+        return (f"'{name}' is a directly-listed tool, not a deferrable tool. "
                 "Call it directly instead of via tool_call.")
     suffix = f"__{name}"
     try:
@@ -238,5 +238,6 @@ def not_deferrable_error(name: str) -> str:
         candidates = []
     hint = (f" Did you mean {', '.join(repr(c) for c in candidates)}?" if candidates
             else " Use tool_search to find the exact name.")
-    return (f"'{name}' is not a known tool name. Deferred tools must be invoked through tool_call "
+    return (f"'{name}' is not a deferrable tool and is not a known tool name. "
+            f"Deferred tools must be invoked through tool_call "
             f"by the exact name tool_search returns (e.g. mcp__<server>__<tool>).{hint}")

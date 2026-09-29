@@ -165,7 +165,12 @@ from agent.codex_responses_adapter import (
     _split_responses_tool_id as _codex_split_responses_tool_id,
     _summarize_user_message_for_log,
 )
-from agent.tool_guardrails import ToolGuardrailDecision, append_toolguard_guidance, toolguard_synthetic_result
+from agent.tool_guardrails import (
+    ToolGuardrailDecision,
+    append_non_retryable_notice,
+    append_toolguard_guidance,
+    toolguard_synthetic_result,
+)
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens
 
 
@@ -1666,8 +1671,7 @@ class AIAgent(
                         pass
             if not _nr.should_retry:
                 _nr_line = f"\n\n⚠️ Non-retryable: {_nr.category.value}. {_nr.hint}"
-                if "Non-retryable:" not in function_result:
-                    function_result = function_result + _nr_line
+                function_result = append_non_retryable_notice(function_result, _nr_line)
 
         if failed and getattr(self, "_failure_recovery_enabled", False):
             from tools.recovery_strategy_dispatcher import (
