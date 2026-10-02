@@ -15,7 +15,7 @@ from statistics import mean
 
 RESULTS = Path(__file__).resolve().parent / "results"
 
-METRICS = ["score", "api_turns", "tool_calls", "read_file_calls", "total_tokens", "wall_s"]
+METRICS = ["score", "gold_in_first_chunk", "api_turns", "tool_calls", "read_file_calls", "total_tokens", "wall_s"]
 
 
 def load_label(label: str, model_filter: str | None) -> dict:
@@ -43,7 +43,7 @@ def load_label(label: str, model_filter: str | None) -> dict:
 
 
 def fmt(v: float, metric: str) -> str:
-    if metric == "score":
+    if metric in ("score", "gold_in_first_chunk"):
         return f"{v:.3f}"
     if metric == "wall_s":
         return f"{v:.0f}s"

@@ -401,6 +401,92 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
     return "\n".join(kept), len(kept), True
 
 
+# ── First-chunk selection (issue #165) ────────────────────────────────
+# Truncation historically kept the HEAD of an oversized read. Agents rarely
+# paginate, so a hit sitting past the budget — an ERROR near the tail of a
+# log, a version string in a lockfile — was effectively unreachable: the
+# model would have had to guess an offset it never asks for. When the caller
+# states what it wants (`query`), the retained window is ranked by keyword
+# hits instead, always emitting lines in NATIVE order, and the response
+# reports what was skipped so the model can still page from the top. No
+# query, or no usable hit, keeps the exact previous head-first behaviour.
+_QUERY_MIN_TOKEN_LEN = 2
+
+
+def _tokenize_query(query: str) -> list[str]:
+    """Lowercase keyword tokens from a free-text query, order preserved."""
+    tokens: list[str] = []
+    for raw in re.split(r"[^0-9A-Za-z_]+", query.lower()):
+        if len(raw) >= _QUERY_MIN_TOKEN_LEN and raw not in tokens:
+            tokens.append(raw)
+    return tokens
+
+
+def _select_relevance_window(content: str, max_chars: int, query: str) -> dict | None:
+    """Return the most query-relevant window of ``content``, or ``None``.
+
+    ``None`` means "no usable keyword match" — the caller must fall back to
+    native head truncation. Otherwise a dict with the window ``text``, its
+    0-based ``start``/``end`` line indices, the rendered ``total`` line
+    count, the winning ``score``, and ``clamped`` (a single oversized line
+    had to be cut mid-line).
+
+    The window is centred on the highest-scoring line (earliest wins ties):
+    up to half the budget is claimed for leading context, the remainder
+    extends forward. Lines are always consecutive and in file order, so the
+    result reads as a normal excerpt rather than a keyword salad.
+    """
+    tokens = _tokenize_query(query)
+    if not tokens:
+        return None
+    lines = content.split("\n")
+    if not lines:
+        return None
+
+    scores = []
+    for line in lines:
+        low = line.lower()
+        scores.append(sum(low.count(tok) for tok in tokens))
+    best = max(scores)
+    if best <= 0:
+        return None
+    anchor = scores.index(best)
+
+    # +1 per line for the newline that rejoins it to the previous one.
+    costs = [len(line) + (1 if idx else 0) for idx, line in enumerate(lines)]
+
+    if costs[anchor] > max_chars:
+        return {
+            "text": lines[anchor][:max_chars],
+            "start": anchor,
+            "end": anchor,
+            "total": len(lines),
+            "score": best,
+            "clamped": True,
+        }
+
+    budget = max_chars
+    start = anchor
+    used = costs[anchor]
+    while start > 0 and used + costs[start - 1] <= budget // 2:
+        start -= 1
+        used += costs[start]
+    end = anchor
+    remaining = budget - used
+    while end + 1 < len(lines) and costs[end + 1] <= remaining:
+        end += 1
+        remaining -= costs[end]
+
+    return {
+        "text": "\n".join(lines[start:end + 1]),
+        "start": start,
+        "end": end,
+        "total": len(lines),
+        "score": best,
+        "clamped": False,
+    }
+
+
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
 _LARGE_FILE_HINT_BYTES = 512_000  # 512 KB
@@ -2007,8 +2093,15 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
-    """Read a file with pagination and line numbers."""
+def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default",
+                   query: str = "") -> str:
+    """Read a file with pagination and line numbers.
+
+    ``query`` is optional — keywords describing what the caller is looking
+    for. It is consulted ONLY when the read overflows the char budget, where
+    it selects the retained window (see ``_select_relevance_window``) instead
+    of always taking the head. Content that fits is never reordered.
+    """
     try:
         if not path or not isinstance(path, str) or not path.strip():
             return tool_error("Invalid path: path must be a non-empty string.")
@@ -2179,7 +2272,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
         resolved_str = str(_resolved)
-        dedup_key = (resolved_str, offset, limit)
+        # `query` is part of the key: a relevance-window read of a region is
+        # not the same result as the plain head read of that region.
+        dedup_key = (resolved_str, offset, limit, (query or "").strip().lower())
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0,
@@ -2319,28 +2414,72 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             # "few but very long lines" case (logs, wide CSVs, minified data)
             # that sails past the line-count `limit` but blows the char budget.
             total_lines = result_dict.get("total_lines", "unknown")
-            trimmed, lines_kept, _ = _truncate_to_char_budget(
-                result.content or "", max_chars
+            _query = (query or "").strip()
+            _window = (
+                _select_relevance_window(result.content or "", max_chars, _query)
+                if _query else None
             )
-            next_offset = offset + lines_kept
-            shown_end = offset + lines_kept - 1
-            result.content = trimmed
-            result_dict["content"] = trimmed
-            result_dict["truncated"] = True
-            result_dict["truncated_by"] = "bytes"
-            result_dict["next_offset"] = next_offset
-            result_dict["hint"] = (
-                f"Output truncated at the {max_chars:,}-char read budget after "
-                f"{lines_kept} line(s) (showing lines {offset}-{shown_end} of "
-                f"{total_lines}). Use offset={next_offset} to continue."
-            )
-            if len(trimmed.split("\n", 1)[0]) >= max_chars:
-                result_dict["hint"] += (
-                    " Note: the first line alone exceeded the budget and was "
-                    "clamped mid-line; its remainder is not retrievable via "
-                    "offset."
+            if _window is not None:
+                # #165 — first-chunk selection. The caller told us what it is
+                # looking for, so keep the most relevant window rather than the
+                # head; the skipped-line counts keep the top of the file
+                # reachable for free (drop `query`, or use the reported
+                # offsets).
+                trimmed = _window["text"]
+                start_line = offset + _window["start"]
+                end_line = offset + _window["end"]
+                next_offset = offset + _window["end"] + 1
+                result.content = trimmed
+                result_dict["content"] = trimmed
+                result_dict["truncated"] = True
+                result_dict["truncated_by"] = "bytes"
+                result_dict["next_offset"] = next_offset
+                result_dict["selected_by"] = "query"
+                result_dict["window_start_line"] = start_line
+                result_dict["window_end_line"] = end_line
+                result_dict["omitted_before"] = _window["start"]
+                result_dict["omitted_after"] = max(
+                    0, _window["total"] - 1 - _window["end"]
                 )
-            content_len = len(trimmed)
+                result_dict["hint"] = (
+                    f"Output truncated at the {max_chars:,}-char read budget; "
+                    f"returned the most query-relevant window (lines "
+                    f"{start_line}-{end_line} of {total_lines}; "
+                    f"{result_dict['omitted_before']} line(s) before and "
+                    f"{result_dict['omitted_after']} after omitted) instead of "
+                    f"the head. Use offset={next_offset} to continue forward, "
+                    f"or call again without 'query' to read from the top."
+                )
+                if _window["clamped"]:
+                    result_dict["hint"] += (
+                        " Note: the selected line alone exceeded the budget and "
+                        "was clamped mid-line; its remainder is not retrievable "
+                        "via offset."
+                    )
+                content_len = len(trimmed)
+            else:
+                trimmed, lines_kept, _ = _truncate_to_char_budget(
+                    result.content or "", max_chars
+                )
+                next_offset = offset + lines_kept
+                shown_end = offset + lines_kept - 1
+                result.content = trimmed
+                result_dict["content"] = trimmed
+                result_dict["truncated"] = True
+                result_dict["truncated_by"] = "bytes"
+                result_dict["next_offset"] = next_offset
+                result_dict["hint"] = (
+                    f"Output truncated at the {max_chars:,}-char read budget after "
+                    f"{lines_kept} line(s) (showing lines {offset}-{shown_end} of "
+                    f"{total_lines}). Use offset={next_offset} to continue."
+                )
+                if len(trimmed.split("\n", 1)[0]) >= max_chars:
+                    result_dict["hint"] += (
+                        " Note: the first line alone exceeded the budget and was "
+                        "clamped mid-line; its remainder is not retrievable via "
+                        "offset."
+                    )
+                content_len = len(trimmed)
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
@@ -3280,7 +3419,7 @@ READ_FILE_SCHEMA = {
     # route we trust (_read_file_schema_overrides). Scanned-page coverage
     # teaching lives in the response-time NEEDS-OCR warning
     # (read_extract.py); the schema doesn't pre-teach it.
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB. Cannot read images/binary — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Pass 'query' keywords and an oversized read returns the most relevant window instead of the head. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB. Cannot read images/binary — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -3290,7 +3429,8 @@ READ_FILE_SCHEMA = {
                 "description": "Path to the file to read (absolute, relative, or ~/path), or a list of up to 10 paths for batch reading",
             },
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": 2000, "maximum": 2000},
+            "query": {"type": "string", "description": "Optional keywords describing what you are looking for (e.g. 'ERROR', 'version timeout'). Only consulted when the read exceeds the ~100K-character budget: the returned chunk is then the most relevant contiguous window of lines, in native file order, instead of the head. Ignored when the content fits and when nothing matches. The response reports window_start_line, omitted_before and omitted_after so the rest of the file stays reachable."}
         },
         "required": ["path"]
     }
@@ -3437,7 +3577,11 @@ def _handle_read_file(args, **kw):
     # #757/#784 — batch mode: read multiple files in one tool call.
     if isinstance(path, list):
         return _handle_read_file_batch(path, args, tid)
-    return read_file_tool(path=path, offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    query = args.get("query") or ""
+    if not isinstance(query, str):
+        query = str(query)
+    return read_file_tool(path=path, offset=args.get("offset", 1),
+                          limit=args.get("limit", 500), task_id=tid, query=query)
 
 
 _BATCH_READ_MAX_FILES = 10
@@ -3454,12 +3598,16 @@ def _handle_read_file_batch(paths: list, args: dict, tid: str) -> str:
         })
     offset = args.get("offset", 1)
     limit = args.get("limit", 500)
+    batch_query = args.get("query") or ""
+    if not isinstance(batch_query, str):
+        batch_query = str(batch_query)
     files = []
     for p in paths:
         if not isinstance(p, str):
             files.append({"path": str(p), "error": "Invalid path type: expected string"})
             continue
-        raw = read_file_tool(path=p, offset=offset, limit=limit, task_id=tid)
+        raw = read_file_tool(path=p, offset=offset, limit=limit, task_id=tid,
+                             query=batch_query)
         try:
             parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
