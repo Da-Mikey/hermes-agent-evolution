@@ -56,6 +56,23 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _apply_idempotency_advisory(tool_name: str, tool_args: Any, result: Any) -> Any:
+    """Best-effort ``[idempotency]`` advisory for post-dispatch failures (#173).
+
+    A side-effecting tool that failed *after* dispatch (timeout, dropped
+    connection) may already have landed its effect; retrying blindly then
+    duplicates it.  This appends an advisory telling the model to verify before
+    retrying.  It is cheap, never raises, and never blocks the result path.
+    """
+    try:
+        from agent.idempotency import apply_retry_advisory
+
+        return apply_retry_advisory(tool_name, tool_args, result)
+    except Exception:
+        logger.debug("idempotency advisory unavailable", exc_info=True)
+        return result
+
+
 def _pairing_tool_call_id(tool_call: Any) -> str:
     """Return the canonical id used by the persisted assistant message."""
     return coalesce_tool_call_id(tool_call)
@@ -1608,6 +1625,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 return
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
+                result = _apply_idempotency_advisory(function_name, function_args, result)
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             if not blocked and not dispatched:
@@ -1880,6 +1898,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
+            function_result = _apply_idempotency_advisory(name, args, function_result)
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -2773,6 +2792,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
+                function_result = _apply_idempotency_advisory(
+                    function_name, function_args, function_result
+                )
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             finally:
                 tool_duration = time.time() - tool_start_time
@@ -2852,6 +2874,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
+                function_result = _apply_idempotency_advisory(
+                    function_name, function_args, function_result
+                )
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
