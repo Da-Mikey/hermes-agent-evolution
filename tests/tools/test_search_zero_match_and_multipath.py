@@ -107,6 +107,22 @@ class TestMultiPathRecovery:
         assert "error" in r
         assert "Path not found" in r["error"]
 
+    def test_missing_path_with_candidates_steers_to_discovery(self, proj):
+        # #169: a not-found path is a discovery signal, not a retry signal —
+        # the error must say what to do differently, not just list names.
+        r = json.loads(search_tool("TOKEN_ALPHA", path=str(proj / "pro"), task_id="t-mp"))
+        assert "Similar paths" in r["error"]
+        assert "instead of retrying" in r["error"]
+
+    def test_missing_path_without_candidates_steers_to_discovery(self, proj):
+        # The repeat-retry case: nothing similar in the parent directory, so a
+        # bare "Path not found" leaves the model re-issuing the same call.
+        r = json.loads(search_tool("TOKEN_ALPHA", path=str(proj / "zzqqx"), task_id="t-mp"))
+        assert "error" in r
+        assert "Path not found" in r["error"]
+        assert "stale or wrong" in r["error"]
+        assert "instead of" in r["error"] or "rather than" in r["error"]
+
     def test_files_target_multi_path(self, proj):
         p = f"{proj / 'proj'} {proj / 'extra'}"
         r = json.loads(search_tool("*.py", path=p, target="files", task_id="t-mp"))
