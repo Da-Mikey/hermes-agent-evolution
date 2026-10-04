@@ -221,6 +221,27 @@ authorization model, but the rules below apply uniformly.
    `--host 0.0.0.0` or equivalent makes public-exposure hardening
    (§4) the operator's responsibility.
 
+### 2.7 Vendor Claims Are Calibration, Not Evidence
+
+A security evaluation published by a vendor or a third party — "0.00%
+of indirect prompt-injection attempts succeeded against model X" — is a
+statement about *that evaluation's* threat model, harness, and budget.
+It is not a property of the software, and it is not evidence that a
+control holds in a deployment Hermes Agent did not run.
+
+Hermes Agent treats such a claim as **calibration**: a prior telling us
+where to look and how much effort an attacker is expected to spend,
+never a substitute for a result reproduced here. In practice that means
+a quoted success rate stays a hypothesis until it is re-tested against
+the operator's own threat model with targeted chains — and an
+unqualified 0.00% is a reason to inspect the harness before trusting
+the boundary, not a reason to relax it.
+
+The boundary itself is unchanged and remains as stated in §2.2:
+OS-level isolation is load-bearing. No in-process heuristic (§2.4)
+inherits credibility from a number a vendor published, and a vendor
+result never moves a surface between §3.1 and §3.2.
+
 ---
 
 ## 3. Scope

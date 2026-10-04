@@ -26,12 +26,13 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-import sys
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from evolution.lib.untrusted_exec import run_untrusted_python
 
 logger = logging.getLogger(__name__)
 
@@ -120,10 +121,8 @@ class SandboxValidator:
             f"print('OK')\n"
         )
         try:
-            proc = subprocess.run(
-                [sys.executable, "-c", harness],
-                capture_output=True,
-                text=True,
+            proc = run_untrusted_python(
+                ["-c", harness],
                 timeout=10,
             )
             return proc.returncode == 0
