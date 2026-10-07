@@ -6,10 +6,11 @@ Auth is a Long-Lived Access Token (``HASS_TOKEN``); the instance URL comes from
 """
 
 import asyncio
+import difflib
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from agent.secret_scope import get_secret
 from tools.registry import registry, tool_error
@@ -87,8 +88,95 @@ async def _async_list_entities(domain: Optional[str] = None, area: Optional[str]
     return _filter_and_summarize(await _api_json("GET", "/api/states", 15), domain, area)
 
 
+# ── not-found disambiguation (issue #182) ───────────────────────────────────
+# A bare "not found" turns a one-call device check into a multi-turn guessing
+# game: every recorded ``ha_get_state`` failure in the observed 7d window had
+# that shape (~7.9% of calls on the tool). On a miss we now resolve the closest
+# known ``entity_id``s from the live state list and hand them back WITH the
+# miss, so the caller can correct itself in one step instead of retrying blind.
+_NEAR_MATCH_LIMIT = 5
+# A shared domain is NOT sufficient evidence on its own — treating it as such
+# suggested every unrelated ``light.*`` for a nonsense id (caught in review:
+# "light.zzzzzz" returned three lights). Require a real name resemblance first;
+# the domain then only breaks ties between genuine lookalikes. Below this floor
+# the entity count is still reported, so the caller knows to enumerate.
+_NEAR_MATCH_MIN_OBJ_RATIO = 0.5
+
+
+class EntityNotFoundError(Exception):
+    """The requested ``entity_id`` is unknown to the Home Assistant instance.
+
+    Carries the near-match candidates (best first) and the number of entities
+    the instance actually has, so the caller can report *why* the lookup failed
+    and what was probably meant instead of a bare not-found.
+    """
+
+    def __init__(self, entity_id: str, candidates: List[str], entity_count: int):
+        self.entity_id = entity_id
+        self.candidates = list(candidates)
+        self.entity_count = entity_count
+        hint = f" — closest known IDs: {', '.join(self.candidates)}" if self.candidates else ""
+        super().__init__(f"Entity '{entity_id}' not found{hint}")
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    """True only for Home Assistant's "no such entity" answer (HTTP 404).
+
+    Deliberately narrow: an auth failure, a connection error or a 5xx must keep
+    raising as-is, because disambiguating those would disguise a real outage as
+    a typo.
+    """
+    if getattr(exc, "status", None) == 404:
+        return True
+    text = str(exc).lower()
+    return "404" in text and "not found" in text
+
+
+def _closest_entity_ids(
+    missing: str, available: Iterable[str], limit: int = _NEAR_MATCH_LIMIT,
+) -> List[str]:
+    """Rank known ``entity_id``s by similarity to *missing* (best match first).
+
+    Scores the object_id (the part after the dot) with ``difflib`` and rewards a
+    matching domain, so ``light.living_room`` ranks ``light.living_room_lamp``
+    above ``switch.living_room``. Candidates below a similarity floor are
+    dropped rather than padding the list with unrelated IDs; ties break on the
+    entity_id so the ordering is deterministic.
+    """
+    domain, _, obj = missing.partition(".")
+    scored = []
+    for candidate in available:
+        if not isinstance(candidate, str) or "." not in candidate:
+            continue
+        cand_domain, _, cand_obj = candidate.partition(".")
+        obj_ratio = difflib.SequenceMatcher(None, obj, cand_obj).ratio()
+        if obj_ratio < _NEAR_MATCH_MIN_OBJ_RATIO:
+            continue
+        score = 2.0 * obj_ratio + (1.0 if domain and cand_domain == domain else 0.0)
+        scored.append((-score, candidate))
+    scored.sort()
+    return [candidate for _, candidate in scored[:limit]]
+
+
 async def _async_get_state(entity_id: str) -> Dict[str, Any]:
-    data = await _api_json("GET", f"/api/states/{entity_id}", 10)
+    try:
+        data = await _api_json("GET", f"/api/states/{entity_id}", 10)
+    except Exception as exc:
+        if not _is_not_found(exc):
+            raise
+        # Known miss: resolve candidates from the live state list. If that
+        # second call fails too, still raise the miss — just without hints.
+        candidates: List[str] = []
+        entity_count = 0
+        try:
+            states = await _api_json("GET", "/api/states", 15)
+            if isinstance(states, list):
+                available = [s.get("entity_id", "") for s in states if isinstance(s, dict)]
+                entity_count = len(available)
+                candidates = _closest_entity_ids(entity_id, available)
+        except Exception as inner:
+            logger.warning("ha_get_state: could not list entities for near-match hints: %s", inner)
+        raise EntityNotFoundError(entity_id, candidates, entity_count) from exc
     return {
         "entity_id": data["entity_id"], "state": data["state"], "attributes": data.get("attributes", {}),
         "last_changed": data.get("last_changed"), "last_updated": data.get("last_updated")}
@@ -167,7 +255,25 @@ def _handle_get_state(args: dict, **kw) -> str:
         return tool_error("Missing required parameter: entity_id")
     if not _ENTITY_ID_RE.match(entity_id):
         return tool_error(f"Invalid entity_id format: {entity_id}")
-    return _dispatch(_async_get_state(entity_id), "ha_get_state", f"Failed to get state for {entity_id}")
+    try:
+        return json.dumps({"result": _run_async(_async_get_state(entity_id))})
+    except EntityNotFoundError as exc:
+        # Structured near-match so the caller can correct itself in one step
+        # instead of guessing again (#182). ``candidates`` stays machine
+        # readable; the message repeats it for plain-text consumers.
+        message = f"Entity '{entity_id}' not found"
+        if exc.candidates:
+            message += f" — closest known IDs: {', '.join(exc.candidates)}"
+        return tool_error(
+            message,
+            candidates=exc.candidates,
+            entity_count=exc.entity_count,
+            hint=("No entity has that id. Use one of the candidates above, or call "
+                  "ha_list_entities to see what this instance actually has."),
+        )
+    except Exception as e:
+        logger.error("ha_get_state error: %s", e)
+        return tool_error(f"Failed to get state for {entity_id}: {e}")
 
 
 def _handle_call_service(args: dict, **kw) -> str:
