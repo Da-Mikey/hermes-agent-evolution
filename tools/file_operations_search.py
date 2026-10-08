@@ -578,6 +578,19 @@ class SearchMixin:
                     if e and (lq in e.lower() or e.lower() in lq or e.lower().startswith(lq[:3]))]
                 if candidates:
                     hint_parts.append("Similar paths: " + ", ".join(candidates[:5]))
+                    hint_parts.append(
+                        "Re-run with one of these paths. A not-found path "
+                        "recalled from earlier in this session is stale — "
+                        "discover the current location instead of retrying "
+                        "the same path again."
+                    )
+                else:
+                    hint_parts.append(
+                        "No similarly named entry in that directory. The "
+                        "path is stale or wrong: locate the current one "
+                        "(search_files with target=files, or list_dir on "
+                        "the parent) rather than retrying the same path."
+                    )
         return SearchResult(error=". ".join(hint_parts), total_count=0)
 
     def _try_multi_path_search(self, pattern: str, path: str, target: str,
