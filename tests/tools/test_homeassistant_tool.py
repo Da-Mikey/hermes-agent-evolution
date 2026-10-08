@@ -4,11 +4,13 @@ Tests real logic: entity filtering, payload building, response parsing,
 handler validation, and availability gating.
 """
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tools import homeassistant_tool
 from tools.homeassistant_tool import (
     _check_ha_available,
     _filter_and_summarize,
@@ -20,6 +22,10 @@ from tools.homeassistant_tool import (
     _BLOCKED_DOMAINS,
     _ENTITY_ID_RE,
     _SERVICE_NAME_RE,
+    _async_get_state,
+    _closest_entity_ids,
+    _is_not_found,
+    EntityNotFoundError,
 )
 
 
@@ -342,3 +348,103 @@ class TestRegistration:
         invalidate_check_fn_cache()
         defs = registry.get_definitions({"ha_list_entities", "ha_get_state", "ha_call_service"})
         assert len(defs) == 3
+
+
+# ---------------------------------------------------------------------------
+# Not-found disambiguation (#182)
+# ---------------------------------------------------------------------------
+
+
+class _NotFound(Exception):
+    """Stand-in for aiohttp's ClientResponseError on an unknown entity."""
+
+    def __init__(self, message="404: Not Found", status=404):
+        self.status = status
+        super().__init__(message)
+
+
+class TestNotFoundDisambiguation:
+    """A miss must say *which* identifier was meant, not just that it failed."""
+
+    def test_is_not_found_matches_404_only(self):
+        assert _is_not_found(_NotFound())
+        assert _is_not_found(_NotFound("ClientResponseError 404 ... not found"))
+        assert not _is_not_found(_NotFound("401: Unauthorized", status=401))
+        assert not _is_not_found(TimeoutError("request timed out"))
+
+    def test_closest_entity_ids_prefers_same_domain_typo(self):
+        ids = _closest_entity_ids(
+            "light.bedrom",
+            ["light.bedroom", "light.kitchen", "switch.bedroom_lamp", "sensor.temperature"],
+        )
+        assert ids[0] == "light.bedroom"
+
+    def test_closest_entity_ids_drops_unrelated_ids(self):
+        assert _closest_entity_ids("light.xyzzy", ["sensor.temperature", "binary_sensor.motion"]) == []
+
+    def test_same_domain_alone_is_not_evidence(self):
+        """Regression: a nonsense id must not return every same-domain entity."""
+        ids = _closest_entity_ids("light.zzzzzz", ["light.bedroom", "light.kitchen", "light.bedroom_lamp"])
+        assert ids == []
+
+    def test_closest_entity_ids_is_capped_and_deterministic(self):
+        available = [f"sensor.humidity_{i}" for i in range(9)]
+        ids = _closest_entity_ids("sensor.humidity", available)
+        assert len(ids) == 5
+        assert ids == sorted(ids)
+
+    def test_handler_returns_candidates_instead_of_bare_not_found(self, monkeypatch):
+        def _boom(entity_id):
+            raise EntityNotFoundError(entity_id, ["light.bedroom", "light.bedroom_lamp"], 42)
+
+        monkeypatch.setattr(homeassistant_tool, "_async_get_state", _boom)
+        result = json.loads(_handle_get_state({"entity_id": "light.bedrom"}))
+        assert "not found" in result["error"]
+        assert result["candidates"] == ["light.bedroom", "light.bedroom_lamp"]
+        assert result["entity_count"] == 42
+        assert result["hint"]
+
+    def test_handler_still_reports_unrelated_errors_plainly(self, monkeypatch):
+        def _boom(entity_id):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(homeassistant_tool, "_async_get_state", _boom)
+        result = json.loads(_handle_get_state({"entity_id": "light.bedroom"}))
+        assert "connection refused" in result["error"]
+        assert "candidates" not in result
+
+    def test_async_get_state_resolves_candidates_on_404(self, monkeypatch):
+        paths = []
+
+        async def _fake_api_json(method, path, timeout, payload=None):
+            paths.append(path)
+            if path.startswith("/api/states/"):
+                raise _NotFound()
+            return SAMPLE_STATES
+
+        monkeypatch.setattr(homeassistant_tool, "_api_json", _fake_api_json)
+        with pytest.raises(EntityNotFoundError) as excinfo:
+            asyncio.run(_async_get_state("light.bedrom"))
+        assert excinfo.value.candidates[0] == "light.bedroom"
+        assert excinfo.value.entity_count == len(SAMPLE_STATES)
+        assert paths == ["/api/states/light.bedrom", "/api/states"]
+
+    def test_async_get_state_reraises_non_404(self, monkeypatch):
+        async def _fake_api_json(method, path, timeout, payload=None):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(homeassistant_tool, "_api_json", _fake_api_json)
+        with pytest.raises(RuntimeError):
+            asyncio.run(_async_get_state("light.bedroom"))
+
+    def test_async_get_state_still_raises_when_candidate_lookup_fails(self, monkeypatch):
+        async def _fake_api_json(method, path, timeout, payload=None):
+            if path.startswith("/api/states/"):
+                raise _NotFound()
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(homeassistant_tool, "_api_json", _fake_api_json)
+        with pytest.raises(EntityNotFoundError) as excinfo:
+            asyncio.run(_async_get_state("light.bedrom"))
+        assert excinfo.value.candidates == []
+        assert excinfo.value.entity_count == 0
