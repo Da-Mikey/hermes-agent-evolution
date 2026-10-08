@@ -30,6 +30,15 @@ ground truth), **api_turns**, **tool_calls**, **read_file_calls**,
 **total_tokens**, **wall_s**. Efficiency aggregates are per-task means,
 never sums.
 
+**`gold_in_first_chunk`** is the first-chunk inclusion coverage (issue #165):
+the fraction of a task's declared `gold` terms that were present in the FIRST
+`read_file` result of the run (`evals/readtool/metrics.py`). It is what makes
+"the model never paginates, so the head of an oversized read is the whole
+read" falsifiable — a task whose answer sits past the char budget scores 0.0
+even when the tool reported success. Tasks with no literal gold declared
+score 1.0 (not applicable), so compare only tasks that declare one
+(`lockfile_version`, `log_error_hunt`, `past_eof`).
+
 ## Running
 
 ```bash

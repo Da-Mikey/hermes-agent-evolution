@@ -31,6 +31,12 @@ class Task:
     timeout_s: int = 300
     notes: str = ""
     tags: list = field(default_factory=list)
+    # Literal ground-truth terms planted by fixtures.py, when the answer is a
+    # fact that lives inside a file. The runner scores their inclusion in the
+    # FIRST read_file chunk ("gold-in-window", issue #165); tasks whose answer
+    # is a judgement call (empty file, FIFO) leave this empty and are reported
+    # as not-applicable rather than as a win.
+    gold: list = field(default_factory=list)
 
 
 def _has(*needles: str) -> Callable[[str], float]:
@@ -92,6 +98,7 @@ TASKS: list[Task] = [
         ),
         grade=_grade_lockfile,
         notes="package-lock.json is 80K lines; the answer is in package.json.",
+        gold=[LEFT_PAD_VERSION],
     ),
     Task(
         task_id="minified_backoff",
@@ -113,6 +120,7 @@ TASKS: list[Task] = [
         ),
         grade=_has(LOG_ERROR_REQ_ID, "23:41:17"),
         timeout_s=420,
+        gold=[LOG_ERROR_REQ_ID, "23:41:17"],
     ),
     Task(
         task_id="past_eof",
@@ -122,6 +130,7 @@ TASKS: list[Task] = [
             "Include the file's total line count in your answer."
         ),
         grade=_has(str(REPORT_LINES)),
+        gold=[str(REPORT_LINES)],
     ),
     Task(
         task_id="empty_config",
