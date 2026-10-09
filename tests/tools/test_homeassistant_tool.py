@@ -25,6 +25,8 @@ from tools.homeassistant_tool import (
     _async_get_state,
     _closest_entity_ids,
     _is_not_found,
+    _obj_similarity,
+    _NEAR_MATCH_MIN_OBJ_RATIO,
     EntityNotFoundError,
 )
 
@@ -448,3 +450,74 @@ class TestNotFoundDisambiguation:
             asyncio.run(_async_get_state("light.bedrom"))
         assert excinfo.value.candidates == []
         assert excinfo.value.entity_count == 0
+
+    # ── #190: abbreviation misses, empty-candidate hints, failed listing ──────
+
+    def test_closest_entity_ids_resolves_abbreviation_to_prefix_match(self):
+        """Regression (#190): ``light.tv`` is an abbreviation, not a typo.
+
+        ``difflib`` scores ``tv`` vs ``tv_living`` at 4/11 = 0.36 — below the
+        floor and above nothing — so the caller was told nothing matched.
+        """
+        ids = _closest_entity_ids("light.tv", ["light.tv_living", "light.kitchen"])
+        assert ids[0] == "light.tv_living"
+
+    def test_abbreviation_path_keeps_the_nonsense_id_regression_closed(self):
+        """Containment must not re-open "a same-domain id is evidence"."""
+        assert _closest_entity_ids(
+            "light.zzzzzz", ["light.bedroom", "light.kitchen"]
+        ) == []
+        assert _closest_entity_ids("light.z", ["light.bedroom"]) == []
+
+    def test_obj_similarity_ignores_single_character_containment(self):
+        assert _obj_similarity("x", "xyzzy") < _NEAR_MATCH_MIN_OBJ_RATIO
+        assert _obj_similarity("tv", "tv_living") >= _NEAR_MATCH_MIN_OBJ_RATIO
+
+    def test_failed_listing_is_distinct_from_an_empty_instance(self, monkeypatch):
+        """#190: a failed ``GET /api/states`` must not read as "no entities"."""
+        async def _fake_api_json(method, path, timeout, payload=None):
+            if path.startswith("/api/states/"):
+                raise _NotFound()
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(homeassistant_tool, "_api_json", _fake_api_json)
+        with pytest.raises(EntityNotFoundError) as excinfo:
+            asyncio.run(_async_get_state("light.bedrom"))
+        assert excinfo.value.entity_count == 0
+        assert excinfo.value.candidates == []
+        assert excinfo.value.listing_error
+        assert "boom" in excinfo.value.listing_error
+
+    def test_empty_instance_records_no_listing_error(self, monkeypatch):
+        async def _fake_api_json(method, path, timeout, payload=None):
+            if path.startswith("/api/states/"):
+                raise _NotFound()
+            return []
+
+        monkeypatch.setattr(homeassistant_tool, "_api_json", _fake_api_json)
+        with pytest.raises(EntityNotFoundError) as excinfo:
+            asyncio.run(_async_get_state("light.bedrom"))
+        assert excinfo.value.entity_count == 0
+        assert excinfo.value.listing_error is None
+
+    def test_handler_points_at_listing_when_the_lookup_itself_failed(self, monkeypatch):
+        def _boom(entity_id):
+            raise EntityNotFoundError(entity_id, [], 0, "RuntimeError: boom")
+
+        monkeypatch.setattr(homeassistant_tool, "_async_get_state", _boom)
+        result = json.loads(_handle_get_state({"entity_id": "light.bedrom"}))
+        assert result["listing_failed"] is True
+        assert "candidates above" not in result["hint"]
+        assert "ha_list_entities" in result["hint"]
+        assert "could not list" in result["error"]
+
+    def test_handler_hint_reports_the_real_entity_count_with_no_candidates(self, monkeypatch):
+        def _boom(entity_id):
+            raise EntityNotFoundError(entity_id, [], 12)
+
+        monkeypatch.setattr(homeassistant_tool, "_async_get_state", _boom)
+        result = json.loads(_handle_get_state({"entity_id": "light.zzzzzz"}))
+        assert "candidates above" not in result["hint"]
+        assert "12" in result["hint"]
+        assert result["entity_count"] == 12
+        assert "listing_failed" not in result
