@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -390,6 +391,7 @@ _FILTER_COMMAND_KEY = re.compile(r"^filter\..+\.(?:clean|smudge|process)$", re.I
 # is therefore read directly, whatever its condition, and its filter names are neutralized too.
 # Global/system config is already /dev/null, so only repo-local includes reach this.
 _INCLUDE_IF_KEY = re.compile(r"^includeif\..*\.path$", re.IGNORECASE)
+# Any include (conditional or not) inside an include target: discovery does not walk it twice.
 _INCLUDE_KEY = re.compile(r"^include(?:if\..*)?\.path$", re.IGNORECASE)
 # `git config --get-regexp` pattern for the keys discovery reads (filter commands and includes).
 _DISCOVERY_KEYS_REGEXP = r"^(filter\..*\.(clean|smudge|process)|include\.path|includeif\..*\.path)$"
@@ -440,13 +442,16 @@ def noninteractive_repo_git_env(
             return None
         origin_path = Path(origin[len("file:"):])
         if not origin_path.is_absolute():
-            # git prints repo-local origins relative to the worktree top level, not to *cwd*.
+            # git prints repo-local origins relative to the worktree top level, not to *cwd*; with a
+            # caller-set GIT_DIR/GIT_WORK_TREE they are relative to something else, so refuse.
+            if env.get("GIT_DIR") or env.get("GIT_WORK_TREE"):
+                return None
             if toplevel is None:
                 top = bounded_probe_run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
                                         timeout=2, env=env)
                 if top is None or top.returncode != 0:
                     return None
-                toplevel = Path(top.stdout.strip())
+                toplevel = Path(top.stdout.rstrip("\r\n"))  # a checkout path may end in a space
             origin_path = toplevel / origin_path
         # A relative include path resolves against the directory of the config file naming it.
         target = (origin_path.parent / os.path.expanduser(value)).resolve()
@@ -476,14 +481,16 @@ def noninteractive_repo_git_env(
         key = raw.strip()
         if not key or key in seen or not _FILTER_COMMAND_KEY.fullmatch(key):
             continue
-        seen.add(lowered)
+        seen.add(key)
         keys.append(key)
+        if len(keys) > _MAX_FILTER_KEYS:
+            return None
         required_key = key.rsplit(".", 1)[0] + ".required"
-        if required_key.lower() not in seen:
-            seen.add(required_key.lower())
+        if required_key not in seen:
+            seen.add(required_key)
             required.append(required_key)
 
-    start = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+    start = int(env["GIT_CONFIG_COUNT"])  # always set by noninteractive_git_env
     overrides = [(key, "") for key in keys] + [(key, "false") for key in required]
     for offset, (key, value) in enumerate(overrides):
         env[f"GIT_CONFIG_KEY_{start + offset}"] = key
