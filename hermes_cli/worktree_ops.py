@@ -548,7 +548,7 @@ def _include_symlink_paths(worktree_path: str, repo_root) -> set:
     return paths
 
 
-def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool:
+def _worktree_is_dirty(worktree_path: str, repo_root=None, timeout: int = 10) -> bool:
     """Whether a worktree has staged/unstaged/untracked changes. Fails SAFE toward True.
 
     Untracked ``.worktreeinclude`` directory symlinks back to the main checkout *repo_root* are
@@ -569,6 +569,11 @@ def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool
         if not entries:
             return False
         if any(not e.startswith("?? ") for e in entries):
+            return True
+        if repo_root is None:
+            # Caller supplied no main checkout, so there is no include-scaffolding to discount:
+            # any untracked entry counts as real state (the pre-hardening behaviour). Keeps old
+            # callers working instead of failing safe toward "dirty" forever.
             return True
         include_links = _include_symlink_paths(worktree_path, repo_root)
         return any(e[3:].rstrip("/") not in include_links for e in entries)
@@ -601,24 +606,17 @@ def _deepen_shallow_repo(repo_root: str, timeout: int = 600) -> bool:
         names = [r.strip() for r in remotes.splitlines() if r.strip()]
         remote = "origin" if "origin" in names else names[0]
 
-        try:
-            for extra in (["--filter=blob:none"], []):
-                try:
-                    # Unattended fetch: a repo-level core.sshCommand / credential.helper must not run.
-                    result = _git(["fetch", remote, "--unshallow", *extra], repo_root, timeout=timeout,
-                                  stdin=subprocess.DEVNULL, env=noninteractive_git_env())
-                except subprocess.TimeoutExpired:
-                    return False
-                if result.returncode == 0:
-                    break
-                logger.debug("git fetch --unshallow%s failed: %s", " " + " ".join(extra) if extra else "",
-                             result.stderr.strip()[-500:])
-        finally:
-            # The filtered attempt makes the clone partial (git writes the config before fetching,
-            # so even when it fails); its old packs need the marker or git 2.53+ crashes every
-            # later fetch (#124272). Markers are inert in a clone without a promisor remote.
-            from hermes_cli.gitlock import mark_unmarked_packs_promisor
-            mark_unmarked_packs_promisor(Path(repo_root))
+        for extra in (["--filter=blob:none"], []):
+            try:
+                # Unattended fetch: a repo-level core.sshCommand / credential.helper must not run.
+                result = _git(["fetch", remote, "--unshallow", *extra], repo_root, timeout=timeout,
+                              stdin=subprocess.DEVNULL, env=noninteractive_git_env())
+            except subprocess.TimeoutExpired:
+                return False
+            if result.returncode == 0:
+                break
+            logger.debug("git fetch --unshallow%s failed: %s", " " + " ".join(extra) if extra else "",
+                         result.stderr.strip()[-500:])
     except Exception as e:
         logger.debug("Deepening shallow repo failed (non-fatal): %s", e)
         return False
