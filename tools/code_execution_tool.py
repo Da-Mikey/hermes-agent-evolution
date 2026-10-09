@@ -1057,11 +1057,17 @@ _TOOL_DOC_LINES = [
     ("web_extract", "  web_extract(urls: list[str], char_limit: int = None) -> dict\n"
      "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
      "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
-    ("read_file", "  read_file(path: str, offset: int = 1, limit: int = 2000) -> dict\n"
-     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
+    ("read_file", "  read_file(path: str, offset: int = 1, limit: int = 2000, query: str = None) -> dict\n"
+     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}. When a read\n"
+     "    exceeds the ~100K-character budget, query (optional keywords, e.g. 'ERROR') makes the\n"
+     "    returned chunk the most relevant contiguous window, in native file order, instead of\n"
+     "    the head; the response reports what was skipped. Ignored when the content fits and\n"
+     "    when nothing matches."),
     ("write_file", "  write_file(path: str, content: str) -> dict\n    Always overwrites the entire file."),
-    ("search_files", "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50, order=\"discovery\") -> dict\n"
-     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
+    ("search_files", "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50, order=\"discovery\", offset=0, output_mode=\"content\", context=0) -> dict\n"
+     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}.\n"
+     "    offset skips the first N results; output_mode is \"content\" (matching lines), \"files_only\"\n"
+     "    (paths only) or \"count\" (per-file counts); context adds N lines around each match."),
     ("patch", "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
      "    Replaces old_string with new_string in the file."),
     ("terminal", "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
