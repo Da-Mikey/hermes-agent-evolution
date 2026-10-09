@@ -477,6 +477,11 @@ class TestStubSchemaDrift(unittest.TestCase):
             schema_params = set(
                 entry.schema.get("parameters", {}).get("properties", {}).keys()
             ) - self._INTERNAL_PARAMS
+            if tool_name == "terminal":
+                # The sandbox terminal helper is foreground-only, so the params that
+                # only make sense for a supervised background run are blocked there and
+                # must NOT be documented - the same exclusion the stub test applies.
+                schema_params -= self._BLOCKED_TERMINAL_PARAMS
             missing = {p for p in schema_params if p not in text}
             self.assertEqual(
                 missing, set(),
