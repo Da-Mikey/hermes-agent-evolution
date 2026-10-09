@@ -101,6 +101,11 @@ _NEAR_MATCH_LIMIT = 5
 # the domain then only breaks ties between genuine lookalikes. Below this floor
 # the entity count is still reported, so the caller knows to enumerate.
 _NEAR_MATCH_MIN_OBJ_RATIO = 0.5
+# Containment is evidence in its own right, but only once the shorter side says
+# something: ``tv`` in ``tv_living`` is a real abbreviation, ``t`` in ``tv_living``
+# is noise. Guards against re-opening the every-same-domain-id regression below
+# the length where a prefix means anything.
+_NEAR_MATCH_MIN_PREFIX_LEN = 2
 
 
 class EntityNotFoundError(Exception):
@@ -111,11 +116,21 @@ class EntityNotFoundError(Exception):
     and what was probably meant instead of a bare not-found.
     """
 
-    def __init__(self, entity_id: str, candidates: List[str], entity_count: int):
+    def __init__(
+        self, entity_id: str, candidates: List[str], entity_count: int,
+        listing_error: Optional[str] = None,
+    ):
         self.entity_id = entity_id
         self.candidates = list(candidates)
         self.entity_count = entity_count
+        # Set when the follow-up ``GET /api/states`` itself failed: lets a caller
+        # tell "this instance has no entities" (count 0, no error) from "we could
+        # not ask" (count 0 *and* an error). Before this, both read as an empty
+        # instance (#190).
+        self.listing_error = listing_error
         hint = f" — closest known IDs: {', '.join(self.candidates)}" if self.candidates else ""
+        if not hint and listing_error:
+            hint = f" — could not list entities to suggest alternatives ({listing_error})"
         super().__init__(f"Entity '{entity_id}' not found{hint}")
 
 
@@ -132,15 +147,39 @@ def _is_not_found(exc: BaseException) -> bool:
     return "404" in text and "not found" in text
 
 
+def _obj_similarity(obj: str, cand_obj: str) -> float:
+    """Similarity in [0, 1] between two object_ids, tolerant of abbreviations.
+
+    ``difflib`` is length-sensitive, so a correct short abbreviation scores like
+    a miss: ``tv`` vs ``tv_living`` is 4/11 = 0.36 and fell below the floor,
+    telling the caller *nothing* matched (#190). Containment counts as real
+    evidence instead — scaled by how much of the longer id it covers, and only
+    once the shorter side is at least ``_NEAR_MATCH_MIN_PREFIX_LEN`` characters
+    — so ``tv`` → ``tv_living`` clears the floor while ``zzzzzz`` → ``kitchen``
+    still does not.
+    """
+    ratio = difflib.SequenceMatcher(None, obj, cand_obj).ratio()
+    if not obj or not cand_obj:
+        return ratio
+    shorter, longer = (obj, cand_obj) if len(obj) <= len(cand_obj) else (cand_obj, obj)
+    if len(shorter) < _NEAR_MATCH_MIN_PREFIX_LEN:
+        return ratio
+    if longer.startswith(shorter) or shorter in longer:
+        return max(ratio, 0.5 + 0.5 * (len(shorter) / len(longer)))
+    return ratio
+
+
 def _closest_entity_ids(
     missing: str, available: Iterable[str], limit: int = _NEAR_MATCH_LIMIT,
 ) -> List[str]:
     """Rank known ``entity_id``s by similarity to *missing* (best match first).
 
-    Scores the object_id (the part after the dot) with ``difflib`` and rewards a
-    matching domain, so ``light.living_room`` ranks ``light.living_room_lamp``
-    above ``switch.living_room``. Candidates below a similarity floor are
-    dropped rather than padding the list with unrelated IDs; ties break on the
+    Scores the object_id (the part after the dot) with ``difflib`` — plus
+    containment, so abbreviations like ``light.tv`` still find
+    ``light.tv_living`` — and rewards a matching domain, so
+    ``light.living_room`` ranks ``light.living_room_lamp`` above
+    ``switch.living_room``. Candidates below a similarity floor are dropped
+    rather than padding the list with unrelated IDs; ties break on the
     entity_id so the ordering is deterministic.
     """
     domain, _, obj = missing.partition(".")
@@ -149,7 +188,7 @@ def _closest_entity_ids(
         if not isinstance(candidate, str) or "." not in candidate:
             continue
         cand_domain, _, cand_obj = candidate.partition(".")
-        obj_ratio = difflib.SequenceMatcher(None, obj, cand_obj).ratio()
+        obj_ratio = _obj_similarity(obj, cand_obj)
         if obj_ratio < _NEAR_MATCH_MIN_OBJ_RATIO:
             continue
         score = 2.0 * obj_ratio + (1.0 if domain and cand_domain == domain else 0.0)
@@ -168,15 +207,21 @@ async def _async_get_state(entity_id: str) -> Dict[str, Any]:
         # second call fails too, still raise the miss — just without hints.
         candidates: List[str] = []
         entity_count = 0
+        listing_error: Optional[str] = None
         try:
             states = await _api_json("GET", "/api/states", 15)
             if isinstance(states, list):
                 available = [s.get("entity_id", "") for s in states if isinstance(s, dict)]
                 entity_count = len(available)
                 candidates = _closest_entity_ids(entity_id, available)
+            else:
+                listing_error = f"unexpected payload {type(states).__name__}"
         except Exception as inner:
+            # Distinguish "could not list" from "instance has nothing": the caller
+            # otherwise reads entity_count 0 as an empty instance (#190).
+            listing_error = f"{type(inner).__name__}: {inner}"
             logger.warning("ha_get_state: could not list entities for near-match hints: %s", inner)
-        raise EntityNotFoundError(entity_id, candidates, entity_count) from exc
+        raise EntityNotFoundError(entity_id, candidates, entity_count, listing_error) from exc
     return {
         "entity_id": data["entity_id"], "state": data["state"], "attributes": data.get("attributes", {}),
         "last_changed": data.get("last_changed"), "last_updated": data.get("last_updated")}
@@ -264,13 +309,30 @@ def _handle_get_state(args: dict, **kw) -> str:
         message = f"Entity '{entity_id}' not found"
         if exc.candidates:
             message += f" — closest known IDs: {', '.join(exc.candidates)}"
-        return tool_error(
-            message,
-            candidates=exc.candidates,
-            entity_count=exc.entity_count,
-            hint=("No entity has that id. Use one of the candidates above, or call "
-                  "ha_list_entities to see what this instance actually has."),
-        )
+        elif exc.listing_error:
+            message += f" — could not list entities for alternatives ({exc.listing_error})"
+        if exc.listing_error:
+            # Say what actually happened: there are no candidates because the
+            # lookup failed, not because the id resembles nothing (#190).
+            hint = ("No entity has that id, and the entity list could not be read, so no "
+                    "alternatives can be offered. Call ha_list_entities to check this "
+                    "instance directly.")
+        elif exc.candidates:
+            hint = ("No entity has that id. Use one of the candidates above, or call "
+                    "ha_list_entities to see what this instance actually has.")
+        else:
+            # Candidates empty *and* the listing worked: the count is real
+            # information (and can legitimately be zero on an empty instance).
+            hint = (f"No entity id resembles that one; this instance reports "
+                    f"{exc.entity_count} entities. Call ha_list_entities to see them.")
+        payload: Dict[str, Any] = {
+            "candidates": exc.candidates,
+            "entity_count": exc.entity_count,
+            "hint": hint,
+        }
+        if exc.listing_error:
+            payload["listing_failed"] = True
+        return tool_error(message, **payload)
     except Exception as e:
         logger.error("ha_get_state error: %s", e)
         return tool_error(f"Failed to get state for {entity_id}: {e}")
