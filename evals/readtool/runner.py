@@ -32,6 +32,7 @@ sys.path.insert(0, str(EVAL_DIR))
 sys.path.insert(0, str(REPO_ROOT))
 
 from fixtures import build_workspace  # noqa: E402
+from metrics import first_read_window, inclusion_coverage  # noqa: E402
 from tasks import TASKS, TASKS_BY_ID  # noqa: E402
 
 SYSTEM_SUFFIX = (
@@ -107,6 +108,17 @@ def run_task(task, model: str, provider: str, timeout_mult: float,
         final = convo.get("final_response") or ""
         messages = convo.get("messages") or []
         result.update(_count_metrics(messages))
+        # #165 — first-chunk selection. `gold_in_first_chunk` is an
+        # inclusion-coverage score, not a pass/fail: it records whether the
+        # planted ground truth ever reached the model's FIRST read chunk,
+        # which is the thing head-only truncation hides. Tasks with no
+        # literal gold declared score 1.0 (not applicable), so compare only
+        # tasks whose gold is non-empty.
+        _first_window = first_read_window(messages)
+        result["gold_in_first_chunk"] = inclusion_coverage(
+            getattr(task, "gold", None) or [], _first_window
+        )
+        result["first_read_window_chars"] = len(_first_window)
         result.update(
             {
                 "final_response": final,
