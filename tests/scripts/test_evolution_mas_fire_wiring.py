@@ -79,14 +79,24 @@ class TestMasFireWiring:
             json.dumps({"date": d, "selected": 1, "rejected": 0, "merged": 0}) + "\n",
             encoding="utf-8",
         )
-        # Clear cached imports and restrict path so mas_fire can't be found
+        # Clear cached imports and restrict path so mas_fire can't be found.
+        # RESTORE both afterwards: deleting evolution_* modules from
+        # sys.modules leaks across the whole pytest process — the next test
+        # module re-imports a FRESH evolution_watchdog object, and a
+        # monkeypatch on that fresh object no longer affects the original
+        # module's functions already bound elsewhere (this silently turned
+        # TestUpstreamLagFilesIssue's stubbed ensure_upstream_issue into the
+        # real gh-calling one in full-suite runs).
         original_path = sys.path[:]
-        sys.path[:] = [p for p in sys.path if "scripts" not in p]
-        for mod_name in list(sys.modules.keys()):
-            if mod_name.startswith("evolution_"):
-                del sys.modules[mod_name]
+        removed_modules = {
+            name: sys.modules.pop(name)
+            for name in list(sys.modules)
+            if name.startswith("evolution_")
+        }
         try:
+            sys.path[:] = [p for p in sys.path if "scripts" not in p]
             rc = ef.main(["evolution_funnel.py", d])
             assert rc == 0
         finally:
             sys.path[:] = original_path
+            sys.modules.update(removed_modules)
