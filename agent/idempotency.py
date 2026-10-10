@@ -20,11 +20,12 @@ hint can reference the correct tool.
 
 Usage (in the dispatch layer's error path)::
 
-    from agent.idempotency import check_before_retry
+    from agent.idempotency import apply_retry_advisory
 
-    verdict = check_before_retry(function_name, function_args, result)
-    if verdict is not None:
-        function_result += "\\n\\n" + verdict.feedback
+    result = apply_retry_advisory(function_name, function_args, result)
+
+``check_before_retry`` is the underlying decision function; call it directly
+only when you need the structured verdict rather than the augmented result.
 
 Intentionally lightweight: the registry is a plain dict and the whole module
 is standalone (no agent state required).
@@ -41,24 +42,34 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 # ── Side-effect registry ────────────────────────────────────────────────
-# Maps a side-effecting MCP tool name to metadata about how to verify whether
-# the effect landed.  These are the canonical tool names for the connected MCP
-# servers in this Hermes environment.
+# Maps a side-effecting MCP tool to metadata about how to verify whether the
+# effect landed.  Entries are keyed by the ``service__tool`` TAIL of the tool
+# name, never by the full name: the server prefix in front of the tail is a
+# deployment detail that changes with how the MCP server is mounted.  The same
+# logical tool is exposed as ``mcp__murable__agentmail__send_message`` (the
+# murable-bundled server) and ``mcp__agentmail__send_message`` (the standalone
+# server) — matching on the tail keeps the registry correct for both instead
+# of going silently stale when the prefix changes.  That staleness was the bug
+# this registry shipped with: a tool name that matched nothing in this
+# environment (#173).
 _SIDE_EFFECT_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "mcp__murable__agentmail__send_message": {
-        "verify_tool": "mcp__murable__agentmail__list_messages",
+    "agentmail__send_message": {
+        "verify_tool": "mcp__agentmail__list_messages",
         "effect_type": "email_send",
     },
-    "mcp__murable__agentmail__create_draft": {
-        "verify_tool": "mcp__murable__agentmail__list_drafts",
+    "agentmail__create_draft": {
+        "verify_tool": "mcp__agentmail__list_drafts",
         "effect_type": "email_draft",
     },
-    "mcp__murable__github__create_issue": {
-        "verify_tool": "mcp__murable__github__list_issues",
+    # Kept for installs that mount a GitHub MCP server.  This install files
+    # issues through the `gh` CLI, where the advisory is still the right
+    # instruction (list before re-creating), just with a different mechanism.
+    "github__create_issue": {
+        "verify_tool": "mcp__github__list_issues",
         "effect_type": "github_issue",
     },
-    "mcp__murable__x_twitter__create_tweet": {
-        "verify_tool": "mcp__murable__x_twitter__get_user_tweets",
+    "x_twitter__create_tweet": {
+        "verify_tool": "mcp__x_twitter__get_user_tweets",
         "effect_type": "tweet",
     },
 }
@@ -96,9 +107,23 @@ class RetryVerdict:
     effect_type: str = ""
 
 
+def _registry_key(tool_name: str) -> str:
+    """Normalise a tool name to its ``service__tool`` tail.
+
+    MCP tool names carry a server prefix: ``mcp__<server>__<service>__<tool>``
+    (or ``mcp__<service>__<tool>`` when the server mounts under its own name).
+    Only the last two ``__``-separated segments identify the logical tool, so
+    that is what the registry matches on.
+    """
+    parts = [p for p in tool_name.split("__") if p]
+    if len(parts) < 2:
+        return tool_name
+    return "__".join(parts[-2:])
+
+
 def is_side_effecting_tool(tool_name: str) -> bool:
     """True when *tool_name* is in the side-effect registry."""
-    return tool_name in _SIDE_EFFECT_REGISTRY
+    return _registry_key(tool_name) in _SIDE_EFFECT_REGISTRY
 
 
 def _looks_like_post_dispatch_error(result: Any) -> bool:
@@ -136,7 +161,7 @@ def check_before_retry(
     higher than the cost of a missed retry (the user re-sends manually), so
     when in doubt, the feedback directs the agent to assume the effect landed.
     """
-    entry = _SIDE_EFFECT_REGISTRY.get(tool_name)
+    entry = _SIDE_EFFECT_REGISTRY.get(_registry_key(tool_name))
     if entry is None:
         return None  # Not a side-effecting tool
 
@@ -159,6 +184,47 @@ def check_before_retry(
         verify_tool=verify_tool,
         effect_type=effect_type,
     )
+
+
+def _looks_like_error_result(result: Any) -> bool:
+    """True when *result* is a tool-failure string, not a successful result.
+
+    Guards the advisory against false positives: a successful tool result can
+    legitimately contain the word "timeout" (reading a log, echoing config),
+    and appending a retry advisory to it would be noise.  The dispatch layer
+    builds failure strings as ``Error executing tool '<name>': <cause>``.
+    """
+    if not isinstance(result, str):
+        return False
+    stripped = result.lstrip()
+    return stripped.lower().startswith(("error", "[errno", "exception"))
+
+
+def apply_retry_advisory(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    result: Any,
+) -> Any:
+    """Return *result* with the ``[idempotency]`` advisory appended, or unchanged.
+
+    This is the call-site helper for the dispatch layer: hand it every tool
+    result on an error path and it decides whether the failure looks like a
+    post-dispatch one on a side-effecting tool.  Anything else — a successful
+    result, a non-side-effecting tool, a plain argument error — passes through
+    byte-identical.
+
+    Never raises: the advisory must not be able to break the tool result path.
+    """
+    if not _looks_like_error_result(result):
+        return result
+    try:
+        verdict = check_before_retry(tool_name, args or {}, result)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("idempotency check failed for %s", tool_name, exc_info=True)
+        return result
+    if verdict is None:
+        return result
+    return f"{result}\n\n{verdict.feedback}"
 
 
 def idempotency_key(

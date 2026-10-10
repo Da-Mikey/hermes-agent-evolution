@@ -6,6 +6,7 @@ Tests the classification logic, key generation, and the side-effect registry.
 
 import pytest
 from agent.idempotency import (
+    apply_retry_advisory,
     check_before_retry,
     idempotency_key,
     is_side_effecting_tool,
@@ -169,3 +170,149 @@ class TestCheckBeforeRetry:
         )
         assert result is not None
         assert "[idempotency]" in result.feedback
+
+
+class TestRegistryPrefixDrift:
+    """The registry matches on the tool-name tail, not the server prefix (#173).
+
+    Deployments mount the same MCP server under different prefixes:
+    ``mcp__murable__agentmail__send_message`` (bundled) and
+    ``mcp__agentmail__send_message`` (standalone).  Matching the full name made
+    the guard silently inert whenever the prefix changed.
+    """
+
+    def test_standalone_server_name_is_recognised(self):
+        assert is_side_effecting_tool("mcp__agentmail__send_message")
+        assert is_side_effecting_tool("mcp__agentmail__create_draft")
+
+    def test_bundled_server_name_still_recognised(self):
+        assert is_side_effecting_tool("mcp__murable__agentmail__send_message")
+        assert is_side_effecting_tool("mcp__murable__agentmail__create_draft")
+
+    def test_verdict_for_standalone_name(self):
+        """The advisory must name a verify tool that exists in this install."""
+        result = check_before_retry(
+            "mcp__agentmail__send_message",
+            {"inboxId": "1", "to": ["a@b.com"]},
+            "Error executing tool 'send_message': timed out after 30.0s",
+        )
+        assert result is not None
+        assert result.verify_tool == "mcp__agentmail__list_messages"
+        assert "mcp__agentmail__list_messages" in result.feedback
+
+    def test_read_only_verify_tools_are_not_side_effecting(self):
+        assert not is_side_effecting_tool("mcp__agentmail__list_messages")
+        assert not is_side_effecting_tool("mcp__agentmail__list_drafts")
+
+    def test_short_name_without_prefix(self):
+        assert not is_side_effecting_tool("send_message")
+
+
+class TestApplyRetryAdvisory:
+    """The call-site helper wired into the dispatch error paths."""
+
+    def test_post_dispatch_error_is_annotated(self):
+        raw = "Error executing tool 'mcp__agentmail__send_message': timed out"
+        out = apply_retry_advisory(
+            "mcp__agentmail__send_message", {"to": ["a@b.com"]}, raw
+        )
+        assert out.startswith(raw)
+        assert "[idempotency]" in out
+        assert "do NOT retry" in out
+
+    def test_success_result_mentioning_timeout_is_untouched(self):
+        """A successful result may contain the word 'timeout' — no advisory."""
+        raw = "Sent. Server note: previous attempt hit a timeout at 12:00."
+        out = apply_retry_advisory("mcp__agentmail__send_message", {}, raw)
+        assert out == raw
+
+    def test_argument_error_is_untouched(self):
+        raw = "Error executing tool 'send_message': invalid recipient address"
+        out = apply_retry_advisory("mcp__agentmail__send_message", {}, raw)
+        assert out == raw
+
+    def test_non_registered_tool_is_untouched(self):
+        raw = "Error executing tool 'read_file': timed out"
+        assert apply_retry_advisory("read_file", {}, raw) == raw
+
+    def test_non_string_result_is_untouched(self):
+        payload = {"error": "timed out"}
+        assert (
+            apply_retry_advisory("mcp__agentmail__send_message", {}, payload) is payload
+        )
+
+    def test_none_args_do_not_raise(self):
+        raw = "Error executing tool 'send_message': timed out"
+        out = apply_retry_advisory("mcp__agentmail__send_message", None, raw)
+        assert "[idempotency]" in out
+
+
+class TestDispatchWiring:
+    """The guard must be reachable from the real dispatch error paths.
+
+    The module shipped unwired once: a correct advisory that nothing ever
+    called. These tests fail if the wiring is removed, or moved somewhere the
+    real result paths do not pass through.
+    """
+
+    def _tool_executor_source(self) -> str:
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[2] / "agent" / "tool_executor.py"
+        return path.read_text(encoding="utf-8")
+
+    def _commit_funnel_source(self) -> str:
+        import inspect
+
+        from agent import tool_executor
+
+        return inspect.getsource(tool_executor._commit_tool_result)
+
+    def test_helper_defined(self):
+        assert "def _apply_idempotency_advisory(" in self._tool_executor_source()
+
+    def test_advisory_is_wired_into_the_commit_funnel(self):
+        """Wired inside ``_commit_tool_result`` — the ONE funnel both the concurrent and
+        sequential executors commit results through — so no result path bypasses it."""
+        src = self._commit_funnel_source()
+        assert "_apply_idempotency_advisory(" in src
+        assert "if is_error and not blocked:" in src
+
+    def test_gate_precedes_the_observed_block(self):
+        """The timed-out / never-returned path commits with ``observed=False``, so a gate
+        nested inside ``if observed:`` would miss exactly the failure class this exists to
+        annotate — the most expensive one to retry blindly."""
+        src = self._commit_funnel_source()
+        assert src.index("_apply_idempotency_advisory(") < src.index("if observed:")
+
+    def test_both_executors_commit_through_the_funnel(self):
+        """One definition plus the concurrent and sequential commit sites. The single
+        wiring above is only complete while every path funnels through here."""
+        assert self._tool_executor_source().count("_commit_tool_result(") >= 3
+
+    def test_wrapper_returns_result_unchanged_when_the_module_fails(self):
+        """The wrapper exists so the advisory can never break the result path."""
+        from unittest.mock import patch
+
+        from agent.tool_executor import _apply_idempotency_advisory
+
+        raw = "Error executing tool 'mcp__agentmail__send_message': timed out"
+        with patch(
+            "agent.idempotency.apply_retry_advisory", side_effect=RuntimeError("boom")
+        ):
+            assert (
+                _apply_idempotency_advisory("mcp__agentmail__send_message", {}, raw)
+                == raw
+            )
+
+    def test_wrapper_appends_the_advisory_end_to_end(self):
+        """Exercised through the wrapper the dispatch layer actually calls, not just the
+        module function underneath it."""
+        from agent.tool_executor import _apply_idempotency_advisory
+
+        raw = "Error executing tool 'mcp__agentmail__send_message': timed out"
+        out = _apply_idempotency_advisory(
+            "mcp__agentmail__send_message", {"to": ["a@b.com"]}, raw
+        )
+        assert out.startswith(raw)
+        assert "[idempotency]" in out
