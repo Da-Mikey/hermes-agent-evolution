@@ -64,6 +64,23 @@ _LARGE_TOOL_RESULT_TRIM_CHARS = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+def _apply_idempotency_advisory(tool_name: str, tool_args: Any, result: Any) -> Any:
+    """Best-effort ``[idempotency]`` advisory for post-dispatch failures (#173).
+
+    A side-effecting tool that failed *after* dispatch (timeout, dropped
+    connection) may already have landed its effect; retrying blindly then
+    duplicates it. This appends an advisory telling the model to verify before
+    retrying. It is cheap, never raises, and never blocks the result path.
+    """
+    try:
+        from agent.idempotency import apply_retry_advisory
+
+        return apply_retry_advisory(tool_name, tool_args, result)
+    except Exception:
+        logger.debug("idempotency advisory unavailable", exc_info=True)
+        return result
+
+
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
 
 
@@ -1260,6 +1277,19 @@ def _commit_tool_result(
     pre-persist content for UI previews) or ``None`` when the flush failed (stop the batch).
     """
     function_name, function_args, tool_call_id, effective_task_id = ref.name, ref.args, ref.call_id, ref.task_id
+
+    # #173: a side-effecting tool that failed *after* dispatch (timeout, dropped
+    # connection) may already have landed its effect, so a blind retry would duplicate
+    # it. Attach the "verify before retrying" advisory here — at the single funnel both
+    # the concurrent and sequential paths commit through, and *outside* the `observed`
+    # gate below, because the timed-out / never-returned path arrives with
+    # ``observed=False`` and is exactly the case this must reach. Successes and blocked
+    # calls (which never ran) pass through byte-identical.
+    if is_error and not blocked:
+        function_result = _apply_idempotency_advisory(
+            function_name, function_args, function_result
+        )
+
     if observed:
         if not blocked:
             function_result = agent._append_guardrail_observation(
