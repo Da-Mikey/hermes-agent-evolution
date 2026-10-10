@@ -305,6 +305,20 @@ def _get_unattended_approval_mode() -> str:
     return _binary_approval_mode("unattended_mode")
 
 
+def _get_subagent_approval_mode() -> str:
+    """Read the delegated-subagent approval mode from config. Returns 'deny' or 'approve'.
+
+    A delegated subagent runs with nobody present to answer an approval prompt, so the
+    default is deny — a gated call from a child is refused unless the operator has
+    explicitly set ``approvals.subagent_mode: approve``.
+
+    The name is load-bearing: ``approval._Unattended.mode()`` resolves this function
+    dynamically as ``_get_{name}_approval_mode`` for the ``subagent`` context, so its
+    absence raises AttributeError at dispatch instead of denying cleanly.
+    """
+    return _binary_approval_mode("subagent_mode")
+
+
 def _tirith_fail_open() -> bool:
     """``security.tirith_fail_open`` (default True; True when config is unreadable).
     False means the operator opted into fail-closed: an un-importable scanner
