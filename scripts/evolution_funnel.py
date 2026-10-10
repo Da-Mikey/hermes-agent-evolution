@@ -567,7 +567,19 @@ def main(argv: list[str]) -> int:
     _halt_threshold_merged = 5  # cycles with merged=0
     _halt_threshold_selected = 3  # cycles with selected=0
     _halt_file = evolution_dir / "halt-state.txt"
+    # Re-arm cooldown (#evolution — halt re-arm trap).
+    # The halt is self-sealing: it suppresses exactly the stages
+    # (research/analysis/implementation/introspection, see
+    # cron/evolution_preflight.py::_HALT_GATED_STAGES) whose output is what
+    # breaks the zero-streaks. So a manual clear that the very NEXT funnel run
+    # undoes can never recover — the observed 37-day dead loop. Mark our own
+    # arms, and when the halt file is gone although we armed it, treat that as
+    # a manual clear and let the un-halted stages run a full cadence before
+    # arming again.
+    _armed_marker = evolution_dir / "halt-armed.marker"
+    _rearm_marker = evolution_dir / "halt-rearm-deadline.epoch"
     try:
+        _halt_rearm_days = float(os.environ.get("EVOLUTION_HALT_REARM_DAYS", "3"))
         _all_records = load_records(evolution_dir / "metrics.jsonl")
         _summary = summarize(
             _all_records, max(_halt_threshold_merged, _halt_threshold_selected)
@@ -584,28 +596,63 @@ def main(argv: list[str]) -> int:
             _merged_zero >= _halt_threshold_merged
             and _selected_zero_streak >= _halt_threshold_selected
         ):
-            _halt_file.write_text(
-                f"# Evolution pipeline HALTED\n"
-                f"# Date: {date}\n"
-                f"# merged_zero_streak: {_merged_zero} (threshold: {_halt_threshold_merged})\n"
-                f"# selected_zero_streak: {_selected_zero_streak} (threshold: {_halt_threshold_selected})\n"
-                f"# The pipeline has produced zero automated deliverables for "
-                f"{_merged_zero}+ consecutive cycles. All expensive LLM stages "
-                f"(research, analysis, implementation) will skip until the halt "
-                f"is manually cleared.\n"
-                f"#\n"
-                f"# To resume: delete this file and address the root cause "
-                f"(provider timeout, broken fallback, credential expiry).\n",
-                encoding="utf-8",
-            )
-            print(
-                f"[evolution-funnel] HALT DETECTED: merged=0 x{_merged_zero}, "
-                f"selected=0 x{_selected_zero_streak} — wrote {_halt_file}"
-            )
+            _suppress_rearm = False
+            if not _halt_file.exists() and _armed_marker.exists():
+                # We armed a halt before and the file is gone now: the owner
+                # cleared it by hand. Give the pipeline a cadence of un-halted
+                # cycles to break the streaks before arming again.
+                import time as _time
+
+                _deadline = None
+                try:
+                    _deadline = float(_rearm_marker.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    _deadline = None
+                if _deadline is None:
+                    _deadline = _time.time() + _halt_rearm_days * 86400
+                    try:
+                        _rearm_marker.write_text(repr(_deadline), encoding="utf-8")
+                    except OSError:
+                        pass
+                if _time.time() < _deadline:
+                    _suppress_rearm = True
+                    print(
+                        f"[evolution-funnel] HALT RE-ARM SUPPRESSED until epoch "
+                        f"{_deadline:.0f} (manual clear cooldown, "
+                        f"{_halt_rearm_days:g}d) — letting the un-halted stages run"
+                    )
+            if not _suppress_rearm:
+                _halt_file.write_text(
+                    f"# Evolution pipeline HALTED\n"
+                    f"# Date: {date}\n"
+                    f"# merged_zero_streak: {_merged_zero} (threshold: {_halt_threshold_merged})\n"
+                    f"# selected_zero_streak: {_selected_zero_streak} (threshold: {_halt_threshold_selected})\n"
+                    f"# The pipeline has produced zero automated deliverables for "
+                    f"{_merged_zero}+ consecutive cycles. All expensive LLM stages "
+                    f"(research, analysis, implementation) will skip until the halt "
+                    f"is manually cleared.\n"
+                    f"#\n"
+                    f"# To resume: delete this file and address the root cause "
+                    f"(provider timeout, broken fallback, credential expiry).\n",
+                    encoding="utf-8",
+                )
+                try:
+                    _armed_marker.write_text("1", encoding="utf-8")
+                except OSError:
+                    pass
+                print(
+                    f"[evolution-funnel] HALT DETECTED: merged=0 x{_merged_zero}, "
+                    f"selected=0 x{_selected_zero_streak} — wrote {_halt_file}"
+                )
         elif _halt_file.exists():
             # Auto-clear the halt if metrics improved enough to drop below
             # either threshold.
             _halt_file.unlink()
+            for _stale in (_armed_marker, _rearm_marker):
+                try:
+                    _stale.unlink()
+                except OSError:
+                    pass
             print(
                 f"[evolution-funnel] HALT CLEARED: merged_zero_streak={_merged_zero}, "
                 f"selected_zero_streak={_selected_zero_streak}",
