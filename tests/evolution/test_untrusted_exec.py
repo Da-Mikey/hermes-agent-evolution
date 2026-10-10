@@ -17,6 +17,7 @@ import pytest
 from evolution.lib import caf_loop, tool_synthesis
 from evolution.lib.untrusted_exec import (
     ISOLATED_FLAG,
+    absolute_script_args,
     isolated_env,
     isolated_python_command,
     neutral_cwd,
@@ -136,3 +137,73 @@ def test_untrusted_call_sites_are_wired_to_the_isolated_runner(module):
 
     assert "run_untrusted_python(" in source
     assert "sys.executable" not in source
+
+
+# ---------------------------------------------------------------------------
+# A relative script path must not be defeated by the neutral cwd.
+#
+# The failure closed here (household queue 85343599bb, raised against PR 201):
+# children start in ``neutral_cwd()``, so ``run_untrusted_python(["verifier.py"])``
+# launched a child that could not find its entry point.  The resulting
+# ``FileNotFoundError`` is an ``OSError``, which ``CafSandboxVerifier.verify``
+# catches and reports as a FAILED VERIFICATION — a configuration error that reads
+# as a candidate failure.  Measured live: the same verifier returned ``False``
+# through a relative path and ``True`` through an absolute one.
+# ---------------------------------------------------------------------------
+
+def test_relative_script_path_is_resolved_against_the_callers_cwd(tmp_path, monkeypatch):
+    script = tmp_path / "verifier.py"
+    script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    proc = run_untrusted_python(["verifier.py"])
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_unresolvable_relative_script_path_still_fails_closed(tmp_path, monkeypatch):
+    """Resolution must not turn a missing verifier into an exception.
+
+    The sibling contract (``test_caf_loop.py``: a missing verifier is a FAILED
+    verification) is deliberate, so an unresolvable path keeps returning False
+    rather than raising — a broken verifier must never read as a pass.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    assert caf_loop.CafSandboxVerifier().verify("t", "x", "no_such_verifier.py") is False
+
+
+def test_absolute_script_args_resolves_against_the_callers_directory(tmp_path, monkeypatch):
+    script = tmp_path / "v.py"
+    script.write_text("pass\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert absolute_script_args(["v.py"]) == [str(tmp_path / "v.py")]
+
+
+def test_absolute_script_args_leaves_inline_code_alone():
+    assert absolute_script_args(["-c", "print('hi')"]) == ["-c", "print('hi')"]
+    assert absolute_script_args(["-m", "json.tool"]) == ["-m", "json.tool"]
+
+
+def test_absolute_script_args_skips_flags_that_take_a_value(tmp_path):
+    script = tmp_path / "v.py"
+    script.write_text("pass\n", encoding="utf-8")
+
+    resolved = absolute_script_args(["-W", "ignore", str(script)])
+
+    assert resolved == ["-W", "ignore", str(script)]
+
+
+def test_caf_loop_relative_verifier_is_no_longer_a_false_failure(tmp_path, monkeypatch):
+    """The exact measurement in queue 85343599bb: ``verify()`` returned False."""
+    script = tmp_path / "verify_ok.py"
+    script.write_text(
+        "import json, sys\nsys.exit(0 if json.load(sys.stdin).get('answer') else 1)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert caf_loop.CafSandboxVerifier().verify("t", "a", "verify_ok.py") is True
+    assert caf_loop.CafSandboxVerifier().verify("t", "a", str(script)) is True
+

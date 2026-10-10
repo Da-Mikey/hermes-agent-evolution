@@ -41,6 +41,7 @@ from typing import Dict, Mapping, Optional, Sequence, Union
 
 __all__ = [
     "ISOLATED_FLAG",
+    "absolute_script_args",
     "isolated_python_command",
     "isolated_env",
     "neutral_cwd",
@@ -51,9 +52,59 @@ __all__ = [
 #: constant so that every call site is greppable and the rule is auditable.
 ISOLATED_FLAG = "-I"
 
+#: Interpreter flags whose FOLLOWING argument is not a script path.  ``-c`` and
+#: ``-m`` carry code / a module name, so a caller that passes them has no path
+#: to resolve; the rest carry a value that must not be mistaken for the script.
+_CODE_FLAGS = ("-c", "-m")
+_VALUE_FLAGS = ("-W", "-X", "--check-hash-based-pycs")
+
 _NEUTRAL_CWD_NAME = "hermes-untrusted-exec"
 
 PathLike = Union[str, os.PathLike]
+
+
+def absolute_script_args(args: Sequence[str]) -> list[str]:
+    """Resolve a script path in ``args`` against the CALLER's cwd.
+
+    The failure this closes (#160 item 1 follow-up, household queue 85343599bb):
+    children always start in :func:`neutral_cwd`, so a caller that hands over a
+    RELATIVE script path (``"verifier.py"``) gets a child that cannot find its
+    entry point.  The ``FileNotFoundError`` is an ``OSError``, which the existing
+    call sites catch and report as *a failed verification* — a configuration
+    error silently disguised as a candidate failure, and therefore a wrong
+    routing decision.  Measured live before this fix: the same verifier returned
+    ``False`` through a relative path and ``True`` through an absolute one.
+
+    Resolving against ``os.getcwd()`` restores exactly the behaviour that
+    preceded the neutral cwd (the child used to inherit the caller's directory),
+    so correct callers see no change and a relative verifier path works again.
+
+    Rules:
+
+    * ``["-c", code]`` / ``["-m", module]`` carry no path — returned unchanged.
+    * A relative script path becomes absolute; arguments after it are untouched.
+    * A path that does not resolve is NOT rejected here: an unrunnable verifier
+      failing closed (``verify() -> False``) is a deliberate, tested contract
+      (``tests/evolution/test_caf_loop.py::test_script_verifier_missing_or_crashing_is_fail``)
+      — turning it into an exception would change a verdict the callers rely on.
+    """
+    out = list(args)
+    i = 0
+    while i < len(out):
+        token = out[i]
+        if token in _CODE_FLAGS:
+            return out
+        if token in _VALUE_FLAGS:
+            i += 2
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        path = Path(token)
+        if not path.is_absolute():
+            out[i] = str(Path.cwd() / path)
+        return out
+    return out
 
 
 def isolated_python_command(*args: str) -> list[str]:
@@ -99,11 +150,14 @@ def run_untrusted_python(
     """Run Python over content this project did not author.
 
     Always launches in isolated mode and always from :func:`neutral_cwd`
-    unless a caller names a directory explicitly.  Timeouts and OS errors
+    unless a caller names a directory explicitly.  A script path among ``args``
+    is made absolute first (:func:`absolute_script_args`) so a relative verifier
+    path cannot be defeated by that neutral cwd.  Timeouts and OS errors
     propagate exactly as ``subprocess.run`` would, so existing callers keep
     their current ``try``/``except`` handling.
     """
-    command = isolated_python_command(*args) if isolated else [sys.executable, *args]
+    safe_args = absolute_script_args(args)
+    command = isolated_python_command(*safe_args) if isolated else [sys.executable, *safe_args]
     return subprocess.run(
         command,
         input=stdin_data,
