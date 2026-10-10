@@ -169,6 +169,46 @@ def _stage_ran_clean_for_slot(
     return _stage_clean_job_for_slot(jobs, stage, date, slot_hour) is not None
 
 
+def _stage_cron_weekday(jobs: List[dict], stage: str) -> int | None:
+    """Python weekday (Mon=0 .. Sun=6) of the stage's weekly cron slot, or None.
+
+    Weekly stages fire on a fixed cron weekday (research Mon, introspection
+    Wed). The watchdog must judge their reports against THAT weekday; using
+    the daily "most recent slot" rule false-positives on every other day.
+    """
+    name = f"evolution-{stage}"
+    for job in jobs:
+        if str(job.get("name", "")) != name:
+            continue
+        sched = job.get("schedule")
+        expr = str(sched.get("expr", "")) if isinstance(sched, dict) else ""
+        parts = expr.split()
+        if len(parts) != 5:
+            return None
+        dow = parts[4]
+        if not dow.isdigit():
+            return None
+        # cron: 0/7 = Sunday .. 6 = Saturday  ->  python: Mon=0 .. Sun=6
+        return (int(dow) + 6) % 7
+    return None
+
+
+def expected_weekly_report_date(
+    now: datetime, weekday: int, slot_hour: int, grace_hours: int = GRACE_HOURS
+) -> str:
+    """Date of the most recent weekly slot that must already have a report.
+
+    Walks back to the stage's weekday at ``slot_hour``; if that instant (plus
+    grace) is still in the future, the previous week's occurrence is the last
+    one that must have delivered.
+    """
+    candidate = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+    candidate -= timedelta(days=(now.weekday() - weekday) % 7)
+    if now < candidate + timedelta(hours=grace_hours):
+        candidate -= timedelta(days=7)
+    return candidate.date().isoformat()
+
+
 def check_stage_reports(
     evolution_dir: Path, now: datetime, jobs_file: Path | None = None
 ) -> List[str]:
@@ -179,7 +219,15 @@ def check_stage_reports(
     alerts: List[str] = []
     jobs = _load_jobs(jobs_file)
     for stage, (slot_hour, ext) in STAGES.items():
-        date = expected_report_date(now, slot_hour)
+        # A weekly stage's slot is its cron WEEKDAY, not "the most recent daily
+        # slot": demanding yesterday's report from a Monday-only stage fires a
+        # false alarm on every other day of the week.
+        weekly_wd = _stage_cron_weekday(jobs, stage) if stage in WEEKLY_STAGES else None
+        date = (
+            expected_weekly_report_date(now, weekly_wd, slot_hour)
+            if weekly_wd is not None
+            else expected_report_date(now, slot_hour)
+        )
         report = evolution_dir / stage / f"{date}.{ext}"
         if not report.exists() and stage in WEEKLY_STAGES:
             # Accept any report from the last 8 days (weekly cadence).
@@ -196,6 +244,18 @@ def check_stage_reports(
                         continue
             if recent:
                 continue
+            # No report for the weekly slot AND none inside the whole weekly
+            # window: the deliverable is genuinely missing. The daily-stage
+            # clean-run suppression below must NOT swallow this — a weekly
+            # stage that ran a full cadence without emitting anything is
+            # exactly the anomaly the owner needs to see.
+            alerts.append(
+                f"stage '{stage}': expected report {report.name} is MISSING "
+                f"(weekly slot {slot_hour:02d}:00 + {GRACE_HOURS}h grace passed "
+                f"and no report in the last {WEEKLY_STALE_HOURS // 24}d — the "
+                f"job died without record or never ran)"
+            )
+            continue
         if not report.exists():
             clean_job = _stage_clean_job_for_slot(jobs, stage, date, slot_hour)
             if clean_job is not None:
