@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ __all__ = [
     "bounded_git_probe",
     "bounded_probe_run",
     "noninteractive_git_env",
+    "noninteractive_repo_git_env",
     "NO_DRIVER_DIFF_FLAGS",
     "NO_LAZY_FETCH_ENV",
     "pid_is_hermes",
@@ -37,8 +39,8 @@ __all__ = [
 # arbitrary program via ``[diff "evil"] command=/textconv=`` in ``.git/config``; because the
 # attacker chooses the name, ``GIT_CONFIG_KEY`` overrides in ``noninteractive_git_env`` cannot
 # enumerate it — only these flags do. ``--no-ext-diff`` kills ``command=``; ``--no-textconv`` kills
-# ``textconv=``; each alone leaves the other live. Smudge/clean filters are neutralized by the env
-# layer's ``core.hooksPath`` + running against the index without checkout.
+# ``textconv=``; each alone leaves the other live. Repository-named clean/smudge/process filters
+# are handled separately by ``noninteractive_repo_git_env`` at repo-scoped automatic call sites.
 NO_DRIVER_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 # Only these subcommands accept ``NO_DRIVER_DIFF_FLAGS`` — ``status`` and friends reject them
@@ -382,6 +384,188 @@ def noninteractive_git_env(base: "Mapping[str, str] | None" = None) -> dict[str,
     return env
 
 
+_FILTER_COMMAND_KEY = re.compile(r"^filter\..+\.(?:clean|smudge|process)$", re.IGNORECASE)
+# ``includeIf`` is evaluated against the CURRENT checkout: ``onbranch:`` against the current branch,
+# ``gitdir:`` against the current git dir (``.git/worktrees/<name>`` during ``worktree add``), so
+# the spawned git can load an include this discovery's ``--includes`` skipped. Every include target
+# is therefore read directly, whatever its condition, and its filter names are neutralized too.
+# Global/system config is already /dev/null, so only repo-local includes reach this.
+_INCLUDE_IF_KEY = re.compile(r"^includeif\..*\.path$", re.IGNORECASE)
+# Any include (conditional or not) inside an include target: discovery does not walk it twice.
+_INCLUDE_KEY = re.compile(r"^include(?:if\..*)?\.path$", re.IGNORECASE)
+# `git config --get-regexp` pattern for the keys discovery reads (filter commands and includes).
+_DISCOVERY_KEYS_REGEXP = r"^(filter\..*\.(clean|smudge|process)|include\.path|includeif\..*\.path)$"
+# Each include target costs one bounded spawn on every hardened git call; refuse past this many.
+_MAX_INCLUDE_TARGETS = 16
+# Each discovered key costs two env entries; a repo with tens of thousands of filters would make
+# every spawn fail with E2BIG ("Argument list too long"), so refuse past a generous cap.
+_MAX_FILTER_KEYS = 256
+# Stand-in stderr for a git call refused because filter discovery could not be trusted.
+FILTER_DISCOVERY_FAILED = "git filter discovery failed"
+
+
+def noninteractive_repo_git_env(
+    cwd: "str | os.PathLike[str]",
+    base: "Mapping[str, str] | None" = None,
+) -> "dict[str, str] | None":
+    """Harden internal git for one repository, including named clean/smudge/process filters.
+
+    The static environment can pin fixed config keys such as core.fsmonitor and
+    core.hooksPath, but a repository chooses filter driver names through .gitattributes.
+    Discover the effective filter command keys for this checkout and append empty command
+    overrides plus required=false to the already-isolated config block. Discovery is
+    bounded and fail-closed: if filter discovery cannot be trusted, callers skip the
+    automatic git operation instead of running with only partial hardening.
+    """
+    env = noninteractive_git_env(base)
+    # bounded_probe_run, not subprocess.run: Windows' post-timeout communicate() can deadlock and
+    # a bare spawn flashes a console. (Not bounded_git_probe: rc 1 = "no filters" is a verdict.)
+    # One probe lists the filter keys and the include paths with their origin file: -z --show-origin
+    # yields "file:<origin>", "<key>\n<value>" pairs.
+    proc = bounded_probe_run(
+        ["git", "-C", str(cwd), "config", "--includes", "--show-origin", "-z", "--get-regexp",
+         _DISCOVERY_KEYS_REGEXP],
+        timeout=2, env=env,
+    )
+    if proc is None or proc.returncode not in (0, 1):
+        return None
+    names: list[str] = []
+    targets: set[Path] = set()
+    toplevel: "Path | None" = None
+    fields = proc.stdout.split("\0")
+    for origin, entry in zip(fields[0::2], fields[1::2]):
+        key, _, value = entry.partition("\n")
+        if not _INCLUDE_IF_KEY.fullmatch(key):
+            names.append(key)
+            continue
+        if not origin.startswith("file:"):
+            return None
+        origin_path = Path(origin[len("file:"):])
+        if not origin_path.is_absolute():
+            # git prints repo-local origins relative to the worktree top level, not to *cwd*; with a
+            # caller-set GIT_DIR/GIT_WORK_TREE they are relative to something else, so refuse.
+            if env.get("GIT_DIR") or env.get("GIT_WORK_TREE"):
+                return None
+            if toplevel is None:
+                top = bounded_probe_run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                                        timeout=2, env=env)
+                if top is None or top.returncode != 0:
+                    return None
+                toplevel = Path(top.stdout.rstrip("\r\n"))  # a checkout path may end in a space
+            origin_path = toplevel / origin_path
+        # A relative include path resolves against the directory of the config file naming it.
+        target = (origin_path.parent / os.path.expanduser(value)).resolve()
+        if target in targets or not target.exists():
+            continue  # already read, or missing (git skips a missing include file)
+        if not target.is_file() or len(targets) >= _MAX_INCLUDE_TARGETS:
+            return None  # a FIFO/device/directory, or too many targets to read on every call
+        targets.add(target)
+        probe = bounded_probe_run(
+            ["git", "config", "--file", str(target), "--name-only", "-z", "--get-regexp", _DISCOVERY_KEYS_REGEXP],
+            timeout=2, env=env,
+        )
+        if probe is None or probe.returncode not in (0, 1):
+            return None
+        found = probe.stdout.split("\0")
+        # An include inside an include target would need the same walk again; refuse instead.
+        if any(_INCLUDE_KEY.fullmatch(name) for name in found):
+            return None
+        names.extend(found)
+
+    keys: list[str] = []
+    required: list[str] = []
+    seen: set[str] = set()
+    # Dedup on the exact key name git prints: section and variable lowercased, subsection case kept,
+    # and ``[filter "Evil"]`` is a different driver from ``[filter "evil"]``.
+    for raw in names:
+        key = raw.strip()
+        if not key or key in seen or not _FILTER_COMMAND_KEY.fullmatch(key):
+            continue
+        seen.add(key)
+        keys.append(key)
+        if len(keys) > _MAX_FILTER_KEYS:
+            return None
+        required_key = key.rsplit(".", 1)[0] + ".required"
+        if required_key not in seen:
+            seen.add(required_key)
+            required.append(required_key)
+
+    start = int(env["GIT_CONFIG_COUNT"])  # always set by noninteractive_git_env
+    overrides = [(key, "") for key in keys] + [(key, "false") for key in required]
+    for offset, (key, value) in enumerate(overrides):
+        env[f"GIT_CONFIG_KEY_{start + offset}"] = key
+        env[f"GIT_CONFIG_VALUE_{start + offset}"] = value
+    env["GIT_CONFIG_COUNT"] = str(start + len(overrides))
+    return env
+
+
+def posix_is_zombie(pid: int) -> bool:
+    """Zombie via ``/proc/<pid>/stat`` field 3, or ``ps -o state=`` without /proc (macOS/BSD)."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            stat_fields = fh.read().split()
+        return len(stat_fields) > 2 and stat_fields[2] == "Z"
+    except FileNotFoundError:
+        try:
+            r = subprocess.run(
+                ["ps", "-o", "state=", "-p", str(pid)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            )
+            return r.returncode == 0 and r.stdout.strip().startswith("Z")
+        except Exception:
+            pass
+    except (IndexError, PermissionError, OSError):
+        pass
+    return False
+
+
+def win32_pid_exists(pid: int) -> bool:
+    """psutil-free Windows liveness probe via OpenProcess/WaitForSingleObject."""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # Pin restypes: default c_int mangles WAIT_* DWORDs into negatives.
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint
+        kernel32.GetLastError.restype = ctypes.c_uint
+        PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE = 0x1000, 0x100000  # SYNCHRONIZE: for Wait*
+        WAIT_TIMEOUT, ERROR_ACCESS_DENIED = 0x00000102, 5
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+        if not handle:
+            # ERROR_INVALID_PARAMETER (87): PID definitely gone. ACCESS_DENIED: exists
+            # but owned by another user/session. Any other error: conservative False.
+            return kernel32.GetLastError() == ERROR_ACCESS_DENIED
+        try:
+            # WAIT_TIMEOUT = still running; anything else = gone.
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError):
+        return False
+
+
+def pid_exists_stdlib(pid: int) -> bool:
+    """Stdlib-only "is this PID alive" check that never signals the target (zombies report dead).
+
+    For code that must run without the dependency environment: the detached gateway restart
+    watcher is started by whatever interpreter the updater runs on (the bare store Python after
+    the package-manager handoff), so it cannot import ``gateway.status`` (``utils`` pulls in
+    ``ruamel``). ``gateway.status._pid_exists`` prefers psutil and falls back to this.
+    """
+    pid = int(pid)
+    if IS_WINDOWS:
+        return win32_pid_exists(pid)
+    if posix_is_zombie(pid):  # a zombie still answers os.kill(pid, 0)
+        return False
+    try:
+        os.kill(pid, 0)  # windows-footgun: ok — POSIX-only branch (Windows returned above)
+    except PermissionError:
+        return True  # Exists but we can't signal it.
+    except OSError:  # ProcessLookupError included
+        return False
+    return True
+
+
 def _process_start_time(pid: int) -> int | None:
     """The repository's stable process-start fingerprint, if available."""
     try:
@@ -593,11 +777,7 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float, env: Mapping[str, 
     openai/codex#36793). ``process_group`` only changes which group the child belongs to; it does not detach
     the terminal or alter the fast path.
     """
-    if env is None:
-        env = {**noninteractive_git_env(), **NO_LAZY_FETCH_ENV}
-    else:
-        env = {**dict(env), **NO_LAZY_FETCH_ENV}
-    result = bounded_probe_run(argv, timeout=timeout, env=env)
+    result = bounded_probe_run(argv, timeout=timeout, env={**(env or noninteractive_git_env()), **NO_LAZY_FETCH_ENV})
     if result is None or result.returncode != 0:
         return ""
     return (result.stdout or "").strip()
