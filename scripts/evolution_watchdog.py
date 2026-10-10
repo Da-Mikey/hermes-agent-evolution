@@ -86,6 +86,12 @@ WEEKLY_JOBS = {
     "evolution-upstream-sync",
     "evolution-harness-gate",
     "evolution-proceed-hold-calibration",
+    # Chat-safe cadence made these three weekly too (research Mon 09:30,
+    # issues Mon 12:45, introspection Wed 20:50) — the 26h daily threshold
+    # false-positived on them every Tue/Thu/Sat (watchdog alerts 2026-10-10).
+    "evolution-research",
+    "evolution-issues",
+    "evolution-introspection",
 }
 # The watchdog itself must not alert about its own first run.
 SELF_NAMES = {"evolution-watchdog"}
