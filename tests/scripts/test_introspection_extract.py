@@ -345,6 +345,117 @@ class TestFailureReasonClassification:
         s = scan_session(p)
         assert s["tool_failures_by_reason"] == {"patch": {"other": 1}}
 
+    # --- #184: execute_code + deferred tool_call classified at capture ------
+
+    def test_execute_code_exception_class_reason(self, tmp_path):
+        """An ``execute_code`` failure reported only as ``error`` (no exit_code)
+        used to land in 'other'; the traceback's exception class is now the tag,
+        so KeyError and ModuleNotFoundError stop looking identical."""
+        p = _session(
+            tmp_path,
+            "r6",
+            [
+                _asst("execute_code", "c1"),
+                _tool(
+                    "c1",
+                    _fail(
+                        "Traceback (most recent call last):\n"
+                        '  File "<string>", line 1, in <module>\n'
+                        "KeyError: 'user_id'"
+                    ),
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {
+            "execute_code": {"exception:KeyError": 1}
+        }
+        # Only the class NAME is emitted — never the traceback body.
+        assert "user_id" not in json.dumps(s)
+
+    def test_execute_code_exception_class_on_terminal_envelope(self, tmp_path):
+        """The same classification works when code-exec reports exit_code too."""
+        p = _session(
+            tmp_path,
+            "r7",
+            [
+                _asst("execute_code", "c1"),
+                _tool(
+                    "c1",
+                    _term(
+                        "Traceback (most recent call last):\n"
+                        "ModuleNotFoundError: No module named 'pandas'",
+                        exit_code=1,
+                    ),
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {
+            "execute_code": {"exception:ModuleNotFoundError": 1}
+        }
+
+    def test_exception_class_match_is_case_sensitive(self, tmp_path):
+        """All-caps prose must not be mistaken for an exception class name."""
+        p = _session(
+            tmp_path,
+            "r8",
+            [
+                _asst("execute_code", "c1"),
+                _tool("c1", _fail("SEVERE ERROR: the snippet returned nothing")),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {"execute_code": {"other": 1}}
+
+    def test_tool_call_bridge_unknown_tool_reason(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "r9",
+            [
+                _asst("tool_call", "c1"),
+                _tool("c1", _fail("unknown tool: 'weather_now'")),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {
+            "tool_call": {"bridge-unknown-tool": 1}
+        }
+
+    def test_tool_call_bridge_invalid_args_reason(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "r10",
+            [
+                _asst("tool_call", "c1"),
+                _tool(
+                    "c1",
+                    _fail(
+                        "Invalid arguments for tool 'search': "
+                        "unexpected keyword argument 'limit'"
+                    ),
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {
+            "tool_call": {"bridge-invalid-args": 1}
+        }
+
+    def test_tool_call_bridge_missing_field_reason(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "r11",
+            [
+                _asst("tool_call", "c1"),
+                _tool("c1", _fail("missing required argument: 'query'")),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {
+            "tool_call": {"bridge-missing-field": 1}
+        }
+
     def test_patch_no_match_classified_not_other(self, tmp_path):
         """The dominant patch failure message — "Could not find a match for
         old_string in the file" (tools/fuzzy_match.py) — is classified as

@@ -272,6 +272,42 @@ _PATCH_NO_MATCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- #184: the two paths the digest could not diagnose ----------------------
+# 32/46 ``execute_code`` failures and 27/30 deferred-``tool_call`` failures were
+# landing in the opaque 'other' bucket with no cause recorded, so the agent
+# repeated an identical call instead of correcting it (up to 16 consecutive
+# identical calls in one session). Both shapes DO carry their cause; nothing
+# was reading it. These rules read it at capture time.
+#
+# Exception CLASS only, matched case-sensitively: Python exception names are
+# CamelCase (``KeyError``, ``ModuleNotFoundError``), so a case-sensitive match
+# cannot fire on ALL-CAPS prose ("NO ERROR") the way a folded one would. The
+# traceback BODY is deliberately not emitted — see the no-raw-text contract in
+# ``_tool_result_failed`` and the test that pins it.
+_EXCEPTION_CLASS_RE = re.compile(r"\b([A-Z][A-Za-z_]*(?:Error|Exception|Interrupt))\b")
+
+# The bridge refuses in prose the digest never classified. The reason tag names
+# the FAILURE SHAPE (unknown sub-tool / bad arguments / missing field) rather
+# than quoting the offending field value: a schema field name is exactly the
+# kind of raw text the no-raw-text contract exists to keep out of the digest,
+# and the shape is what tells the agent which correction to make.
+_BRIDGE_UNKNOWN_TOOL_RE = re.compile(
+    r"\b(unknown tool|no such tool|tool (?:not found|is not (?:available|registered))|"
+    r"unrecognized (?:tool|tool name))\b",
+    re.IGNORECASE,
+)
+_BRIDGE_MISSING_FIELD_RE = re.compile(
+    r"\b(missing required (?:argument|parameter|field)|"
+    r"required (?:argument|parameter|field)s? (?:is|are)? ?missing|field required)\b",
+    re.IGNORECASE,
+)
+_BRIDGE_INVALID_ARGS_RE = re.compile(
+    r"\b(unexpected keyword argument|invalid (?:arguments|parameters|argument|parameter|schema)|"
+    r"arguments? (?:did not|does not) (?:validate|match)|validation (?:error|failed)|"
+    r"schema (?:violation|mismatch)|failed to validate)\b",
+    re.IGNORECASE,
+)
+
 
 def _classify_failure_reason(content: Any) -> Optional[str]:
     """Sub-classify a *failed* tool result into a coarse reason tag (issue #1325).
@@ -344,6 +380,23 @@ def _classify_failure_reason(content: Any) -> Optional[str]:
         return "patch-no-match"
     if _NO_MATCH_RE.search(haystack):
         return "no-match"
+    # #184 — deferred ``tool_call`` bridge: name the refusal shape. Ordered most
+    # specific first, and entirely additive: these tags are new, so no failure
+    # that already had a tag is re-tagged by them.
+    if _BRIDGE_UNKNOWN_TOOL_RE.search(haystack):
+        return "bridge-unknown-tool"
+    if _BRIDGE_MISSING_FIELD_RE.search(haystack):
+        return "bridge-missing-field"
+    if _BRIDGE_INVALID_ARGS_RE.search(haystack):
+        return "bridge-invalid-args"
+    # #184 — ``execute_code`` (and any code-exec path) reports its cause as a
+    # Python exception class inside the traceback. Without this the class was
+    # invisible: KeyError, ModuleNotFoundError and a plain non-zero exit all
+    # rendered as the same tag, so the agent retried rather than corrected.
+    # Last specific rule, so every pre-existing tag keeps winning.
+    exc = _EXCEPTION_CLASS_RE.search(haystack)
+    if exc:
+        return f"exception:{exc.group(1)}"
     if "exit_code" in data:
         return "non-zero-exit"
     return "other"
