@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from evolution_watchdog import (  # noqa: E402
     STAGES,
+    _load_jobs,
+    _stage_cron_weekday,
     check_gh,
     check_jobs,
     check_runtime_divergence,
@@ -19,6 +21,7 @@ from evolution_watchdog import (  # noqa: E402
     check_upstream_lag,
     ensure_upstream_issue,
     expected_report_date,
+    expected_weekly_report_date,
 )
 
 
@@ -177,6 +180,117 @@ class TestStageReports:
             last_tool_calls=7,
         )
         assert check_stage_reports(tmp_path, NOW, jf) == []
+
+
+class TestWeeklyStageReportDates:
+    """Weekly stages must be judged against their own cron weekday.
+
+    Before this, ``check_stage_reports`` applied the DAILY "most recent slot"
+    rule to weekly stages too, so research (Mon 09:30) was expected to have a
+    report dated *yesterday* on every Tue–Sun — a permanent false alarm that
+    also masked the real signal (no report for a whole cadence).
+    """
+
+    def _jobs_file(self, tmp_path, jobs):
+        f = tmp_path / "jobs.json"
+        f.write_text(json.dumps({"jobs": jobs}))
+        return f
+
+    def _research_jobs(self, tmp_path, **extra):
+        """Cron registry holding BOTH weekly stages (research + introspection)."""
+        return self._jobs_file(
+            tmp_path,
+            [
+                {
+                    "name": "evolution-research",
+                    "enabled": True,
+                    "last_status": "ok",
+                    "last_run_at": "2026-06-08T09:30:56",
+                    "schedule": {"kind": "cron", "expr": "30 9 * * 1"},
+                    **extra,
+                },
+                {
+                    "name": "evolution-introspection",
+                    "enabled": True,
+                    "last_status": "ok",
+                    "last_run_at": "2026-06-10T20:50:00",
+                    "schedule": {"kind": "cron", "expr": "50 20 * * 3"},
+                },
+            ],
+        )
+
+    def _other_stage_reports(self, tmp_path):
+        """Every stage EXCEPT research gets a current report.
+
+        introspection is weekly too, so it is dated at its own Wednesday slot
+        (2026-06-10) rather than at a daily slot.
+        """
+        for stage, (slot, ext) in STAGES.items():
+            sd = tmp_path / stage
+            sd.mkdir(exist_ok=True)
+            if stage == "research":
+                continue
+            if stage == "introspection":
+                dt = expected_weekly_report_date(NOW, 2, slot)
+            else:
+                dt = expected_report_date(NOW, slot)
+            (sd / f"{dt}.{ext}").write_text("x" * 500)
+
+    def test_stage_cron_weekday_reads_expr(self, tmp_path):
+        jf = self._jobs_file(
+            tmp_path,
+            [
+                {"name": "evolution-research", "schedule": {"expr": "30 9 * * 1"}},
+                {"name": "evolution-introspection", "schedule": {"expr": "50 20 * * 3"}},
+                {"name": "evolution-analysis", "schedule": {"expr": "15 21 * * *"}},
+                {"name": "evolution-integration", "schedule": "not-a-dict"},
+            ],
+        )
+        jobs = _load_jobs(jf)
+        assert _stage_cron_weekday(jobs, "research") == 0  # Monday
+        assert _stage_cron_weekday(jobs, "introspection") == 2  # Wednesday
+        # Daily (`*`) and unparseable schedules must fall back, not guess.
+        assert _stage_cron_weekday(jobs, "analysis") is None
+        assert _stage_cron_weekday(jobs, "integration") is None
+
+    def test_expected_weekly_report_date_walks_back_to_slot_weekday(self):
+        # Thursday 2026-06-11: the Monday 2026-06-08 slot already delivered.
+        assert expected_weekly_report_date(NOW, 0, 9) == "2026-06-08"
+
+    def test_expected_weekly_report_date_before_grace_uses_previous_week(self):
+        # Monday 07:45 — its own 09:00 + 2h grace has not passed yet, so the
+        # previous Monday is the last slot that MUST have delivered.
+        monday = datetime(2026, 6, 8, 7, 45)
+        assert expected_weekly_report_date(monday, 0, 9) == "2026-06-01"
+
+    def test_weekly_stage_accepts_its_weekday_report(self, tmp_path):
+        # Report dated the Monday slot → healthy, even though no report dated
+        # "yesterday" exists.
+        d = tmp_path / "research"
+        d.mkdir()
+        (d / "2026-06-08.md").write_text("x" * 500)
+        self._other_stage_reports(tmp_path)
+        assert check_stage_reports(tmp_path, NOW, self._research_jobs(tmp_path)) == []
+
+    def test_weekly_stage_alerts_without_report_in_window(self, tmp_path):
+        # A "clean" slot run must NOT suppress a weekly stage that emitted
+        # nothing for a whole cadence — that absence IS the anomaly.
+        d = tmp_path / "research"
+        d.mkdir()
+        self._other_stage_reports(tmp_path)
+        alerts = check_stage_reports(tmp_path, NOW, self._research_jobs(tmp_path))
+        assert len(alerts) == 1
+        assert "research" in alerts[0]
+        assert "2026-06-08" in alerts[0]
+
+    def test_weekly_stage_quiet_with_any_recent_report(self, tmp_path):
+        # The 8-day window still absorbs a report that landed on a non-slot
+        # day (e.g. a manual catch-up run).
+        d = tmp_path / "research"
+        d.mkdir()
+        (d / "2026-06-10.md").write_text("x" * 500)  # 1 day old, not the slot
+        self._other_stage_reports(tmp_path)
+        assert check_stage_reports(tmp_path, NOW, self._research_jobs(tmp_path)) == []
 
 
 class TestJobsHealth:
