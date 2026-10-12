@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
+
+from evolution.lib.untrusted_exec import run_untrusted_python
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +56,10 @@ class CafRecord:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CafRecord":
         return cls(
-            str(d.get("task_dim", "")), str(d.get("model", "")),
-            bool(d.get("passed", False)), str(d.get("timestamp", "")),
+            str(d.get("task_dim", "")),
+            str(d.get("model", "")),
+            bool(d.get("passed", False)),
+            str(d.get("timestamp", "")),
         )
 
 
@@ -76,11 +79,9 @@ class CafSandboxVerifier:
                 logger.warning("C-A-F verifier callable failed: %s", exc)
                 return False
         try:
-            proc = subprocess.run(
-                [sys.executable, str(verifier)],
-                input=json.dumps({"task": task, "answer": answer}),
-                capture_output=True,
-                text=True,
+            proc = run_untrusted_python(
+                [str(verifier)],
+                stdin_data=json.dumps({"task": task, "answer": answer}),
                 timeout=self.timeout_seconds,
             )
             return proc.returncode == 0
@@ -182,6 +183,7 @@ def save_routing_table(table: Any, path: Optional[Union[str, Path]] = None) -> P
 def load_routing_table(path: Optional[Union[str, Path]] = None) -> Any:
     """Load a RoutingTable from *path*; fail-open to an empty table."""
     from tools.model_routing_table import RoutingTable
+
     p = Path(path) if path is not None else default_routing_table_path()
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
