@@ -425,6 +425,73 @@ class TestStubSchemaDrift(unittest.TestCase):
             )
 
 
+    def test_doc_line_coverage_check_is_non_vacuous(self):
+        """The coverage check must be ABLE to fire.
+
+        If a refactor emptied entry.schema, or renamed the registry attribute, the
+        coverage assertion above would pass while testing nothing — reporting safety
+        it never measured. This pins the premise it depends on.
+        """
+        from tools.code_execution_tool import _TOOL_DOC_LINES
+
+        from tools.registry import registry
+        import tools.file_tools  # noqa: F401
+        import tools.web_tools  # noqa: F401
+
+        total = 0
+        for tool_name, _ in _TOOL_DOC_LINES:
+            entry = registry._tools.get(tool_name)
+            if entry:
+                total += len(entry.schema.get("parameters", {}).get("properties", {}))
+        self.assertGreaterEqual(
+            total, 15,
+            f"the registry exposed only {total} advertised parameters across the "
+            f"documented sandbox helpers, so the doc-line coverage check is passing "
+            f"vacuously"
+        )
+
+
+    def test_doc_lines_cover_all_schema_params(self):
+        """Every ADVERTISED schema parameter must appear in its _TOOL_DOC_LINES entry.
+
+        _TOOL_DOC_LINES is the model-facing description of the sandbox helpers, so a
+        parameter missing here is invisible to the model even though the handler accepts
+        it. Measured 2026-10-09: read_file's `query` was added to _TOOL_STUBS and to the
+        real schema by #192 but never to this list, and search_files' `offset`,
+        `output_mode` and `context` were missing for the same reason.
+
+        This asserts the ADVERTISED set, not everything the handler accepts: parameters
+        deliberately kept out of the schema (write_file/patch's `cross_profile`) are
+        correctly absent from the doc line and must stay absent.
+        """
+        from tools.code_execution_tool import _TOOL_DOC_LINES
+
+        from tools.registry import registry
+        import tools.file_tools  # noqa: F401 - registers read_file, write_file, patch, search_files
+        import tools.web_tools  # noqa: F401 - registers web_search, web_extract
+
+        for tool_name, text in _TOOL_DOC_LINES:
+            entry = registry._tools.get(tool_name)
+            if not entry:
+                continue  # not every documented helper is a registry tool
+            schema_params = set(
+                entry.schema.get("parameters", {}).get("properties", {}).keys()
+            ) - self._INTERNAL_PARAMS
+            if tool_name == "terminal":
+                # The sandbox terminal helper is foreground-only, so the params that
+                # only make sense for a supervised background run are blocked there and
+                # must NOT be documented - the same exclusion the stub test applies.
+                schema_params -= self._BLOCKED_TERMINAL_PARAMS
+            missing = {p for p in schema_params if p not in text}
+            self.assertEqual(
+                missing, set(),
+                f"_TOOL_DOC_LINES entry for '{tool_name}' omits advertised schema "
+                f"parameters: {missing}. The doc line is what the model sees inside "
+                f"execute_code, so an undocumented parameter is invisible there. "
+                f"Update _TOOL_DOC_LINES in code_execution_tool.py to include them."
+            )
+
+
     def test_generated_module_accepts_all_params(self):
         """Executing the generated hermes_tools module: every stub accepts all of
         its parameters as keyword arguments and forwards each one, by name and
