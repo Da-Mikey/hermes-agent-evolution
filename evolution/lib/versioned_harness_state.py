@@ -59,6 +59,49 @@ class HarnessVersion:
         )
 
 
+@dataclass
+class ReflectorRecord:
+    """A structured diagnosis of a REJECTED harness edit (issue #203).
+
+    The self-evolution loop invokes the proposer and the diagnosis in separate
+    subagent invocations, and the proposer was stateless with respect to its own
+    history: the diagnosis that rejected edit *N* never reached proposal *N+1*,
+    so the loop re-rolled instead of converging and every rejection taught the
+    next proposal nothing (Evo^2, arXiv:2610.13025 — one policy, two hats).
+
+    A record is scoped to a single **harness surface** (a prompt / tool / context
+    field key), not globally, so a rejection on one surface cannot pollute a
+    proposal for an unrelated one. Slice 1 persists the record and exposes it;
+    loading it into prompt assembly is slice 2.
+    """
+
+    surface: str
+    failed_predicate: str
+    input: str
+    rejected_edit: str = ""
+    nearest_passing_config: Optional[Dict[str, Any]] = None
+    timestamp: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ReflectorRecord":
+        nearest = data.get("nearest_passing_config")
+        return cls(
+            surface=str(data.get("surface", "")),
+            failed_predicate=str(data.get("failed_predicate", "")),
+            input=str(data.get("input", "")),
+            rejected_edit=str(data.get("rejected_edit", "")),
+            nearest_passing_config=(
+                dict(nearest) if isinstance(nearest, dict) else None
+            ),
+            timestamp=float(data.get("timestamp", time.time())),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
 class VersionedHarnessState:
     """Harness state manager tracking version history and enabling rollbacks."""
 
@@ -75,6 +118,7 @@ class VersionedHarnessState:
         )
         self.auto_save = auto_save
         self._history: List[HarnessVersion] = []
+        self._reflector: List[ReflectorRecord] = []
         if self.storage_file.exists():
             if not self.load():
                 self._init_first_version(initial_instructions)
@@ -115,6 +159,82 @@ class VersionedHarnessState:
     def history(self) -> List[HarnessVersion]:
         """Full list of version snapshots."""
         return list(self._history)
+
+    @property
+    def reflector_history(self) -> List[ReflectorRecord]:
+        """All persisted rejection diagnoses, oldest first."""
+        return list(self._reflector)
+
+    def record_rejection(
+        self,
+        surface: str,
+        failed_predicate: str,
+        input: str,
+        *,
+        rejected_edit: str = "",
+        nearest_passing_config: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ReflectorRecord:
+        """Persist the diagnosis of a rejected edit on one harness surface.
+
+        This is the half of the loop that was missing: the rejecting verdict is
+        written down, keyed by surface, so the next proposal for that same
+        surface can be generated against it instead of re-rolling blind.
+        """
+        if not (surface or "").strip():
+            raise ValueError("surface must be a non-empty harness surface key")
+        record = ReflectorRecord(
+            surface=surface.strip(),
+            failed_predicate=failed_predicate,
+            input=input,
+            rejected_edit=rejected_edit,
+            nearest_passing_config=nearest_passing_config,
+            metadata=metadata or {},
+        )
+        self._reflector.append(record)
+        if self.auto_save:
+            self.save()
+        return record
+
+    def reflector_records(self, surface: Optional[str] = None) -> List[ReflectorRecord]:
+        """Rejection diagnoses for one surface, or all of them (oldest first)."""
+        if surface is None:
+            return list(self._reflector)
+        key = surface.strip()
+        return [r for r in self._reflector if r.surface == key]
+
+    def reflector_context(self, surface: str, limit: int = 5) -> str:
+        """Render the most recent rejection diagnoses for *surface* as context.
+
+        This is the proposer-side input for slice 2 (prompt assembly is
+        deliberately untouched here). It returns ``""`` when the surface has no
+        rejection history, so a surface with a clean record gets exactly the
+        input it got before — the memory is purely additive. Only *this*
+        surface's records are rendered: a rejection elsewhere must not steer
+        this proposal.
+        """
+        key = (surface or "").strip()
+        records = self.reflector_records(key)
+        if not records:
+            return ""
+        window = records[-max(1, limit) :]
+        lines = [
+            f"[reflector] {len(records)} prior rejection(s) for surface "
+            f"{key!r} — do not repeat:"
+        ]
+        for rec in window:
+            nearest = (
+                json.dumps(rec.nearest_passing_config, sort_keys=True)
+                if rec.nearest_passing_config is not None
+                else "none recorded"
+            )
+            lines.append(
+                f"- rejected edit: {rec.rejected_edit or '(unspecified)'} | "
+                f"failed predicate: {rec.failed_predicate} | "
+                f"on input: {rec.input} | "
+                f"nearest passing config: {nearest}"
+            )
+        return "\n".join(lines)
 
     def update(
         self,
@@ -207,11 +327,19 @@ class VersionedHarnessState:
             for v in self._history
         ]
 
+    @staticmethod
+    def _parse_reflector(payload: Any) -> List[ReflectorRecord]:
+        """Parse the persisted reflector list, tolerating absence/legacy files."""
+        if not isinstance(payload, list):
+            return []
+        return [ReflectorRecord.from_dict(r) for r in payload if isinstance(r, dict)]
+
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize state and history to dictionary."""
+        """Serialize state, version history and reflector records."""
         return {
             "session_id": self.session_id,
             "history": [v.to_dict() for v in self._history],
+            "reflector": [r.to_dict() for r in self._reflector],
         }
 
     @classmethod
@@ -223,6 +351,7 @@ class VersionedHarnessState:
             state._history = [
                 HarnessVersion.from_dict(v) for v in hist_data if isinstance(v, dict)
             ]
+        state._reflector = cls._parse_reflector(data.get("reflector", []))
         return state
 
     def save(self, path: Optional[Union[str, Path]] = None) -> Path:
@@ -236,12 +365,25 @@ class VersionedHarnessState:
         return target
 
     def load(self, path: Optional[Union[str, Path]] = None) -> bool:
-        """Load history from disk."""
+        """Load history to disk.
+
+        A file written before reflector records existed has no ``reflector``
+        key and still loads — the rejection memory is additive, never a
+        migration requirement.
+        """
         target = Path(path) if path else self.storage_file
         if not target.exists():
             return False
         try:
             data = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                logger.warning(
+                    "Harness state file %s is not a JSON object — ignoring.", target
+                )
+                return False
+            # Assign before the history short-circuit: a reflector-only file must
+            # not silently lose its rejection memory when __init__ re-seeds v1.
+            self._reflector = self._parse_reflector(data.get("reflector", []))
             hist_data = data.get("history", [])
             if isinstance(hist_data, list) and hist_data:
                 self._history = [
