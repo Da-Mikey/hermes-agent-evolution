@@ -395,6 +395,102 @@ class TestFailureReasonClassification:
             "execute_code": {"exception:ModuleNotFoundError": 1}
         }
 
+    def test_exception_class_precedes_non_zero_exit_fallback(self, tmp_path):
+        """PRECEDENCE PIN (#184 slice 2). The exception rule sits *before* the
+        generic ``exit_code`` fallback, so a failing envelope that carries BOTH
+        a traceback and a non-zero exit tags ``exception:<Class>`` and never
+        ``non-zero-exit``.
+
+        This is the case the 2026-10-13 pre-merge review measured: the shipped
+        "#184 additions are entirely additive — no failure that already had a tag
+        is re-tagged" comment was FALSE for non-zero exits. Behaviour is the
+        better outcome (a blind retry becomes a correction), so it is pinned
+        here and the comment was corrected to match. The counterpart assertion
+        keeps the fallback alive: with no exception class present, a non-zero
+        exit still tags ``non-zero-exit``. Together they pin an ORDER, not a
+        one-off result.
+        """
+        p = _session(
+            tmp_path,
+            "r7b",
+            [
+                _asst("execute_code", "c1"),
+                _tool(
+                    "c1",
+                    _term(
+                        "Traceback (most recent call last):\n"
+                        "ZeroDivisionError: division by zero",
+                        exit_code=2,
+                    ),
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {
+            "execute_code": {"exception:ZeroDivisionError": 1}
+        }, "exception rule must win over the exit_code fallback"
+
+        # Counterpart: same failing shape, no exception class → fallback intact.
+        p2 = _session(
+            tmp_path,
+            "r7c",
+            [
+                _asst("execute_code", "c1"),
+                _tool("c1", _term("just some output", exit_code=2)),
+            ],
+        )
+        s2 = scan_session(p2)
+        assert s2["tool_failures_by_reason"] == {
+            "execute_code": {"non-zero-exit": 1}
+        }, "exit_code fallback must survive when no exception class is present"
+
+    def test_pre_existing_specific_tag_beats_exception_rule(self, tmp_path):
+        """The OTHER half of the additive claim, which IS true and worth
+        pinning: a pre-existing *specific* tag matched earlier in
+        ``_classify_failure_reason`` still wins over the newer exception rule.
+
+        Here the envelope carries both a "No such file or directory" hint
+        (``file-not-found``, matched before) and a traceback with an exception
+        class. ``file-not-found`` must win — the newer rule only ever re-tags
+        the generic ``non-zero-exit`` fallback, never an existing specific tag.
+        """
+        p = _session(
+            tmp_path,
+            "r7d",
+            [
+                _asst("execute_code", "c1"),
+                _tool(
+                    "c1",
+                    _term(
+                        "No such file or directory: '/tmp/missing.py'\n"
+                        "Traceback (most recent call last):\n"
+                        "FileNotFoundError: [Errno 2] No such file",
+                        exit_code=1,
+                    ),
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {"execute_code": {"file-not-found": 1}}
+
+        # Second, measured-in-this-cycle specific-tag case: ``_PARSE_RE`` lists
+        # ``valueerror``/``syntaxerror`` case-insensitively and is tested BEFORE
+        # the exception rule, so those two classes surface as ``parse-error``,
+        # never ``exception:ValueError``. Pinned because it was invisible until
+        # this test was written (the first draft of the test above asserted
+        # ``exception:ValueError`` and failed) — anyone re-ordering the rules
+        # now gets told which contract they are breaking.
+        p2 = _session(
+            tmp_path,
+            "r7e",
+            [
+                _asst("execute_code", "c1"),
+                _tool("c1", _term("ValueError: bad operand type", exit_code=1)),
+            ],
+        )
+        s2 = scan_session(p2)
+        assert s2["tool_failures_by_reason"] == {"execute_code": {"parse-error": 1}}
+
     def test_exception_class_match_is_case_sensitive(self, tmp_path):
         """All-caps prose must not be mistaken for an exception class name."""
         p = _session(
