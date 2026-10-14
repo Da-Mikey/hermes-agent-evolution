@@ -381,8 +381,14 @@ def _classify_failure_reason(content: Any) -> Optional[str]:
     if _NO_MATCH_RE.search(haystack):
         return "no-match"
     # #184 — deferred ``tool_call`` bridge: name the refusal shape. Ordered most
-    # specific first, and entirely additive: these tags are new, so no failure
-    # that already had a tag is re-tagged by them.
+    # specific first. CORRECTED (#184 slice 2, 2026-10-13): the claim that these
+    # rules were "entirely additive … no failure that already had a tag is
+    # re-tagged" is FALSE, and was measured so before merge. They sit BEFORE the
+    # generic ``exit_code`` fallback at the end of this function, so a non-zero
+    # exit whose structured text names a bridge shape is re-tagged away from
+    # ``non-zero-exit``. What is true, and is pinned by
+    # ``test_pre_existing_specific_tag_beats_exception_rule``: every
+    # pre-existing *specific* tag matched EARLIER in this function still wins.
     if _BRIDGE_UNKNOWN_TOOL_RE.search(haystack):
         return "bridge-unknown-tool"
     if _BRIDGE_MISSING_FIELD_RE.search(haystack):
@@ -393,7 +399,12 @@ def _classify_failure_reason(content: Any) -> Optional[str]:
     # Python exception class inside the traceback. Without this the class was
     # invisible: KeyError, ModuleNotFoundError and a plain non-zero exit all
     # rendered as the same tag, so the agent retried rather than corrected.
-    # Last specific rule, so every pre-existing tag keeps winning.
+    # This rule sits BEFORE the ``exit_code`` fallback too, so an exception class
+    # deliberately re-tags what would otherwise have rendered as the opaque
+    # ``non-zero-exit`` (pinned by
+    # ``test_exception_class_precedes_non_zero_exit_fallback``). Every
+    # pre-existing *specific* tag still wins, being matched earlier in this
+    # function — that is the additive part, and only that part.
     exc = _EXCEPTION_CLASS_RE.search(haystack)
     if exc:
         return f"exception:{exc.group(1)}"
