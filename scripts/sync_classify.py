@@ -60,7 +60,11 @@ def _tests(source: str) -> dict[str, str]:
 
 def _at(ref: str, path: str) -> dict[str, str]:
     blob = subprocess.run(
-        ["git", "show", f"{ref}:{path}"], capture_output=True, text=True
+        ["git", "show", f"{ref}:{path}"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return _tests(blob.stdout) if blob.returncode == 0 else {}
 
@@ -70,16 +74,26 @@ def _paths(fork: str, roots: list[str]) -> list[str]:
         ["git", "ls-tree", "-r", "--name-only", fork, "--", *roots],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     ).stdout.split()
     return [p for p in listed if p.endswith(".py")]
 
 
 def main() -> int:
+    if any(
+        arg == "--upstream" or arg.startswith("--upstream=") for arg in sys.argv[1:]
+    ):
+        from sync_conflict_classify import main as classify_conflicts
+
+        return classify_conflicts()
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base", default="v2026.7.20", help="merge-base ref")
     ap.add_argument("--fork", default="origin/main", help="fork ref")
-    ap.add_argument("--show-diff", action="store_true", help="print each FORK-MODIFIED diff")
+    ap.add_argument(
+        "--show-diff", action="store_true", help="print each FORK-MODIFIED diff"
+    )
     ap.add_argument("roots", nargs="*", default=["tests/"])
     args = ap.parse_args()
 
