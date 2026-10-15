@@ -408,7 +408,7 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 
 # Fields that must never change after creation: ``id`` is a path component under OUTPUT_DIR, so an
 # update could leak ``../escape``/absolute/nested values into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "decision_ledger", "decision_repeat_claim"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -2104,6 +2104,7 @@ def create_job(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: bool = False,
+    decision: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -2221,6 +2222,8 @@ def create_job(
         if value is not None:
             job[key] = value
 
+    from cron.decision_ledger import capture
+    job["decision_ledger"] = capture(decision, workdir=job.get("workdir"))
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
     return job
@@ -2403,6 +2406,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if "decision" in updates:
+            from cron.decision_ledger import capture
+            updated["decision_ledger"] = capture(updated.pop("decision"), workdir=updated.get("workdir"))
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -2777,6 +2783,7 @@ def _record_run_outcome(
     if tool_calls is not None:
         job["last_tool_calls"] = tool_calls
     job.pop("manual_run_at", None)
+    job.pop("decision_repeat_claim", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
@@ -2792,7 +2799,7 @@ def _record_run_outcome(
         job.pop("last_fire_error", None)
         job.pop("failure_backoff_skips", None)
         job["failure_streak"] = 0
-    elif status in _SYNTHETIC_FAILURE_STATUSES:
+    elif status in _SYNTHETIC_FAILURE_STATUSES or status == "decision_reopened":
         # Recorded (last_status/last_error) but excluded from the
         # failure-streak circuit breaker (#70 review).
         pass
@@ -2898,6 +2905,14 @@ def mark_job_run(
                     job_id)
                 return False
         now = _hermes_now().isoformat()
+        ledger = job.get("decision_ledger")
+        if isinstance(ledger, dict) and ledger.get("state") == "reopened":
+            # No action ran: preserve the pause and repeat budget, including one-shots.
+            _record_run_outcome(job, False, error, delivery_error, "decision_reopened", now,
+                                tool_calls=tool_calls)
+            job.update(enabled=False, state="paused", next_run_at=None)
+            save_jobs(jobs)
+            return True
         _record_run_outcome(job, success, error, delivery_error, status, now, tool_calls=tool_calls)
         _advance_after_run(job, now)
         from cron import quota_hold
@@ -3056,6 +3071,10 @@ def claim_dispatch(job_id: str) -> bool:
             return False
         # Claim this dispatch before the side effect runs.
         repeat["completed"] = completed + 1
+        ledger = job.get("decision_ledger")
+        if isinstance(ledger, dict) and ledger.get("state") == "active":
+            job["decision_repeat_claim"] = {"decision_id": ledger.get("id"),
+                                            "completed": completed + 1}
         save_jobs(jobs)
         logger.debug("Job '%s': claimed dispatch %d/%d", label, repeat["completed"], times)
         return True

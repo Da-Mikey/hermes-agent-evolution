@@ -481,11 +481,16 @@ def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[
 
 
 def _harm_blocked_tool_result(reason: str) -> str:
+    from tools.tool_failure_classifier import SAFETY_GATE_RECOVERY_HINT
+
     return json.dumps(
         {
             "error": f"Tool execution blocked by safety gate: {reason}",
             "status": "blocked",
             "harm_gate": "agent_process_bench",
+            "reason": "safety-gate-blocked",
+            "retryable": False,
+            "recovery_hint": SAFETY_GATE_RECOVERY_HINT,
         },
         ensure_ascii=False,
     )
@@ -1329,6 +1334,22 @@ def _commit_tool_result(
             config=budget,
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
+
+    # The delegated controller consumes the real result before the append-only
+    # persistence fence. Advice remains tool data, never a synthetic user turn.
+    escalation = getattr(agent, "_delegation_escalation", None)
+    if escalation is not None:
+        from tools.delegation_escalation import EscalationRun
+        if isinstance(escalation, EscalationRun):
+            try:
+                advice = escalation.contact(function_name, function_result, blocked=blocked)
+                if advice:
+                    if _is_multimodal_tool_result(persisted_result):
+                        _append_subdir_hint_to_multimodal(persisted_result, advice)
+                    else:
+                        persisted_result += advice
+            except Exception:
+                logging.warning("Delegation contact processing failed", exc_info=True)
 
     subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
     if subdir_hints:

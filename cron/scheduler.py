@@ -3380,6 +3380,10 @@ def _run_job_impl(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    from cron.decision_ledger import preflight
+    if (decision_error := preflight(job)) is not None:
+        return False, "", "", decision_error
+
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
