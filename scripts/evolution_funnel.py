@@ -180,6 +180,10 @@ def compute_funnel(
         # outflow
         "merged": len(merged) if isinstance(merged, list) else 0,
         "skipped": len(skipped) if isinstance(skipped, list) else 0,
+        "decisions_reopened": sum(
+            1 for path in (evolution_dir / "decision-reopens").glob("*.json")
+            if str(_as_dict(_load_json(path)).get("created_at", "")).startswith(date + "T")
+        ),
         # test-quality (#1210) — longitudinal mock-ratio trend
         "mock_ratio": mock_ratio_value,
     }
