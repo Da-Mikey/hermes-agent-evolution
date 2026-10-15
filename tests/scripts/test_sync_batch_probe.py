@@ -1,5 +1,6 @@
 """Tests for scripts/sync_batch_probe.py — probe core (issue #3457)."""
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -130,6 +131,27 @@ def test_probe_tag_reports_known_conflicts(syn_repo, monkeypatch):
         encoding="utf-8",
     ).stdout
     assert before == after
+    cli = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[2] / "scripts/sync_batch_probe.py"),
+            "--source",
+            "main",
+            "--tags",
+            "vTEST",
+            "clean",
+            "unrelated",
+        ],
+        cwd=syn_repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert cli.returncode == 2, cli.stderr
+    reports = json.loads(cli.stdout)
+    assert [p["total"] for p in reports] == [probe.total, 0, 0]
+    assert reports[-1]["error"] and reports[-1]["verdict"] == "OWNER-SESSION"
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=syn_repo,

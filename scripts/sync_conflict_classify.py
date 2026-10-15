@@ -74,8 +74,8 @@ def _bucket(path: str) -> str:
 def _verdict_for(base, fork, upstream) -> str:
     """Assign a verdict from the three side-blobs (None == path absent).
 
-    One consistent rule, no 3x3 case grid: compare each side vs base. The side
-    that did NOT change wins by default — so a fork deletion (fork=None) where
+    Compare each side vs base. Keep the changed side when the other side is
+    unchanged — so a fork deletion (fork=None) where
     upstream kept the file is ``fork-keeps`` (preserve the deletion), and a
     fork addition (fork=new, upstream=None) is also ``fork-keeps`` (preserve
     the new file). Only when BOTH sides changed do we hand off to ``manual``.
@@ -157,7 +157,7 @@ def _read_paths_file(path: str) -> list[str]:
     p = Path(path)
     if not p.exists():
         raise SystemExit(f"paths file not found: {path}")
-    text = p.read_text(encoding="utf-8", errors="surrogateescape")
+    text = p.read_bytes().decode("utf-8", "surrogateescape")
     return [
         line
         for line in (text.split("\0") if "\0" in text else text.splitlines())
