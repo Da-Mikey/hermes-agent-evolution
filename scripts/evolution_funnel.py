@@ -164,7 +164,13 @@ def compute_funnel(
         except (TypeError, ValueError):
             mock_ratio_value = None
 
+    try:
+        from scripts.delegation_escalation_report import summarize as escalation_summary
+    except ModuleNotFoundError:  # Direct script invocation outside the checkout.
+        from delegation_escalation_report import summarize as escalation_summary
+
     return {
+        "delegation_escalation": escalation_summary(evolution_dir / "trajectories", date),
         "date": date,
         # inflow
         "research_proposals": int(issues.get("total_proposals", 0) or 0),

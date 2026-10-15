@@ -1300,6 +1300,22 @@ def _commit_tool_result(
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
 
+    # The delegated controller consumes the real result before the append-only
+    # persistence fence. Advice remains tool data, never a synthetic user turn.
+    escalation = getattr(agent, "_delegation_escalation", None)
+    if escalation is not None:
+        from tools.delegation_escalation import EscalationRun
+        if isinstance(escalation, EscalationRun):
+            try:
+                advice = escalation.contact(function_name, function_result, blocked=blocked)
+                if advice:
+                    if _is_multimodal_tool_result(persisted_result):
+                        _append_subdir_hint_to_multimodal(persisted_result, advice)
+                    else:
+                        persisted_result += advice
+            except Exception:
+                logging.warning("Delegation contact processing failed", exc_info=True)
+
     subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
     if subdir_hints:
         if _is_multimodal_tool_result(persisted_result):
