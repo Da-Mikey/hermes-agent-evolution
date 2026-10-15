@@ -75,3 +75,58 @@ def test_safety_refusal_stops_dispatch_and_survives_recovery(tmp_path, monkeypat
     }) is None
     assert classify_tool_failure("write_file", "connection timed out").should_retry
 
+
+@pytest.mark.parametrize("dispatch", ["sequential", "concurrent"])
+def test_executor_publishes_terminal_refusal_as_failure(tmp_path, monkeypatch, dispatch):
+    from unittest.mock import patch
+    from run_agent import AIAgent
+    import model_tools
+    from scripts.introspection_extract import _classify_failure_reason
+    from agent.display import _detect_tool_failure
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config = {"tool_failure_recovery": {"enabled": True}}
+    definitions = [{"type": "function", "function": {
+        "name": name, "description": name,
+        "parameters": {"type": "object", "properties": {}},
+    }} for name in ("terminal", "write_file")]
+    with (
+        patch("model_tools.get_tool_definitions", return_value=definitions),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch("hermes_cli.config.load_config_readonly", return_value=config),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key", base_url="https://example.invalid/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    handler = Mock(side_effect=AssertionError("blocked call reached handler"))
+    monkeypatch.setattr(model_tools, "handle_function_call", handler)
+    monkeypatch.setattr(agent, "_invoke_tool", handler)
+    report = home / "report.md"
+    calls = [SimpleNamespace(
+        id=name, type="function",
+        function=SimpleNamespace(name=name, arguments=json.dumps(args)),
+    ) for name, args in (
+        ("terminal", {"command": "cat .ssh/id_rsa"}),
+        ("write_file", {"path": str(report), "content": "Audit: protect .ssh/id_rsa"}),
+    )]
+    messages = []
+    execute = getattr(agent, f"_execute_tool_calls_{dispatch}")
+    execute(SimpleNamespace(tool_calls=calls, content=""), messages, f"safety-{dispatch}")
+    assert len(messages) == len(calls)
+    for message in messages:
+        result = message["content"]
+        assert "Non-retryable: safety_gate_blocked" in result
+        assert "Recovery strategy: surface_blocker" in result
+        assert _classify_failure_reason(result) == "safety-gate-blocked"
+        assert _detect_tool_failure(message["tool_call_id"], result)[0]
+        assert "exit_code" not in json.loads(result)  # no process was started
+    handler.assert_not_called()
+    assert not report.exists()
+    assert not _detect_tool_failure("terminal", {"exit_code": 0, "output": "ok"})[0]
