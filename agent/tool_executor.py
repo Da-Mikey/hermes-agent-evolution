@@ -464,11 +464,16 @@ def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[
 
 
 def _harm_blocked_tool_result(reason: str) -> str:
+    from tools.tool_failure_classifier import SAFETY_GATE_RECOVERY_HINT
+
     return json.dumps(
         {
             "error": f"Tool execution blocked by safety gate: {reason}",
             "status": "blocked",
             "harm_gate": "agent_process_bench",
+            "reason": "safety-gate-blocked",
+            "retryable": False,
+            "recovery_hint": SAFETY_GATE_RECOVERY_HINT,
         },
         ensure_ascii=False,
     )
