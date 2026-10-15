@@ -54,7 +54,9 @@ def _resolve(ref: str) -> str:
 def _tree(ref: str) -> dict[str, str]:
     # Object IDs compare binary bytes without lossy decoding; mode also matters.
     output = subprocess.run(
-        ["git", "ls-tree", "-r", "-z", ref], capture_output=True, check=True
+        ["git", "ls-tree", "--full-tree", "-r", "-z", ref],
+        capture_output=True,
+        check=True,
     ).stdout
     entries = {}
     for record in output.split(b"\0"):

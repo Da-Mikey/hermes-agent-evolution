@@ -91,6 +91,7 @@ def test_cli_preserves_binary_mode_deletion_evidence_and_counts(repo, tmp_path):
             "--out-dir",
             str(out),
         ],
+        cwd=tmp_path / ".github",
         capture_output=True,
         text=True,
         encoding="utf-8",
