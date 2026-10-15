@@ -396,6 +396,38 @@ def check_merge_policy_with_quality(
             violations.extend(check_safety_gate(files, source_contents=source_contents))
         except ImportError:
             pass
+    # Guard-rule table admission (#204): the guard rules the safety-review gate
+    # above enforces are themselves a shipped artefact, so they are checked for
+    # structural conflicts on EVERY merge.
+    #
+    # Deliberately NOT gated on ``source_contents``: the rule table is a property
+    # of the shipped code, not of the diff under review, and the two content gates
+    # above skip entirely when no contents are supplied. The first slice of #204
+    # hosted its conflict checker on this path behind exactly that guard — and
+    # nothing on the production path ever supplies ``source_contents``, so the
+    # checker was unreachable and protected nothing. Unconditional here, and
+    # fail-closed on both a conflict and an unimportable module, because a safety
+    # control that cannot run must not read as having passed.
+    try:
+        # The repo root must be importable for `evolution.lib.*`: running this
+        # file as a script puts only `scripts/` on sys.path (`sys.path[0]`), so
+        # without this the import below would fail on the production path and the
+        # fail-closed branch would block every merge. Cheap, and makes the
+        # fail-closed branch genuinely exceptional.
+        _repo_root = str(Path(__file__).resolve().parents[1])
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from evolution.lib.safety_review_gate import find_rule_conflicts  # noqa: E402
+
+        for _conflict in find_rule_conflicts():
+            violations.append(f"GUARD_RULE_CONFLICT: {_conflict}")
+    except ImportError:
+        violations.append(
+            "GUARD_RULE_TABLE_UNVERIFIABLE: evolution.lib.safety_review_gate could "
+            "not be imported — cannot verify the guard-rule table is conflict-free; "
+            "refusing unattended self-merge (fix the deploy or merge with human review)"
+        )
     # Flip gate (#1447): per-example P→F regression check. Opt-in per skill —
     # when flip_gate_results is None the gate is skipped entirely.
     if flip_gate_results is not None:
