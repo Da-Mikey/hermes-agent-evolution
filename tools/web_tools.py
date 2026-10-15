@@ -41,12 +41,8 @@ def _env_value(name: str) -> str:
     Without this, a config-only ``SEARXNG_URL`` (or any provider key) leaves the backend auto-detect cascade
     and ``check_web_api_key()`` blind to it. See #34290.
     """
-    try:
-        from hermes_cli.config import get_env_value
-        val = get_env_value(name)
-    except Exception:
-        val = None
-    return ((os.getenv(name, "") if val is None else val) or "").strip()
+    from agent.web_search_provider import get_provider_env
+    return get_provider_env(name)
 
 
 def _has_env(name: str) -> bool:
