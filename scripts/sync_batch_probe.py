@@ -190,7 +190,11 @@ def main() -> int:
         help="write JSON, markdown and NUL-delimited conflict lists",
     )
     args = ap.parse_args()
-    source = _resolve(args.source)  # pin once for the entire batch
+    try:
+        source = _resolve(args.source)  # pin once for the entire batch
+    except subprocess.CalledProcessError as exc:
+        print(exc.stderr.strip(), file=sys.stderr)
+        return 2
     probes = [_probe_tag(source, t) for t in args.tags]
     payload = (
         json.dumps([{**vars(p), "verdict": p.verdict} for p in probes], indent=2) + "\n"

@@ -46,6 +46,7 @@ def repo(tmp_path, monkeypatch):
     git("add", ".")
     git("commit", "-qm", "base")
     git("tag", "base")
+    Path("fork-only").write_bytes(b"new fork")
     for p in ("cron/b", ".github/c", "space ü.txt"):
         Path(p).write_bytes(b"fork\x00\xfe")
     Path("tools/e").unlink()
@@ -57,9 +58,10 @@ def repo(tmp_path, monkeypatch):
     for p in ("agent/a", ".github/c", "space ü.txt"):
         Path(p).write_bytes(b"upstream\x00\xfd")
     Path("hermes_cli/d").unlink()
+    Path("upstream-only").write_bytes(b"new upstream")
     git("add", "-A")
     git("commit", "-qm", "upstream")
-    return paths
+    return [*paths, "fork-only", "upstream-only"]
 
 
 def test_cli_preserves_binary_mode_deletion_evidence_and_counts(repo, tmp_path):
@@ -101,6 +103,8 @@ def test_cli_preserves_binary_mode_deletion_evidence_and_counts(repo, tmp_path):
                 "fork-keeps",
                 "manual",
                 "fork-keeps",
+                "fork-keeps",
+                "upstream-wins",
             ],
         )
     )
@@ -110,7 +114,7 @@ def test_cli_preserves_binary_mode_deletion_evidence_and_counts(repo, tmp_path):
         sum(counts.values()) for counts in report["summary"]["by_bucket"].values()
     ) == len(expected)
     for v in report["verdicts"]:
-        assert v["base_entry"]
+        assert v["base_exists"] == (v["base_entry"] is not None)
         assert v["fork_exists"] == (v["fork_entry"] is not None)
         assert v["upstream_exists"] == (v["upstream_entry"] is not None)
     assert report["fork"] == git("rev-parse", "fork")
