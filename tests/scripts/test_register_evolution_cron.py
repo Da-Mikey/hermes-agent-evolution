@@ -1,5 +1,8 @@
 """Tests for scripts.register_evolution_cron."""
 
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -639,75 +642,120 @@ class TestInstallEvolutionHelpers:
 
         assert mod._install_evolution_helpers(repo) == []
 
-
-    def test_installs_siblings_the_family_imports(self, tmp_path, monkeypatch):
-        """The ``evolution_*.py`` glob cannot see the modules the family imports
-        from OUTSIDE that prefix (funnel -> delegation_escalation_report). Those
-        siblings must be deployed too: the scheduler executes from
-        HERMES_HOME/scripts, so an undeployed sibling is an ImportError that took
-        the whole job down — evolution-funnel died outright on 2026-10-16."""
+    def test_installs_only_imported_siblings_despite_unparseable_family_file(
+        self, tmp_path, monkeypatch
+    ):
+        """Missing/non-local imports and one broken file cannot stop the install."""
         mod = _import_module()
         repo = self._fake_repo(tmp_path)
         scripts = repo / "scripts"
-        (scripts / "delegation_escalation_report.py").write_text("# report\n")
-        # Both spellings the funnel uses: the checkout form and the copy form.
+        (scripts / "delegation_escalation_report.py").write_text("# report\n", encoding="utf-8")
         (scripts / "evolution_funnel.py").write_text(
-            "try:\n"
-            "    from scripts.delegation_escalation_report import summarize\n"
-            "except ModuleNotFoundError:\n"
-            "    from delegation_escalation_report import summarize\n"
-        )
-        home = tmp_path / "hermes-home"
-        monkeypatch.setenv("HERMES_HOME", str(home))
-
-        installed = mod._install_evolution_helpers(repo)
-
-        assert "delegation_escalation_report.py" in installed
-        assert (home / "scripts" / "delegation_escalation_report.py").is_file()
-        # Not a blanket copy of the directory.
-        assert not (home / "scripts" / "helper.py").exists()
-        assert not (home / "scripts" / "register_evolution_cron.py").exists()
-
-    def test_sibling_scan_ignores_absent_modules(self, tmp_path, monkeypatch):
-        """Only names that exist as scripts/<name>.py are installed: an import of
-        json/math or of a module living elsewhere pulls nothing in."""
-        mod = _import_module()
-        repo = self._fake_repo(tmp_path)
-        (repo / "scripts" / "evolution_funnel.py").write_text(
             "import json\n"
             "import math\n"
             "from pathlib import Path\n"
             "from evolution.lib.telemetry_guard import validate\n"
-            "from delegation_escalation_report import summarize\n"
+            "from absent_sibling import missing\n"
+            "try:\n"
+            "    from scripts.delegation_escalation_report import summarize\n"
+            "except ModuleNotFoundError:\n"
+            "    from delegation_escalation_report import summarize\n",
+            encoding="utf-8",
         )
+        (scripts / "evolution_broken.py").write_text("def (:\n", encoding="utf-8")
         home = tmp_path / "hermes-home"
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
 
         installed = mod._install_evolution_helpers(repo)
 
-        assert sorted(installed) == [
-            "evolution_funnel.py",
-            "evolution_metrics.py",
-            "evolution_realized_impact.py",
-        ]
-        assert not (home / "scripts" / "json.py").exists()
-        assert not (home / "scripts" / "delegation_escalation_report.py").exists()
+        assert set(installed) == {
+            "evolution_funnel.py", "evolution_metrics.py",
+            "evolution_realized_impact.py", "evolution_broken.py",
+            "delegation_escalation_report.py",
+        }
+        assert {path.name for path in (home / "scripts").iterdir()} == set(installed)
+        for unrelated in ("json.py", "absent_sibling.py", "helper.py",
+                          "register_evolution_cron.py"):
+            assert not (home / "scripts" / unrelated).exists()
 
-    def test_unparseable_family_file_does_not_block_the_deploy(
+    def test_installed_funnel_runs_with_and_without_optional_sidecar(
         self, tmp_path, monkeypatch
     ):
-        """A syntax error in one family file must not abort the whole install —
-        the scan is fail-open and the file is still mirrored."""
+        """Real installed scripts must run without checkout or editable imports."""
         mod = _import_module()
-        repo = self._fake_repo(tmp_path)
-        (repo / "scripts" / "evolution_broken.py").write_text("def (:\n")
         home = tmp_path / "hermes-home"
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME", str(home))
+        mod._install_evolution_helpers(SCRIPT.parents[1])
+        installed = home / "scripts"
+        evolution = home / "evolution"
+        trajectories = evolution / "trajectories"
+        trajectories.mkdir(parents=True)
+        date = "2026-10-15"
+        (trajectories / "example.json").write_text(json.dumps({
+            "date": date,
+            "entries": [{"tool": "delegation_escalation_report", "args_summary": {
+                "schema": "delegation-escalation-v1", "contacts": 3,
+                "consultations": 1, "added_cost_usd": 0.25,
+            }}],
+        }), encoding="utf-8")
+        (evolution / "integration").mkdir()
+        (evolution / "integration" / f"{date}.json").write_text(
+            json.dumps({"merged": [], "skipped": []}), encoding="utf-8"
+        )
+        # No credentials, gh/git executables, PYTHONPATH, or site-packages.
+        # -S excludes editable checkout .pth files; the scripts use stdlib only.
+        env = {
+            "HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
+            "HERMES_HOME": str(home), "EVOLUTION_PROFILE_DIR": str(evolution),
+            "PATH": "", "TZ": "UTC", "LANG": "C.UTF-8",
+        }
+        if "SYSTEMROOT" in os.environ:
+            env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
 
-        installed = mod._install_evolution_helpers(repo)
+        def run(*args, cwd=tmp_path):
+            result = subprocess.run(
+                [sys.executable, "-E", "-S", "-B", *map(str, args)],
+                cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            return result
 
-        assert "evolution_broken.py" in installed
-        assert "evolution_funnel.py" in installed
+        run(installed / "evolution_funnel.py", date)
+        record = json.loads((evolution / "metrics.jsonl").read_text(encoding="utf-8").strip())
+        sidecar = record["delegation_escalation"]
+        assert sidecar["runs"] == 1
+        assert sidecar["contacts"] == 3
+        assert sidecar["consultations"] == 1
+        assert sidecar["added_cost_usd"] == 0.25
+        assert record["date"] == date
+        assert record["merged"] == 0
+        assert (evolution / "funnel-summary.txt").is_file()
+
+        # Resolve both real non-prefixed dependencies from the installed directory.
+        # The evaluator must actually load its dataset, not just swallow ImportError.
+        imports = run("-c", (
+            "import json, pathlib, delegation_escalation_report as report; "
+            "import evolution_evaluator as evaluator; import eval_tasks; "
+            "assert evaluator._EVAL_TASK_SET_OK; "
+            "assert eval_tasks.load_task_set(); "
+            "print(json.dumps([str(pathlib.Path(m.__file__).resolve()) "
+            "for m in (report, evaluator, eval_tasks)]))"
+        ), cwd=installed)
+        assert all(Path(path).parent == installed
+                   for path in json.loads(imports.stdout))
+
+        # A partial/old install must still record the cycle and warn, using the
+        # real import failure in a fresh interpreter rather than a patched global.
+        (installed / "delegation_escalation_report.py").unlink()
+        degraded = run(installed / "evolution_funnel.py", date)
+        record = json.loads((evolution / "metrics.jsonl").read_text(encoding="utf-8").strip())
+        assert record["delegation_escalation"] is None
+        assert record["date"] == date
+        assert record["merged"] == 0
+        assert "delegation_escalation_report is not importable" in degraded.stderr
 
 
 class TestEnsureEvolutionLabels:
