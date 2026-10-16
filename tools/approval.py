@@ -706,16 +706,10 @@ def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
         if ctx.name == "single_query":
             result.update(pattern_key=pattern_key, description=description)
         return result
-    try:
-        from tools.tirith_security import check_command_security
-        tirith = check_command_security(command)
-    except ImportError:
-        if _tirith_fail_open():
-            return None
-        return {"approved": False, "message": (
-            "BLOCKED: the Tirith security scanner could not be imported and security.tirith_fail_open is false, "
-            f"so this command cannot be silently allowed — and {ctx.clause}. "
-            f"Find an alternative approach, install tirith, or set approvals.{ctx.cfg_key}: approve in config.yaml.")}
+    tirith = _tirith_scan(command)
+    if tirith.get("configuration_error"):
+        return {"approved": False, "message": tirith["summary"],
+                "failure_class": "configuration_error"}
     if tirith.get("action") in ("block", "warn"):
         return block(_format_tirith_description(tirith))
     return None
@@ -1194,7 +1188,12 @@ def _tirith_scan(command: str) -> dict:
         from tools.tirith_security import check_command_security
         return check_command_security(command)
     except ImportError:
-        if _tirith_fail_open():
+        from tools.tirith_config import TirithConfigurationError, configuration_error_result
+        try:
+            fail_open = _tirith_fail_open()
+        except TirithConfigurationError:
+            return configuration_error_result()
+        if fail_open:
             return {"action": "allow", "findings": [], "summary": ""}
         return {"action": "warn", "summary": "Tirith unavailable (fail-closed)", "findings": [{
             "rule_id": "tirith-import-error", "severity": "HIGH",
@@ -1244,6 +1243,10 @@ def check_all_command_guards(command: str, env_type: str,
     # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
     # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
     tirith_result = _tirith_scan(command)
+    # A missing policy cannot be approved or cached as an ordinary scan finding.
+    if tirith_result.get("configuration_error"):
+        return {"approved": False, "message": tirith_result["summary"],
+                "failure_class": "configuration_error"}
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     warnings = []
     session_key = get_current_session_key()
