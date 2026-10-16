@@ -116,8 +116,8 @@ def test_loopback_destination_is_not_exfiltration():
 
     The exfil arm matched a network verb plus any scheme-qualified address later in the
     same text, so a loopback target scored 1.0 and was refused before the tool ran, while
-    a genuinely remote target was indistinguishable from it. Only the destination
-    separates the two cases, so only the destination may decide.
+    a genuinely remote target was indistinguishable from it. Plain literal local
+    targets may be exempted when no routing override or parse uncertainty is visible.
 
     Commands are synthetic input to the real gate helper; none are executed.
     """
@@ -139,6 +139,10 @@ def test_loopback_destination_is_not_exfiltration():
     ):
         assert g("terminal", {"command": f"{verb} -s -m 5 {local}"}) is None, local
 
+    assert g("terminal", {"command": (
+        "curl -fsS --max-time 5 --connect-timeout 2 http://localhost/health"
+    )}) is None
+
     # A host that merely begins with a loopback literal is still remote, and every
     # genuinely remote destination must keep flagging.
     for remote in (
@@ -157,8 +161,8 @@ def test_loopback_destination_is_not_exfiltration():
     assert reason is not None and "exfiltration" in reason, piped
 
 
-def test_loopback_exemption_requires_a_complete_valid_authority():
-    """Ambiguous authorities stay visible, along with other destinations and risks."""
+def test_loopback_exemption_requires_an_unambiguous_destination():
+    """Authorities and command context must agree; other risks stay visible."""
     import agent.tool_executor as te
     from evolution.lib import agent_process_bench as apb
 
@@ -198,6 +202,46 @@ def test_loopback_exemption_requires_a_complete_valid_authority():
         "curl http://localhost/health https://example.com/collect",
         "curl https://example.com/collect http://localhost/health",
         "curl http://localhost/redirect?next=https://example.com/collect",
+        "curl --connect-to localhost:80:203.0.113.10:80 http://localhost/",
+        "curl http://localhost/ --connect-to=localhost:80:203.0.113.10:80",
+        "curl --resolve localhost:80:203.0.113.10 http://localhost/",
+        "curl --expand-connect-to={{route}} http://localhost/",
+        "curl --url=example.com http://localhost/",
+        "curl --proxy 203.0.113.10:8080 http://localhost/",
+        "curl --PROXY=203.0.113.10:8080 HTTP://LOCALHOST/",
+        "curl --proxy1.0 203.0.113.10:8080 http://localhost/",
+        "curl --preproxy 203.0.113.10:1080 http://localhost/",
+        "curl --socks4 203.0.113.10:1080 http://localhost/",
+        "curl --socks4a 203.0.113.10:1080 http://localhost/",
+        "curl --socks5 203.0.113.10:1080 http://localhost/",
+        "curl --socks5-hostname 203.0.113.10:1080 http://localhost/",
+        "curl -x 203.0.113.10:8080 http://localhost/",
+        "curl -sx203.0.113.10:8080 http://localhost/",
+        "curl --config=routes.txt http://localhost/",
+        "curl -K routes.txt http://localhost/",
+        "curl -sKroutes.txt http://localhost/",
+        "curl --alt-svc routes.txt https://localhost/",
+        "curl --location http://localhost/",
+        "curl --location-trusted http://localhost/",
+        "curl --follow http://localhost/",
+        "curl -L http://localhost/",
+        "curl http://localhost/ -sSL",
+        "curl http://localhost/; curl -x203.0.113.10:8080 http://127.0.0.1/",
+        "curl '--connect-to' localhost:80:203.0.113.10:80 http://localhost/",
+        'curl --connec""t-to localhost:80:203.0.113.10:80 http://localhost/',
+        "curl --noproxy '' http://localhost/",
+        "http_proxy=203.0.113.10:8080 curl http://localhost/",
+        "HTTPS_PROXY=203.0.113.10:8080 curl https://localhost/",
+        "ALL_PROXY=203.0.113.10:8080 curl http://localhost/",
+        "NO_PROXY=example.com curl http://localhost/",
+        "CURL_HOME=/tmp/config curl http://localhost/",
+        "XDG_CONFIG_HOME=/tmp/config curl http://localhost/",
+        "HOME=/tmp/config curl http://localhost/",
+        "curl $options http://localhost/",
+        "curl `options` http://localhost/",
+        "curl --connec\\t-to localhost:80:203.0.113.10:80 http://localhost/",
+        'curl "http://localhost/"',
+        "curl 'http://localhost/",
     ):
         reason = te._harm_gate_block_reason("terminal", {"command": command})
         assert reason is not None and "exfiltration" in reason, command

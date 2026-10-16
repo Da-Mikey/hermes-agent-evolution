@@ -12,14 +12,23 @@ BLOCK_THRESHOLD = 1.0
 
 _SHELL_TOOLS = ("shell", "terminal", "bash")
 
-# A loopback destination is not exfiltration. The exfil arm below matched a network verb
-# plus any scheme-qualified address later in the text, so a local health check against a
-# service on this machine scored 1.0 and was refused before the tool ran. That is the same
-# shape as the root-delete bug directly below: the pattern never looked at its target. Only
-# the target separates the two cases, so only the target may decide. Loopback addresses are
-# removed before matching; every other destination still flags.
-# The pipe-into-network-verb arm is deliberately left alone: once its address is gone there
-# is no target left to judge, so it fails closed rather than assuming the best.
+# Plain literal loopback health checks should not score as exfiltration. Withhold that
+# exemption when visible routing/configuration or shell uncertainty could change the
+# destination. This is a lexical risk heuristic, not proof of network confinement:
+# ambient proxy settings, config files and command implementations are not inspected.
+# The pipe-into-network-verb arm and all other harm categories remain unchanged.
+# Inspect the whole text, including options after a URL and later commands. Short
+# options may be clustered or carry attached arguments; overmatching their arguments
+# is conservative. Do not try to interpret quoted/escaped/expanded shell programs.
+_ROUTING_CONTEXT_RE = re.compile(
+    r"[\"'\\$`\x00-\x1f\x7f]"
+    r"|(?<![\w-])--(?i:(?:expand-)?(?:connect-to|resolve|url|proxy|proxy1\.0|"
+    r"preproxy|socks4a?|socks5(?:-hostname)?|config|location(?:-trusted)?|"
+    r"follow|alt-svc|noproxy))(?=[=\s;|&()]|$)"
+    r"|(?<![\w-])-(?!-)[^\s;|&()]*[xKL]"
+    r"|\b(?i:(?:[a-z][a-z0-9_]*_)?proxy|curl_home|xdg_config_home|home)="
+)
+
 # Capture the complete authority, including userinfo and malformed punctuation.
 # Only a literal space or an RFC URL path/query/fragment delimiter ends it;
 # controls, backslashes and quotes must not turn a partial host into an exemption.
@@ -32,6 +41,9 @@ _LOCAL_AUTHORITY_RE = re.compile(
 
 def _without_loopback_targets(content: str) -> str:
     """Blank only fully validated local authorities; leave all uncertainty visible."""
+    if _ROUTING_CONTEXT_RE.search(content):
+        return content
+
     def replace(match: re.Match[str]) -> str:
         authority = _LOCAL_AUTHORITY_RE.fullmatch(match.group("authority"))
         if authority is None:
