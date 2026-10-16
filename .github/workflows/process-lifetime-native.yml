@@ -110,7 +110,8 @@ jobs:
                                 "normal_background", "helper_lost", "failed_yield", "yield_complete",
                                 "yield_kill", "parent_eof", "release_wins", "cancel_wins",
                                 "stalled_discovery", "unavailable_threads", "empty_evidence_stalled",
-                                "empty_evidence_unavailable", "startup_refusal", "grace_parent_force",
+                                "empty_evidence_unavailable", "startup_refusal", "empty_zero_pid",
+                                "empty_live_member", "empty_inaccessible", "grace_parent_force",
                                 "grace_parent_eof", "grace_descendants_force", "grace_descendants_eof")],
                   "registry": [f"test_adopted_registry_lifetime_macos[{case}]" for case in
                                ("self_managing", "two_grace_windows", "zero_grace_retry",

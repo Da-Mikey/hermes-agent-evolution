@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -193,6 +194,21 @@ def _contract(tmp_path, monkeypatch, caplog, case):
             except psutil.NoSuchProcess:
                 return
             _gone(child)
+        elif case in {"empty_zero_pid", "empty_live_member", "empty_inaccessible"}:
+            from tools.environments import local_process_owner as owner
+            member = SimpleNamespace(pid=0 if case == "empty_zero_pid" else 424242,
+                                     status=lambda: psutil.STATUS_RUNNING)
+            monkeypatch.setattr(psutil, "process_iter", lambda: [member])
+            def group(pid):
+                if case == "empty_inaccessible":
+                    raise PermissionError("membership unknown")
+                return 31337
+            monkeypatch.setattr(owner.os, "getpgid", group)
+            if case == "empty_inaccessible":
+                with pytest.raises(PermissionError):
+                    owner._group_empty(31337, [])
+            else:
+                assert owner._group_empty(31337, []) is (case == "empty_zero_pid")
         elif case.startswith("grace_"):
             file = tmp_path / "terms"
             code = ("import pathlib,signal,sys,time; p=pathlib.Path(sys.argv[1]); "
@@ -277,6 +293,7 @@ _CASES = ["io_status", "negative_signal", "early_stdin_close", "early_stdout_clo
           "helper_lost", "failed_yield", "yield_complete", "yield_kill", "parent_eof",
           "release_wins", "cancel_wins", "stalled_discovery", "unavailable_threads",
           "empty_evidence_stalled", "empty_evidence_unavailable", "startup_refusal",
+          "empty_zero_pid", "empty_live_member", "empty_inaccessible",
           "grace_parent_force", "grace_parent_eof", "grace_descendants_force", "grace_descendants_eof"]
 
 

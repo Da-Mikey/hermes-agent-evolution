@@ -75,7 +75,9 @@ def _group_empty(group, descendants):
         if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
             return False
     for process in psutil.process_iter():
-        if process.pid == os.getpid():
+        # Darwin exposes kernel_task as PID 0. getpgid(0) means *our* group,
+        # not that kernel entry, and would falsely keep every group alive.
+        if process.pid <= 0 or process.pid == os.getpid():
             continue
         try:
             if os.getpgid(process.pid) == group and process.status() != psutil.STATUS_ZOMBIE:
