@@ -102,12 +102,18 @@ def _make_malicious_repo(tmp: Path) -> tuple[Path, Path]:
     hooks = repo / "evil-hooks"
     hooks.mkdir()
     hook = hooks / "post-checkout"
-    hook.write_text(f"#!/bin/sh\ntouch {marker}.hook\n")
+    marker_shell = marker.as_posix()
+    hook.write_text(f"#!/bin/sh\ntouch '{marker_shell}.hook'\n")
     hook.chmod(0o755)
-    with (repo / ".git" / "config").open("a") as f:
-        f.write(f'[core]\n\tfsmonitor = "touch {marker}.fsmonitor"\n\thooksPath = {hooks}\n')
-        f.write(f'[diff "evil"]\n\tcommand = "touch {marker}.extdiff"\n')
-        f.write(f'\ttextconv = "sh -c \'touch {marker}.textconv; cat\'"\n')
+    # Let git encode config values; raw Windows backslashes are escapes.
+    settings = {
+        "core.fsmonitor": f"touch '{marker_shell}.fsmonitor'",
+        "core.hooksPath": hooks.as_posix(),
+        "diff.evil.command": f"touch '{marker_shell}.extdiff'",
+        "diff.evil.textconv": f"touch '{marker_shell}.textconv'; cat",
+    }
+    for key, value in settings.items():
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True, env=clean)
     (repo / ".gitattributes").write_text("* diff=evil\n")
     (repo / "README").write_text("changed\n")  # dirty working tree so diffs run
     return repo, marker
@@ -180,6 +186,26 @@ def test_subagent_worktree_add_is_safe(malicious_repo, tmp_path):
     from tools import subagent_worktree as sw
     repo, marker = malicious_repo
     sw._run_git(["worktree", "add", str(tmp_path / "wt1"), "-b", "safe1"], str(repo))
+    assert _fired(marker) == []
+
+
+def test_index_reading_session_probes_are_safe(malicious_repo):
+    """``status`` / ``ls-files`` read the index, which runs ``core.fsmonitor``."""
+    from tools.async_delegation_recovery_hints import git_state_hint
+    from tui_gateway import server
+    repo, marker = malicious_repo
+    assert git_state_hint(str(repo)) is not None
+    assert "README" in list(server._git_repo_files(str(repo)))
+    assert _fired(marker) == []
+
+
+def test_kanban_and_gc_worktree_git_is_safe(malicious_repo, tmp_path):
+    from hermes_cli import kanban_db_workspace as kw
+    from hermes_cli import worktree_gc
+    repo, marker = malicious_repo
+    kw._ensure_git_worktree(repo, tmp_path / "wt2", "safe2")
+    assert (tmp_path / "wt2" / "README").exists()
+    assert worktree_gc._git(["status", "--porcelain"], cwd=str(repo)).returncode == 0
     assert _fired(marker) == []
 
 
