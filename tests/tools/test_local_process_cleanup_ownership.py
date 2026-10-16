@@ -137,14 +137,12 @@ def _owned(cleanup, monkeypatch, caplog, scenario):
         new = SimpleNamespace(pid=500, poll=lambda: None, kill=MagicMock())
         current = [1000000]
         monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: current[0])
-        monkeypatch.setattr(local.subprocess, "Popen", MagicMock(side_effect=[proc, new]))
-        monkeypatch.setattr(local, "_find_bash", lambda: "/synthetic/bash")
-        monkeypatch.setattr(local, "_make_run_env", lambda env: {})
-        monkeypatch.setattr(env, "_recover_cwd", lambda: None)
-        env.cwd, env.env = "/synthetic", {}
-        old = env._run_bash("old")
+        # Ownership belongs to each handle even if the kernel recycles its PID.
+        old = proc
+        local._capture_process_identity(old)
         current[0] = 9000000
-        newer = env._run_bash("new")
+        newer = new
+        local._capture_process_identity(newer)
         assert old._hermes_process_identity != newer._hermes_process_identity
         env._kill_process(old)
         signals.assert_not_called()

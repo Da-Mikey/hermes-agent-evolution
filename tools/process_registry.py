@@ -64,6 +64,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local_process import LocalProcessHandle
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -550,7 +551,7 @@ class ProcessSession:
                                                 # checks must use this, not task_id
     session_key: str = ""                       # Gateway session key (reset protection)
     pid: Optional[int] = None
-    process: Optional[subprocess.Popen] = None  # Popen handle (local only)
+    process: Optional[subprocess.Popen | LocalProcessHandle] = None  # owned local handle
     env_ref: Any = None                         # Environment object (sandbox spawns)
     cwd: Optional[str] = None
     started_at: float = 0.0                     # time.time() of spawn
@@ -1324,7 +1325,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             proc.wait(timeout=5)
 
     def adopt_local(
-        self, proc: subprocess.Popen, *, command: str, cwd: Optional[str], task_id: str = "",
+        self, proc: subprocess.Popen | LocalProcessHandle, *, command: str, cwd: Optional[str], task_id: str = "",
         session_key: str = "", owner_task_id: str = "", output_so_far: str = "",
         notify_on_complete: bool = True) -> ProcessSession:
         """Take over a still-running foreground Popen as a tracked background session
@@ -1700,6 +1701,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """
         proc = session.process
         if proc is not None:
+            if isinstance(proc, LocalProcessHandle):
+                proc.release()
             for stream in (proc.stdout, proc.stderr, proc.stdin):
                 if stream is not None:
                     with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
@@ -2219,7 +2222,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
         elif session.process:
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
             # leaves Git Bash descendants behind.
-            self._terminate_host_pid(session.process.pid, session.host_start_time)
+            if isinstance(session.process, LocalProcessHandle):
+                if not session.process.terminate_owned():
+                    return {"status": "error", "session_id": session.id, "process_running": True,
+                            "error": "Local process cleanup incomplete: lifetime owner unavailable"}
+            else:
+                self._terminate_host_pid(session.process.pid, session.host_start_time)
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:

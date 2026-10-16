@@ -19,6 +19,7 @@ from pathlib import Path
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment
 from tools.environments.base_output import _pipe_stdin
+from tools.environments.local_process import LocalProcessHandle
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.environments.local_env_policy import (  # noqa: F401 — _HERMES_PROVIDER_ENV_BLOCKLIST stays importable from here
     _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_BLOCKLIST, _HERMES_PROVIDER_ENV_FORCE_PREFIX,
@@ -855,6 +856,9 @@ def _kill_process_group_posix(proc) -> None:
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
     init — and we wait on the group, not the wrapper, which can exit before
     grandchildren under load. POSIX-only (_IS_WINDOWS handled by the caller)."""
+    if isinstance(proc, LocalProcessHandle):
+        proc.terminate_owned()
+        return
     pgid = _owned_process_group(proc)
     if pgid is None:
         _cleanup_incomplete()
@@ -1013,7 +1017,7 @@ class LocalEnvironment(BaseEnvironment):
         self.cwd = safe_cwd
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None) -> subprocess.Popen | LocalProcessHandle:
         bash = _find_bash()
         # Login invocations (init_session's env snapshot) source the user's rc /
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
@@ -1021,17 +1025,38 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        proc = subprocess.Popen(
+        spawn = subprocess.Popen if _IS_WINDOWS else LocalProcessHandle
+        proc = spawn(
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+            cwd=self.cwd,
+            **({"creationflags": windows_hide_flags(), "start_new_session": True} if _IS_WINDOWS else {}))
         if not _IS_WINDOWS:
             _capture_process_identity(proc)
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc
+
+    def _wait_for_process(self, proc, timeout, **kwargs):
+        if not isinstance(proc, LocalProcessHandle):
+            return super()._wait_for_process(proc, timeout, **kwargs)
+        transferred = False
+        handler = kwargs.get("yield_handler")
+        if handler is not None:
+            def handoff(handle, output):
+                nonlocal transferred
+                result = handler(handle, output)
+                transferred = result is not None
+                return result
+            kwargs["yield_handler"] = handoff
+        try:
+            return super()._wait_for_process(proc, timeout, **kwargs)
+        finally:
+            if not transferred:
+                if proc.poll() is None:
+                    proc.terminate_owned(force=True)
+                proc.release()
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
@@ -1054,6 +1079,9 @@ class LocalEnvironment(BaseEnvironment):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
+        if isinstance(proc, LocalProcessHandle):
+            proc.terminate_owned(force=True, wait=False)
+            return
         pgid = _owned_process_group(proc)
         if pgid is None:
             _cleanup_incomplete()
