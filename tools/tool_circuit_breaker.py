@@ -4,6 +4,10 @@
 Prevents infinite retry spirals on core tools (read_file, patch, terminal, search_files)
 by tracking consecutive failures per session, classifying the failure mode, and
 tripping with structured diagnostic guidance once the per-tool budget is exceeded.
+
+Only failures that indicate an unhealthy *tool* spend that budget. A caller-side class
+(`not_found`) is a served negative result — the tool answered, the target named in the
+call does not exist — so it is recorded but never trips the breaker (#218).
 """
 
 from __future__ import annotations
@@ -28,6 +32,21 @@ FAILURE_CLASS_INVALID_ARG = "invalid_argument"
 FAILURE_CLASS_TIMEOUT = "timeout"
 FAILURE_CLASS_PROVIDER = "provider_error"
 FAILURE_CLASS_TRANSIENT = "transient"
+
+# #218 — classes that describe the CALLER'S ARGUMENT rather than the tool's health.
+# `not_found` means the tool ran and answered: the target named in the call does not
+# exist. That is a negative result, not a malfunction. Counting it toward the
+# retry-spiral budget tripped the breaker on a demonstrably healthy tool and told the
+# model that a working tool had failed N times in a row — observed live as
+# `[CIRCUIT_BREAKER] Tool 'ha_get_state' has failed 3 consecutive times ... Class:
+# not_found` after a couple of probes of stale entity ids.
+#
+# Deliberately NOT included: `invalid_argument`. That bucket also swallows
+# `typeerror` / `schema` texts, which are tool-side defects rather than caller
+# mistakes, so excluding the whole class would disarm the breaker for real
+# malfunctions. It joins this set only once the classifier separates a caller-side
+# bad argument from a tool-side bad implementation.
+CALLER_ERROR_CLASSES = frozenset({FAILURE_CLASS_NOT_FOUND})
 
 
 def classify_tool_error(error_text: Optional[str]) -> str:
@@ -99,12 +118,21 @@ class _ToolCircuitBreakerTracker:
             tool_rec["total_calls"] += 1
 
             if status == "error":
-                tool_rec["consecutive_failures"] += 1
                 tool_rec["total_failures"] += 1
                 tool_rec["last_error"] = error_message
                 fclass = classify_tool_error(error_message)
                 tool_rec["last_failure_class"] = fclass
 
+                # #218 — a caller-side error is a served negative result: the call
+                # reached the tool and came back with "that target does not exist". It
+                # must not spend the tool-health budget, and it clears a stale streak
+                # because it proves the tool answered (earlier transport failures are no
+                # longer evidence).
+                if fclass in CALLER_ERROR_CLASSES:
+                    tool_rec["consecutive_failures"] = 0
+                    return None
+
+                tool_rec["consecutive_failures"] += 1
                 eff_budget = budget or DEFAULT_TOOL_RETRY_BUDGETS.get(tname, 3)
                 consecutive = tool_rec["consecutive_failures"]
 
