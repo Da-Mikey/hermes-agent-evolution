@@ -20,6 +20,7 @@ from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment
 from tools.environments.base_output import _pipe_stdin
 from tools.environments.local_process import LocalProcessHandle
+from tools.environments.local_process import spawn_owned_process
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.environments.local_env_policy import (  # noqa: F401 — _HERMES_PROVIDER_ENV_BLOCKLIST stays importable from here
     _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_BLOCKLIST, _HERMES_PROVIDER_ENV_FORCE_PREFIX,
@@ -1017,7 +1018,7 @@ class LocalEnvironment(BaseEnvironment):
         self.cwd = safe_cwd
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen | LocalProcessHandle:
+                  stdin_data: str | None = None) -> "subprocess.Popen | LocalProcessHandle":
         bash = _find_bash()
         # Login invocations (init_session's env snapshot) source the user's rc /
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
@@ -1025,7 +1026,7 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        spawn = subprocess.Popen if _IS_WINDOWS else LocalProcessHandle
+        spawn = subprocess.Popen if _IS_WINDOWS else spawn_owned_process
         proc = spawn(
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

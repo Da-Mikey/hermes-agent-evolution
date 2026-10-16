@@ -551,7 +551,7 @@ class ProcessSession:
                                                 # checks must use this, not task_id
     session_key: str = ""                       # Gateway session key (reset protection)
     pid: Optional[int] = None
-    process: Optional[subprocess.Popen | LocalProcessHandle] = None  # owned local handle
+    process: "Optional[subprocess.Popen | LocalProcessHandle]" = None  # owned local handle
     env_ref: Any = None                         # Environment object (sandbox spawns)
     cwd: Optional[str] = None
     started_at: float = 0.0                     # time.time() of spawn
@@ -1325,7 +1325,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             proc.wait(timeout=5)
 
     def adopt_local(
-        self, proc: subprocess.Popen | LocalProcessHandle, *, command: str, cwd: Optional[str], task_id: str = "",
+        self, proc: "subprocess.Popen | LocalProcessHandle", *, command: str, cwd: Optional[str], task_id: str = "",
         session_key: str = "", owner_task_id: str = "", output_so_far: str = "",
         notify_on_complete: bool = True) -> ProcessSession:
         """Take over a still-running foreground Popen as a tracked background session
@@ -2223,9 +2223,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
             # leaves Git Bash descendants behind.
             if isinstance(session.process, LocalProcessHandle):
-                if not session.process.terminate_owned():
+                if not session.process.terminate_owned(term_grace=self._daemon_term_grace_seconds()):
                     return {"status": "error", "session_id": session.id, "process_running": True,
-                            "error": "Local process cleanup incomplete: lifetime owner unavailable"}
+                            "error": "Local process cleanup incomplete: owned processes remain or owner unavailable"}
             else:
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
         elif session.env_ref and session.pid:

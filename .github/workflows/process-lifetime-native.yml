@@ -83,11 +83,14 @@ jobs:
           run_file ownership tests/tools/test_local_process_cleanup_ownership.py -m "$NATIVE_MARKER"
           run_file lifetime tests/tools/test_local_process_lifetime.py -m "$NATIVE_MARKER"
           if [ "$NATIVE_MARKER" = macos_only ]; then
+            run_file registry tests/tools/test_local_registry_lifetime.py -m "$NATIVE_MARKER"
             run_file orphan-race tests/tools/test_local_wrapper_exit_ownership.py -m "$NATIVE_MARKER"
             run_file interruption tests/tools/test_local_interrupt_cleanup.py \
               -k test_wait_for_process_kills_subprocess_on_keyboardinterrupt
             run_file descendants tests/tools/test_local_setsid_descendant_sweep.py \
               -k test_timeout_kill_reaps_setsid_grandchild
+            run_file shutdown tests/tui_gateway/test_serve_exit_flush.py \
+              -k test_shutdown_mid_tool_kills_the_command_and_keeps_its_result
           fi
           uv run --no-sync python - <<'PY'
           import os
@@ -106,11 +109,17 @@ jobs:
                                ("io_status", "negative_signal", "early_stdin_close", "early_stdout_close",
                                 "normal_background", "helper_lost", "failed_yield", "yield_complete",
                                 "yield_kill", "parent_eof", "release_wins", "cancel_wins",
-                                "stalled_discovery", "unavailable_threads", "startup_refusal")],
+                                "stalled_discovery", "unavailable_threads", "empty_evidence_stalled",
+                                "empty_evidence_unavailable", "startup_refusal", "grace_parent_force",
+                                "grace_parent_eof", "grace_descendants_force", "grace_descendants_eof")],
+                  "registry": [f"test_adopted_registry_lifetime_macos[{case}]" for case in
+                               ("self_managing", "two_grace_windows", "zero_grace_retry",
+                                "parent_exits", "natural_finish", "escaped_natural_finish")],
                   "orphan-race": [f"test_interruption_reaps_child_born_before_first_observation_macos[{mode}]"
                                   for mode in ("interrupt", "timeout", "force", "deadline")],
                   "interruption": ["test_wait_for_process_kills_subprocess_on_keyboardinterrupt"],
                   "descendants": ["test_timeout_kill_reaps_setsid_grandchild"],
+                  "shutdown": ["test_shutdown_mid_tool_kills_the_command_and_keeps_its_result"],
               },
               "windows_only": {
                   "ownership": ["test_windows_cleanup_preserves_existing_dispatch"],

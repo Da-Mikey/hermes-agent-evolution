@@ -61,8 +61,8 @@ def _run_with_env(extra_os_env=None, self_env=None):
 
     with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
          patch("subprocess.Popen", side_effect=_make_fake_popen(captured)), \
-         patch("tools.environments.local.LocalProcessHandle.__new__",
-               side_effect=lambda cls, *a, **kw: _make_fake_popen(captured)(*a, **kw)), \
+         patch("tools.environments.local.spawn_owned_process",
+               side_effect=lambda *a, **kw: _make_fake_popen(captured)(*a, **kw)), \
          patch.dict(os.environ, test_environ, clear=True):
         env.execute("echo hello")
 
@@ -1034,8 +1034,8 @@ class TestPythonpathSelectiveStrip:
              patch("tools.code_execution_env._uses_hermes_python_environment",
                    return_value=same_env), \
              patch("subprocess.Popen", side_effect=_fake_popen), \
-             patch("tools.environments.local.LocalProcessHandle.__new__",
-                   side_effect=lambda cls, *a, **kw: _fake_popen(*a, **kw)), \
+             patch("tools.environments.local.spawn_owned_process",
+                   side_effect=lambda *a, **kw: _fake_popen(*a, **kw)), \
              patch.dict(os.environ, {
                  "PYTHONPATH": os.pathsep.join(
                      [hermes_root, venv_sp, user_a, user_b]),

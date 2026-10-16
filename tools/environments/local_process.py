@@ -2,6 +2,7 @@
 
 import contextlib
 import logging
+import math
 import os
 from pathlib import Path
 import socket
@@ -11,6 +12,11 @@ import threading
 import time
 
 logger = logging.getLogger(__name__)
+
+
+def spawn_owned_process(args, **kwargs):
+    """Construction boundary shared by real dispatch and generic spawn fixtures."""
+    return LocalProcessHandle(args, **kwargs)
 
 
 class LocalProcessHandle:
@@ -28,6 +34,8 @@ class LocalProcessHandle:
         self._closed = False
         self._state = "owned"
         self._owner_failed = False
+        self._cleanup_pending = False
+        self._cleanup_incomplete = False
         parent, child = socket.socketpair()
         self._control = parent
         self._owner = None
@@ -87,14 +95,21 @@ class LocalProcessHandle:
                 line, self._buffer = self._buffer.split(b"\n", 1)
                 if line.startswith(b"EXIT "):
                     self._returncode = int(line[5:])
+                elif line == b"INCOMPLETE":
+                    self._cleanup_incomplete = True
+                elif line == b"CLEANED":
+                    self._cleanup_pending = False
             owner_code = self._owner.poll()
             if owner_code is not None:
+                self._cleanup_pending = False
                 if self._returncode is None:
                     self._returncode = owner_code or 127
                 if self._state == "owned" and not self._owner_failed:
                     self._owner_failed = True
                     logger.warning("Local process cleanup incomplete: lifetime owner exited unexpectedly")
-            return self._returncode
+            # An adopted parent's exit is not completed cancellation while its
+            # owned children remain. Keep the registry reader/list/kill handle.
+            return None if self._cleanup_pending else self._returncode
 
     def wait(self, timeout=None):
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -109,13 +124,16 @@ class LocalProcessHandle:
             if self._closed:
                 return False
             try:
-                self._control.send(command)  # one byte, nonblocking even during hard exit
-                return True
+                return self._control.send(command) == len(command)  # bounded nonblocking frame
             except OSError:
                 logger.warning("Local process cleanup incomplete: lifetime owner unavailable")
                 return False
 
-    def terminate_owned(self, *, force=False, wait=True):
+    def terminate_owned(self, *, force=False, wait=True, term_grace=None):
+        if term_grace is not None:
+            term_grace = float(term_grace)
+            if not math.isfinite(term_grace) or term_grace < 0:
+                term_grace = 2.0
         with self._lock:
             # Cancellation and normal completion have one linearization point.
             # Once RELEASE wins, ownership has intentionally ended; a late
@@ -127,17 +145,29 @@ class LocalProcessHandle:
                 logger.warning("Local process cleanup incomplete: lifetime owner unavailable")
                 return False
             self._state = "cancelled"
-            if not self._send(b"K" if force else b"T"):
+            if term_grace is not None and not force:
+                self._cleanup_pending = True
+                self._cleanup_incomplete = False
+                command = f"G {term_grace}\n".encode()
+            else:
+                command = b"K\n" if force else b"T\n"
+            if not self._send(command):
                 return self._owner.poll() is not None and not self._owner_failed
         if wait:
-            try:
-                self._owner.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                # Closing the private channel is another bounded cancellation
-                # request, never an excuse to signal a cached PID or group.
-                self._close_control()
-                logger.warning("Local process cleanup incomplete: lifetime owner did not finish")
-                return False
+            deadline = time.monotonic() + (2 * term_grace + 3 if term_grace is not None else 3)
+            while self._owner.poll() is None:
+                self.poll()
+                if term_grace == 0 and self._cleanup_incomplete:
+                    return False  # no escalation: keep the owner/channel/session alive
+                if time.monotonic() >= deadline:
+                    # Registry grace=0 must never turn a timeout into EOF KILL.
+                    # An explicit force request or real controller death remains
+                    # the separate hard-cleanup contract.
+                    if term_grace is None:
+                        self._close_control()
+                    logger.warning("Local process cleanup incomplete: lifetime owner did not finish")
+                    return False
+                time.sleep(0.01)
             self.poll()
         return True
 
@@ -148,9 +178,11 @@ class LocalProcessHandle:
         with self._lock:
             if self._closed or self.poll() is None:
                 return  # premature finalization cannot detach an active command
+            if self._state == "cancelled" and self._owner.poll() is None:
+                return  # a reader must not truncate either registry grace phase
             if self._state == "owned":
                 self._state = "released"
-                self._send(b"R")
+                self._send(b"R\n")
             # A cancellation that won the lock must finish cleanup; never send
             # RELEASE after it and accidentally detach its surviving children.
         try:

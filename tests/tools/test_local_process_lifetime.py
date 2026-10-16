@@ -193,6 +193,52 @@ def _contract(tmp_path, monkeypatch, caplog, case):
             except psutil.NoSuchProcess:
                 return
             _gone(child)
+        elif case.startswith("grace_"):
+            file = tmp_path / "terms"
+            code = ("import pathlib,signal,sys,time; p=pathlib.Path(sys.argv[1]); "
+                    "signal.signal(signal.SIGTERM,lambda *a: p.open('a').write('term\\n')); "
+                    "print('ready',flush=True); time.sleep(30)")
+            env, proc = _spawn(tmp_path, code, file)
+            child = psutil.Process(proc.command_pid)
+            assert proc.stdout.readline().strip() == "ready"
+            assert proc.terminate_owned(term_grace=2, wait=False)
+            target = 2 if "descendants" in case else 1
+            deadline = time.monotonic() + 5
+            while (not file.exists() or len(file.read_text().splitlines()) < target):
+                assert time.monotonic() < deadline, "configured grace phase did not start"
+                time.sleep(.01)
+            started = time.monotonic()
+            if case.endswith("force"):
+                assert proc.terminate_owned(force=True)
+            else:
+                proc._close_control()  # real private-channel EOF during this phase
+                proc._owner.wait(timeout=1)
+            assert time.monotonic() - started < 1, "force/EOF waited for configured TERM grace"
+            _gone(child)
+        elif case in {"empty_evidence_stalled", "empty_evidence_unavailable"}:
+            from tools.environments import local_process
+            popen = subprocess.Popen
+            repo = Path(__file__).resolve().parents[2]
+            failure = ("lambda *a: time.sleep(30)" if case == "empty_evidence_stalled" else
+                       "lambda *a: (_ for _ in ()).throw(OSError('unavailable'))")
+            wrapper = (f"import sys,time; sys.path.insert(0,{str(repo)!r}); "
+                       "from tools.environments import local_process_owner as owner; "
+                       f"owner._group_empty={failure}; sys.exit(owner.main())")
+            def sabotaged(args, **kwargs):
+                return popen([args[0], "-c", wrapper, *args[3:]], **kwargs)
+            monkeypatch.setattr(local_process.subprocess, "Popen", sabotaged)
+            env, proc = _spawn(tmp_path, "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                               "print('ready',flush=True); time.sleep(30)")
+            child = psutil.Process(proc.command_pid)
+            assert proc.stdout.readline().strip() == "ready"
+            assert not proc.terminate_owned(term_grace=0)
+            time.sleep(.3)
+            assert proc.poll() is None and proc._owner.poll() is None
+            assert _alive(child), "missing empty-group evidence caused escalation"
+            started = time.monotonic()
+            assert proc.terminate_owned(force=True)
+            assert time.monotonic() - started < 1
+            _gone(child)
         elif case == "startup_refusal":
             file = tmp_path / "must-not-run"
             from tools.environments import local_process
@@ -229,7 +275,9 @@ def _contract(tmp_path, monkeypatch, caplog, case):
 
 _CASES = ["io_status", "negative_signal", "early_stdin_close", "early_stdout_close", "normal_background",
           "helper_lost", "failed_yield", "yield_complete", "yield_kill", "parent_eof",
-          "release_wins", "cancel_wins", "stalled_discovery", "unavailable_threads", "startup_refusal"]
+          "release_wins", "cancel_wins", "stalled_discovery", "unavailable_threads",
+          "empty_evidence_stalled", "empty_evidence_unavailable", "startup_refusal",
+          "grace_parent_force", "grace_parent_eof", "grace_descendants_force", "grace_descendants_eof"]
 
 
 @pytest.mark.linux_only
