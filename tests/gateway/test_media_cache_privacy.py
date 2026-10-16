@@ -15,8 +15,9 @@ def cache(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    for name in ("HERMES_HOME_MODE", "HERMES_UID", "HERMES_GID"):
+    for name in ("HERMES_HOME_MODE", "HERMES_UID", "HERMES_GID", "HERMES_CONTAINER", "HERMES_SKIP_CHMOD"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
     # Initialize the ordinary home before testing cache-only mode policy; config
     # initialization otherwise applies deliberately malformed modes to the home itself.
     from hermes_cli.config import ensure_hermes_home
@@ -47,8 +48,6 @@ def test_private_directory_and_file(cache, kind):
 def _positive_policy(cache, monkeypatch, kind, policy):
     import os
     from types import SimpleNamespace
-    from gateway.platforms import media_cache_privacy as privacy
-
     cache.mkdir(mode=0o750)
     expected_mode = 0o700
     if policy == "managed":
@@ -61,7 +60,21 @@ def _positive_policy(cache, monkeypatch, kind, policy):
     elif policy in {"invalid", "negative", "out_of_range"}:
         monkeypatch.setenv("HERMES_HOME_MODE", {"invalid": "invalid", "negative": "-1",
                                               "out_of_range": "10000"}[policy])
+    elif policy.startswith(("container_", "skip_chmod_", "detected_")):
+        signal, mode = policy.rsplit("_", 1)
+        if signal == "detected":
+            monkeypatch.setattr("hermes_constants._detect_container", lambda: True)
+        else:
+            name = "HERMES_CONTAINER" if signal == "container" else "HERMES_SKIP_CHMOD"
+            monkeypatch.setenv(name, "1")
+        if mode == "preserved":
+            expected_mode = 0o750
+        else:
+            monkeypatch.setenv("HERMES_HOME_MODE", "700" if mode == "private" else "invalid")
     elif policy == "docker_uid_gid":
+        from gateway.platforms import media_cache_privacy as privacy
+        # Explicit private mode keeps UID/GID verification active inside containers.
+        monkeypatch.setenv("HERMES_HOME_MODE", "700")
         monkeypatch.setenv("HERMES_CONTAINER", "1")
         monkeypatch.setenv("HERMES_UID", "12345")
         monkeypatch.setenv("HERMES_GID", "23456")
@@ -88,6 +101,8 @@ def _positive_policy(cache, monkeypatch, kind, policy):
 
 
 _POLICIES = ["private", "managed", "shared", "invalid", "negative", "out_of_range", "docker_uid_gid"]
+_POLICIES += [f"{signal}_{mode}" for signal in ("container", "skip_chmod", "detected")
+              for mode in ("preserved", "private", "invalid")]
 
 
 @pytest.mark.linux_only
@@ -123,10 +138,12 @@ def _refuse_payload(cache, monkeypatch, kind, failure):
     elif failure == "directory_ineffective":
         monkeypatch.setattr(privacy.os, "fchmod", lambda *args: None)
         monkeypatch.setattr("hermes_cli.config._secure_dir", lambda fd: None)
-    elif failure == "unknown_policy":
+    elif failure in {"unknown_policy", "unknown_container_policy"}:
         def unavailable():
             raise RuntimeError("synthetic unavailable")
-        monkeypatch.setattr("hermes_cli.config.is_managed", unavailable)
+        target = ("hermes_cli.config.is_managed" if failure == "unknown_policy"
+                  else "hermes_constants._container_or_chmod_skipped")
+        monkeypatch.setattr(target, unavailable)
     elif failure == "directory_owner":
         monkeypatch.setattr("hermes_constants._resolve_hermes_uid_gid", lambda: (os.geteuid() + 1000, None))  # windows-footgun: ok — native POSIX matrix only
         monkeypatch.setattr("hermes_cli.config._secure_dir", lambda fd: None)
@@ -167,7 +184,7 @@ def _refuse_payload(cache, monkeypatch, kind, failure):
         assert all(path.read_bytes() == b"" for path in cache.iterdir())
 
 
-_FAILURES = ["directory_error", "directory_ineffective", "unknown_policy", "directory_owner",
+_FAILURES = ["directory_error", "directory_ineffective", "unknown_policy", "unknown_container_policy", "directory_owner",
              "file_owner", "file_open", "file_mode", "directory_symlink", "file_collision", "file_symlink"]
 
 
