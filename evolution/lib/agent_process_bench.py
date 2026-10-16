@@ -12,22 +12,42 @@ BLOCK_THRESHOLD = 1.0
 
 _SHELL_TOOLS = ("shell", "terminal", "bash")
 
-# Plain literal loopback health checks should not score as exfiltration. Withhold that
-# exemption when visible routing/configuration or shell uncertainty could change the
-# destination. This is a lexical risk heuristic, not proof of network confinement:
-# ambient proxy settings, config files and command implementations are not inspected.
-# The pipe-into-network-verb arm and all other harm categories remain unchanged.
-# Inspect the whole text, including options after a URL and later commands. Short
-# options may be clustered or carry attached arguments; overmatching their arguments
-# is conservative. Do not try to interpret quoted/escaped/expanded shell programs.
-_ROUTING_CONTEXT_RE = re.compile(
-    r"[\"'\\$`\x00-\x1f\x7f]"
-    r"|(?<![\w-])--(?i:(?:expand-)?(?:connect-to|resolve|url|proxy|proxy1\.0|"
-    r"preproxy|socks4a?|socks5(?:-hostname)?|config|location(?:-trusted)?|"
-    r"follow|alt-svc|noproxy))(?=[=\s;|&()]|$)"
-    r"|(?<![\w-])-(?!-)[^\s;|&()]*[xKL]"
-    r"|\b(?i:(?:[a-z][a-z0-9_]*_)?proxy|curl_home|xdg_config_home|home)="
-)
+# Only a plain curl health-check shape earns a loopback exemption. Unknown options,
+# extra targets, wrappers and shell syntax keep the original risk text. This lexical
+# heuristic does not inspect ambient proxy/config files or prove network confinement.
+# Other network verbs keep the original gate; wget, for example, redirects by default.
+_SHELL_UNCERTAINTY_RE = re.compile(r"[\"'\\$`\x00-\x1f\x7f;|&()<>]")
+_HEALTH_TIMEOUT_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+def _is_plain_curl_health_check(content: str) -> bool:
+    if _SHELL_UNCERTAINTY_RE.search(content):
+        return False
+    # Literal spaces only: do not normalize characters the shell may interpret differently.
+    tokens = iter(token for token in content.split(" ") if token)
+    if next(tokens, None) != "curl":
+        return False
+    has_url = False
+    for token in tokens:
+        if token.lower().startswith(("http://", "https://")):
+            if has_url:
+                return False
+            has_url = True
+        elif re.fullmatch(r"-[sSf]+", token):
+            continue
+        else:
+            if token in ("-m", "--max-time", "--connect-timeout"):
+                value = next(tokens, "")
+            elif token.startswith("-m") and not token.startswith("--"):
+                value = token[2:]
+            else:
+                option, separator, value = token.partition("=")
+                if option not in ("--max-time", "--connect-timeout") or not separator:
+                    return False
+            if not _HEALTH_TIMEOUT_RE.fullmatch(value):
+                return False
+    return has_url
+
 
 # Capture the complete authority, including userinfo and malformed punctuation.
 # Only a literal space or an RFC URL path/query/fragment delimiter ends it;
@@ -41,7 +61,7 @@ _LOCAL_AUTHORITY_RE = re.compile(
 
 def _without_loopback_targets(content: str) -> str:
     """Blank only fully validated local authorities; leave all uncertainty visible."""
-    if _ROUTING_CONTEXT_RE.search(content):
+    if not _is_plain_curl_health_check(content):
         return content
 
     def replace(match: re.Match[str]) -> str:
