@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+import os
 import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -42,13 +43,14 @@ class _AsyncCM:
 def _make_adapter():
     """Create a WhatsAppAdapter with test attributes (bypass __init__)."""
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+    from hermes_constants import get_hermes_home
 
     adapter = WhatsAppAdapter.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
     adapter.config = MagicMock()
     adapter._bridge_port = 19876
     adapter._bridge_script = "/tmp/test-bridge.js"
-    adapter._session_path = Path("/tmp/test-wa-session")
+    adapter._session_path = get_hermes_home() / "test-wa-session"
     adapter._bridge_log_fh = None
     adapter._bridge_log = None
     adapter._bridge_process = None
@@ -94,8 +96,10 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
     }
     base = [
         patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True),
-        patch.object(Path, "exists", return_value=True),
-        patch.object(Path, "mkdir", return_value=None),
+        # Mock bridge availability, not the entire filesystem: the bridge env
+        # must receive real, permission-checked cache directories under test HOME.
+        patch("plugins.platforms.whatsapp.adapter.WhatsAppAdapter._preflight", return_value=True),
+        patch("plugins.platforms.whatsapp.adapter.WhatsAppAdapter._ensure_bridge_deps", return_value=True),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
         patch("subprocess.Popen", return_value=mock_proc),
         patch("builtins.open", return_value=mock_fh),
@@ -140,8 +144,9 @@ class TestDataInitialized:
 
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+        with patches[0], patches[1], patches[2], patches[3], patches[4] as spawn, \
              patches[5], patches[6], patches[7], patches[8], \
+             patch.object(adapter, "_poll_bridge_health", wraps=adapter._poll_bridge_health) as health, \
              patch.object(type(adapter), "_poll_messages", return_value=MagicMock()):
             # Must NOT raise NameError
             result = await adapter.connect()
@@ -149,6 +154,15 @@ class TestDataInitialized:
         # connect() returns True (warn-and-proceed path)
         assert result is True
         assert adapter._running is True
+        assert health.await_count == 2  # both real health-check phases still ran
+        response = mock_client_cls.return_value.value.get.return_value.value
+        response.json.assert_awaited()  # the configured malformed JSON was consumed
+        bridge_env = spawn.call_args.kwargs["env"]
+        for key in ("HERMES_IMAGE_CACHE_DIR", "HERMES_AUDIO_CACHE_DIR", "HERMES_DOCUMENT_CACHE_DIR"):
+            cache_dir = Path(bridge_env[key])
+            assert cache_dir.is_dir()
+            if os.name == "posix":
+                assert cache_dir.stat().st_mode & 0o777 == 0o700
 
 
 # ---------------------------------------------------------------------------
