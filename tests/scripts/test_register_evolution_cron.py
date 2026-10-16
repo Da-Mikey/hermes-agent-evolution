@@ -640,6 +640,76 @@ class TestInstallEvolutionHelpers:
         assert mod._install_evolution_helpers(repo) == []
 
 
+    def test_installs_siblings_the_family_imports(self, tmp_path, monkeypatch):
+        """The ``evolution_*.py`` glob cannot see the modules the family imports
+        from OUTSIDE that prefix (funnel -> delegation_escalation_report). Those
+        siblings must be deployed too: the scheduler executes from
+        HERMES_HOME/scripts, so an undeployed sibling is an ImportError that took
+        the whole job down — evolution-funnel died outright on 2026-10-16."""
+        mod = _import_module()
+        repo = self._fake_repo(tmp_path)
+        scripts = repo / "scripts"
+        (scripts / "delegation_escalation_report.py").write_text("# report\n")
+        # Both spellings the funnel uses: the checkout form and the copy form.
+        (scripts / "evolution_funnel.py").write_text(
+            "try:\n"
+            "    from scripts.delegation_escalation_report import summarize\n"
+            "except ModuleNotFoundError:\n"
+            "    from delegation_escalation_report import summarize\n"
+        )
+        home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        installed = mod._install_evolution_helpers(repo)
+
+        assert "delegation_escalation_report.py" in installed
+        assert (home / "scripts" / "delegation_escalation_report.py").is_file()
+        # Not a blanket copy of the directory.
+        assert not (home / "scripts" / "helper.py").exists()
+        assert not (home / "scripts" / "register_evolution_cron.py").exists()
+
+    def test_sibling_scan_ignores_absent_modules(self, tmp_path, monkeypatch):
+        """Only names that exist as scripts/<name>.py are installed: an import of
+        json/math or of a module living elsewhere pulls nothing in."""
+        mod = _import_module()
+        repo = self._fake_repo(tmp_path)
+        (repo / "scripts" / "evolution_funnel.py").write_text(
+            "import json\n"
+            "import math\n"
+            "from pathlib import Path\n"
+            "from evolution.lib.telemetry_guard import validate\n"
+            "from delegation_escalation_report import summarize\n"
+        )
+        home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        installed = mod._install_evolution_helpers(repo)
+
+        assert sorted(installed) == [
+            "evolution_funnel.py",
+            "evolution_metrics.py",
+            "evolution_realized_impact.py",
+        ]
+        assert not (home / "scripts" / "json.py").exists()
+        assert not (home / "scripts" / "delegation_escalation_report.py").exists()
+
+    def test_unparseable_family_file_does_not_block_the_deploy(
+        self, tmp_path, monkeypatch
+    ):
+        """A syntax error in one family file must not abort the whole install —
+        the scan is fail-open and the file is still mirrored."""
+        mod = _import_module()
+        repo = self._fake_repo(tmp_path)
+        (repo / "scripts" / "evolution_broken.py").write_text("def (:\n")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        installed = mod._install_evolution_helpers(repo)
+
+        assert "evolution_broken.py" in installed
+        assert "evolution_funnel.py" in installed
+
+
 class TestEnsureEvolutionLabels:
     """``_ensure_evolution_labels`` idempotently creates the GitHub labels used
     by every evolution skill.  It must succeed when labels already exist and
