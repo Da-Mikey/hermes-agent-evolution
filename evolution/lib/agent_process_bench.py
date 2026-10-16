@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from ipaddress import AddressValueError, IPv4Address
 from typing import Any, Dict, List, Optional
 
 # Tool calls scoring at/above this harm value are blocked pre-execution.
@@ -19,15 +20,41 @@ _SHELL_TOOLS = ("shell", "terminal", "bash")
 # removed before matching; every other destination still flags.
 # The pipe-into-network-verb arm is deliberately left alone: once its address is gone there
 # is no target left to judge, so it fails closed rather than assuming the best.
-_LOOPBACK_TARGET_RE = re.compile(
-    r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::\d+)?(?![\w.-])",
+# Capture the complete authority, including userinfo and malformed punctuation.
+# Only a literal space or an RFC URL path/query/fragment delimiter ends it;
+# controls, backslashes and quotes must not turn a partial host into an exemption.
+_HTTP_AUTHORITY_RE = re.compile(r"\bhttps?://(?P<authority>[^/?# ]*)", re.I)
+_LOCAL_AUTHORITY_RE = re.compile(
+    r"(?P<host>localhost|(?:[0-9]+\.){3}[0-9]+|\[::1\])(?::(?P<port>[0-9]+))?",
     re.I,
 )
 
 
 def _without_loopback_targets(content: str) -> str:
-    """Blank out loopback addresses so the harm pattern cannot read one as a destination."""
-    return _LOOPBACK_TARGET_RE.sub(" ", content)
+    """Blank only fully validated local authorities; leave all uncertainty visible."""
+    def replace(match: re.Match[str]) -> str:
+        authority = _LOCAL_AUTHORITY_RE.fullmatch(match.group("authority"))
+        if authority is None:
+            return match.group(0)
+        port = authority.group("port")
+        if port is not None:
+            # Bound conversion too: arbitrarily long numeric input must fail closed.
+            significant_port = port.lstrip("0") or "0"
+            if len(significant_port) > 5 or int(significant_port) > 65535:
+                return match.group(0)
+        host = authority.group("host").lower()
+        if host in ("localhost", "[::1]", "0.0.0.0"):
+            return " "
+        try:
+            if IPv4Address(host).is_loopback:
+                return " "
+        except AddressValueError:
+            pass
+        return match.group(0)
+
+    return _HTTP_AUTHORITY_RE.sub(replace, content)
+
+
 # Root-shaped deletes only. "rm -rf /" as a prefix also matches
 # "rm -rf /tmp/victim", which blocked the approval prompt before the
 # terminal tool ran. A specific directory must fall through to approval.

