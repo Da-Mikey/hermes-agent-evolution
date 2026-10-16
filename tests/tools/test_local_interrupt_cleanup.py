@@ -66,13 +66,8 @@ def _wait_for_pgid_exit(pgid: int, timeout: float = 60.0) -> bool:
     return not _pgid_still_alive(pgid)
 
 
-def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
-    """If the shell wrapper exits before cleanup, still kill its process group.
-
-    Without the cached pgid fallback, ``os.getpgid(proc.pid)`` raises for the
-    dead wrapper and cleanup falls back to ``proc.kill()``, which cannot reach
-    orphaned grandchildren still running in the original process group.
-    """
+def test_kill_process_refuses_cached_pgid_without_live_ownership(monkeypatch, caplog):
+    """A cached numeric group cannot authorize signals after its owner disappears."""
     env = object.__new__(LocalEnvironment)
     proc = SimpleNamespace(
         pid=12345,
@@ -95,18 +90,17 @@ def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
 
     env._kill_process(proc)
 
-    assert killpg_calls == [(67890, signal.SIGTERM), (67890, 0)]
+    assert killpg_calls == []
+    assert "cleanup incomplete" in caplog.text
 
 
-def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
+def test_wait_for_process_kills_subprocess_on_keyboardinterrupt(monkeypatch):
     """When KeyboardInterrupt arrives mid-poll, the subprocess group must be
     killed before the exception is re-raised."""
     env = LocalEnvironment(cwd="/tmp")
     try:
         result_holder = {}
-        proc_holder = {}
-        started = threading.Event()
-        raise_at = [None]  # set by the main thread to tell worker when
+        started, proc_holder = _observe_foreground_wait(env, monkeypatch)
 
         # Drive execute() on a separate thread so we can SIGNAL-interrupt it
         # via a thread-targeted exception without killing our test process.
@@ -121,41 +115,10 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-        # Wait until the subprocess actually exists.  LocalEnvironment.execute
-        # does init_session() (one spawn) before the real command, so we need
-        # to wait until a sleep 30 is visible.  Use pgrep-style lookup via
-        # /proc to find the bash process running our sleep.
-        deadline = time.monotonic() + 20.0  # generous: init_session + spawn dilate under CI load
-        target_pid = None
-        while time.monotonic() < deadline:
-            # Walk our children and grand-children to find one running 'sleep 30'
-            try:
-                import psutil  # optional — fall back if absent
-                for p in psutil.Process(os.getpid()).children(recursive=True):
-                    try:
-                        if "sleep 30" in " ".join(p.cmdline()):
-                            target_pid = p.pid
-                            break
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
-            except ImportError:
-                # Fall back to ps
-                ps = subprocess.run(
-                    ["ps", "-eo", "pid,ppid,pgid,cmd"], capture_output=True, text=True,
-                )
-                for line in ps.stdout.splitlines():
-                    if "sleep 30" in line and "grep" not in line:
-                        parts = line.split()
-                        if parts and parts[0].isdigit():
-                            target_pid = int(parts[0])
-                            break
-            if target_pid:
-                break
-            time.sleep(0.1)
-
-        assert target_pid is not None, (
-            "test setup: couldn't find 'sleep 30' subprocess after 5 s"
-        )
+        # Observe the actual published handle, never an argv substring during
+        # helper startup before its private session has been established.
+        assert started.wait(20), "foreground command never reached its wait"
+        target_pid = proc_holder["proc"].pid
         pgid = os.getpgid(target_pid)
         assert _pgid_still_alive(pgid), "sanity: subprocess should be alive"
 
@@ -203,15 +166,15 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             pass
 
 
-def _descendant_running(marker: str):
-    import psutil
-    for p in psutil.Process(os.getpid()).children(recursive=True):
-        try:
-            if marker in " ".join(p.cmdline()):
-                return p
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return None
+def _observe_foreground_wait(env, monkeypatch):
+    started, captured = threading.Event(), {}
+    wait = env._wait_for_process
+    def observed(proc, *args, **kwargs):
+        captured["proc"] = proc
+        started.set()
+        return wait(proc, *args, **kwargs)
+    monkeypatch.setattr(env, "_wait_for_process", observed)
+    return started, captured
 
 
 def test_exit_cleanup_kills_foreground_command_still_running(monkeypatch):
@@ -223,13 +186,13 @@ def test_exit_cleanup_kills_foreground_command_still_running(monkeypatch):
     monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
     env = LocalEnvironment(cwd="/tmp")
     result: dict = {}
+    started, captured = _observe_foreground_wait(env, monkeypatch)
+    proc = None
     t = threading.Thread(target=lambda: result.update(env.execute("sleep 3517", timeout=600)), daemon=True)
     try:
         t.start()
-        deadline = time.monotonic() + 20.0
-        while (proc := _descendant_running("sleep 3517")) is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert proc is not None, "test setup: foreground sleep never started"
+        assert started.wait(20), "foreground command never reached its wait"
+        proc = captured["proc"]
         pgid = os.getpgid(proc.pid)
 
         terminal_tool_lifecycle.cleanup_all_environments()
@@ -239,8 +202,8 @@ def test_exit_cleanup_kills_foreground_command_still_running(monkeypatch):
         t.join(timeout=15.0)
         assert not t.is_alive() and result.get("returncode") not in (None, 0), result
     finally:
-        with contextlib.suppress(Exception):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        if proc is not None:
+            env._kill_process(proc)
         env.cleanup()
 
 
