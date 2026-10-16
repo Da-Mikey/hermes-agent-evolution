@@ -83,6 +83,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
     "ollama-cloud": HermesOverlay(base_url_override="https://ollama.com/v1", base_url_env_var="OLLAMA_BASE_URL"),
     # Azure Foundry serves OpenAI- and Anthropic-style endpoints; transport comes from model.api_mode.
     "azure-foundry": HermesOverlay(base_url_env_var="AZURE_FOUNDRY_BASE_URL"),
+    # The models.dev catalog carries a ``commandcode`` entry (env ``CMD_API_KEY``) that shadows the
+    # plugin profile on the catalog rung, but this build configures ``COMMANDCODE_API_KEY``
+    # (plugins/model-providers/commandcode, config_defaults, doctor, docs). Listing ours as an extra
+    # keeps the resolved provider pointing at the key the runtime actually reads.
+    "commandcode": HermesOverlay(extra_env_vars=("COMMANDCODE_API_KEY",),
+                                 base_url_env_var="COMMANDCODE_BASE_URL"),
     "bedrock": HermesOverlay(transport="bedrock_converse", auth_type="aws_sdk"),
     # Vertex is OAuth2 (service-account JSON / ADC), resolved by agent/vertex_adapter.py. Without an
     # overlay get_provider("vertex") is None and auxiliary_client._preserve_provider_with_base_url
