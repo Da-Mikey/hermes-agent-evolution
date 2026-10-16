@@ -1,7 +1,13 @@
 """MemoryStore — bounded, file-backed curated memory (MEMORY.md / USER.md).
 Entries are joined by ``ENTRY_DELIMITER``; budgets are in chars (model-independent).
 Module state that tests monkeypatch (``get_memory_dir``, ``fcntl``/``msvcrt``) stays
-in ``tools.memory_tool`` and is read lazily."""
+in ``tools.memory_tool`` and is read lazily.
+
+Issue #149 slice 1 (ChronoMem-style versioning): every mutating write first
+captures the PREVIOUS on-disk bytes as a bounded, content-deduplicated
+snapshot under a dedicated store subdirectory, with ``list_snapshots`` /
+``read_snapshot`` to walk the history. Natural-language semantic rollback is a
+later slice."""
 
 import copy
 import hashlib
@@ -353,6 +359,159 @@ def _locate_stored(entries: List[str], old_text: str, matched_entry: Optional[st
 # silent about the loss (#117952). Same convention as _error(**extra).
 
 
+# ---------------------------------------------------------------------------
+# Versioned memory snapshots (issue #149, slice 1)
+#
+# Agent memory used to be forward-only — every write overwrote the on-disk file
+# with no history, so there was nothing to roll back to. This slice adds a
+# git-style history: BEFORE a mutating write replaces MEMORY.md / USER.md, the
+# PREVIOUS on-disk bytes are captured as a versioned snapshot. Slice 1 ships
+# capture + list + read; natural-language semantic rollback (and hybrid lexical
+# + semantic retrieval over this history) is a later slice.
+#
+# Design constraints:
+#   * Snapshots live in a dedicated subdirectory of the memory dir, never a
+#     sibling MEMORY.md / USER.md a loader could read as an entry. The name
+#     ends in ``-snapshots`` so the repo's existing ``*-snapshots/`` .gitignore
+#     rule keeps it out of any tree that happens to sit inside the checkout.
+#   * Bounded and cheap: a snapshot whose content hash already exists for the
+#     target is skipped (identical content never creates a new version), and
+#     only the newest ``SNAPSHOT_RETENTION`` versions per target are kept.
+#   * FAIL-OPEN by design: a snapshot is a RECOVERY AID, not a guard. A snapshot
+#     failure is logged and reported on the write result (see
+#     ``MemoryStore.save_to_disk``), but must never block or corrupt the real
+#     memory write.
+# ---------------------------------------------------------------------------
+
+# Subdirectory of the memory dir holding snapshots. Ends in ``-snapshots`` so
+# the repo's ``*-snapshots/`` gitignore rule matches it.
+SNAPSHOT_DIR_NAME = "memory-snapshots"
+
+# Maximum number of snapshots retained PER TARGET (memory / user); older ones
+# are pruned oldest-first on write. A fixed cap keeps the history bounded on a
+# long-lived profile while still covering a run of bad consolidations.
+SNAPSHOT_RETENTION = 20
+
+
+def snapshot_dir(target: str) -> Path:
+    """Return the snapshot directory for ``target`` ("memory" or "user")."""
+    name = "user" if target == "user" else "memory"
+    return get_memory_dir() / SNAPSHOT_DIR_NAME / name
+
+
+def _snapshot_version_name(digest: str) -> str:
+    """Snapshot filename: a sortable ns timestamp followed by the content hash."""
+    return f"{time.time_ns()}-{digest}.md"
+
+
+def _digest_from_version(name: str) -> Optional[str]:
+    """Recover the content hash from a snapshot filename; None if unshaped."""
+    if not name.endswith(".md"):
+        return None
+    stem = name[: -len(".md")]
+    _, sep, digest = stem.partition("-")
+    return digest if sep and digest else None
+
+
+def list_snapshots(target: str) -> List[Dict[str, Any]]:
+    """List one target's stored snapshots, oldest-first (issue #149 slice 1).
+
+    Each entry is ``{"version", "path", "size", "created_ns"}`` where
+    ``version`` is the filename :func:`read_snapshot` accepts. Fail-open: a
+    missing or unreadable snapshot directory yields an empty list.
+    """
+    try:
+        directory = snapshot_dir(target)
+        if not directory.is_dir():
+            return []
+        snapshots: List[Dict[str, Any]] = []
+        for path in sorted(directory.glob("*.md")):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            head = path.name.partition("-")[0]
+            snapshots.append({
+                "version": path.name,
+                "path": str(path),
+                "size": size,
+                "created_ns": int(head) if head.isdigit() else None,
+            })
+        return snapshots
+    except OSError:
+        logger.warning("Could not list memory snapshots for %s", target, exc_info=True)
+        return []
+
+
+def read_snapshot(target: str, version: str) -> Optional[str]:
+    """Return one snapshot's stored text, or None if absent/unreadable.
+
+    ``version`` is the filename from :func:`list_snapshots`. Only a bare
+    filename is honored, so the snapshot directory cannot be escaped.
+    """
+    if not version or Path(version).name != version:
+        return None
+    try:
+        return (snapshot_dir(target) / version).read_text(encoding="utf-8")
+    except (OSError, IOError, UnicodeDecodeError):
+        return None
+
+
+def capture_memory_snapshot(target: str, previous_content: str) -> Dict[str, Any]:
+    """Write ``previous_content`` as a new version for ``target`` (#149 slice 1).
+
+    Skips empty content (nothing to version) and de-duplicates by SHA-256: if a
+    snapshot holding identical content already exists for the target, no new
+    version is written. Enforces ``SNAPSHOT_RETENTION`` versions per target,
+    pruning the oldest first.
+
+    FAIL-OPEN: this is a recovery aid, not a guard, so any failure is logged and
+    returned as ``{"error": ...}`` instead of raised — a snapshot problem must
+    never block or corrupt the real memory write.
+
+    Returns ``{"created", "version", "pruned", "error", ...}``.
+    """
+    result: Dict[str, Any] = {
+        "created": False,
+        "version": None,
+        "pruned": [],
+        "error": None,
+    }
+    if not previous_content.strip():
+        return result
+    try:
+        digest = hashlib.sha256(previous_content.encode("utf-8")).hexdigest()
+        directory = snapshot_dir(target)
+        directory.mkdir(parents=True, exist_ok=True)
+        existing = [p for p in sorted(directory.glob("*.md")) if p.is_file()]
+        for path in existing:
+            if _digest_from_version(path.name) == digest:
+                # Identical content never creates a new version.
+                result["version"] = path.name
+                result["deduped"] = True
+                return result
+        version = _snapshot_version_name(digest)
+        atomic_write_text(directory / version, previous_content, tmp_prefix=".mem_")
+        result["created"] = True
+        result["version"] = version
+        # Retention: keep only the newest SNAPSHOT_RETENTION versions.
+        retained = [p for p in sorted(directory.glob("*.md")) if p.is_file()]
+        stale = retained[:-SNAPSHOT_RETENTION] if SNAPSHOT_RETENTION > 0 else retained
+        for path in stale:
+            try:
+                path.unlink()
+                result["pruned"].append(path.name)
+            except OSError:
+                logger.debug("Could not prune memory snapshot %s", path, exc_info=True)
+        return result
+    except Exception as exc:  # fail-open by contract: never break the write
+        logger.warning(
+            "Memory snapshot capture failed for %s: %s", target, exc, exc_info=True
+        )
+        result["error"] = f"snapshot capture failed: {exc}"
+        return result
+
+
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -414,6 +573,9 @@ class MemoryStore:
         # lazily from a sidecar under the memory dir so a poisoned entry warns
         # ONCE across sessions instead of at every session start.
         self._blocked_warned: Optional[set] = None
+        # Issue #149 slice 1: outcome of the most recent snapshot capture,
+        # surfaced on the next success response (None when nothing to report).
+        self._last_snapshot: Optional[Dict[str, Any]] = None
 
     def target_enabled(self, target: str) -> bool:
         """Return whether this session's selected built-in store is writable."""
@@ -749,9 +911,47 @@ class MemoryStore:
         return bak
 
     def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
+        """Persist entries to the appropriate file. Called after every mutation.
+
+        Issue #149 slice 1: the PREVIOUS on-disk bytes are captured as a
+        versioned snapshot before the file is replaced, so a later slice can
+        build rollback on top. The read happens here, under the caller's
+        ``_file_lock``; a snapshot failure never blocks the write (see
+        ``_snapshot_before_write``).
+        """
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        path = self._path_for(target)
+        previous_raw, read_ok = self._read_raw_checked(path)
+        self._snapshot_before_write(target, previous_raw if read_ok else None)
+        self._write_file(path, self._entries_for(target))
+
+    def _snapshot_before_write(self, target: str, previous_raw: Optional[str]) -> None:
+        """Record the pre-write on-disk content as a snapshot (issue #149 slice 1).
+
+        Called with the previous file text while the caller holds ``_file_lock``,
+        immediately before the file is atomically replaced. Sets
+        ``self._last_snapshot`` so ``_success_response`` can surface the outcome.
+
+        FAIL-OPEN: the snapshot is a recovery aid, not a guard — a capture
+        failure is logged and reported on the write result, but the memory write
+        itself always proceeds. ``previous_raw`` is None when the previous file
+        exists but could not be read.
+        """
+        if previous_raw is None:
+            self._last_snapshot = {
+                "error": "previous memory content unreadable; snapshot skipped"
+            }
+            logger.warning(
+                "Skipped memory snapshot for %s: previous content unreadable", target
+            )
+            return
+        try:
+            self._last_snapshot = capture_memory_snapshot(target, previous_raw)
+        except Exception as exc:  # defensive: capture is already fail-open
+            self._last_snapshot = {"error": f"snapshot capture failed: {exc}"}
+            logger.warning(
+                "Memory snapshot failed for %s: %s", target, exc, exc_info=True
+            )
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -852,6 +1052,7 @@ class MemoryStore:
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
+            self._snapshot_before_write(target, raw)
             self._write_file(path, result[0])
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
@@ -1765,6 +1966,16 @@ class MemoryStore:
             resp["message"] = message
         if extra:
             resp.update(extra)
+        # Issue #149 slice 1: surface the snapshot outcome of this write, if any.
+        # Read-and-clear so an unrelated response never echoes a stale result.
+        # getattr: callers that bypass __init__ (e.g. __new__ in tests) lack it.
+        snapshot = getattr(self, "_last_snapshot", None)
+        self._last_snapshot = None
+        if snapshot:
+            if snapshot.get("error"):
+                resp["snapshot_error"] = snapshot["error"]
+            elif snapshot.get("created") and snapshot.get("version"):
+                resp["snapshot_version"] = snapshot["version"]
         resp["note"] = "Write saved. This update is complete — do not repeat it."
         return resp
 
