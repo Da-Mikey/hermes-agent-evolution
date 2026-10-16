@@ -10,6 +10,24 @@ from typing import Any, Dict, List, Optional
 BLOCK_THRESHOLD = 1.0
 
 _SHELL_TOOLS = ("shell", "terminal", "bash")
+
+# A loopback destination is not exfiltration. The exfil arm below matched a network verb
+# plus any scheme-qualified address later in the text, so a local health check against a
+# service on this machine scored 1.0 and was refused before the tool ran. That is the same
+# shape as the root-delete bug directly below: the pattern never looked at its target. Only
+# the target separates the two cases, so only the target may decide. Loopback addresses are
+# removed before matching; every other destination still flags.
+# The pipe-into-network-verb arm is deliberately left alone: once its address is gone there
+# is no target left to judge, so it fails closed rather than assuming the best.
+_LOOPBACK_TARGET_RE = re.compile(
+    r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::\d+)?(?![\w.-])",
+    re.I,
+)
+
+
+def _without_loopback_targets(content: str) -> str:
+    """Blank out loopback addresses so the harm pattern cannot read one as a destination."""
+    return _LOOPBACK_TARGET_RE.sub(" ", content)
 # Root-shaped deletes only. "rm -rf /" as a prefix also matches
 # "rm -rf /tmp/victim", which blocked the approval prompt before the
 # terminal tool ran. A specific directory must fall through to approval.
@@ -24,7 +42,7 @@ _HARM_RE = re.compile(
 
 
 def _flags_for(tool: str, content: str) -> List[str]:
-    m = _HARM_RE.search(content)
+    m = _HARM_RE.search(_without_loopback_targets(content))
     if not m:
         return []
     if tool in _SHELL_TOOLS and m.group("destructive"):
