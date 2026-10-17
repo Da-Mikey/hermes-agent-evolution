@@ -15,11 +15,14 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 import uuid
 
 from hermes_constants import get_hermes_home
 from evolution.lib.skill_reuse_gate import scan_skill_for_misevolution
+
+if TYPE_CHECKING:  # annotation only — keeps the import lazy at runtime
+    from evolution.lib.verifier_independence import RejectedRationaleIndex
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +153,10 @@ class SubSkillStore:
     def __init__(self, store_path: Optional[Path] = None):
         self.store_path = store_path or (get_hermes_home() / _DEFAULT_SUB_SKILLS_RELPATH)
         self._skills: Dict[str, SubSkill] = {}
+        # Promotions withheld by the rationale re-encoding check (#213), keyed by
+        # sub_skill_id. In-memory on purpose: a flag is a "look again" nudge for
+        # this process, not durable state that could outlive its evidence.
+        self._promotion_flags: Dict[str, Dict[str, Any]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -190,16 +197,51 @@ class SubSkillStore:
             return [s for s in self._skills.values() if s.status == status]
         return list(self._skills.values())
 
-    def promote(self, sub_skill_id: str, approver: str = "human") -> bool:
+    def promote(self, sub_skill_id: str, approver: str = "human",
+                rationale: Optional[str] = None) -> bool:
+        """Promote a candidate sub-skill to ``approved``.
+
+        Before promoting, its rationale is checked against the ones the project
+        already quarantined (#213, arXiv 2610.12822). A near-match is **flagged
+        for review and NOT promoted** — the candidate must not ride a rejected
+        justification into reusable policy. ``rationale`` defaults to the
+        candidate's own description.
+        """
         skill = self._skills.get(sub_skill_id)
         if not skill or skill.status == "quarantined":
             return False
+
+        text = rationale if rationale is not None else skill.description
+        match = self.rejected_rationale_index().best_match(text or "")
+        if match is not None:
+            self._promotion_flags[sub_skill_id] = match.to_dict()
+            logger.warning(
+                "Sub-skill %s not promoted: rationale re-encodes rejected %s "
+                "(similarity %.2f) — flagged for review",
+                sub_skill_id, match.candidate_id, match.similarity)
+            return False
+        self._promotion_flags.pop(sub_skill_id, None)
 
         skill.status = "approved"
         skill.human_reviewed = True
         self._persist()
         logger.info("Sub-skill %s approved by %s", sub_skill_id, approver)
         return True
+
+    def rejected_rationale_index(self) -> "RejectedRationaleIndex":
+        """Fingerprints of every quarantined sub-skill's own justification."""
+        from evolution.lib.verifier_independence import RejectedRationaleIndex
+
+        index = RejectedRationaleIndex()
+        for skill in self._skills.values():
+            if skill.status == "quarantined":
+                index.add(skill.sub_skill_id,
+                          f"{skill.description}\n{skill.action_template}")
+        return index
+
+    def promotion_flags(self) -> Dict[str, Dict[str, Any]]:
+        """``{sub_skill_id: match}`` for promotions withheld by the re-encoding check."""
+        return dict(self._promotion_flags)
 
     def quarantine(self, sub_skill_id: str, reason: str = "") -> bool:
         skill = self._skills.get(sub_skill_id)

@@ -27,7 +27,10 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoids a runtime import cycle between the gate and the module
+    from evolution.lib.verifier_independence import RejectedRationaleIndex
 
 logger = logging.getLogger(__name__)
 
@@ -94,13 +97,14 @@ def _content_hash(text: str) -> str:
 def scan_skill_for_misevolution(
     skill_markdown: str,
     source_chain: Optional[Sequence[Dict[str, Any]]] = None,
+    rationale_index: Optional["RejectedRationaleIndex"] = None,
 ) -> Tuple[bool, List[str]]:
     """Scan *skill_markdown* for misevolution content.
 
     Returns ``(safe, reasons)``. ``safe=False`` means the skill must be
     quarantined, never promoted to reusable policy.
 
-    Two independent signals are checked:
+    Three independent signals are checked:
 
     * **Self-propagation / instruction-following markers** — textual
       fingerprints of a skill that tries to make the agent obey it
@@ -108,6 +112,10 @@ def scan_skill_for_misevolution(
     * **Untrusted-source reproduction** — either a verbatim quoted block
       (``>`` / ``|`` lines) or a source chain whose entries are all
       untrusted (per the SkillJack taxonomy in ``tools/skill_provenance``).
+    * **Rationale re-encoding** — only when *rationale_index* is supplied: a
+      candidate whose justification merely re-states one the project already
+      rejected is flagged instead of promoted (#213, arXiv 2610.12822: reward
+      hacking travels in the artifact *and* its rationalisation).
     """
     reasons: List[str] = []
     md = skill_markdown or ""
@@ -126,6 +134,9 @@ def scan_skill_for_misevolution(
                 f"source chain has no trusted sources (all untrusted: {untrusted})"
             )
 
+    if rationale_index is not None:
+        reasons.extend(rationale_index.check(md))
+
     return (not reasons, reasons)
 
 
@@ -141,9 +152,14 @@ class SkillReuseGate:
         self,
         quarantine_dir: Path | str,
         version_dir: Path | str,
+        rationale_index: Optional["RejectedRationaleIndex"] = None,
     ) -> None:
         self.quarantine_dir = Path(quarantine_dir)
         self.version_dir = Path(version_dir)
+        # Optional: rationales of candidates the project already rejected. When
+        # supplied, a candidate that re-encodes one is flagged instead of
+        # promoted (#213).
+        self.rationale_index = rationale_index
 
     # -- quarantine -----------------------------------------------------
     def quarantine(
@@ -254,7 +270,8 @@ class SkillReuseGate:
         quarantined (never promoted) and ``quarantined=True``. Every skill is
         versioned so a poisoned revision can be rolled back.
         """
-        safe, reasons = scan_skill_for_misevolution(skill_markdown, source_chain)
+        safe, reasons = scan_skill_for_misevolution(
+            skill_markdown, source_chain, self.rationale_index)
         version = self.version(skill_name, skill_markdown, source_chain)
         quarantined = False
         if not safe:
