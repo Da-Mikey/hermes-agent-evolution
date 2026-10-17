@@ -13,6 +13,7 @@ whole-file overwrite of content this task never saw or that changed since.
 import fnmatch
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.file_safety import get_nt_namespace_error
@@ -551,8 +552,53 @@ def write_failure_reason(message: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) -> str | None:
-    """Reason write_file must NOT replace the existing file, else ``None``.
+# ── Refusal classes: ONE deterministic remedy per refusal (#217) ─────────
+# The refusal used to read the same whichever way it was hit, and could
+# alternate between two contradictory remedies ("re-read, it changed on disk"
+# vs "re-read every page, you never saw it all"). Those two situations need
+# opposite fixes, so each refusal now names its class and exactly one action.
+STALE_ON_DISK = "stale_on_disk"
+NOT_FULLY_READ = "not_fully_read"
+
+
+@dataclass(frozen=True)
+class StaleOverwriteBlocker:
+    """Why ``write_file`` must not replace the existing file — plus its one fix.
+
+    ``reason_class`` is ``stale_on_disk`` (the file changed under you, so
+    re-read to get the *current* bytes) or ``not_fully_read`` (this task never
+    saw the whole file, so read it to the last line). ``str(blocker)`` stays the
+    human reason, so it formats like the plain string this used to be.
+    """
+
+    reason_class: str
+    message: str
+    next_action: str
+
+    def __str__(self) -> str:  # back-compat: format/concatenate as text
+        return self.message
+
+
+def _reread_action(resolved: str | None) -> str:
+    """The single remedy for ``stale_on_disk``: read the CURRENT bytes, then write."""
+    target = resolved or "the file"
+    return (
+        f"Re-read {target} now to pick up its current content, merge your change "
+        "into what is on disk, then call write_file again.")
+
+
+def _read_fully_action(resolved: str | None) -> str:
+    """The single remedy for ``not_fully_read``: see every page, then write."""
+    target = resolved or "the file"
+    return (
+        f"Read {target} through to its last line (call read_file again with offset "
+        "if the first page stops short — contiguous pages count as a full read), "
+        "then call write_file again.")
+
+
+def _stale_overwrite_blocker(
+        filepath: str, resolved: str | None, task_id: str) -> "StaleOverwriteBlocker | None":
+    """Why write_file must NOT replace the existing file, else ``None``.
 
     Refuses BEFORE any disk mutation (the pre-#65604 warning arrived after the
     clobber): a sibling/external/partial-read staleness finding, or an existing
@@ -560,16 +606,26 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
     redacted, only patched). Net-new files, files this task fully read (in one
     page or by paging contiguously to the last line) or wrote, unresolvable
     paths and the file-state kill switch all let the write proceed.
+
+    Every refusal carries its class and ONE remedy (#217): a file that changed
+    on disk and a file this task never fully saw are different problems, and
+    handing the model both remedies at once left it retrying a precondition it
+    could not satisfy.
     """
     if file_state.guard_disabled():
         return None
     stale = file_state.check_stale(task_id, resolved) if resolved else None
     if stale:
-        return stale
+        if file_state.stale_kind(stale) in (file_state.STALE_PARTIAL_VIEW,
+                                            file_state.STALE_NEVER_READ):
+            return StaleOverwriteBlocker(NOT_FULLY_READ, stale, _read_fully_action(resolved))
+        return StaleOverwriteBlocker(STALE_ON_DISK, stale, _reread_action(resolved))
     if _read_mtime_drifted(filepath, task_id):
-        return (
+        return StaleOverwriteBlocker(
+            STALE_ON_DISK,
             f"{filepath} was modified since you last read it (external edit or "
-            "concurrent agent). Re-read the file before writing.")
+            "concurrent agent).",
+            _reread_action(resolved or filepath))
     if not resolved or _has_full_write_baseline(resolved, task_id):
         return None
     try:
@@ -578,31 +634,42 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
         return None
     if not exists:
         return None
-    return (
+    return StaleOverwriteBlocker(
+        NOT_FULLY_READ,
         f"{resolved} exists but this task has not seen its full current content "
-        "(never read, only patched, or only a redacted/partial view). Read the "
-        "file — every page of it, if it needs offset/limit — or use patch for a "
-        "targeted edit; a stale conversation copy must not overwrite the current "
-        "disk content.")
+        "(never read, only patched, or only a redacted/partial view).",
+        _read_fully_action(resolved))
 
 
-def _stale_write_refusal(filepath: str, reason: str, resolved: str | None = None) -> dict:
-    """Model-facing refusal payload for write_file; ``stale_write_blocked`` lets
-    callers tell it apart from I/O errors."""
+def _stale_write_refusal(filepath: str, reason: "StaleOverwriteBlocker | str",
+                         resolved: str | None = None) -> dict:
+    """Model-facing refusal payload for write_file.
+
+    ``stale_write_blocked`` lets callers tell it apart from I/O errors.
+    ``stale_reason_class`` + a single top-level ``next_action`` say which
+    recovery actually applies (#217) — stale-on-disk means re-read for the
+    CURRENT bytes, not-fully-read means see every page; they are not the same
+    instruction and the model must not have to guess between them.
+    """
+    if isinstance(reason, StaleOverwriteBlocker):
+        message, next_action = reason.message, reason.next_action
+        reason_class: str | None = reason.reason_class
+    else:  # plain-string reason from an older call site
+        message = str(reason)
+        next_action = _reread_action(resolved or filepath)
+        reason_class = None
     result = {
         "error": (
-            f"Refusing to overwrite {filepath}: {reason} "
-            "The file was NOT modified. Reload the current contents with read_file "
-            "(every page, for a file that needs offset/limit), merge the requested "
-            "change, then call write_file again. For small edits, prefer patch so "
-            "existing unrelated changes are preserved."),
+            f"Refusing to overwrite {filepath}: {message} "
+            f"The file was NOT modified. {next_action}"),
         "stale_write_blocked": True,
+        "next_action": next_action,
         "path": filepath,
         "reason": "write-stale-overwrite",
-        "recovery_hint": (
-            "Reload the current contents with read_file, merge the change, then write again; "
-            "use patch for a targeted edit."),
+        "recovery_hint": next_action,
     }
+    if reason_class:
+        result["stale_reason_class"] = reason_class
     if resolved:
         result["resolved_path"] = resolved
     return result

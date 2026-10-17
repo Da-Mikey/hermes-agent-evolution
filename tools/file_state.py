@@ -224,6 +224,42 @@ def get_registry() -> FileStateRegistry:
     return _registry
 
 
+# ── Staleness classes (#217) ──────────────────────────────────────────────
+# ``check_stale`` returns one human message out of five distinct situations.
+# Callers that must give the model ONE deterministic remedy (the write_overwrite
+# guard does) need to know WHICH situation it is: "the file changed under you"
+# and "you never saw the whole file" have opposite fixes. The markers below are
+# the distinctive phrases of those five messages; ``tests/tools/test_file_stale_kind.py``
+# asserts every class is still reachable, so a reworded message fails loudly
+# instead of silently degrading to STALE_UNKNOWN.
+STALE_SIBLING_WRITE = "sibling_write"
+STALE_DISK_DRIFT = "disk_drift"
+STALE_PARTIAL_VIEW = "partial_view"
+STALE_NEVER_READ = "never_read"
+STALE_UNKNOWN = "unknown"
+
+_STALE_KIND_MARKERS: tuple[tuple[str, str], ...] = (
+    ("was modified by sibling subagent", STALE_SIBLING_WRITE),
+    ("was modified since you last read it on disk", STALE_DISK_DRIFT),
+    ("was last read with offset/limit pagination", STALE_PARTIAL_VIEW),
+    ("was not read by this agent", STALE_NEVER_READ),
+)
+
+
+def stale_kind(message: Optional[str]) -> str:
+    """Classify a ``check_stale`` message into one of the STALE_* classes.
+
+    Anything unrecognised degrades to ``STALE_UNKNOWN`` rather than guessing:
+    an unclassified refusal is treated as "stale on disk" by callers, which is
+    the conservative (re-read) remedy.
+    """
+    text = message or ""
+    for marker, kind in _STALE_KIND_MARKERS:
+        if marker in text:
+            return kind
+    return STALE_UNKNOWN
+
+
 # Convenience wrappers (short names used at call sites).
 def record_read(task_id: str, resolved_or_path: str | Path, *, partial: bool = False) -> None:
     _registry.record_read(task_id, str(resolved_or_path), partial=partial)
