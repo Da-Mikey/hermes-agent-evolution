@@ -57,6 +57,7 @@ Run it with a manifest path.
 
 # ── stripping ─────────────────────────────────────────────────────────────
 
+
 def test_rationale_headings_are_recognised():
     assert is_rationale_heading("Rationale")
     assert is_rationale_heading("Why this matters to our stack")
@@ -100,6 +101,7 @@ def test_strip_fields_handles_dicts_and_nesting():
 
 
 # ── acceptance 1: the verifier never sees the pitch ───────────────────────
+
 
 def test_harness_synthesis_prompt_carries_no_rationale():
     prompt = build_harness_synthesis_prompt(SKILL_MARKDOWN)
@@ -145,6 +147,7 @@ def test_verifier_bundle_refuses_an_empty_candidate():
 
 # ── fingerprinting ────────────────────────────────────────────────────────
 
+
 def test_fingerprint_is_stable_and_similarity_bounds():
     a = "the change removes the retry loop so timeouts stop doubling the work"
     b = "the change removes the retry loop so timeouts stop doubling the workload"
@@ -187,6 +190,7 @@ def test_rejected_index_rejects_a_nonsense_threshold():
 
 # ── the gate: re-encoding is flagged, not promoted ────────────────────────
 
+
 def test_misevolution_scan_flags_re_encoding_only_when_an_index_is_supplied():
     index = RejectedRationaleIndex()
     index.add("cand-1", "ship it because the benchmark numbers look good to us")
@@ -205,12 +209,14 @@ def test_reuse_gate_quarantines_a_re_encoded_rationale(tmp_path):
     gate = SkillReuseGate(tmp_path / "q", tmp_path / "v", rationale_index=index)
 
     verdict = gate.evaluate(
-        "malicious-cache", "ship it because the benchmark numbers look good to us")
+        "malicious-cache", "ship it because the benchmark numbers look good to us"
+    )
     assert verdict.safe is False
     assert verdict.quarantined is True
 
 
 # ── acceptance 2: promotion is withheld ───────────────────────────────────
+
 
 def _sub_skill(skill_id, description, *, status="candidate"):
     return SubSkill(

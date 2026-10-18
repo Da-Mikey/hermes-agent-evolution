@@ -60,7 +60,11 @@ class SubSkill:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> SubSkill:
         prov_data = data.get("provenance", {})
-        prov = SubSkillProvenance(**prov_data) if isinstance(prov_data, dict) else prov_data
+        prov = (
+            SubSkillProvenance(**prov_data)
+            if isinstance(prov_data, dict)
+            else prov_data
+        )
         return cls(
             sub_skill_id=data["sub_skill_id"],
             name=data["name"],
@@ -107,7 +111,7 @@ class SubSkillExtractor:
         if "terminal" in tool_names or "read_file" in tool_names:
             sub_id = f"subskill-{uuid.uuid4().hex[:8]}"
             preconds = [f"domain: {task_description[:30].strip() or 'general'}"]
-            
+
             error_keywords = ["error", "fail", "flak", "timeout", "lock", "concurren"]
             for a in actions:
                 output_str = str(a.get("output", "") or a.get("inputs", ""))
@@ -119,7 +123,7 @@ class SubSkillExtractor:
             steps = []
             for i, a in enumerate(actions[:5]):
                 t = a.get("tool", "action")
-                steps.append(f"Step {i+1}: invoke {t}")
+                steps.append(f"Step {i + 1}: invoke {t}")
             template = "\n".join(steps)
 
             skill = SubSkill(
@@ -151,7 +155,9 @@ class SubSkillExtractor:
 
 class SubSkillStore:
     def __init__(self, store_path: Optional[Path] = None):
-        self.store_path = store_path or (get_hermes_home() / _DEFAULT_SUB_SKILLS_RELPATH)
+        self.store_path = store_path or (
+            get_hermes_home() / _DEFAULT_SUB_SKILLS_RELPATH
+        )
         self._skills: Dict[str, SubSkill] = {}
         # Promotions withheld by the rationale re-encoding check (#213), keyed by
         # sub_skill_id. In-memory on purpose: a flag is a "look again" nudge for
@@ -175,12 +181,16 @@ class SubSkillStore:
                 except Exception:
                     continue
         except Exception as exc:
-            logger.warning("Failed to load sub-skills from %s: %s", self.store_path, exc)
+            logger.warning(
+                "Failed to load sub-skills from %s: %s", self.store_path, exc
+            )
 
     def _persist(self) -> None:
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         lines = [json.dumps(s.to_dict(), sort_keys=True) for s in self._skills.values()]
-        self.store_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        self.store_path.write_text(
+            "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
+        )
 
     def add(self, skill: SubSkill) -> None:
         is_safe, reason = skill.validate_safety()
@@ -197,8 +207,12 @@ class SubSkillStore:
             return [s for s in self._skills.values() if s.status == status]
         return list(self._skills.values())
 
-    def promote(self, sub_skill_id: str, approver: str = "human",
-                rationale: Optional[str] = None) -> bool:
+    def promote(
+        self,
+        sub_skill_id: str,
+        approver: str = "human",
+        rationale: Optional[str] = None,
+    ) -> bool:
         """Promote a candidate sub-skill to ``approved``.
 
         Before promoting, its rationale is checked against the ones the project
@@ -218,7 +232,10 @@ class SubSkillStore:
             logger.warning(
                 "Sub-skill %s not promoted: rationale re-encodes rejected %s "
                 "(similarity %.2f) — flagged for review",
-                sub_skill_id, match.candidate_id, match.similarity)
+                sub_skill_id,
+                match.candidate_id,
+                match.similarity,
+            )
             return False
         self._promotion_flags.pop(sub_skill_id, None)
 
@@ -235,8 +252,9 @@ class SubSkillStore:
         index = RejectedRationaleIndex()
         for skill in self._skills.values():
             if skill.status == "quarantined":
-                index.add(skill.sub_skill_id,
-                          f"{skill.description}\n{skill.action_template}")
+                index.add(
+                    skill.sub_skill_id, f"{skill.description}\n{skill.action_template}"
+                )
         return index
 
     def promotion_flags(self) -> Dict[str, Dict[str, Any]]:
@@ -259,7 +277,8 @@ class SubSkillStore:
         approved_only: bool = True,
     ) -> List[SubSkill]:
         candidates = [
-            s for s in self._skills.values()
+            s
+            for s in self._skills.values()
             if (not approved_only or s.status in ("approved", "promoted"))
         ]
 

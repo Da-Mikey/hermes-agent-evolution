@@ -271,7 +271,8 @@ class SkillReuseGate:
         versioned so a poisoned revision can be rolled back.
         """
         safe, reasons = scan_skill_for_misevolution(
-            skill_markdown, source_chain, self.rationale_index)
+            skill_markdown, source_chain, self.rationale_index
+        )
         version = self.version(skill_name, skill_markdown, source_chain)
         quarantined = False
         if not safe:

@@ -84,15 +84,32 @@ RATIONAL_SECTION_KEYWORDS: Tuple[str, ...] = (
 #: match as a substring — a skill's "## Impact" section is not a self-narrative,
 #: but a proposal's "## Impact" score line is).
 _RATIONALE_EXACT_HEADINGS = frozenset({
-    "impact", "priority", "score", "value", "why", "pitch",
+    "impact",
+    "priority",
+    "score",
+    "value",
+    "why",
+    "pitch",
 })
 
 #: Mapping keys that carry a proposer's self-narrative.
 _RATIONALE_FIELD_KEYS = frozenset({
-    "rationale", "justification", "justifications", "why", "why_now",
-    "why_it_matters", "why_this_matters", "why_it_matters_now",
-    "motivation", "value_proposition", "self_narrative", "self_justification",
-    "justification_text", "proposer_rationale", "benefits", "pitch",
+    "rationale",
+    "justification",
+    "justifications",
+    "why",
+    "why_now",
+    "why_it_matters",
+    "why_this_matters",
+    "why_it_matters_now",
+    "motivation",
+    "value_proposition",
+    "self_narrative",
+    "self_justification",
+    "justification_text",
+    "proposer_rationale",
+    "benefits",
+    "pitch",
 })
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -102,6 +119,7 @@ _MAX_FIELD_DEPTH = 6
 
 
 # ── detection ─────────────────────────────────────────────────────────────
+
 
 def _normalise_heading(heading: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", " ", (heading or "").strip().lower()).strip()
@@ -133,6 +151,7 @@ def contains_rationale_key(obj: Any, _depth: int = 0) -> bool:
 
 
 # ── stripping ─────────────────────────────────────────────────────────────
+
 
 def strip_rationale_sections(text: str) -> Tuple[str, List[str]]:
     """Remove rationale sections from markdown *text*.
@@ -219,10 +238,12 @@ def build_verifier_bundle(
 
     if not clean_task and not clean_edit and not clean_evidence:
         raise ValueError(
-            "verifier bundle would carry no task, edit or evidence — nothing to score")
+            "verifier bundle would carry no task, edit or evidence — nothing to score"
+        )
 
-    bundle: Dict[str, Any] = dict(zip(VERIFIER_INPUT_KEYS,
-                                      (clean_task, clean_edit, clean_evidence)))
+    bundle: Dict[str, Any] = dict(
+        zip(VERIFIER_INPUT_KEYS, (clean_task, clean_edit, clean_evidence))
+    )
     # The contract is closed: no proposer-authored narrative may ride along.
     if contains_rationale_key(bundle):
         raise ValueError("verifier bundle still carries a rationale field")
@@ -230,6 +251,7 @@ def build_verifier_bundle(
 
 
 # ── rationale fingerprinting (re-encoding check) ──────────────────────────
+
 
 def _tokens(text: str) -> frozenset:
     """Content words (>=3 chars) — the vocabulary a re-encoding reuses."""
@@ -243,7 +265,7 @@ def _char_grams(text: str) -> frozenset:
         return frozenset()
     if len(norm) < _CHAR_N:
         return frozenset({norm})
-    return frozenset(norm[i:i + _CHAR_N] for i in range(len(norm) - _CHAR_N + 1))
+    return frozenset(norm[i : i + _CHAR_N] for i in range(len(norm) - _CHAR_N + 1))
 
 
 def _jaccard(left: frozenset, right: frozenset) -> float:
@@ -269,8 +291,10 @@ def rationale_similarity(left: str, right: str) -> float:
     edits). Either is enough to mark a candidate as re-encoding — see the module
     docstring for what this deliberately does NOT catch.
     """
-    return max(_jaccard(_tokens(left), _tokens(right)),
-               _jaccard(_char_grams(left), _char_grams(right)))
+    return max(
+        _jaccard(_tokens(left), _tokens(right)),
+        _jaccard(_char_grams(left), _char_grams(right)),
+    )
 
 
 @dataclass(frozen=True)
@@ -293,7 +317,9 @@ class RejectedRationaleIndex:
     the paper evaluates, applied at our promotion point.
     """
 
-    def __init__(self, threshold: float = 0.6, entries: Optional[Mapping[str, str]] = None):
+    def __init__(
+        self, threshold: float = 0.6, entries: Optional[Mapping[str, str]] = None
+    ):
         if not 0.0 < threshold <= 1.0:
             raise ValueError("threshold must be in (0.0, 1.0]")
         self.threshold = float(threshold)
