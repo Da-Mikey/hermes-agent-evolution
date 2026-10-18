@@ -352,11 +352,32 @@ def parse_skill_capabilities(
     }
 
 
+def _verifier_safe_skill_def(
+    skill_def: Union[Dict[str, Any], str],
+) -> Union[Dict[str, Any], str]:
+    """Strip the candidate's self-narrative before the synthesizer reads it (#213).
+
+    ``build_harness_synthesis_prompt`` feeds a skill's own description to the
+    agent that writes the test cases that later score it — a candidate judging
+    itself through its own prose (arXiv 2610.12822). Rationale/justification
+    sections are removed here so the synthesizer scores the *specification*
+    (name, category, capability bullets), never the pitch.
+    """
+    from evolution.lib.verifier_independence import strip_rationale_fields
+
+    return strip_rationale_fields(skill_def)
+
+
 def build_harness_synthesis_prompt(
     skill_def: Union[Dict[str, Any], str],
 ) -> str:
-    """Build the prompt for synthesizing an evaluation harness spec from a skill definition."""
-    parsed = parse_skill_capabilities(skill_def)
+    """Build the prompt for synthesizing an evaluation harness spec from a skill definition.
+
+    The synthesizer is a verifier — the test cases it writes define what
+    "passing" means — so the candidate's justification is stripped first
+    (``_verifier_safe_skill_def``); its rationale must not steer its own rubric.
+    """
+    parsed = parse_skill_capabilities(_verifier_safe_skill_def(skill_def))
     caps_formatted = (
         "\n".join(f"- {cap}" for cap in parsed["capabilities"])
         or "- General skill execution"
