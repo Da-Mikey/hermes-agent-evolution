@@ -69,15 +69,20 @@ def test_stale_kind_classifies_each_check_stale_message(name, payload):
 
 
 def test_stale_kind_degrades_to_unknown_and_none_is_safe():
-    assert file_state.stale_kind("something completely different") == file_state.STALE_UNKNOWN
+    assert (
+        file_state.stale_kind("something completely different")
+        == file_state.STALE_UNKNOWN
+    )
     assert file_state.stale_kind(None) == file_state.STALE_UNKNOWN
 
 
 # ── the refusal payload ───────────────────────────────────────────────────
 
+
 def test_refusal_payload_names_class_and_one_action():
     blocker = StaleOverwriteBlocker(
-        STALE_ON_DISK, "the file changed.", "Re-read it, then write.")
+        STALE_ON_DISK, "the file changed.", "Re-read it, then write."
+    )
     payload = _stale_write_refusal("/tmp/x", blocker, "/tmp/x")
 
     assert payload["stale_write_blocked"] is True
@@ -104,6 +109,7 @@ def test_blocker_str_is_the_human_reason():
 
 # ── end to end through write_file: right class, right single remedy ───────
 
+
 @pytest.fixture()
 def existing(tmp_path):
     path = tmp_path / "output.md"
@@ -125,7 +131,8 @@ def test_partial_read_is_not_fully_read(existing, tmp_path):
     big = tmp_path / "big.md"
     big.write_text("".join(f"line {i}\n" for i in range(1, 201)))
     assert "error" not in json.loads(
-        read_file_tool(str(big), offset=1, limit=5, task_id="t-217-partial"))
+        read_file_tool(str(big), offset=1, limit=5, task_id="t-217-partial")
+    )
 
     refused = json.loads(write_file_tool(str(big), "x\n", task_id="t-217-partial"))
     assert refused.get("stale_write_blocked"), refused
@@ -154,7 +161,8 @@ def test_fully_paged_read_clears_the_guard(existing, tmp_path):
     first = json.loads(read_file_tool(str(big), offset=1, limit=150, task_id=task))
     assert "error" not in first, first
     assert "error" not in json.loads(
-        read_file_tool(str(big), offset=151, limit=200, task_id=task))
+        read_file_tool(str(big), offset=151, limit=200, task_id=task)
+    )
 
     written = json.loads(write_file_tool(str(big), "rewritten\n", task_id=task))
     assert not written.get("stale_write_blocked"), written
@@ -162,5 +170,9 @@ def test_fully_paged_read_clears_the_guard(existing, tmp_path):
 
 
 def test_blocker_is_none_for_a_net_new_file(tmp_path):
-    assert _stale_overwrite_blocker(str(tmp_path / "nope.md"), str(tmp_path / "nope.md"),
-                                    "t-217-new") is None
+    assert (
+        _stale_overwrite_blocker(
+            str(tmp_path / "nope.md"), str(tmp_path / "nope.md"), "t-217-new"
+        )
+        is None
+    )

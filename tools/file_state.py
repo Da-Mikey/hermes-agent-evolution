@@ -7,6 +7,7 @@ check in ``agent.tool_dispatch_helpers._should_parallelize_tool_batch``. A proce
 ``FileStateRegistry`` tracks per-agent read stamps, the global last writer and
 a per-path lock; every method is a no-op under ``HERMES_DISABLE_FILE_STATE_GUARD=1``.
 """
+
 from __future__ import annotations
 
 import os
@@ -94,14 +95,22 @@ class FileStateRegistry:
                     self._path_lock_users.pop(resolved, None)
                     self._path_locks.pop(resolved, None)
 
-    def _stamp(self, task_id: str, resolved: str, mtime: float, now: float, partial: bool) -> None:
+    def _stamp(
+        self, task_id: str, resolved: str, mtime: float, now: float, partial: bool
+    ) -> None:
         """Caller holds ``_state_lock``."""
         agent_reads = self._reads[task_id]
         agent_reads[resolved] = (float(mtime), now, bool(partial))
         _evict_oldest(agent_reads, _MAX_PATHS_PER_AGENT)
 
-    def record_read(self, task_id: str, resolved: str, *, partial: bool = False,
-                    mtime: Optional[float] = None) -> None:
+    def record_read(
+        self,
+        task_id: str,
+        resolved: str,
+        *,
+        partial: bool = False,
+        mtime: Optional[float] = None,
+    ) -> None:
         if _disabled():
             return
         mtime = _mtime_or_none(resolved) if mtime is None else mtime
@@ -110,7 +119,9 @@ class FileStateRegistry:
         with self._state_lock:
             self._stamp(task_id, resolved, mtime, time.time(), partial)
 
-    def note_write(self, task_id: str, resolved: str, *, mtime: Optional[float] = None) -> None:
+    def note_write(
+        self, task_id: str, resolved: str, *, mtime: Optional[float] = None
+    ) -> None:
         """Record a successful write: global last-writer AND this agent's own
         read stamp (a write is an implicit read of the current content)."""
         if _disabled():
@@ -147,14 +158,16 @@ class FileStateRegistry:
                         f"{resolved} was modified by sibling subagent "
                         f"{writer_tid!r} but this agent never read it. "
                         "Read the file before writing to avoid overwriting "
-                        "the sibling's changes.")
+                        "the sibling's changes."
+                    )
                 read_ts = stamp[1]
                 if writer_ts > read_ts:
                     return (
                         f"{resolved} was modified by sibling subagent "
                         f"{writer_tid!r} at {_fmt_ts(writer_ts)} — after "
                         f"this agent's last read at {_fmt_ts(read_ts)}. "
-                        "Re-read the file before writing.")
+                        "Re-read the file before writing."
+                    )
 
         if stamp is not None:
             read_mtime, _read_ts, partial = stamp
@@ -162,20 +175,24 @@ class FileStateRegistry:
                 return (
                     f"{resolved} was modified since you last read it "
                     "on disk (external edit or unrecorded writer). "
-                    "Re-read the file before writing.")
+                    "Re-read the file before writing."
+                )
             if partial:
                 return (
                     f"{resolved} was last read with offset/limit pagination "
                     "(partial view). Read the remaining pages, or use patch, "
-                    "before overwriting it.")
+                    "before overwriting it."
+                )
             return None
 
         return (
             f"{resolved} was not read by this agent. "
-            "Read the file first so you can write an informed edit.")
+            "Read the file first so you can write an informed edit."
+        )
 
-    def writes_since(self, exclude_task_id: str, since_ts: float,
-                     paths: Iterable[str]) -> Dict[str, List[str]]:
+    def writes_since(
+        self, exclude_task_id: str, since_ts: float, paths: Iterable[str]
+    ) -> Dict[str, List[str]]:
         """``{writer_task_id: [paths]}`` for writes after ``since_ts`` by agents
         other than ``exclude_task_id`` (delegate_task's "subagent modified files
         you previously read" reminder)."""
@@ -204,7 +221,11 @@ class FileStateRegistry:
         same scratch path as "modified by sibling subagent" hours after the writer exited."""
         with self._state_lock:
             self._reads.pop(task_id, None)
-            for p in [p for p, (writer_tid, _ts) in self._last_writer.items() if writer_tid == task_id]:
+            for p in [
+                p
+                for p, (writer_tid, _ts) in self._last_writer.items()
+                if writer_tid == task_id
+            ]:
                 del self._last_writer[p]
 
     def clear(self) -> None:
@@ -261,7 +282,9 @@ def stale_kind(message: Optional[str]) -> str:
 
 
 # Convenience wrappers (short names used at call sites).
-def record_read(task_id: str, resolved_or_path: str | Path, *, partial: bool = False) -> None:
+def record_read(
+    task_id: str, resolved_or_path: str | Path, *, partial: bool = False
+) -> None:
     _registry.record_read(task_id, str(resolved_or_path), partial=partial)
 
 
@@ -277,7 +300,9 @@ def lock_path(resolved_or_path: str | Path):
     return _registry.lock_path(str(resolved_or_path))
 
 
-def writes_since(exclude_task_id: str, since_ts: float, paths: Iterable[str | Path]) -> Dict[str, List[str]]:
+def writes_since(
+    exclude_task_id: str, since_ts: float, paths: Iterable[str | Path]
+) -> Dict[str, List[str]]:
     return _registry.writes_since(exclude_task_id, since_ts, [str(p) for p in paths])
 
 
@@ -293,4 +318,5 @@ __all__ = [
     "check_stale",
     "lock_path",
     "writes_since",
-    "known_reads"]
+    "known_reads",
+]
