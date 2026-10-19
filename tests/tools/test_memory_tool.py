@@ -11,8 +11,12 @@ from typing import Any, Dict
 
 from tools.memory_tool import (
     BLOCKED_WARNINGS_FILE,
+    SNAPSHOT_DIR_NAME,
     MemoryStore,
+    capture_memory_snapshot,
+    list_snapshots,
     memory_tool,
+    read_snapshot,
     _scan_memory_content,
     MEMORY_SCHEMA,
 )
@@ -2025,3 +2029,107 @@ class TestBackgroundReviewDeleteGate:
             reset_current_write_origin(token)
         assert result["success"] is True
         assert "rewritten by refine" in store._entries_for("memory")
+
+
+# =========================================================================
+# Issue #149 slice 1 — versioned memory snapshots
+# =========================================================================
+
+
+class TestMemorySnapshots:
+    """Every mutating write snapshots the PREVIOUS on-disk content (issue #149).
+
+    Slice 1 ships capture + list + read (no semantic rollback yet); these tests
+    drive the real ``MemoryStore`` write path (``add`` / ``save_to_disk``), not
+    the snapshot helper directly.
+    """
+
+    def test_write_captures_previous_content_as_one_snapshot(self, store, tmp_path):
+        # The first write has no prior content on disk -> nothing to version.
+        store.add("memory", "first fact")
+        assert list_snapshots("memory") == []
+
+        result = store.add("memory", "second fact")
+
+        assert result["success"] is True
+        snaps = list_snapshots("memory")
+        assert len(snaps) == 1
+        # The snapshot holds the PREVIOUS on-disk bytes, not the new ones.
+        assert read_snapshot("memory", snaps[0]["version"]) == "first fact"
+        # ...and the write result reported the version it created.
+        assert result["snapshot_version"] == snaps[0]["version"]
+        # The live file now holds the new state; the snapshot is a separate copy.
+        assert (tmp_path / "MEMORY.md").read_text(encoding="utf-8") == (
+            "first fact\n§\nsecond fact"
+        )
+
+    def test_repeated_identical_write_creates_no_duplicate_version(self, store):
+        store.add("memory", "one")
+        store.save_to_disk("memory")  # previous content "one" -> version 1
+        assert len(list_snapshots("memory")) == 1
+
+        store.save_to_disk("memory")  # identical previous content -> de-duped
+        assert len(list_snapshots("memory")) == 1
+
+    def test_retention_prunes_to_configured_maximum(self, store, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool_store.SNAPSHOT_RETENTION", 3)
+        for i in range(6):
+            store.add("memory", f"entry-{i}")
+
+        snaps = list_snapshots("memory")
+        assert len(snaps) == 3
+        contents = [read_snapshot("memory", s["version"]) for s in snaps]
+        # The oldest contexts were pruned; the newest three survive.
+        assert "entry-0" not in contents
+        assert contents[-1].endswith("entry-4")
+
+    def test_snapshot_files_are_not_loaded_as_memory_entries(self, store, tmp_path):
+        store.add("memory", "alpha")
+        store.add("memory", "beta")
+        # A snapshot carrying a unique marker; if the loader picked it up as an
+        # entry the marker would surface in memory_entries.
+        capture_memory_snapshot("memory", "SNAPSHOT-ONLY-MARKER")
+        assert (tmp_path / SNAPSHOT_DIR_NAME).is_dir()
+
+        fresh = MemoryStore(memory_char_limit=500, user_char_limit=300)
+        fresh.load_from_disk()
+
+        assert fresh.memory_entries == ["alpha", "beta"]
+        assert "SNAPSHOT-ONLY-MARKER" not in fresh.memory_entries
+
+    def test_snapshot_failure_does_not_block_write_and_is_reported(
+        self, store, tmp_path, monkeypatch, caplog
+    ):
+        store.add("memory", "one")  # seed disk so a snapshot is attempted
+
+        def _boom(target, previous_content):
+            raise RuntimeError("snapshot disk full")
+
+        monkeypatch.setattr("tools.memory_tool_store.capture_memory_snapshot", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="tools.memory_tool"):
+            result = store.add("memory", "two")
+
+        # The real memory write still landed and succeeded...
+        assert result["success"] is True
+        assert "two" in (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+        # ...the failure is not silently swallowed: it is logged and reported.
+        assert "snapshot_error" in result
+        assert "snapshot disk full" in result["snapshot_error"]
+        assert any("snapshot" in rec.getMessage().lower() for rec in caplog.records)
+
+    def test_list_and_read_roundtrip_for_user_target(self, store):
+        store.add("user", "likes tea")
+        store.add("user", "lives in Berlin")
+
+        snaps = list_snapshots("user")
+        assert len(snaps) == 1
+        assert read_snapshot("user", snaps[0]["version"]) == "likes tea"
+        # The user and memory targets keep independent histories.
+        assert list_snapshots("memory") == []
+
+    def test_read_snapshot_rejects_path_traversal(self, store):
+        store.add("memory", "one")
+        store.save_to_disk("memory")
+        assert read_snapshot("memory", "../MEMORY.md") is None
+        assert read_snapshot("memory", "") is None

@@ -62,15 +62,25 @@ prompt: |
 # No `skills:` here on purpose. The Hydra is a pure delegator: it inspects the
 # knowledge pool and DISPATCHES each stage to a subagent via delegate_task (the
 # stage definitions, including each stage's own toolsets, live inline in the
-# prompt above). Each stage's cron skill carries its script-running instructions
-# and runs under a `terminal` toolset. Loading those script-running skills here
-# would be dead wiring — the Hydra has no `terminal` and must never run stage
-# scripts directly. Enforced by scripts/evolution_skill_lint.py
-# (tests/scripts/test_evolution_skill_integrity.py).
+# prompt above). The Hydra never runs a stage script itself — every stage is
+# performed by a child, under that stage's own skill.
+#
+# `terminal` IS required here even though the Hydra never uses a shell directly.
+# Subagent toolsets are INTERSECTED with the parent's (tools/delegate_tool_toolsets.py),
+# so a Hydra without `terminal` silently strips it from every child — which is why
+# the issues/implementation/integration stages ran for days unable to reach `gh`
+# or `git`. This list is authoritative: scripts/register_evolution_cron.py
+# reconciles jobs.json against it on every `hermes update`, so a hand-edit to
+# jobs.json alone is reverted within a day. Change it HERE or not at all.
+#
+# (The old comment claimed the `terminal`-lessness was "enforced by
+# scripts/evolution_skill_lint.py" — it never was: that lint only checks stages
+# that carry skills, and the Hydra carries none.)
 
 toolsets:
   - file
   - delegation
+  - terminal
 
 # Keep on disk; the Hydra is internal pipeline orchestration, not user-facing.
 deliver: local

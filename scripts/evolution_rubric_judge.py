@@ -194,6 +194,11 @@ _SHIPPED_RUBRIC_TEXT = "\n".join(
     for dim, spec in RUBRIC_DIMENSIONS.items()
 )
 
+# Held-out tail size the acceptance gates score (#2782/#215). Kept in one place
+# so the split the new checks reason about is byte-identical to the split the
+# false-pass gate measures.
+_HOLDOUT = 3
+
 
 def _keyword_requirements_judge(rubric_text: str, example: Any) -> bool:
     """Deterministic default judge for RubricForge agreement (#2780).
@@ -220,10 +225,13 @@ def resolve_active_rubric(evolution_dir: Path) -> Optional[Dict[str, Any]]:
     carry ``<dimension>: <int>`` override lines) and ``rubric-forge/labeled.json``
     (keyword-requirement examples with ground-truth labels), selects the best
     candidate via :func:`evolution.lib.rubric_forge.select_best_rubric`,
-    records the verdict to ``rubric-forge/selected.json`` for audit, and
-    returns ``{"rubric", "agreement", "max_overrides"}``. Returns ``None``
+    records the verdicts to ``rubric-forge/selected.json`` for audit, and
+    returns ``{"rubric", "agreement", "max_overrides", "held_out_gate",
+    "hollow_runtime_gate", "unsupported_completion_gate"}``. Returns ``None``
     when either input is absent — the judge then runs the shipped rubric,
-    byte-identical to pre-RubricForge behavior.
+    byte-identical to pre-RubricForge behavior. Adoption is refused unless the
+    held-out parity gate AND the #215 hollow-runtime and unsupported-completion
+    checks all pass.
     """
     rf_dir = evolution_dir / "rubric-forge"
     candidates = _load_json(rf_dir / "candidates.json")
@@ -250,26 +258,81 @@ def resolve_active_rubric(evolution_dir: Path) -> Optional[Dict[str, Any]]:
         m = re.match(r"^([a-z_]+)\s*:\s*(\d+)\s*$", line.strip())
         if m and m.group(1) in RUBRIC_DIMENSIONS:
             max_overrides[m.group(1)] = float(m.group(2))
-    # Held-out false-pass gate (#2782): the winner was selected ON this
-    # labeled set, so before its overrides become the ACTIVE rubric it must
-    # prove false-pass parity on a held-out tail it never saw. Refusal
-    # means the shipped rubric runs (recorded as gate=blocked).
+    # Held-out false-pass gate (#2782) and its AgentSWE acceptance siblings
+    # (#215): the winner was selected ON this labeled set, so before its
+    # overrides become the ACTIVE rubric it must (a) prove false-pass parity on
+    # a held-out tail it never saw, (b) show the held-out measurement actually
+    # EXERCISED every held-out case it is scored on (no hollow runtime), and
+    # (c) report a completion the captured evidence backs. Any refusal means
+    # the shipped rubric runs (recorded as gate=blocked).
     gate_verdict = None
+    hollow_verdict = None
+    completion_verdict = None
     active_text, active_agreement, active_overrides = best_text, agreement, max_overrides
     try:
-        from evolution.lib.rubric_heldout_gate import held_out_false_pass_gate
+        from evolution.lib.rubric_heldout_gate import (
+            CompletionClaim,
+            HeldOutEvidence,
+            held_out_false_pass_gate,
+            hollow_runtime_gate,
+            split_labeled_set,
+            unsupported_completion_gate,
+        )
+
+        # Capture per-case exercise evidence (#215): the counting judge wraps
+        # the real judge, so a held-out case records a run only when the
+        # measurement path actually invoked it. Only labeled-BAD held-out
+        # examples are scored (a false pass is a bad example accepted), so those
+        # are the cases the path must exercise.
+        _, _, held_out, held_labels = split_labeled_set(
+            labeled, labels, holdout=_HOLDOUT
+        )
+        case_ids = {
+            id(ex): f"heldout_{i}"
+            for i, (ex, label) in enumerate(zip(held_out, held_labels))
+            if not label
+        }
+        invocations: Dict[str, int] = {case_id: 0 for case_id in case_ids.values()}
+
+        def _counting_judge(rubric_text: str, example: Any) -> bool:
+            case_id = case_ids.get(id(example))
+            if case_id is not None:
+                invocations[case_id] += 1
+            return _keyword_requirements_judge(rubric_text, example)
 
         gate_verdict = held_out_false_pass_gate(
             best_text,
             _SHIPPED_RUBRIC_TEXT,
             labeled,
             labels,
-            _keyword_requirements_judge,
+            _counting_judge,
+            holdout=_HOLDOUT,
         )
-        if not gate_verdict.adopt:
+        hollow_verdict = hollow_runtime_gate(
+            invocations, expected_cases=list(invocations)
+        )
+        completion_verdict = unsupported_completion_gate(
+            CompletionClaim(
+                adopt=True,  # the selection asserts its winner is adoptable
+                passed=bool(agreement >= 1.0),
+                evolved_false_pass_rate=gate_verdict.evolved_false_pass_rate,
+                baseline_false_pass_rate=gate_verdict.baseline_false_pass_rate,
+            ),
+            HeldOutEvidence(
+                held_out_size=gate_verdict.held_out_size,
+                evolved_false_pass_rate=gate_verdict.evolved_false_pass_rate,
+                baseline_false_pass_rate=gate_verdict.baseline_false_pass_rate,
+            ),
+        )
+        if (
+            not gate_verdict.adopt
+            or not hollow_verdict.exercised
+            or not completion_verdict.supported
+        ):
             active_text, active_agreement, active_overrides = "", 0.0, {}
     except ImportError:
-        gate_verdict = None  # standalone deployment — no gate, run the winner
+        # Standalone deployment — no acceptance gates, run the winner.
+        gate_verdict = hollow_verdict = completion_verdict = None
 
     try:
         rf_dir.mkdir(parents=True, exist_ok=True)
@@ -288,6 +351,21 @@ def resolve_active_rubric(evolution_dir: Path) -> Optional[Dict[str, Any]]:
                     }
                     if gate_verdict is not None
                     else None,
+                    "hollow_runtime_gate": {
+                        "exercised": hollow_verdict.exercised,
+                        "case_count": hollow_verdict.case_count,
+                        "unexercised_cases": hollow_verdict.unexercised_cases,
+                        "reason": hollow_verdict.reason,
+                    }
+                    if hollow_verdict is not None
+                    else None,
+                    "unsupported_completion_gate": {
+                        "supported": completion_verdict.supported,
+                        "held_out_size": completion_verdict.held_out_size,
+                        "reason": completion_verdict.reason,
+                    }
+                    if completion_verdict is not None
+                    else None,
                     "selected_at": datetime.now().isoformat(),
                 },
                 indent=2,
@@ -297,12 +375,14 @@ def resolve_active_rubric(evolution_dir: Path) -> Optional[Dict[str, Any]]:
     except OSError:
         pass
     if not active_text:
-        return None  # gate blocked — the judge runs the shipped rubric
+        return None  # an acceptance gate blocked — the judge runs the shipped rubric
     return {
         "rubric": active_text,
         "agreement": active_agreement,
         "max_overrides": active_overrides,
         "held_out_gate": gate_verdict,
+        "hollow_runtime_gate": hollow_verdict,
+        "unsupported_completion_gate": completion_verdict,
     }
 
 
