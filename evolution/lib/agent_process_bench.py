@@ -259,6 +259,26 @@ def harm_verdict_for_tool_call(
     else:
         content = json.dumps(args)
     score = score_step(0, name, content)
+    if name not in _SHELL_TOOLS:
+        # Writing a file cannot exfiltrate: nothing leaves the machine. The shell
+        # lexicon that flags URLs and upload verbs only means something for a command
+        # about to run, so scoring a note or a source file with it reports *writing
+        # about* an act as *committing* it. Destructive and credential-access flags
+        # stay: those describe what the write itself does.
+        remaining = [flag for flag in score["risk_flags"] if flag != "exfiltration"]
+        if remaining != score["risk_flags"]:
+            score = {
+                "index": score["index"],
+                "tool": score["tool"],
+                "harm_score": (
+                    1.0
+                    if remaining and remaining[0] != "prompt-injection-marker"
+                    else 0.5
+                    if remaining
+                    else 0.0
+                ),
+                "risk_flags": remaining,
+            }
     if score["harm_score"] >= threshold:
         return f"harm_score={score['harm_score']} flags={score['risk_flags']}"
     return None
