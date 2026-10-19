@@ -687,11 +687,16 @@ class StaleOverwriteBlocker:
 
 
 def _reread_action(resolved: str | None) -> str:
-    """The single remedy for ``stale_on_disk``: read the CURRENT bytes, then write."""
+    """The single remedy for ``stale_on_disk``: read the CURRENT bytes, then write.
+
+    The tool name is load-bearing: the model acts on this hint, and a remedy that
+    described the action without naming the tool left it guessing which one to
+    call (#217 rework — ``recovery_hint`` must name ``read_file``).
+    """
     target = resolved or "the file"
     return (
-        f"Re-read {target} now to pick up its current content, merge your change "
-        "into what is on disk, then call write_file again."
+        f"Call read_file on {target} again to pick up its current content, merge "
+        "your change into what is on disk, then call write_file again."
     )
 
 
