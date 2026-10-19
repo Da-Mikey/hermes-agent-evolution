@@ -636,7 +636,18 @@ class _Unattended:
 
     def mode(self) -> str:
         # Looked up on the defining module at call time so tests patching the getters keep working.
-        return getattr(approval_context, f"_get_{self.name}_approval_mode")()
+        # Fail CLOSED when a context has no getter: a missing ``_get_<name>_approval_mode``
+        # used to raise AttributeError at dispatch, so a gated call from that context died
+        # before any approval decision was made (#196, regressed as #229). Denying is the
+        # only safe default — nobody is present to answer a prompt.
+        getter = getattr(approval_context, f"_get_{self.name}_approval_mode", None)
+        if getter is None:
+            logger.warning(
+                "no approval-mode getter for unattended context %r; denying by default",
+                self.name,
+            )
+            return "deny"
+        return getter()
 
     def block_message(self, subject: str, *, noun: str, advice: str) -> str:
         return (f"BLOCKED: {subject} but {self.clause}. {advice} To allow {noun} {self.scope}, set "
@@ -1030,7 +1041,10 @@ def _run_approval_gate(
         }
         for ctx in _unattended_contexts():
             if ctx.mode() == "deny":
-                message = deny_messages[ctx.name]
+                # ``.get`` with an empty default, not ``[ctx.name]``: a context with no
+                # caller-specific wording (``subagent`` today) falls through to
+                # ``ctx.block_message`` below instead of raising KeyError at dispatch (#229).
+                message = deny_messages.get(ctx.name, "")
                 if not message and ctx.name == "unattended":
                     # Platform contexts keep the generic wording (historical shape).
                     message = ctx.block_message(f"approval required ({description})", noun="flagged actions",
