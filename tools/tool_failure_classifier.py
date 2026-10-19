@@ -413,6 +413,17 @@ _TERMINAL_CATEGORY_MAP: dict[_TerminalCategory, ToolFailureCategory] = {
     _TerminalCategory.timeout_deterministic: ToolFailureCategory.persistent_error,
     _TerminalCategory.timeout: ToolFailureCategory.timeout,
     _TerminalCategory.unknown: ToolFailureCategory.unknown,
+    # Deterministic terminal categories: the identical command cannot succeed
+    # on an unchanged retry (#2243 shell parse errors, #2717 encoding and host
+    # resource ceilings), so they share the non-retryable ``persistent_error``
+    # bucket rather than widening the shared vocabulary every terminal surface
+    # consumes. Listed explicitly on purpose: an implicit default is what hid
+    # the ``shell_syntax_error`` gap, and the resulting KeyError propagated out
+    # of the conversation loop and killed the rest of an unattended run (#230).
+    _TerminalCategory.shell_syntax_error: ToolFailureCategory.persistent_error,
+    _TerminalCategory.output_encoding: ToolFailureCategory.persistent_error,
+    _TerminalCategory.resource_limit: ToolFailureCategory.persistent_error,
+    _TerminalCategory.env_not_found: ToolFailureCategory.persistent_error,
 }
 
 
@@ -548,7 +559,14 @@ def classify_tool_failure(
             consecutive_count=consecutive_count,
         )
         return ToolFailureClassification(
-            category=_TERMINAL_CATEGORY_MAP[terminal.category],
+            # Degrade rather than raise: this runs inside ``classify_tool_error``,
+            # i.e. on the failure path of a live turn. An unmapped terminal
+            # category used to raise KeyError out of the conversation loop and
+            # destroy the rest of an unattended run (#230), so an unknown
+            # category is treated as the non-retryable bucket instead.
+            category=_TERMINAL_CATEGORY_MAP.get(
+                terminal.category, ToolFailureCategory.persistent_error
+            ),
             tool_type=ToolType.terminal,
             hint=terminal.hint,
             should_retry=terminal.should_retry,
