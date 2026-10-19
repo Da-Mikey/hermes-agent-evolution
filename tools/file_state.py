@@ -7,6 +7,7 @@ check in ``agent.tool_dispatch_helpers._should_parallelize_tool_batch``. A proce
 ``FileStateRegistry`` tracks per-agent read stamps, the global last writer and
 a per-path lock; every method is a no-op under ``HERMES_DISABLE_FILE_STATE_GUARD=1``.
 """
+
 from __future__ import annotations
 
 import os
@@ -94,14 +95,22 @@ class FileStateRegistry:
                     self._path_lock_users.pop(resolved, None)
                     self._path_locks.pop(resolved, None)
 
-    def _stamp(self, task_id: str, resolved: str, mtime: float, now: float, partial: bool) -> None:
+    def _stamp(
+        self, task_id: str, resolved: str, mtime: float, now: float, partial: bool
+    ) -> None:
         """Caller holds ``_state_lock``."""
         agent_reads = self._reads[task_id]
         agent_reads[resolved] = (float(mtime), now, bool(partial))
         _evict_oldest(agent_reads, _MAX_PATHS_PER_AGENT)
 
-    def record_read(self, task_id: str, resolved: str, *, partial: bool = False,
-                    mtime: Optional[float] = None) -> None:
+    def record_read(
+        self,
+        task_id: str,
+        resolved: str,
+        *,
+        partial: bool = False,
+        mtime: Optional[float] = None,
+    ) -> None:
         if _disabled():
             return
         mtime = _mtime_or_none(resolved) if mtime is None else mtime
@@ -110,7 +119,9 @@ class FileStateRegistry:
         with self._state_lock:
             self._stamp(task_id, resolved, mtime, time.time(), partial)
 
-    def note_write(self, task_id: str, resolved: str, *, mtime: Optional[float] = None) -> None:
+    def note_write(
+        self, task_id: str, resolved: str, *, mtime: Optional[float] = None
+    ) -> None:
         """Record a successful write: global last-writer AND this agent's own
         read stamp (a write is an implicit read of the current content)."""
         if _disabled():
@@ -147,14 +158,16 @@ class FileStateRegistry:
                         f"{resolved} was modified by sibling subagent "
                         f"{writer_tid!r} but this agent never read it. "
                         "Read the file before writing to avoid overwriting "
-                        "the sibling's changes.")
+                        "the sibling's changes."
+                    )
                 read_ts = stamp[1]
                 if writer_ts > read_ts:
                     return (
                         f"{resolved} was modified by sibling subagent "
                         f"{writer_tid!r} at {_fmt_ts(writer_ts)} — after "
                         f"this agent's last read at {_fmt_ts(read_ts)}. "
-                        "Re-read the file before writing.")
+                        "Re-read the file before writing."
+                    )
 
         if stamp is not None:
             read_mtime, _read_ts, partial = stamp
@@ -162,20 +175,24 @@ class FileStateRegistry:
                 return (
                     f"{resolved} was modified since you last read it "
                     "on disk (external edit or unrecorded writer). "
-                    "Re-read the file before writing.")
+                    "Re-read the file before writing."
+                )
             if partial:
                 return (
                     f"{resolved} was last read with offset/limit pagination "
                     "(partial view). Read the remaining pages, or use patch, "
-                    "before overwriting it.")
+                    "before overwriting it."
+                )
             return None
 
         return (
             f"{resolved} was not read by this agent. "
-            "Read the file first so you can write an informed edit.")
+            "Read the file first so you can write an informed edit."
+        )
 
-    def writes_since(self, exclude_task_id: str, since_ts: float,
-                     paths: Iterable[str]) -> Dict[str, List[str]]:
+    def writes_since(
+        self, exclude_task_id: str, since_ts: float, paths: Iterable[str]
+    ) -> Dict[str, List[str]]:
         """``{writer_task_id: [paths]}`` for writes after ``since_ts`` by agents
         other than ``exclude_task_id`` (delegate_task's "subagent modified files
         you previously read" reminder)."""
@@ -204,7 +221,11 @@ class FileStateRegistry:
         same scratch path as "modified by sibling subagent" hours after the writer exited."""
         with self._state_lock:
             self._reads.pop(task_id, None)
-            for p in [p for p, (writer_tid, _ts) in self._last_writer.items() if writer_tid == task_id]:
+            for p in [
+                p
+                for p, (writer_tid, _ts) in self._last_writer.items()
+                if writer_tid == task_id
+            ]:
                 del self._last_writer[p]
 
     def clear(self) -> None:
@@ -224,8 +245,46 @@ def get_registry() -> FileStateRegistry:
     return _registry
 
 
+# ── Staleness classes (#217) ──────────────────────────────────────────────
+# ``check_stale`` returns one human message out of five distinct situations.
+# Callers that must give the model ONE deterministic remedy (the write_overwrite
+# guard does) need to know WHICH situation it is: "the file changed under you"
+# and "you never saw the whole file" have opposite fixes. The markers below are
+# the distinctive phrases of those five messages; ``tests/tools/test_file_stale_kind.py``
+# asserts every class is still reachable, so a reworded message fails loudly
+# instead of silently degrading to STALE_UNKNOWN.
+STALE_SIBLING_WRITE = "sibling_write"
+STALE_DISK_DRIFT = "disk_drift"
+STALE_PARTIAL_VIEW = "partial_view"
+STALE_NEVER_READ = "never_read"
+STALE_UNKNOWN = "unknown"
+
+_STALE_KIND_MARKERS: tuple[tuple[str, str], ...] = (
+    ("was modified by sibling subagent", STALE_SIBLING_WRITE),
+    ("was modified since you last read it on disk", STALE_DISK_DRIFT),
+    ("was last read with offset/limit pagination", STALE_PARTIAL_VIEW),
+    ("was not read by this agent", STALE_NEVER_READ),
+)
+
+
+def stale_kind(message: Optional[str]) -> str:
+    """Classify a ``check_stale`` message into one of the STALE_* classes.
+
+    Anything unrecognised degrades to ``STALE_UNKNOWN`` rather than guessing:
+    an unclassified refusal is treated as "stale on disk" by callers, which is
+    the conservative (re-read) remedy.
+    """
+    text = message or ""
+    for marker, kind in _STALE_KIND_MARKERS:
+        if marker in text:
+            return kind
+    return STALE_UNKNOWN
+
+
 # Convenience wrappers (short names used at call sites).
-def record_read(task_id: str, resolved_or_path: str | Path, *, partial: bool = False) -> None:
+def record_read(
+    task_id: str, resolved_or_path: str | Path, *, partial: bool = False
+) -> None:
     _registry.record_read(task_id, str(resolved_or_path), partial=partial)
 
 
@@ -241,7 +300,9 @@ def lock_path(resolved_or_path: str | Path):
     return _registry.lock_path(str(resolved_or_path))
 
 
-def writes_since(exclude_task_id: str, since_ts: float, paths: Iterable[str | Path]) -> Dict[str, List[str]]:
+def writes_since(
+    exclude_task_id: str, since_ts: float, paths: Iterable[str | Path]
+) -> Dict[str, List[str]]:
     return _registry.writes_since(exclude_task_id, since_ts, [str(p) for p in paths])
 
 
@@ -257,4 +318,5 @@ __all__ = [
     "check_stale",
     "lock_path",
     "writes_since",
-    "known_reads"]
+    "known_reads",
+]

@@ -13,6 +13,7 @@ whole-file overwrite of content this task never saw or that changed since.
 import fnmatch
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.file_safety import get_nt_namespace_error
@@ -30,9 +31,13 @@ from tools.file_tools_read_tracking import _has_full_write_baseline, _read_mtime
 # sensitive subtrees only; a blanket "/private/var/" refuses every temp-file
 # write because $TMPDIR, /tmp and /var/folders all realpath there.
 _SENSITIVE_PATH_PREFIXES = (
-    "/etc/", "/boot/", "/usr/lib/systemd/",
+    "/etc/",
+    "/boot/",
+    "/usr/lib/systemd/",
     "/private/etc/",
-    "/private/var/db/", "/private/var/root/")
+    "/private/var/db/",
+    "/private/var/root/",
+)
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 # NOTE: these four are a TEST-OVERRIDE surface, not a process cache. Both getters
@@ -52,11 +57,13 @@ _real_hermes_home_loaded = False
 
 def _config_path_resolved() -> str:
     from hermes_cli.config import get_config_path
+
     return str(get_config_path().resolve())
 
 
 def _hermes_home_real() -> str:
     from hermes_constants import get_hermes_home
+
     return os.path.realpath(str(get_hermes_home()))
 
 
@@ -68,6 +75,7 @@ def _get_hermes_config_resolved() -> str | None:
     on this module or the ``tools.file_tools`` facade."""
     try:
         import tools.file_tools as ft
+
         if ft.__dict__.get("_hermes_config_resolved_loaded"):
             return ft.__dict__.get("_hermes_config_resolved")
     except Exception:
@@ -87,6 +95,7 @@ def _get_hermes_config_resolved() -> str | None:
         # unrelated home if even that is gone (#107327 follow-up; PR #107335).
         try:
             from hermes_constants import get_hermes_home
+
             return str((Path(str(get_hermes_home())) / "config.yaml").resolve())
         except Exception:
             return None
@@ -113,6 +122,7 @@ def _get_real_hermes_home() -> str | None:
         # the consumer: the ``~/.hermes`` exemption is skipped, so the gate runs.
         try:
             from hermes_constants import get_hermes_home
+
             return os.path.realpath(str(get_hermes_home()))
         except Exception:
             return None
@@ -133,6 +143,7 @@ def _hermes_exempt_homes() -> tuple[str, ...]:
         return ()
     try:
         from hermes_constants import named_profile_home
+
         profile_home = named_profile_home(home)
     except Exception:
         profile_home = None
@@ -160,11 +171,18 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     nt_err = get_nt_namespace_error(filepath, verb="Write")
     if nt_err:
         return nt_err
-    candidates = (_resolved_or_raw(filepath, task_id), os.path.normpath(_expand_tilde(filepath)))
-    if any(c.startswith(_SENSITIVE_PATH_PREFIXES) or c in _SENSITIVE_EXACT_PATHS for c in candidates):
+    candidates = (
+        _resolved_or_raw(filepath, task_id),
+        os.path.normpath(_expand_tilde(filepath)),
+    )
+    if any(
+        c.startswith(_SENSITIVE_PATH_PREFIXES) or c in _SENSITIVE_EXACT_PATHS
+        for c in candidates
+    ):
         return (
             f"Refusing to write to sensitive system path: {filepath}\n"
-            "Use the terminal tool with sudo if you need to modify system files.")
+            "Use the terminal tool with sudo if you need to modify system files."
+        )
     # approvals.mode and other security settings live in config.yaml; a
     # prompt-injected agent could silently disable exec approval by editing it.
     hermes_config = _get_hermes_config_resolved()
@@ -172,7 +190,8 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         return (
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
+            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
     return None
 
 
@@ -189,7 +208,11 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # case-insensitive filesystems (macOS/Windows) cannot slip past; on case-sensitive filesystems most loaders
 # probe common case variants too, so the stricter behavior is kept uniform.
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
-    "agents.md", "claude.md", "soul.md", ".cursorrules"})
+    "agents.md",
+    "claude.md",
+    "soul.md",
+    ".cursorrules",
+})
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
@@ -198,9 +221,12 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     failures keep the gate ON — fail-safe for a security boundary."""
     try:
         from hermes_cli.config import load_config, cfg_get
+
         cfg = load_config()
         enabled = cfg_get(cfg, "security", "protected_instruction_files", default=True)
-        extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns", default=[])
+        extra = cfg_get(
+            cfg, "security", "protected_instruction_extra_patterns", default=[]
+        )
     except Exception:
         return True, []
     if not isinstance(enabled, bool):
@@ -210,9 +236,13 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     return enabled, [str(p) for p in extra if p]
 
 
-def _protected_instruction_reason(filepath: str, task_id: str = "default",
-                                  *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+def _protected_instruction_reason(
+    filepath: str,
+    task_id: str = "default",
+    *,
+    enabled: bool | None = None,
+    extra_patterns: list[str] | None = None,
+) -> str | None:
     """Return a short label when ``filepath`` targets a protected instruction file, else ``None``.
     Matches BOTH the normalized input and its realpath so no symlink direction escapes.
 
@@ -244,7 +274,8 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         base = os.path.basename(candidate)
         base_lower = base.lower()
         if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
+            fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns
+        ):
             return base
         # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
         # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
@@ -256,10 +287,14 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
 
 _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavailable."
-_NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
+_NO_HUMAN = (
+    "requires approval but no interactive user or gateway is present to approve it."
+)
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(
+    reasons: list[str], task_id: str = "default"
+) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -270,14 +305,18 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     description = (
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
-        "required (not bypassed by auto-approve).")
+        "required (not bypassed by auto-approve)."
+    )
     display = f"<write to {targets}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
-        "etc.).")
-    timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
+        "etc.)."
+    )
+    timed_out = blocked.format(
+        why="approval prompt timed out without a user response. Silence is not consent."
+    )
     denied = blocked.format(why="was denied by the user.")
 
     try:
@@ -304,17 +343,25 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             "pattern_keys": ["protected_instruction_file"],
             "description": description,
             "allow_permanent": False,
-            "allow_session": False}
-        decision = _await_gateway_decision(session_key, notify_cb, approval_data, surface="gateway")
+            "allow_session": False,
+        }
+        decision = _await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="gateway"
+        )
         if decision.get("notify_failed"):
-            return blocked.format(why="requires approval but the approval request could not be delivered.")
+            return blocked.format(
+                why="requires approval but the approval request could not be delivered."
+            )
         if decision.get("cancelled"):
-            return blocked.format(why=f"approval was withdrawn before the user answered ({decision['cancelled']}).")
+            return blocked.format(
+                why=f"approval was withdrawn before the user answered ({decision['cancelled']})."
+            )
         choice, timed = decision.get("choice"), not decision.get("resolved")
     else:
         # CLI surface: per-thread approval callback (prompt_toolkit panel).
         try:
             from tools.terminal_tool import _get_approval_callback
+
             callback = _get_approval_callback()
         except Exception:
             callback = None
@@ -323,10 +370,17 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             # auto-approving here would recreate the persistence vector.
             return blocked.format(why=_NO_HUMAN)
         choice = prompt_dangerous_approval(
-            display, description, allow_permanent=False, allow_session=False, approval_callback=callback)
+            display,
+            description,
+            allow_permanent=False,
+            allow_session=False,
+            approval_callback=callback,
+        )
         if choice == "cancelled":
-            return blocked.format(why="approval prompt could not be delivered or was not answered "
-                                      f"({getattr(choice, 'cause', 'no answer')}).")
+            return blocked.format(
+                why="approval prompt could not be delivered or was not answered "
+                f"({getattr(choice, 'cause', 'no answer')})."
+            )
         timed = choice == "timeout"
     # Any tapped scope is a one-operation grant; nothing is persisted.
     if not timed and choice in {"once", "session", "always"}:
@@ -334,20 +388,32 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(
+    paths: list[str], task_id: str = "default"
+) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
-    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
-                           for p in paths) if r]
+    reasons = [
+        r
+        for r in (
+            _protected_instruction_reason(
+                p, task_id, enabled=enabled, extra_patterns=extra
+            )
+            for p in paths
+        )
+        if r
+    ]
     if not reasons:
         return None
     return _request_protected_instruction_approval(reasons, task_id)
 
 
-def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_approval_required_write(
+    paths: list[str], task_id: str = "default"
+) -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config`` can steer
     execution via ``ProxyCommand``). Routine gate: once/session/always, honors --yolo,
     fail-closed without an interactive/gateway channel."""
@@ -364,11 +430,13 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
     description = (
         f"Write to SSH client config file(s): {display_targets}. "
         "The SSH config can carry ProxyCommand / Match exec directives that "
-        "run commands, so writes require your approval.")
+        "run commands, so writes require your approval."
+    )
     blocked = (
         f"BLOCKED: write to SSH config file(s) ({display_targets}) "
         "{why} Do NOT retry it via another path (terminal, execute_code) "
-        "without the user's explicit consent.")
+        "without the user's explicit consent."
+    )
 
     try:
         import tools.approval as _approval
@@ -379,15 +447,19 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
         pattern_key="ssh_config_write",
         description=description,
         display_target=f"<write to {display_targets}>",
-        cron_deny_message=blocked.format(why="requires approval but this cron session denies it."),
+        cron_deny_message=blocked.format(
+            why="requires approval but this cron session denies it."
+        ),
         single_query_deny_message=blocked.format(
             why="requires approval but single-query (-q) sessions run "
-                "without a user present to approve it. To allow flagged "
-                "actions in single-query mode, set approvals.single_query_mode: "
-                "approve in config.yaml."),
+            "without a user present to approve it. To allow flagged "
+            "actions in single-query mode, set approvals.single_query_mode: "
+            "approve in config.yaml."
+        ),
         autoapprove_log_prefix="ssh_config_write",
         fail_closed_when_no_human=True,
-        no_human_block_message=blocked.format(why=_NO_HUMAN))
+        no_human_block_message=blocked.format(why=_NO_HUMAN),
+    )
     if result.get("approved"):
         return None
     return result.get("message") or blocked.format(why="was denied.")
@@ -397,13 +469,21 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     """Return the container-side Hermes mirror prefix for persistent Docker file tools."""
     try:
         from tools.terminal_tool import (
-            _active_environments, _env_lock, _get_env_config, _resolve_container_task_id)
+            _active_environments,
+            _env_lock,
+            _get_env_config,
+            _resolve_container_task_id,
+        )
+
         container_key = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key) or _active_environments.get(
+                task_id
+            )
         if env is not None:
-            persistent_docker = (env.__class__.__name__ == "DockerEnvironment"
-                                 and bool(getattr(env, "_persistent", False)))
+            persistent_docker = env.__class__.__name__ == "DockerEnvironment" and bool(
+                getattr(env, "_persistent", False)
+            )
             return "/root/.hermes" if persistent_docker else None
         config = _get_env_config()
     except Exception:
@@ -418,14 +498,19 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     Hermes state (a write the host never reads). Not profile isolation — that guard was
     removed; ``cross_profile=True`` keeps bypassing this one for replay compat. Fails open."""
     try:
-        from agent.file_safety import get_container_mirror_warning, get_sandbox_mirror_warning
+        from agent.file_safety import (
+            get_container_mirror_warning,
+            get_sandbox_mirror_warning,
+        )
     except Exception:
         return None
     resolved = _resolved_or_raw(filepath, task_id)
     warning = get_sandbox_mirror_warning(resolved)
     if warning is not None:
         return warning
-    return get_container_mirror_warning(resolved, mirror_prefix=_get_container_mirror_prefix_for_task(task_id))
+    return get_container_mirror_warning(
+        resolved, mirror_prefix=_get_container_mirror_prefix_for_task(task_id)
+    )
 
 
 def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
@@ -448,7 +533,8 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
             "corrupt the file (read_file showed you EXTRACTED text, not the real "
             "bytes). Use the docx/xlsx/powerpoint skills or a library like "
             "python-docx/openpyxl/python-pptx via the terminal to create or edit "
-            "this document.")
+            "this document."
+        )
     # A -wal/-shm/-journal path is never a legitimate text target, even when
     # no sidecar exists yet: a checkpointed db has none on disk, and a garbage
     # WAL dropped next to a live database is picked up on the next open.
@@ -458,7 +544,8 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
             "A -wal/-shm/-journal file holds raw database pages that SQLite "
             "reads on the next open; text there corrupts the database. Use the "
             "sqlite3 CLI or a SQLite library via the terminal to modify the "
-            "database instead.")
+            "database instead."
+        )
     # Overwriting an existing binary (PDF, image, archive, SQLite db, ...)
     # with text destroys it — the model only ever saw extracted or mojibake
     # text. Creating a NEW file with such an extension stays allowed: raw PDF
@@ -477,14 +564,16 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
                         "read_file showed you EXTRACTED text, not the real bytes — writing "
                         "text back would destroy the document. Use the pdf skill or a PDF "
                         "library via the terminal to modify it. (Creating a NEW .pdf file "
-                        "is allowed.)")
+                        "is allowed.)"
+                    )
                 return (
                     f"Refusing to overwrite existing binary file '{filepath}' ({ext}) "
                     "with plain text — read_file showed you extracted or mojibake "
                     "text, not the real bytes, and writing text back would destroy "
                     "the file. Use a binary-aware tool via the terminal to modify it "
                     "(for SQLite databases, the sqlite3 CLI or a SQLite library). "
-                    "(Creating a NEW file with this extension is allowed.)")
+                    "(Creating a NEW file with this extension is allowed.)"
+                )
         except OSError:
             pass
     return None
@@ -494,7 +583,8 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
 _READ_DEDUP_STATUS_MESSAGE = (
     "File unchanged since last read. The content from "
     "the earlier read_file result in this conversation is "
-    "still current — refer to that instead of re-reading.")
+    "still current — refer to that instead of re-reading."
+)
 
 
 # ── write_file failure taxonomy (#3468) ──────────────────────────────────
@@ -507,33 +597,51 @@ _READ_DEDUP_STATUS_MESSAGE = (
 # patch #1537); this is the same additive treatment. Order matters — first hit
 # wins, so the specific shapes precede the broader ones.
 WRITE_REASON_HINTS: tuple[tuple[str, str, str], ...] = (
-    ("write-sensitive-path",
-     r"refusing to write to sensitive system path|refusing to write to hermes config file",
-     "Pick a path outside the system/config set, or drive the change through terminal."),
-    ("write-protected-instruction",
-     r"steers? future agent behavior|protected (instruction|agent-instruction)",
-     "These files need interactive approval; ask the user, or edit them outside the agent."),
-    ("write-binary-content",
-     r"refusing to write plain text to|refusing to overwrite existing (binary|pdf)",
-     "write_file is text-only for these paths — use a binary-aware tool via terminal."),
-    ("write-stale-overwrite",
-     r"has not seen its full current content|was modified since you last read it",
-     "read_file the current content (every page), merge, then retry; patch for small edits."),
-    ("write-internal-content",
-     r"refusing to write internal read_file display text",
-     "Strip the read_file LINE_NUM| prefixes and pass the real file text."),
-    ("write-cross-profile",
-     r"cross-profile|cross profile",
-     "Pass cross_profile=true only when the mirror write is intentional."),
-    ("write-path-not-found",
-     r"no such file or directory|parent director|directory does not exist",
-     "Create the parent directory first (terminal: mkdir -p) or fix the path."),
-    ("write-path-is-directory",
-     r"is a directory",
-     "Target a file path, not a directory."),
-    ("write-content-too-large",
-     r"too large|exceeds (?:the )?(?:size|limit)|size limit",
-     "Split the content, or write it from a script via terminal."),
+    (
+        "write-sensitive-path",
+        r"refusing to write to sensitive system path|refusing to write to hermes config file",
+        "Pick a path outside the system/config set, or drive the change through terminal.",
+    ),
+    (
+        "write-protected-instruction",
+        r"steers? future agent behavior|protected (instruction|agent-instruction)",
+        "These files need interactive approval; ask the user, or edit them outside the agent.",
+    ),
+    (
+        "write-binary-content",
+        r"refusing to write plain text to|refusing to overwrite existing (binary|pdf)",
+        "write_file is text-only for these paths — use a binary-aware tool via terminal.",
+    ),
+    (
+        "write-stale-overwrite",
+        r"has not seen its full current content|was modified since you last read it",
+        "read_file the current content (every page), merge, then retry; patch for small edits.",
+    ),
+    (
+        "write-internal-content",
+        r"refusing to write internal read_file display text",
+        "Strip the read_file LINE_NUM| prefixes and pass the real file text.",
+    ),
+    (
+        "write-cross-profile",
+        r"cross-profile|cross profile",
+        "Pass cross_profile=true only when the mirror write is intentional.",
+    ),
+    (
+        "write-path-not-found",
+        r"no such file or directory|parent director|directory does not exist",
+        "Create the parent directory first (terminal: mkdir -p) or fix the path.",
+    ),
+    (
+        "write-path-is-directory",
+        r"is a directory",
+        "Target a file path, not a directory.",
+    ),
+    (
+        "write-content-too-large",
+        r"too large|exceeds (?:the )?(?:size|limit)|size limit",
+        "Split the content, or write it from a script via terminal.",
+    ),
 )
 
 
@@ -551,8 +659,61 @@ def write_failure_reason(message: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) -> str | None:
-    """Reason write_file must NOT replace the existing file, else ``None``.
+# ── Refusal classes: ONE deterministic remedy per refusal (#217) ─────────
+# The refusal used to read the same whichever way it was hit, and could
+# alternate between two contradictory remedies ("re-read, it changed on disk"
+# vs "re-read every page, you never saw it all"). Those two situations need
+# opposite fixes, so each refusal now names its class and exactly one action.
+STALE_ON_DISK = "stale_on_disk"
+NOT_FULLY_READ = "not_fully_read"
+
+
+@dataclass(frozen=True)
+class StaleOverwriteBlocker:
+    """Why ``write_file`` must not replace the existing file — plus its one fix.
+
+    ``reason_class`` is ``stale_on_disk`` (the file changed under you, so
+    re-read to get the *current* bytes) or ``not_fully_read`` (this task never
+    saw the whole file, so read it to the last line). ``str(blocker)`` stays the
+    human reason, so it formats like the plain string this used to be.
+    """
+
+    reason_class: str
+    message: str
+    next_action: str
+
+    def __str__(self) -> str:  # back-compat: format/concatenate as text
+        return self.message
+
+
+def _reread_action(resolved: str | None) -> str:
+    """The single remedy for ``stale_on_disk``: read the CURRENT bytes, then write.
+
+    The tool name is load-bearing: the model acts on this hint, and a remedy that
+    described the action without naming the tool left it guessing which one to
+    call (#217 rework — ``recovery_hint`` must name ``read_file``).
+    """
+    target = resolved or "the file"
+    return (
+        f"Call read_file on {target} again to pick up its current content, merge "
+        "your change into what is on disk, then call write_file again."
+    )
+
+
+def _read_fully_action(resolved: str | None) -> str:
+    """The single remedy for ``not_fully_read``: see every page, then write."""
+    target = resolved or "the file"
+    return (
+        f"Read {target} through to its last line (call read_file again with offset "
+        "if the first page stops short — contiguous pages count as a full read), "
+        "then call write_file again."
+    )
+
+
+def _stale_overwrite_blocker(
+    filepath: str, resolved: str | None, task_id: str
+) -> "StaleOverwriteBlocker | None":
+    """Why write_file must NOT replace the existing file, else ``None``.
 
     Refuses BEFORE any disk mutation (the pre-#65604 warning arrived after the
     clobber): a sibling/external/partial-read staleness finding, or an existing
@@ -560,16 +721,31 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
     redacted, only patched). Net-new files, files this task fully read (in one
     page or by paging contiguously to the last line) or wrote, unresolvable
     paths and the file-state kill switch all let the write proceed.
+
+    Every refusal carries its class and ONE remedy (#217): a file that changed
+    on disk and a file this task never fully saw are different problems, and
+    handing the model both remedies at once left it retrying a precondition it
+    could not satisfy.
     """
     if file_state.guard_disabled():
         return None
     stale = file_state.check_stale(task_id, resolved) if resolved else None
     if stale:
-        return stale
+        if file_state.stale_kind(stale) in (
+            file_state.STALE_PARTIAL_VIEW,
+            file_state.STALE_NEVER_READ,
+        ):
+            return StaleOverwriteBlocker(
+                NOT_FULLY_READ, stale, _read_fully_action(resolved)
+            )
+        return StaleOverwriteBlocker(STALE_ON_DISK, stale, _reread_action(resolved))
     if _read_mtime_drifted(filepath, task_id):
-        return (
+        return StaleOverwriteBlocker(
+            STALE_ON_DISK,
             f"{filepath} was modified since you last read it (external edit or "
-            "concurrent agent). Re-read the file before writing.")
+            "concurrent agent).",
+            _reread_action(resolved or filepath),
+        )
     if not resolved or _has_full_write_baseline(resolved, task_id):
         return None
     try:
@@ -578,31 +754,45 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
         return None
     if not exists:
         return None
-    return (
+    return StaleOverwriteBlocker(
+        NOT_FULLY_READ,
         f"{resolved} exists but this task has not seen its full current content "
-        "(never read, only patched, or only a redacted/partial view). Read the "
-        "file — every page of it, if it needs offset/limit — or use patch for a "
-        "targeted edit; a stale conversation copy must not overwrite the current "
-        "disk content.")
+        "(never read, only patched, or only a redacted/partial view).",
+        _read_fully_action(resolved),
+    )
 
 
-def _stale_write_refusal(filepath: str, reason: str, resolved: str | None = None) -> dict:
-    """Model-facing refusal payload for write_file; ``stale_write_blocked`` lets
-    callers tell it apart from I/O errors."""
+def _stale_write_refusal(
+    filepath: str, reason: "StaleOverwriteBlocker | str", resolved: str | None = None
+) -> dict:
+    """Model-facing refusal payload for write_file.
+
+    ``stale_write_blocked`` lets callers tell it apart from I/O errors.
+    ``stale_reason_class`` + a single top-level ``next_action`` say which
+    recovery actually applies (#217) — stale-on-disk means re-read for the
+    CURRENT bytes, not-fully-read means see every page; they are not the same
+    instruction and the model must not have to guess between them.
+    """
+    if isinstance(reason, StaleOverwriteBlocker):
+        message, next_action = reason.message, reason.next_action
+        reason_class: str | None = reason.reason_class
+    else:  # plain-string reason from an older call site
+        message = str(reason)
+        next_action = _reread_action(resolved or filepath)
+        reason_class = None
     result = {
         "error": (
-            f"Refusing to overwrite {filepath}: {reason} "
-            "The file was NOT modified. Reload the current contents with read_file "
-            "(every page, for a file that needs offset/limit), merge the requested "
-            "change, then call write_file again. For small edits, prefer patch so "
-            "existing unrelated changes are preserved."),
+            f"Refusing to overwrite {filepath}: {message} "
+            f"The file was NOT modified. {next_action}"
+        ),
         "stale_write_blocked": True,
+        "next_action": next_action,
         "path": filepath,
         "reason": "write-stale-overwrite",
-        "recovery_hint": (
-            "Reload the current contents with read_file, merge the change, then write again; "
-            "use patch for a targeted edit."),
+        "recovery_hint": next_action,
     }
+    if reason_class:
+        result["stale_reason_class"] = reason_class
     if resolved:
         result["resolved_path"] = resolved
     return result
@@ -614,8 +804,11 @@ def _is_internal_file_status_text(content: str) -> bool:
     if not isinstance(content, str):
         return False
     stripped = content.strip()
-    return bool(stripped) and _READ_DEDUP_STATUS_MESSAGE in stripped and (
-        len(stripped) <= 2 * len(_READ_DEDUP_STATUS_MESSAGE))
+    return (
+        bool(stripped)
+        and _READ_DEDUP_STATUS_MESSAGE in stripped
+        and (len(stripped) <= 2 * len(_READ_DEDUP_STATUS_MESSAGE))
+    )
 
 
 def _looks_like_read_file_line_numbered_content(content: str) -> bool:
@@ -633,10 +826,14 @@ def _looks_like_read_file_line_numbered_content(content: str) -> bool:
             numbered.append(int(prefix))
     if len(numbered) < 2 or len(numbered) / len(lines) < 0.6:
         return False
-    consecutive_pairs = sum(1 for prev, current in zip(numbered, numbered[1:]) if current == prev + 1)
+    consecutive_pairs = sum(
+        1 for prev, current in zip(numbered, numbered[1:]) if current == prev + 1
+    )
     return consecutive_pairs >= len(numbered) - 1
 
 
 def _is_internal_file_tool_content(content: str) -> bool:
     """Return True when content is file-tool display text, not intended file bytes."""
-    return _is_internal_file_status_text(content) or _looks_like_read_file_line_numbered_content(content)
+    return _is_internal_file_status_text(
+        content
+    ) or _looks_like_read_file_line_numbered_content(content)
