@@ -222,6 +222,8 @@ def record_review_critic_verdict(
     grounded: bool,
     failure_mode: str = "",
     agreement_reason: str = "",
+    outcome: str = "",
+    config_fingerprint: "dict[str, Any] | None" = None,
 ) -> None:
     """Append one adversarial reviewer-to-critic verdict to the stage-gate ledger.
 
@@ -232,10 +234,21 @@ def record_review_critic_verdict(
     (which filters on ``branch``) skips them rather than confusing critic
     verdicts with branch decisions. Never raises — instrumentation must not
     take a pipeline boundary down with it.
+
+    ``outcome`` (#234) is the three-valued gate result — ``pass`` / ``fail`` /
+    ``unscored`` — kept separate from ``reviewer_ok`` so a run that measured
+    nothing is not counted as a measured failure. It defaults to the two-valued
+    reading for older callers that do not pass it. ``config_fingerprint`` records
+    which model/prompt/toolset produced the score: a delta across different
+    fingerprints is not a delta.
     """
     try:
         from datetime import datetime, timezone
 
+        if not outcome:
+            outcome = "pass" if (reviewer_ok and verdict == "proceed") else "fail"
+        if outcome == "unscored":
+            reviewer_ok = False
         ledger_file.parent.mkdir(parents=True, exist_ok=True)
         with open(ledger_file, "a", encoding="utf-8") as fh:
             fh.write(
@@ -243,6 +256,8 @@ def record_review_critic_verdict(
                     {
                         "kind": "review_critic",
                         "verdict": verdict,
+                        "outcome": outcome,
+                        "config_fingerprint": config_fingerprint or {},
                         "reviewer_ok": bool(reviewer_ok),
                         "dissent": bool(dissent),
                         "grounded": bool(grounded),
