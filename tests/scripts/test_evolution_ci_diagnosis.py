@@ -718,3 +718,209 @@ def test_comment_on_existing_posts_when_new_sha_on_open_issue():
     posts = [c for c in client.calls if c[0] == "POST"]
     assert len(posts) == 1
     assert "new_sha_456" in (posts[0][2] or "")
+
+
+# --- #231: honest PR/check totals, per-check-run dedupe, insufficient-evidence gap ---
+
+
+def _summary_of(report_dir: Path) -> Dict[str, Any]:
+    reports = sorted(report_dir.glob("diagnosis-*.json"))
+    assert reports, "no diagnosis report written"
+    data = json.loads(reports[-1].read_text(encoding="utf-8"))
+    if len(reports) > 1:  # same-second runs share a timestamp; pick the newest content
+        data = json.loads(max(reports, key=lambda p: p.stat().st_mtime).read_text(encoding="utf-8"))
+    return data["summary"]
+
+
+def _no_evidence_check(check_id: int, name: str) -> Dict[str, Any]:
+    """A failing check with no annotations and a details URL that yields no run id."""
+    return {
+        "id": check_id,
+        "name": name,
+        "conclusion": "failure",
+        "details_url": f"https://ci.example/check/{check_id}",
+    }
+
+
+def test_report_summary_counts_prs_and_checks_separately(hermes_home, monkeypatch):
+    """13 failing checks on 1 PR must report total_prs=1, total_checks=13 (#231).
+
+    Regression for the 2026-10-17/18 artifacts, which claimed ``total_prs: 13``
+    and ``child_issues_created: 13`` for a single PR and two issues.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    report_dir = hermes_home / "reports"
+
+    pr = _pr_payload(3494, "sync: integrate upstream", "sha3494")
+    checks = [{"id": 100 + i, "name": f"check {i}", "conclusion": "failure",
+               "details_url": f"https://d/{i}"} for i in range(13)]
+    ann = [{"path": "tests/x.py", "start_line": 1, "annotation_level": "failure",
+            "message": "KeyError: 'missing'", "title": "t"}]
+    issue = {"html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/3496"}
+
+    responses: List[Tuple[int, Any]] = [(200, [pr]), (200, _check_runs_payload(checks))]
+    responses += [(200, ann)] * 13
+    responses += [(200, {"total_count": 0, "items": []}), (201, issue)]
+    client = FakeClient(responses)
+
+    results = diag.diagnose_prs(dry_run=False, client=client, report_dir=report_dir)
+
+    summary = _summary_of(report_dir)
+    assert summary["total_prs"] == 1
+    assert summary["total_checks"] == 13
+    assert summary["prs_failed"] == 1
+    assert summary["failed"] == 13  # check-level count, explicitly named
+    assert summary["child_issues_created"] == 1
+    assert len({r["pr_number"] for r in results}) == 1
+    assert all(r["child_issue_action"] == "created" for r in results)
+
+
+def test_second_run_over_unchanged_checks_creates_no_issue(hermes_home, monkeypatch):
+    """Dedupe by (pr_number, check_run_id): re-running the same checks creates 0 issues."""
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    state_path = hermes_home / "evolution" / "ci_diagnosis" / "recorded_issues.json"
+    report_dir = hermes_home / "reports"
+
+    pr = _pr_payload(3494, "sync: integrate upstream", "sha3494")
+    checks = [{"id": 500 + i, "name": f"check {i}", "conclusion": "failure",
+               "details_url": f"https://d/{i}"} for i in range(3)]
+    ann = [{"path": "tests/x.py", "start_line": 1, "annotation_level": "failure",
+            "message": "KeyError: 'missing'", "title": "t"}]
+    issue = {"html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/4000"}
+
+    first: List[Tuple[int, Any]] = [(200, [pr]), (200, _check_runs_payload(checks))]
+    first += [(200, ann)] * 3
+    first += [(200, {"total_count": 0, "items": []}), (201, issue)]
+    diag.diagnose_prs(dry_run=False, client=FakeClient(first),
+                      recorded_state_path=state_path, report_dir=report_dir)
+
+    # Second run: the client is only allowed to answer the read calls.
+    second = FakeClient([(200, [pr]), (200, _check_runs_payload(checks))] + [(200, ann)] * 3)
+    results = diag.diagnose_prs(dry_run=False, client=second,
+                                recorded_state_path=state_path, report_dir=report_dir)
+
+    assert [c for c in second.calls if c[0] == "POST"] == []
+    assert all(r["child_issue_action"] == "deduped" for r in results)
+    assert all(r["child_issue_url"] == issue["html_url"] for r in results)
+    summary = _summary_of(report_dir)
+    assert summary["child_issues_created"] == 0
+    assert summary["child_issues_reused"] == 1
+
+
+def test_insufficient_evidence_records_gap_not_per_check_issues(hermes_home, monkeypatch):
+    """No annotations and no run log => one needs-info issue + a recorded capability gap."""
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    report_dir = hermes_home / "reports"
+
+    pr = _pr_payload(3494, "sync: integrate upstream", "sha3494")
+    checks = [_no_evidence_check(700, "All required checks pass (v2)"),
+              _no_evidence_check(701, "Python tests / slice 1/8")]
+    issue = {"html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/4001"}
+    client = FakeClient([
+        (200, [pr]),
+        (200, _check_runs_payload(checks)),
+        (200, []),  # annotations empty for check 700
+        (200, []),  # annotations empty for check 701
+        (201, issue),
+    ])
+
+    results = diag.diagnose_prs(dry_run=False, client=client, report_dir=report_dir)
+
+    posts = [c for c in client.calls if c[0] == "POST" and c[1].endswith("/issues")]
+    assert len(posts) == 1, "exactly one aggregate issue, not one per check"
+    body = json.loads(posts[0][2] or "{}")
+    assert "needs-info" in body["title"]
+    assert "Capability gap: insufficient evidence" in body["body"]
+    assert "All required checks pass (v2)" in body["body"]
+    assert "Python tests / slice 1/8" in body["body"]
+
+    assert {r["capability_gap"] for r in results} == {"insufficient_evidence"}
+    assert {r["child_issue_url"] for r in results} == {issue["html_url"]}
+    summary = _summary_of(report_dir)
+    assert summary["capability_gaps"] == ["insufficient_evidence"]
+    assert summary["total_prs"] == 1
+    assert summary["total_checks"] == 2
+    assert summary["child_issues_created"] == 1
+
+
+def test_insufficient_evidence_second_run_creates_nothing(hermes_home, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    state_path = hermes_home / "evolution" / "ci_diagnosis" / "recorded_issues.json"
+    report_dir = hermes_home / "reports"
+
+    pr = _pr_payload(3494, "sync: integrate upstream", "sha3494")
+    checks = [_no_evidence_check(800, "check a"), _no_evidence_check(801, "check b")]
+    issue = {"html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/4002"}
+
+    diag.diagnose_prs(
+        dry_run=False,
+        client=FakeClient([(200, [pr]), (200, _check_runs_payload(checks)),
+                           (200, []), (200, []), (201, issue)]),
+        recorded_state_path=state_path,
+        report_dir=report_dir,
+    )
+
+    second = FakeClient([(200, [pr]), (200, _check_runs_payload(checks)), (200, []), (200, [])])
+    results = diag.diagnose_prs(dry_run=False, client=second,
+                                recorded_state_path=state_path, report_dir=report_dir)
+
+    assert [c for c in second.calls if c[0] == "POST"] == []
+    assert all(r["capability_gap"] == "insufficient_evidence" for r in results)
+    assert _summary_of(report_dir)["child_issues_created"] == 0
+
+
+def test_new_check_run_attaches_to_existing_issue_without_recreating(hermes_home, monkeypatch):
+    """A *new* check_run_id on a known PR comments on the existing issue (no new issue)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    state_path = hermes_home / "evolution" / "ci_diagnosis" / "recorded_issues.json"
+    report_dir = hermes_home / "reports"
+
+    pr = _pr_payload(900, "feat: flaky", "sha900")
+    ann = [{"path": "tests/x.py", "start_line": 1, "annotation_level": "failure",
+            "message": "KeyError: 'missing'", "title": "t"}]
+    issue = {"html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/4100"}
+
+    diag.diagnose_prs(
+        dry_run=False,
+        client=FakeClient([
+            (200, [pr]),
+            (200, _check_runs_payload([{"id": 1, "name": "tests", "conclusion": "failure",
+                                        "details_url": "https://d/1"}])),
+            (200, ann),
+            (200, {"total_count": 0, "items": []}),
+            (201, issue),
+        ]),
+        recorded_state_path=state_path,
+        report_dir=report_dir,
+    )
+
+    second = FakeClient([
+        (200, [pr]),
+        (200, _check_runs_payload([{"id": 2, "name": "tests", "conclusion": "failure",
+                                    "details_url": "https://d/2"}])),
+        (200, ann),
+        (200, {"state": "open", "body": "old body"}),  # existing issue read
+        (200, []),  # comments
+        (201, {"id": 9, "body": "comment"}),  # comment posted
+    ])
+    results = diag.diagnose_prs(dry_run=False, client=second,
+                               recorded_state_path=state_path, report_dir=report_dir)
+
+    creates = [c for c in second.calls if c[0] == "POST" and c[1].endswith("/issues")]
+    comments = [c for c in second.calls if c[0] == "POST" and "/comments" in c[1]]
+    assert creates == []
+    assert len(comments) == 1
+    assert results[0]["child_issue_url"] == issue["html_url"]
+    assert results[0]["child_issue_action"] == "existing"
+
+
+def test_covered_checks_ledger_merges_and_is_idempotent(hermes_home):
+    state_path = hermes_home / "evolution" / "ci_diagnosis" / "recorded_issues.json"
+    assert diag._all_checks_covered(7, [1, 2], state_path) is False
+    diag._record_covered(7, [1], state_path)
+    assert diag._all_checks_covered(7, [1], state_path) is True
+    assert diag._all_checks_covered(7, [1, 2], state_path) is False
+    diag._record_covered(7, [2], state_path)
+    diag._record_covered(7, [2], state_path)  # idempotent
+    assert diag._all_checks_covered(7, [1, 2], state_path) is True
+    assert diag._load_covered(state_path)[diag._covered_key(7)] == [1, 2]

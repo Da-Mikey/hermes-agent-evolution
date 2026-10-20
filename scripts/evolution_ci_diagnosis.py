@@ -30,7 +30,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 
@@ -340,8 +340,8 @@ def _recorded_issues_path() -> Path:
     return path
 
 
-def _load_recorded() -> Dict[str, str]:
-    path = _recorded_issues_path()
+def _load_recorded(state_path: Optional[Path] = None) -> Dict[str, str]:
+    path = state_path or _recorded_issues_path()
     if not path.is_file():
         return {}
     try:
@@ -371,6 +371,82 @@ def _record_issue(key: str, issue_url: str, state_path: Optional[Path] = None) -
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(recorded, fh, indent=2, sort_keys=True)
     tmp.replace(path)
+
+
+# --- Per-check-run coverage state (#231) -------------------------------------
+#
+# ``recorded_issues.json`` dedups child issues by (PR, error_class). That is not
+# the same as "this exact failing check run has already been reported": when a
+# PR keeps failing the same 13 checks day after day, the (PR, error_class) key
+# only proves an issue exists, not which check runs it covers — so a second run
+# over unchanged checks cannot tell "nothing new" from "new failure, same class".
+# ``covered_checks.json`` records the check_run_ids already reported per PR, so a
+# re-run over an unchanged check set creates zero issues.
+
+_COVERED_STATE_FILE = "covered_checks.json"
+
+
+def _covered_checks_path(state_path: Optional[Path] = None) -> Path:
+    """Path of the coverage ledger — beside the recorded-issues file when one is given."""
+    if state_path is not None:
+        return state_path.with_name(_COVERED_STATE_FILE)
+    path = _state_dir() / _COVERED_STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _covered_key(pr_number: int) -> str:
+    return f"{_REPO}#{pr_number}"
+
+
+def _load_covered(state_path: Optional[Path] = None) -> Dict[str, List[int]]:
+    path = _covered_checks_path(state_path)
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    covered: Dict[str, List[int]] = {}
+    for key, ids in data.items():
+        if isinstance(ids, list):
+            covered[str(key)] = [int(i) for i in ids if isinstance(i, int)]
+    return covered
+
+
+def _record_covered(
+    pr_number: int, check_run_ids: Iterable[int], state_path: Optional[Path] = None
+) -> None:
+    """Merge *check_run_ids* into the PR's covered set (idempotent, sorted)."""
+    path = _covered_checks_path(state_path)
+    covered = _load_covered(state_path)
+    key = _covered_key(pr_number)
+    merged = sorted(set(covered.get(key, [])) | {int(i) for i in check_run_ids})
+    covered[key] = merged
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(covered, fh, indent=2, sort_keys=True)
+    tmp.replace(path)
+
+
+def _check_run_ids(failures: List[Tuple[FailedCheck, FailureDetails]]) -> List[int]:
+    return [check.check_run_id for check, _ in failures if check.check_run_id]
+
+
+def _all_checks_covered(
+    pr_number: int,
+    check_run_ids: Iterable[int],
+    state_path: Optional[Path] = None,
+) -> bool:
+    ids = {int(i) for i in check_run_ids}
+    if not ids:
+        return False
+    return ids <= set(_load_covered(state_path).get(_covered_key(pr_number), []))
+
 
 
 # -----------------------------------------------------------------------------
@@ -629,8 +705,9 @@ def _find_existing_issue(
     pr_number: int,
     error_class: str,
     repo: str = _REPO,
+    recorded_state_path: Optional[Path] = None,
 ) -> Optional[str]:
-    recorded = _load_recorded()
+    recorded = _load_recorded(recorded_state_path)
     key = _issue_key(pr_number, error_class)
     if key in recorded:
         return recorded[key]
@@ -646,7 +723,7 @@ def _find_existing_issue(
         if items:
             url = str(items[0].get("html_url", ""))
             if url:
-                _record_issue(key, url)
+                _record_issue(key, url, recorded_state_path)
                 return url
     return None
 
@@ -710,6 +787,25 @@ def _comment_on_existing(
         )
 
 
+def _set_outcome(
+    outcome: Optional[Dict[str, Any]], action: str, url: Optional[str]
+) -> None:
+    """Record what a child-issue call actually did (created / existing / deduped / dry-run)."""
+    if outcome is not None:
+        outcome["action"] = action
+        outcome["url"] = url
+
+
+# Recorded on a PR whose failing checks produced no evidence at all — neither
+# annotations nor a retrievable run log. A capability gap, not N separate bugs.
+_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+def _has_no_evidence(failures: List[Tuple[FailedCheck, FailureDetails]]) -> bool:
+    """True when every failure came from neither annotations nor a run log."""
+    return bool(failures) and all(failure.source == "none" for _, failure in failures)
+
+
 def create_child_issue(
     client: Client,
     pr: PRInfo,
@@ -717,13 +813,19 @@ def create_child_issue(
     error_class: str,
     dry_run: bool = False,
     recorded_state_path: Optional[Path] = None,
+    outcome: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Create ONE focused issue for a single root cause on a PR.
 
-    Dedups by (PR, error_class): if an open CI-failure issue for the same
-    root cause already exists, no new issue is created — the extra failing
-    check runs are attached as a comment instead. Returns None when nothing
-    actionable is present.
+    Dedups twice: by (PR, error_class) via :func:`_find_existing_issue` — extra
+    failing check runs are attached as a comment instead — and by the exact
+    (PR, check_run_id) set via the coverage ledger, so a re-run over unchanged
+    checks creates nothing and makes no write call at all (#231).
+
+    ``outcome``, when given, is filled with ``{"action", "url"}`` so the caller
+    can report how many issues were actually created rather than how many
+    failing checks carry an issue URL. Returns None when nothing actionable is
+    present.
     """
     # Complex failures with a recognised root cause.
     classified = [
@@ -744,7 +846,19 @@ def create_child_issue(
         return None
 
     key = _issue_key(pr.number, error_class)
-    existing = _find_existing_issue(client, pr.number, error_class)
+    check_ids = _check_run_ids(failures)
+    if _all_checks_covered(pr.number, check_ids, recorded_state_path):
+        url = _load_recorded(recorded_state_path).get(key)
+        print(
+            f"[ci-diagnosis] PR #{pr.number}: checks {sorted(set(check_ids))} already "
+            f"reported for ({error_class}) — 0 new issues"
+        )
+        _set_outcome(outcome, "deduped", url)
+        return url
+
+    existing = _find_existing_issue(
+        client, pr.number, error_class, recorded_state_path=recorded_state_path
+    )
     if existing:
         print(
             f"[ci-diagnosis] issue already exists for PR #{pr.number} "
@@ -752,6 +866,8 @@ def create_child_issue(
         )
         if not dry_run:
             _comment_on_existing(client, existing, pr, failures, error_class)
+            _record_covered(pr.number, check_ids, recorded_state_path)
+        _set_outcome(outcome, "existing", existing)
         return existing
 
     # Aggregate error classes for the title
@@ -790,6 +906,13 @@ def create_child_issue(
         ])
 
     for check, failure in unclassified:
+        evidence_line = (
+            "**No evidence available**: the check-run annotations were empty and "
+            "`gh run view --log-failed` returned nothing for this run, so the "
+            "failure cannot be diagnosed from this artifact."
+            if failure.source == "none"
+            else "**Raw log/annotation excerpt (no pattern matched):**"
+        )
         body_lines.extend([
             f"### {check.name}",
             "",
@@ -798,7 +921,7 @@ def create_child_issue(
             f"- **Source**: `{failure.source}`",
             f"- **Check run URL**: {check.details_url}",
             "",
-            "**Raw log/annotation excerpt (no pattern matched):**",
+            evidence_line,
             f"```\n{failure.snippet[:1000] or failure.message}\n```",
             "",
         ])
@@ -821,6 +944,7 @@ def create_child_issue(
 
     if dry_run:
         print(f"[ci-diagnosis] dry-run: would create issue '{title}'")
+        _set_outcome(outcome, "dry-run", "dry-run-issue-url")
         return "dry-run-issue-url"
 
     url = f"{_GITHUB_API}/repos/{_REPO}/issues"
@@ -831,6 +955,7 @@ def create_child_issue(
             f"[ci-diagnosis] failed to create issue: {status} {response}",
             file=sys.stderr,
         )
+        _set_outcome(outcome, "failed", None)
         return None
     try:
         issue_url = json.loads(response).get("html_url", "")
@@ -838,7 +963,96 @@ def create_child_issue(
         issue_url = ""
     if issue_url:
         _record_issue(key, issue_url, recorded_state_path)
+        _record_covered(pr.number, check_ids, recorded_state_path)
+    _set_outcome(outcome, "created" if issue_url else "failed", issue_url or None)
     return issue_url
+
+
+def create_needs_info_issue(
+    client: Client,
+    pr: PRInfo,
+    failures: List[Tuple[FailedCheck, FailureDetails]],
+    dry_run: bool = False,
+    recorded_state_path: Optional[Path] = None,
+    outcome: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """File ONE ``needs-info`` issue for a PR whose failures carry no evidence (#231).
+
+    When every failing check has neither annotations nor a retrievable run log,
+    the run has a *capability gap*, not thirteen problems. Filing one issue per
+    check turns a single unobservable state into daily noise, so this records the
+    gap and files (at most) one aggregate issue per (PR, head SHA) that names the
+    missing input. A second run over the same HEAD creates nothing.
+    """
+    key = f"{_REPO}#{pr.number}:needs-info:{pr.head_sha}"
+    recorded = _load_recorded(recorded_state_path)
+    if key in recorded:
+        print(
+            f"[ci-diagnosis] PR #{pr.number}: needs-info issue already filed for "
+            f"HEAD {pr.head_sha[:8]} — 0 new issues"
+        )
+        _set_outcome(outcome, "deduped", recorded[key])
+        return recorded[key]
+
+    title = f"CI failure on PR #{pr.number}: needs-info (no failure evidence)"
+    checks = "\n".join(
+        f"- `{check.name}` — {check.details_url or 'no run URL'}"
+        for check, _ in failures
+    )
+    body = "\n".join([
+        "## Capability gap: insufficient evidence",
+        "",
+        f"**PR**: #{pr.number} — {pr.title}",
+        f"**PR URL**: {pr.html_url}",
+        f"**Head SHA**: `{pr.head_sha}`",
+        f"**Failing checks**: {len(failures)}",
+        "",
+        "Every failing check was reported with no diagnostic evidence, so no "
+        "root cause can be attributed:",
+        "",
+        "- check-run annotations: empty or unavailable",
+        "- `gh run view --log-failed`: returned no output (missing token scope, "
+        "expired logs, or the run is not readable by this identity)",
+        "",
+        "### Failing checks",
+        "",
+        checks,
+        "",
+        "### To unblock",
+        "",
+        "Provide one of: check-run annotations with a failure message, a readable "
+        "run log (`GITHUB_TOKEN` with `checks:read` + `actions:read`), or the log "
+        "pasted into this issue. Until then this is a diagnosis capability gap, "
+        "not a code defect that can be fixed.",
+        "",
+        "---",
+        "_Generated by evolution-ci-diagnosis (issue #231)_",
+    ])
+
+    if dry_run:
+        print(f"[ci-diagnosis] dry-run: would create needs-info issue '{title}'")
+        _set_outcome(outcome, "dry-run", "dry-run-issue-url")
+        return "dry-run-issue-url"
+
+    status, response = client(
+        "POST", f"{_GITHUB_API}/repos/{_REPO}/issues", json.dumps({"title": title, "body": body})
+    )
+    if status not in {201, 200}:
+        print(
+            f"[ci-diagnosis] failed to create needs-info issue: {status} {response}",
+            file=sys.stderr,
+        )
+        _set_outcome(outcome, "failed", None)
+        return None
+    try:
+        issue_url = json.loads(response).get("html_url", "")
+    except json.JSONDecodeError:
+        issue_url = ""
+    if issue_url:
+        _record_issue(key, issue_url, recorded_state_path)
+    _set_outcome(outcome, "created" if issue_url else "failed", issue_url or None)
+    return issue_url
+
 
 
 # -----------------------------------------------------------------------------
@@ -878,12 +1092,41 @@ def save_diagnosis_report(
     results: List[Dict[str, Any]],
     report_dir: Optional[Path] = None,
 ) -> Path:
+    """Write the run artifact.
+
+    The summary separates PR-level from check-level totals: one PR with 13
+    failing checks is ``total_prs: 1, total_checks: 13``, not ``total_prs: 13``
+    (#231). ``child_issues_created`` counts distinct issues actually created in
+    this run, so a deduped run reports 0 even though every failing check still
+    carries the URL of the issue that already covers it.
+    """
     target = report_dir or _report_dir()
     target.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     report_path = target / f"diagnosis-{date_str}.json"
+    created_urls = {
+        r["child_issue_url"]
+        for r in results
+        if r.get("child_issue_action") == "created" and r.get("child_issue_url")
+    }
+    reused_urls = {
+        r["child_issue_url"]
+        for r in results
+        if r.get("child_issue_action") in {"deduped", "existing"}
+        and r.get("child_issue_url")
+    }
+    failed_prs = {
+        r["pr_number"] for r in results if r.get("conclusion") == "failure"
+    }
     summary = {
-        "total_prs": len(results),
+        # PR-level: one entry per distinct PR.
+        "total_prs": len({r["pr_number"] for r in results if r.get("pr_number") is not None}),
+        "prs_failed": len(failed_prs),
+        "prs_success": len(
+            {r["pr_number"] for r in results if r.get("conclusion") == "success"}
+        ),
+        # Check-level: how many checks, never how many PRs.
+        "total_checks": len(results),
         "success": sum(1 for r in results if r.get("conclusion") == "success"),
         "failed": sum(1 for r in results if r.get("conclusion") == "failure"),
         "in_progress": sum(
@@ -891,7 +1134,11 @@ def save_diagnosis_report(
         ),
         "trivial": sum(1 for r in results if r.get("classification") == "trivial"),
         "complex": sum(1 for r in results if r.get("classification") == "complex"),
-        "child_issues_created": sum(1 for r in results if r.get("child_issue_url")),
+        "child_issues_created": len(created_urls),
+        "child_issues_reused": len(reused_urls),
+        "capability_gaps": sorted(
+            {r["capability_gap"] for r in results if r.get("capability_gap")}
+        ),
     }
     data = {
         "run_time": datetime.now(timezone.utc).isoformat(),
@@ -955,21 +1202,47 @@ def diagnose_prs(
             )
 
         # Group complex failures by root-cause signature; each group becomes
-        # one focused issue, deduped by (PR, error_class).
-        groups: Dict[str, List[Tuple[FailedCheck, FailureDetails]]] = {}
-        for check, failure in all_failures:
-            if failure.classification == "complex":
-                groups.setdefault(failure.error_class, []).append((check, failure))
+        # one focused issue, deduped by (PR, error_class) and then by the exact
+        # (PR, check_run_id) set. When no check produced any evidence, record one
+        # capability gap instead of filing a per-check issue for each unknown (#231).
+        evidence_gap: Optional[str] = None
         issue_by_error: Dict[str, Optional[str]] = {}
-        for error_class, group in sorted(groups.items()):
-            issue_by_error[error_class] = create_child_issue(
+        action_by_error: Dict[str, Optional[str]] = {}
+        if _has_no_evidence(all_failures):
+            evidence_gap = _INSUFFICIENT_EVIDENCE
+            print(
+                f"  PR #{pr.number}: {len(all_failures)} failing check(s) with no "
+                f"annotations and no run log — capability gap '{evidence_gap}'"
+            )
+            gap_outcome: Dict[str, Any] = {}
+            gap_url = create_needs_info_issue(
                 api,
                 pr,
-                group,
-                error_class,
+                all_failures,
                 dry_run=dry_run,
                 recorded_state_path=recorded_state_path,
+                outcome=gap_outcome,
             )
+            for check, failure in all_failures:
+                issue_by_error[failure.error_class] = gap_url
+                action_by_error[failure.error_class] = gap_outcome.get("action")
+        else:
+            groups: Dict[str, List[Tuple[FailedCheck, FailureDetails]]] = {}
+            for check, failure in all_failures:
+                if failure.classification == "complex":
+                    groups.setdefault(failure.error_class, []).append((check, failure))
+            for error_class, group in sorted(groups.items()):
+                group_outcome: Dict[str, Any] = {}
+                issue_by_error[error_class] = create_child_issue(
+                    api,
+                    pr,
+                    group,
+                    error_class,
+                    dry_run=dry_run,
+                    recorded_state_path=recorded_state_path,
+                    outcome=group_outcome,
+                )
+                action_by_error[error_class] = group_outcome.get("action")
 
         for check, failure in all_failures:
             results.append({
@@ -985,6 +1258,8 @@ def diagnose_prs(
                 "mast_mode": failure.mast_mode,
                 "message": failure.message,
                 "child_issue_url": issue_by_error.get(failure.error_class),
+                "child_issue_action": action_by_error.get(failure.error_class),
+                "capability_gap": evidence_gap,
             })
 
     save_diagnosis_report(results, report_dir=report_dir)
