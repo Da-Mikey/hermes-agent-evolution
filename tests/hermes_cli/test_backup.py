@@ -1545,6 +1545,116 @@ class TestQuickSnapshot:
         assert second_id in snap_ids
 
 
+    # --- #232: a live-rows state.db over the cap must be captured, not skipped ---
+
+    @staticmethod
+    def _inflate_state_db(home, rows=4000):
+        """Grow state.db with highly compressible live rows; return its size in bytes."""
+        db = home / "state.db"
+        conn = sqlite3.connect(str(db))
+        conn.executemany(
+            "INSERT OR REPLACE INTO sessions VALUES (?, ?)",
+            [(f"bulk-{i}", "conversation turn " * 200) for i in range(rows)],
+        )
+        conn.commit()
+        conn.close()
+        return db.stat().st_size
+
+    def test_snapshot_db_compresses_instead_of_skipping(self, tmp_path, monkeypatch):
+        """#232: bytes over the cap that are LIVE rows (not free pages) are gzipped,
+        not dropped — the compaction path can never shrink them."""
+        from hermes_cli import backup as backup_mod
+
+        monkeypatch.setattr(backup_mod, "_COMPRESS_MIN_BYTES", 0)
+        src = tmp_path / "state.db"
+        conn = sqlite3.connect(str(src))
+        conn.execute("CREATE TABLE t (x TEXT)")
+        conn.executemany("INSERT INTO t VALUES (?)", [("row " * 100,) for _ in range(2000)])
+        conn.commit()
+        conn.close()
+        cap = src.stat().st_size // 2
+
+        info: dict = {}
+        outcome = backup_mod._snapshot_db(src, tmp_path / "out.db", "state.db", cap, out_info=info)
+        assert outcome == "ok_compressed"
+        assert info["compressed"] is True and info["rel_name"] == "state.db.gz"
+        art = Path(info["artifact"])
+        assert art.exists() and art.stat().st_size <= cap
+        assert not (tmp_path / "out.db").exists()  # no duplicate uncompressed copy
+
+    def test_snapshot_db_leaves_tiny_sources_to_the_old_path(self, tmp_path):
+        """The compression threshold keeps sub-64 MiB behaviour byte-identical."""
+        from hermes_cli.backup import _COMPRESS_MIN_BYTES, _snapshot_db
+
+        assert _COMPRESS_MIN_BYTES >= 64 << 20
+        src = tmp_path / "state.db"
+        conn = sqlite3.connect(str(src))
+        conn.execute("CREATE TABLE t (x BLOB)")
+        conn.execute("INSERT INTO t VALUES (?)", (b"x" * 100_000,))
+        conn.commit()
+        conn.close()
+        dst = tmp_path / "out.db"
+        assert _snapshot_db(src, dst, "state.db", max_file_size=30_000) == "oversized"
+        assert not dst.exists()
+
+    def test_unavoidable_skip_raises_one_error_per_day(self, tmp_path, caplog):
+        """A skip must reach ERROR level exactly once per day, naming the window."""
+        import logging
+
+        from hermes_cli.backup import _error_once_per_day
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        with caplog.at_level(logging.ERROR, logger="hermes_cli.backup"):
+            for _ in range(3):
+                _error_once_per_day(home, "oversized-state.db", "state.db unprotected: %s", "reason")
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1, f"expected exactly one ERROR, got {len(errors)}"
+        assert "state.db unprotected" in errors[0].getMessage()
+        stamp = home / "state" / "snapshot-alerts" / "oversized-state.db.stamp"
+        assert stamp.exists()
+
+    def test_quick_snapshot_captures_gzipped_state_db_and_restores_it(
+        self, hermes_home, monkeypatch
+    ):
+        """#232 end-to-end: the DB is in the manifest as state.db.gz, and a restore
+        decompresses it back to state.db instead of dropping a .gz into the home."""
+        import json as _json
+
+        from hermes_cli import backup as backup_mod
+
+        monkeypatch.setattr(backup_mod, "_COMPRESS_MIN_BYTES", 0)
+        size = TestQuickSnapshot._inflate_state_db(hermes_home)
+        cap = size // 2  # over the cap, but within the VACUUM attempt bound
+
+        snap_id = backup_mod.create_quick_snapshot(
+            label="gzip-cap", hermes_home=hermes_home, max_file_size=cap
+        )
+        assert snap_id is not None
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+        assert (snap_dir / "state.db.gz").exists()
+        assert not (snap_dir / "state.db").exists()
+
+        meta = _json.loads((snap_dir / "manifest.json").read_text())
+        assert "state.db.gz" in meta["files"], meta["files"]
+        assert meta["files"]["state.db.gz"] <= cap
+        assert not meta.get("oversized_skipped"), "DB was captured — it must not be reported oversized"
+
+        # Restore: the artifact must land as state.db and keep the rows.
+        conn = sqlite3.connect(str(hermes_home / "state.db"))
+        conn.execute("DELETE FROM sessions WHERE id LIKE 'bulk-%'")
+        conn.commit()
+        conn.close()
+        assert backup_mod.restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+        restored = hermes_home / "state.db"
+        assert restored.exists()
+        assert not (hermes_home / "state.db.gz").exists()
+        conn = sqlite3.connect(str(restored))
+        n = conn.execute("SELECT COUNT(*) FROM sessions WHERE id LIKE 'bulk-%'").fetchone()[0]
+        conn.close()
+        assert n == 4000, f"restored DB lost rows: {n}"
+
+
 class TestQuickSnapshotProjectsKanban:
     """Regression for #52889: projects.db / kanban.db must survive an upgrade.
 

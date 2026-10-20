@@ -1,5 +1,6 @@
 """Backup and import commands for hermes CLI."""
 
+import gzip
 import json
 import logging
 import os
@@ -1204,9 +1205,62 @@ def _quick_snapshot_candidates(home: Path):
 # compacted copy below.
 _COMPACT_ATTEMPT_MAX_RATIO = 4
 
+# Below this source size, "over cap" cannot mean the snapshot lost the database: no
+# cap in the shipped configurations is small enough for a sub-64 MiB DB to matter, so
+# compressing it would rename an artifact for no recovery benefit. Compression (#232)
+# targets the real case — a multi-hundred-MB ``state.db`` whose COMPACTED copy still
+# exceeds the cap because the bytes are live rows, not free pages.
+_COMPRESS_MIN_BYTES = 64 << 20
+
+
+def _gzip_copy(src: Path, dst: Path) -> Optional[Path]:
+    """gzip *src* into *dst* with a deterministic header; ``None`` if it could not.
+
+    ``mtime=0`` keeps the artifact byte-identical across runs so snapshot ids are
+    reproducible and a diff of two snapshots is meaningful.
+    """
+    try:
+        with open(src, "rb") as fin, open(dst, "wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=6) as gz:
+                shutil.copyfileobj(fin, gz, 1024 * 1024)
+        return dst
+    except (OSError, ValueError) as exc:
+        logger.warning("Quick snapshot gzip of %s failed: %s", src, exc)
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+def _error_once_per_day(home: Path, key: str, msg: str, *args: Any) -> None:
+    """Log an ERROR at most once per UTC day for *key* (#232).
+
+    An unavoidable snapshot skip used to be a WARNING in a log nobody reads, so a
+    restore could look complete while silently missing ``state.db``. The stamp lives
+    in ``<home>/state/snapshot-alerts/`` — deliberately outside ``state-snapshots/`` so
+    it is never captured, pruned or restored as part of a snapshot.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    stamp_dir = home / "state" / "snapshot-alerts"
+    stamp = stamp_dir / f"{key}.stamp"
+    try:
+        if stamp.read_text(encoding="utf-8").strip() == today:
+            logger.debug("Snapshot alert already raised today for %s", key)
+            return
+    except OSError:
+        pass
+    logger.error(msg, *args)
+    try:
+        stamp_dir.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(today, encoding="utf-8")
+    except OSError as exc:
+        logger.debug("Could not write snapshot alert stamp %s: %s", stamp, exc)
+
 
 def _snapshot_db(
-    src: Path, dst: Path, rel_name: str, max_file_size: Optional[int]
+    src: Path, dst: Path, rel_name: str, max_file_size: Optional[int],
+    *, out_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Snapshot a SQLite DB, compacting free pages only when over the cap (#2489).
 
@@ -1217,8 +1271,14 @@ def _snapshot_db(
     to the COMPACTED copy. A DB far over the cap is skipped without a costly
     VACUUM (``_COMPACT_ATTEMPT_MAX_RATIO`` bound).
 
-    Returns ``"ok"``, ``"failed"`` (locked/corrupted), or ``"oversized"``
-    (compacted copy still exceeds the cap and was removed).
+    If the compacted copy is STILL over the cap, the bytes are live rows and no
+    amount of compaction will shrink them — so the copy is gzipped instead of
+    dropped (#232), and that only for sources at or above ``_COMPRESS_MIN_BYTES``.
+
+    Returns ``"ok"``, ``"ok_compressed"`` (gzip artifact written; see *out_info*),
+    ``"failed"`` (locked/corrupted), or ``"oversized"`` (nothing usable fit the cap
+    and what was written was removed). When *out_info* is supplied it is filled with
+    ``{compressed, artifact, rel_name, size}`` describing the published artifact.
     """
     if max_file_size is None:
         return "ok" if _safe_copy_db(src, dst) else "failed"
@@ -1248,6 +1308,33 @@ def _snapshot_db(
         return "ok"
     if size <= max_file_size:
         return "ok"
+    # Still over the cap after compaction: the bytes are live rows, not free pages,
+    # so no further compaction can help. Compress instead of skipping (#232).
+    if src_size >= _COMPRESS_MIN_BYTES:
+        gz = _gzip_copy(dst, dst.with_name(dst.name + ".gz"))
+        if gz is not None:
+            gz_size = gz.stat().st_size
+            if gz_size <= max_file_size:
+                try:
+                    dst.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if out_info is not None:
+                    out_info.update(
+                        compressed=True,
+                        artifact=str(gz),
+                        rel_name=rel_name + ".gz",
+                        size=gz_size,
+                    )
+                logger.info(
+                    "Quick snapshot compressed %s: compacted %d bytes over the cap -> %s (%d bytes)",
+                    rel_name, size, gz.name, gz_size,
+                )
+                return "ok_compressed"
+            try:
+                gz.unlink(missing_ok=True)
+            except OSError:
+                pass
     try:
         dst.unlink(missing_ok=True)
     except OSError:
@@ -1282,14 +1369,20 @@ def _copy_quick_snapshot_files(
             if size is not None and size > max_file_size:
                 print(f"  ⚠ Snapshot: skipping {rel} "
                       f"({_format_size(size)} exceeds {_format_size(max_file_size)} limit)")
-                logger.warning("Quick snapshot skipped %s: %d bytes exceeds %d byte limit", rel, size, max_file_size)
+                _error_once_per_day(
+                    home, f"oversized-{rel}",
+                    "Quick snapshot skipped %s: %d bytes exceeds %d byte limit — "
+                    "this file is NOT in the snapshot (unprotected until the next successful capture)",
+                    rel, size, max_file_size,
+                )
                 continue
         dst = staging_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             # SQLite DBs go through the WAL-safe backup() path (the gateway may hold the WAL open).
             if src.suffix == ".db":
-                outcome = _snapshot_db(src, dst, rel, max_file_size)
+                info: Dict[str, Any] = {}
+                outcome = _snapshot_db(src, dst, rel, max_file_size, out_info=info)
                 if outcome == "failed":
                     failed_dbs.append(rel)
                     print(f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} — file may be locked or corrupted")
@@ -1300,6 +1393,20 @@ def _copy_quick_snapshot_files(
                     continue
                 if outcome == "oversized":
                     oversized_skipped.append(rel)
+                    _error_once_per_day(
+                        home, f"oversized-{rel}",
+                        "Quick snapshot skipped %s: compacted copy still exceeds the %d byte "
+                        "limit and compression did not fit — this DB is NOT in the snapshot "
+                        "(unprotected until the next successful capture)",
+                        rel, max_file_size,
+                    )
+                    continue
+                if info.get("compressed"):
+                    # The DB survived as a gzip artifact: record the real file name so a
+                    # restore finds it and the manifest stays honest about what was captured.
+                    manifest[info["rel_name"]] = info["size"]
+                    print(f"  ✔ Snapshot: {rel} compacted + gzipped to {info['rel_name']} "
+                          f"({_format_size(info['size'])}) — under cap")
                     continue
             else:
                 shutil.copy2(src, dst)
@@ -1380,7 +1487,12 @@ def _create_quick_snapshot_locked(
     else:
         if oversized_skipped:
             print("  ⚠ Skipping snapshot prune: DB file(s) skipped for size: " + ", ".join(oversized_skipped))
-            logger.warning("Quick snapshot skipped oversized DB file(s): %s", ", ".join(oversized_skipped))
+            _error_once_per_day(
+                home, "oversized-dbs",
+                "Quick snapshot is INCOMPLETE: database file(s) not captured: %s — "
+                "a restore from this snapshot has no copy of them",
+                ", ".join(oversized_skipped),
+            )
         logger.warning(
             "Skipping snapshot prune because %d DB(s) failed to capture and/or %d were oversized "
             "— preserving older snapshots as recovery source",
@@ -1440,6 +1552,12 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
     for rel in meta.get("files", {}):
         src = snap_dir / rel
         dst = home / rel
+        # A gzipped DB artifact (#232) restores to its original name, not to ``<name>.gz``:
+        # writing state.db.gz into the home would look like a restore while leaving the
+        # real database untouched.
+        gz_artifact = rel.endswith(".db.gz")
+        if gz_artifact:
+            dst = home / rel[: -len(".gz")]
         if not (_is_within(src, snap_res) and _is_within(dst, home_res)):
             logger.error("Manifest path traversal blocked: %s", rel)
             continue
@@ -1447,7 +1565,21 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if dst.suffix == ".db":
+            if gz_artifact:
+                with open(src, "rb") as raw_in, gzip.GzipFile(
+                    fileobj=raw_in, mode="rb"
+                ) as fin, tempfile.NamedTemporaryFile(
+                    dir=dst.parent, prefix=".restore-", suffix=".db", delete=False
+                ) as tmp:
+                    shutil.copyfileobj(fin, tmp, 1024 * 1024)
+                    tmp_path = Path(tmp.name)
+                try:
+                    if not _safe_restore_db(tmp_path, dst):
+                        logger.error("Failed to restore %s: live-safe restore refused", rel)
+                        continue
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+            elif dst.suffix == ".db":
                 # Through the backup API so live connections see the restored data instead of
                 # stale pages from a replaced inode (#65942).
                 if not _safe_restore_db(src, dst):
