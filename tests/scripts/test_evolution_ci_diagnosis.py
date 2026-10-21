@@ -718,3 +718,110 @@ def test_comment_on_existing_posts_when_new_sha_on_open_issue():
     posts = [c for c in client.calls if c[0] == "POST"]
     assert len(posts) == 1
     assert "new_sha_456" in (posts[0][2] or "")
+
+
+# ---------------------------------------------------------------------------
+# #231 coverage ledger: a real failure must never be silenced
+# ---------------------------------------------------------------------------
+
+
+def _stub_pr():
+    return diag.PRInfo(
+        number=42,
+        title="t",
+        html_url="https://github.com/x/y/pull/42",
+        head_sha="sha1",
+        head_branch="b",
+    )
+
+
+def _stub_failure(check_run_id: int = 9001):
+    check = diag.FailedCheck(
+        check_run_id=check_run_id,
+        name="lint",
+        conclusion="failure",
+        details_url="https://github.com/check/1",
+        head_sha="sha1",
+        annotations=[],
+    )
+    failure = diag.FailureDetails(
+        error_class="lint-error",
+        classification="complex",
+        message="boom",
+        snippet="trace",
+        source="annotations",
+        mast_mode="3.1",
+    )
+    return [(check, failure)]
+
+
+def test_comment_that_does_not_land_leaves_checks_uncovered(tmp_path, monkeypatch):
+    """#231 defect 1: a comment that never posted must not silence the check forever.
+
+    Recording coverage unconditionally made every later run print "0 new issues" and never
+    retry, so a genuinely new check run was lost with no trace.
+    """
+    state = tmp_path / "coverage.json"
+    pr = _stub_pr()
+    monkeypatch.setattr(diag, "_find_existing_issue", lambda *a, **k: "https://x/issues/7")
+    monkeypatch.setattr(diag, "_comment_on_existing", lambda *a, **k: False)
+
+    diag.create_child_issue(
+        FakeClient([]), pr, _stub_failure(), "lint-error", recorded_state_path=state
+    )
+
+    # Not covered => the next run still reports it instead of deduping to nothing.
+    assert diag._all_checks_covered(42, ["9001"], state) is False
+
+
+def test_comment_that_lands_marks_checks_covered(tmp_path, monkeypatch):
+    state = tmp_path / "coverage.json"
+    pr = _stub_pr()
+    monkeypatch.setattr(diag, "_find_existing_issue", lambda *a, **k: "https://x/issues/7")
+    monkeypatch.setattr(diag, "_comment_on_existing", lambda *a, **k: True)
+
+    diag.create_child_issue(
+        FakeClient([]), pr, _stub_failure(), "lint-error", recorded_state_path=state
+    )
+
+    assert diag._all_checks_covered(42, ["9001"], state) is True
+    # A different check run on the same PR is still new.
+    assert diag._all_checks_covered(42, ["9002"], state) is False
+
+
+def test_comment_on_closed_issue_reports_not_covered():
+    """A closed parent must return False so the caller leaves the check uncovered."""
+    pr = _stub_pr()
+    client = FakeClient([(200, {"state": "closed", "body": ""})])
+    reported = diag._comment_on_existing(
+        client,
+        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        pr,
+        _stub_failure(),
+        "lint-error",
+    )
+    assert reported is False
+    assert not [c for c in client.calls if c[0] == "POST"]
+
+
+def test_corrupt_coverage_state_fails_toward_reporting(tmp_path):
+    state = tmp_path / "coverage.json"
+    state.write_text("{not json", encoding="utf-8")
+    assert diag._all_checks_covered(1, ["1"], state) is False
+
+
+def test_total_checks_counts_checks_not_clean_prs(tmp_path):
+    """#231 defect 2: 10 clean PRs + 13 failing checks read as 23 of one thing."""
+    results = [
+        {"pr_number": 1, "conclusion": "success", "check_run_id": None},
+        {"pr_number": 3, "conclusion": "success", "check_run_id": None},
+        {"pr_number": 2, "check_run_id": 11, "conclusion": "failure"},
+        {"pr_number": 2, "check_run_id": 12, "conclusion": "failure"},
+        {"pr_number": 2, "check_run_id": 13, "conclusion": "failure"},
+    ]
+    path = diag.save_diagnosis_report(results, report_dir=tmp_path)
+    summary = json.loads(path.read_text(encoding="utf-8"))["summary"]
+    assert summary["total_checks"] == 3  # the failing checks, not the clean PRs
+    assert summary["total_prs"] == 3  # PR level: 1..3, never 5 rows
+    assert summary["prs_failed"] == 1
+    assert summary["prs_success"] == 2
