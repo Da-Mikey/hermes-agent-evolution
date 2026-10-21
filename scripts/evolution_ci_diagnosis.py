@@ -651,17 +651,107 @@ def _find_existing_issue(
     return None
 
 
+def _check_ids(failures: List[Tuple[FailedCheck, FailureDetails]]) -> List[str]:
+    """Sorted unique check-run ids for one failure set (#231)."""
+    return sorted(
+        {
+            str(check.check_run_id)
+            for check, _ in failures
+            if getattr(check, "check_run_id", None) is not None
+        }
+    )
+
+
+def _coverage_path(state_path: Optional[Path]) -> Optional[Path]:
+    """Where the coverage ledger lives: BESIDE the issue-state file, never inside it.
+
+    The issue-state file maps ``repo#pr:error_class`` to an issue URL (strings). Sharing
+    one file would let a coverage write drop those entries on the floor — the coverage
+    loader only understands list values (#231).
+    """
+    if state_path is None:
+        return None
+    p = Path(state_path)
+    return p.with_name(f"{p.stem}-coverage.json")
+
+
+def _load_coverage(state_path: Optional[Path]) -> Dict[str, List[str]]:
+    """Load the per-PR coverage ledger. Missing or corrupt reads as "nothing covered"."""
+    path = _coverage_path(state_path)
+    if path is None:
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Both failures resolve in the SAFE direction: forgetting coverage may re-report a
+        # check, never suppress one (#231).
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for key, value in raw.items():
+        if isinstance(value, list):
+            out[str(key)] = [str(v) for v in value]
+    return out
+
+
+def _record_covered(
+    pr_number: int,
+    check_ids: List[str],
+    state_path: Optional[Path],
+) -> None:
+    """Remember that these check runs were ACTUALLY reported for this PR (#231).
+
+    Only call this once the report durably landed. Recording a check whose comment never
+    posted makes every later run print "0 new issues" and never retry — the failure is
+    lost with no trace, which is the class of bug this issue exists to kill.
+    """
+    path = _coverage_path(state_path)
+    if path is None or not check_ids:
+        return
+    coverage = _load_coverage(state_path)
+    coverage[str(pr_number)] = sorted(
+        set(coverage.get(str(pr_number), [])) | set(check_ids)
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(coverage, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError as exc:
+        # Not fatal: the next run re-reports rather than silently suppressing.
+        print(f"[ci-diagnosis] could not save coverage state: {exc}", file=sys.stderr)
+
+
+def _all_checks_covered(
+    pr_number: int,
+    check_ids: List[str],
+    state_path: Optional[Path],
+) -> bool:
+    """True only when EVERY check run in question was already reported for this PR."""
+    if state_path is None or not check_ids:
+        return False
+    covered = set(_load_coverage(state_path).get(str(pr_number), []))
+    return set(check_ids) <= covered
+
+
 def _comment_on_existing(
     client: Client,
     existing_url: str,
     pr: PRInfo,
     failures: List[Tuple[FailedCheck, FailureDetails]],
     error_class: str,
-) -> None:
-    """Attach additional failing check runs to an existing issue if not already recorded."""
+) -> bool:
+    """Attach additional failing check runs to an existing issue if not already recorded.
+
+    Returns True only when the failures are now DURABLY reported — already present on the
+    issue, or the comment just landed. False means nothing was written (the parent issue is
+    closed, or the POST failed), and the caller must NOT mark these checks covered: a
+    recorded-but-unreported check is silenced on every later run (#231).
+    """
     match = re.search(r"/issues/(\d+)$", existing_url)
     if not match:
-        return
+        return False
     issue_number = match.group(1)
 
     # 1. Check if the issue is open and if the body already covers this HEAD SHA
@@ -672,10 +762,10 @@ def _comment_on_existing(
                 f"[ci-diagnosis] issue #{issue_number} is closed — skipping comment",
                 file=sys.stderr,
             )
-            return
+            return False
         body = str(issue_data.get("body", ""))
         if pr.head_sha and pr.head_sha in body:
-            return
+            return True
 
     # 2. Check existing comments to prevent duplicate comments across runs/nodes
     comments_data = _get(
@@ -686,13 +776,13 @@ def _comment_on_existing(
             if isinstance(comment, dict):
                 c_body = str(comment.get("body", ""))
                 if pr.head_sha and pr.head_sha in c_body:
-                    return
+                    return True
                 if failures and all(
                     check.details_url in c_body
                     for check, _ in failures
                     if check.details_url
                 ):
-                    return
+                    return True
 
     lines = [
         f"Additional failing check run(s) for `{error_class}` on PR "
@@ -708,6 +798,8 @@ def _comment_on_existing(
             f"[ci-diagnosis] failed to comment on existing issue: {status} {response}",
             file=sys.stderr,
         )
+        return False
+    return True
 
 
 def create_child_issue(
@@ -751,7 +843,15 @@ def create_child_issue(
             f"({error_class}): {existing}"
         )
         if not dry_run:
-            _comment_on_existing(client, existing, pr, failures, error_class)
+            reported = _comment_on_existing(client, existing, pr, failures, error_class)
+            if reported:
+                _record_covered(pr.number, _check_ids(failures), recorded_state_path)
+            else:
+                print(
+                    f"[ci-diagnosis] PR #{pr.number}: {error_class} was NOT reported — "
+                    "leaving those checks uncovered so the next run retries",
+                    file=sys.stderr,
+                )
         return existing
 
     # Aggregate error classes for the title
@@ -838,6 +938,7 @@ def create_child_issue(
         issue_url = ""
     if issue_url:
         _record_issue(key, issue_url, recorded_state_path)
+        _record_covered(pr.number, _check_ids(failures), recorded_state_path)
     return issue_url
 
 
@@ -882,8 +983,18 @@ def save_diagnosis_report(
     target.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     report_path = target / f"diagnosis-{date_str}.json"
+    # Two levels, never conflated (#231 defect 2): a clean PR contributes no check rows, so
+    # counting len(results) reported 10 clean PRs + 13 failing checks as 23 of one thing.
+    check_rows = [r for r in results if r.get("check_run_id") is not None]
+    pr_numbers = {r.get("pr_number") for r in results if r.get("pr_number") is not None}
+    failed_pr_numbers = {
+        r.get("pr_number") for r in check_rows if r.get("pr_number") is not None
+    }
     summary = {
-        "total_prs": len(results),
+        "total_prs": len(pr_numbers),
+        "prs_failed": len(failed_pr_numbers),
+        "prs_success": len(pr_numbers) - len(failed_pr_numbers),
+        "total_checks": len(check_rows),
         "success": sum(1 for r in results if r.get("conclusion") == "success"),
         "failed": sum(1 for r in results if r.get("conclusion") == "failure"),
         "in_progress": sum(
@@ -924,6 +1035,12 @@ def diagnose_prs(
 
     api = client or default_client
 
+    # The ledger must live somewhere the daily cron run actually writes, or the gate below
+    # is dead code (#231).
+    state_path = recorded_state_path or (
+        get_hermes_home() / "evolution" / "ci-diagnosis" / "coverage.json"
+    )
+
     prs = fetch_open_prs(api)
     print(f"[ci-diagnosis] found {len(prs)} open PR(s)")
 
@@ -961,14 +1078,23 @@ def diagnose_prs(
             if failure.classification == "complex":
                 groups.setdefault(failure.error_class, []).append((check, failure))
         issue_by_error: Dict[str, Optional[str]] = {}
+        check_ids = _check_ids(all_failures)
+        already_covered = _all_checks_covered(pr.number, check_ids, state_path)
+        if already_covered:
+            print(
+                f"  PR #{pr.number}: checks {check_ids} already reported — 0 new issues"
+            )
         for error_class, group in sorted(groups.items()):
+            if already_covered:
+                issue_by_error[error_class] = None
+                continue
             issue_by_error[error_class] = create_child_issue(
                 api,
                 pr,
                 group,
                 error_class,
                 dry_run=dry_run,
-                recorded_state_path=recorded_state_path,
+                recorded_state_path=state_path,
             )
 
         for check, failure in all_failures:
