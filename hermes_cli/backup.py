@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import zipfile
+import zlib
 from contextlib import closing, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1564,6 +1565,11 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
         if not src.exists():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
+        # Tracked out here, not inside the ``with``: a truncated artifact raises ``EOFError`` and a
+        # bad CRC raises ``zlib.error`` from ``copyfileobj`` *before* the old post-block
+        # assignment ran, so ``delete=False``'s temp file leaked on exactly the failure this
+        # handler exists for (#245).
+        tmp_path: Optional[Path] = None
         try:
             if gz_artifact:
                 with open(src, "rb") as raw_in, gzip.GzipFile(
@@ -1571,14 +1577,11 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
                 ) as fin, tempfile.NamedTemporaryFile(
                     dir=dst.parent, prefix=".restore-", suffix=".db", delete=False
                 ) as tmp:
-                    shutil.copyfileobj(fin, tmp, 1024 * 1024)
                     tmp_path = Path(tmp.name)
-                try:
-                    if not _safe_restore_db(tmp_path, dst):
-                        logger.error("Failed to restore %s: live-safe restore refused", rel)
-                        continue
-                finally:
-                    tmp_path.unlink(missing_ok=True)
+                    shutil.copyfileobj(fin, tmp, 1024 * 1024)
+                if not _safe_restore_db(tmp_path, dst):
+                    logger.error("Failed to restore %s: live-safe restore refused", rel)
+                    continue
             elif dst.suffix == ".db":
                 # Through the backup API so live connections see the restored data instead of
                 # stale pages from a replaced inode (#65942).
@@ -1589,8 +1592,15 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
             else:
                 shutil.copy2(src, dst)
             restored += 1
-        except (OSError, PermissionError) as exc:
+        except (OSError, PermissionError, EOFError, zlib.error) as exc:
+            # gzip's failure modes are not OSErrors: ``EOFError`` on a truncated artifact,
+            # ``zlib.error`` on a bad CRC. Uncaught they aborted the entire restore loop mid-way,
+            # when the one situation that demands a clean per-file error is a corrupt artifact
+            # (#245).
             logger.error("Failed to restore %s: %s", rel, exc)
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
     logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
     return restored > 0
 

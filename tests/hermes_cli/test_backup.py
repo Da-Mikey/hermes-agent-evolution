@@ -1,6 +1,7 @@
 """Tests for hermes backup and import commands."""
 
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -1653,6 +1654,45 @@ class TestQuickSnapshot:
         n = conn.execute("SELECT COUNT(*) FROM sessions WHERE id LIKE 'bulk-%'").fetchone()[0]
         conn.close()
         assert n == 4000, f"restored DB lost rows: {n}"
+
+    def test_corrupt_gz_artifact_fails_one_file_and_keeps_restoring(
+        self, hermes_home, caplog
+    ):
+        """#245: a truncated ``.db.gz`` must not abort the whole restore.
+
+        ``gzip`` raises ``EOFError`` (short artifact) and ``zlib.error`` (bad CRC) — neither
+        is an ``OSError``. Before this fix they escaped the per-file handler, killed every
+        remaining manifest entry, and leaked the ``delete=False`` temp file.
+        """
+        import gzip as _gzip
+        import json as _json
+
+        from hermes_cli import backup as backup_mod
+
+        snap_id = "corrupt-gz"
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+        snap_dir.mkdir(parents=True)
+        payload = _gzip.compress(b"sqlite-ish" * 5000)
+        # Cut mid-stream: the header parses, then the read hits an unexpected EOF.
+        (snap_dir / "state.db.gz").write_bytes(payload[: len(payload) // 2])
+        (snap_dir / "config.yaml").write_text("model:\n  provider: restored\n")
+        # state.db.gz is deliberately FIRST: if it aborts the loop, config.yaml is skipped.
+        (snap_dir / "manifest.json").write_text(
+            _json.dumps({"files": {"state.db.gz": 1, "config.yaml": 1}})
+        )
+        live_config = hermes_home / "config.yaml"
+        live_config.write_text("model:\n  provider: stale\n")
+
+        with caplog.at_level(logging.ERROR):
+            assert backup_mod.restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+
+        # Reported, and reported against the file that was actually corrupt.
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("state.db.gz" in m for m in errors), errors
+        # The loop carried on: the next manifest entry was restored.
+        assert "restored" in live_config.read_text()
+        # Nothing leaked.
+        assert list(hermes_home.glob(".restore-*")) == []
 
 
 class TestQuickSnapshotProjectsKanban:
