@@ -5,8 +5,18 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from evolution_qc_review import build_qc_review_task, parse_qc_report, main  # noqa: E402  # fmt: skip
+from evolution_qc_review import (  # noqa: E402
+    EXIT_UNSCORED,
+    _record,
+    adjudicate_review,
+    build_config_fingerprint,
+    build_qc_review_task,
+    main,
+    parse_qc_report,
+)
 
 _j = json.dumps
 
@@ -72,3 +82,103 @@ def test_cli_parse(capsys, monkeypatch):
 
 def test_cli_usage():
     assert main(["x"]) == 2 and main(["x", "frob"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# #234 three-valued gate outcomes (rework of the PR #244 review)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_hash_tracks_the_actual_prompt():
+    """Defect 1: a version-stamped hash is one constant, so prompt drift was invisible."""
+    a = build_config_fingerprint("review this diff", outcome="pass")
+    b = build_config_fingerprint("review this diff, harder", outcome="pass")
+    assert a["prompt_hash"] != b["prompt_hash"]
+    assert a["prompt_hash"] == build_config_fingerprint("review this diff", outcome="pass")[
+        "prompt_hash"
+    ]
+    # No prompt supplied is "unknown", never a hash that compares equal across records it
+    # cannot vouch for.
+    assert build_config_fingerprint(None, outcome="unscored")["prompt_hash"] is None
+
+
+def test_unscored_record_carries_outcome_and_prompt_hash():
+    r = parse_qc_report("no json here", prompt="P1")
+    assert r["outcome"] == "unscored"
+    assert not r["ok"]
+    assert r["verdict"] == "fail"  # legacy field, unchanged for existing callers
+    assert r["config"]["prompt_hash"] == build_config_fingerprint(
+        "P1", outcome="unscored"
+    )["prompt_hash"]
+
+
+def test_unknown_verdict_is_unscored_not_fail():
+    assert parse_qc_report(_j({"verdict": "maybe", "has_blocking": False}))["outcome"] == (
+        "unscored"
+    )
+
+
+def test_measured_verdicts_keep_their_outcome():
+    assert parse_qc_report(_j({"verdict": "pass", "has_blocking": False}))["outcome"] == "pass"
+    assert parse_qc_report(_j({"verdict": "fail", "has_blocking": True}))["outcome"] == "fail"
+
+
+def test_mutating_a_returned_unscored_record_does_not_leak():
+    """Defect 3: ``dict(_FAIL)`` shared its lists with the module-level template."""
+    first = parse_qc_report("no json")
+    first["issues"].append({"severity": "high"})
+    first["recommendations"].append("nope")
+    second = parse_qc_report("no json")
+    assert second["issues"] == []
+    assert second["recommendations"] == []
+
+
+def test_unknown_outcome_raises_value_error():
+    """Defect 4: a bare assert would be stripped under ``python -O``."""
+    with pytest.raises(ValueError):
+        _record("bogus")
+
+
+def test_adjudicate_of_unscored_reviewer_is_unscored_but_blocking():
+    """Defect 2: the decision path must not report non-measurement as a rework demand."""
+    v = adjudicate_review(parse_qc_report("garbage output"), {"dissent": False})
+    assert v["block"] is True  # fail safe: absent evidence never widens a gate
+    assert v["outcome"] == "unscored"  # but it is not a measured rejection
+    assert v["verdict"] == "unscored"
+
+
+def _write(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
+def test_cli_parse_garbage_exits_unscored(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("no json at all"))
+    assert main(["x", "parse"]) == EXIT_UNSCORED == 3
+
+
+def test_cli_adjudicate_unscored_exits_3_not_1(tmp_path, capsys):
+    rev = _write(tmp_path, "rev.json", "not json")
+    crit = _write(tmp_path, "crit.json", _j({"dissent": False}))
+    assert main(["x", "adjudicate", "--reviewer", rev, "--critic", crit]) == 3
+    assert json.loads(capsys.readouterr().out)["outcome"] == "unscored"
+
+
+def test_cli_adjudicate_measured_rework_still_exits_1(tmp_path, capsys):
+    rev = _write(tmp_path, "rev.json", _j({"verdict": "fail", "has_blocking": True}))
+    crit = _write(tmp_path, "crit.json", _j({"dissent": False}))
+    assert main(["x", "adjudicate", "--reviewer", rev, "--critic", crit]) == 1
+
+
+def test_cli_parse_prompt_file_feeds_the_fingerprint(tmp_path, capsys, monkeypatch):
+    prompt = _write(tmp_path, "task.json", "the real reviewer prompt")
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO(_j({"verdict": "pass", "has_blocking": False}))
+    )
+    assert main(["x", "parse", "--prompt", prompt]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["config"]["prompt_hash"] == build_config_fingerprint(
+        "the real reviewer prompt", outcome="pass"
+    )["prompt_hash"]
+
