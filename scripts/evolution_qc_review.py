@@ -4,23 +4,93 @@ parse the subagent's report to gate completion. CLI call sites — no dead code.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-_FAIL = {
-    "verdict": "fail",
-    "has_blocking": True,
-    "issues": [],
-    "recommendations": [],
-    "ok": False,
-}
+# The three outcomes a QC gate can report (#234). ``unscored`` is not a third flavour of
+# failure: it means the gate produced no measurement at all (unparseable reviewer output,
+# an unrecognised verdict, a reviewer that never ran), so a caller can alarm on
+# non-measurement instead of counting a non-result as a rejected candidate.
+_OUTCOMES = ("pass", "fail", "unscored")
+
+# Distinct exit code for "no measurement", so CI and callers can tell an unscored review
+# apart from a measured rework demand (exit 1) — the point of the third value.
+EXIT_UNSCORED = 3
+
+
+def _record(
+    outcome: str,
+    *,
+    verdict: str = "",
+    has_blocking: bool = False,
+    issues: Optional[List[Any]] = None,
+    recommendations: Optional[List[Any]] = None,
+    ok: bool = False,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build one QC record around a validated three-valued outcome (#234).
+
+    Every list is built fresh: a record handed to a caller must never share mutable state
+    with a module-level template. ``dict(_FAIL)`` was a shallow copy, so one caller
+    appending to ``issues`` leaked into every record built afterwards (PR #244 review,
+    defect 3).
+    """
+    if outcome not in _OUTCOMES:
+        # A bare ``assert`` vanishes under ``python -O``, silently disabling the only check
+        # that keeps a typo out of every downstream aggregate (PR #244 review, defect 4).
+        raise ValueError(f"unknown QC outcome: {outcome!r}")
+    return {
+        "outcome": outcome,
+        "verdict": verdict,
+        "has_blocking": bool(has_blocking),
+        "issues": list(issues or ()),
+        "recommendations": list(recommendations or ()),
+        "ok": bool(ok),
+        "config": dict(config) if config is not None else None,
+    }
+
+
+# ``_unscored`` marks the template the two-valued core returns when it cannot extract any
+# JSON: a marker for "no measurement", never a measured verdict.
+_FAIL = {**_record("fail", verdict="fail", has_blocking=True), "_unscored": True}
 
 
 def _s(v: Any) -> str:
     return v.strip() if isinstance(v, str) else ""
+
+
+def build_config_fingerprint(
+    prompt: Optional[str],
+    *,
+    outcome: str,
+    critic_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Fingerprint the configuration a QC score was produced under (#234).
+
+    Two scores are only comparable within one prompt and one gate configuration, so
+    ``prompt_hash`` hashes the actual prompt text handed to the reviewer. Hashing a version
+    string instead (``qc-review/v1``) makes it the same constant for every record forever,
+    blinding the fingerprint to exactly the prompt drift it exists to catch (PR #244
+    review, defect 1).
+
+    ``None`` when no prompt was supplied: an honest "unknown", rather than a hash of
+    nothing that would compare equal across records it cannot vouch for.
+    """
+    if outcome not in _OUTCOMES:
+        raise ValueError(f"unknown QC outcome: {outcome!r}")
+    return {
+        "prompt_hash": (
+            None
+            if prompt is None
+            else hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        ),
+        "outcome": outcome,
+        "gate": "critic-on" if critic_enabled else "critic-off",
+    }
 
 
 def build_qc_review_task(
@@ -65,8 +135,13 @@ def _extract_json(text: str) -> Optional[dict]:
     return None
 
 
-def parse_qc_report(subagent_output: str) -> Dict[str, Any]:
-    """Parse QC subagent output. ok=True only when verdict=='pass' and not has_blocking."""
+def _parse_qc_two_valued(subagent_output: str) -> Dict[str, Any]:
+    """Two-valued core, kept verbatim; ``parse_qc_report`` wraps it in three values.
+
+    Returns a ``_FAIL`` copy carrying the ``_unscored`` marker when no JSON could be
+    extracted — the caller, not this function, decides what non-measurement means.
+    ok=True only when verdict=='pass' and not has_blocking.
+    """
     raw = _extract_json(_s(subagent_output))
     if raw is None:
         return dict(_FAIL)
@@ -75,6 +150,38 @@ def parse_qc_report(subagent_output: str) -> Dict[str, Any]:
     issues = raw.get("issues") if isinstance(raw.get("issues"), list) else []
     recs = raw.get("recommendations") if isinstance(raw.get("recommendations"), list) else []  # fmt: skip
     return {"verdict": verdict, "has_blocking": hb, "issues": issues, "recommendations": recs, "ok": verdict == "pass" and not hb}  # fmt: skip
+
+
+def parse_qc_report(
+    subagent_output: str,
+    *,
+    prompt: Optional[str] = None,
+    critic_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Parse QC subagent output into a three-valued record (#234).
+
+    ``ok`` keeps its old meaning (verdict=='pass' and not has_blocking). Output that
+    cannot be measured — no extractable JSON, or a verdict that is neither pass nor fail —
+    becomes ``outcome="unscored"`` instead of being silently counted as a fail.
+    ``verdict`` keeps its legacy value ("fail") on those records so existing callers do not
+    change behaviour; ``outcome`` and the exit code carry the distinction.
+    """
+    legacy = _parse_qc_two_valued(subagent_output)
+    ok = bool(legacy.get("ok"))
+    verdict = _s(legacy.get("verdict")).lower()
+    measurable = not legacy.get("_unscored") and verdict in ("pass", "fail")
+    outcome = ("pass" if ok else "fail") if measurable else "unscored"
+    return _record(
+        outcome,
+        verdict=verdict or "fail",
+        has_blocking=legacy.get("has_blocking", False),
+        issues=legacy.get("issues"),
+        recommendations=legacy.get("recommendations"),
+        ok=ok,
+        config=build_config_fingerprint(
+            prompt, outcome=outcome, critic_enabled=critic_enabled
+        ),
+    )
 
 
 def _files_from_args(args: List[str]) -> List[str]:
@@ -171,16 +278,28 @@ def adjudicate_review(
     - reviewer ok + grounded dissent → block ("rework").
     - reviewer ok + no grounded objection → proceed.
     """
+    # An unscored reviewer is a non-measurement, not a judgement. It must still block —
+    # never widen a gate on absent evidence — but it must not be reported as a measured
+    # rework demand, or every unparseable reviewer inflates the rework rate (#234).
+    if _s(reviewer_report.get("outcome")) == "unscored":
+        return {
+            "block": True,
+            "outcome": "unscored",
+            "verdict": "unscored",
+            "reason": "reviewer produced no measurable verdict",
+        }
     reviewer_ok = bool(reviewer_report.get("ok"))
     if not reviewer_ok:
         return {
             "block": True,
+            "outcome": "fail",
             "verdict": "rework",
             "reason": "reviewer did not approve",
         }
     if not critic_enabled:
         return {
             "block": False,
+            "outcome": "pass",
             "verdict": "proceed",
             "reason": "adversarial critic disabled",
         }
@@ -190,11 +309,13 @@ def adjudicate_review(
         fm = _s(critic_report.get("failure_mode"))
         return {
             "block": True,
+            "outcome": "fail",
             "verdict": "rework",
             "reason": f"critic grounded objection: {fm[:200]}",
         }
     return {
         "block": False,
+        "outcome": "pass",
         "verdict": "proceed",
         "reason": "no grounded objection from critic",
     }
@@ -217,7 +338,7 @@ def record_critic_verdict(
 
         record_review_critic_verdict(
             Path(ledger_file),
-            verdict=str(verdict.get("verdict", "proceed")),
+            verdict="rework" if verdict.get("block") else "proceed",
             reviewer_ok=bool(reviewer_report.get("ok")),
             dissent=bool(critic_report.get("dissent")),
             grounded=bool(critic_report.get("grounded")),
@@ -242,6 +363,18 @@ def _flag(args: List[str], name: str) -> Optional[str]:
         if i + 1 < len(args):
             return args[i + 1]
     return None
+
+
+def _prompt_text(args: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Load the ``--prompt`` task file whose text the config fingerprint hashes (#234).
+
+    The prompt the reviewer was actually given is the only thing that makes two scores
+    comparable, so it is read here and hashed into the record — never version-stamped.
+    """
+    path = _flag(args, "--prompt")
+    if not path:
+        return None, None
+    return _load_text(path)
 
 
 def main(argv: List[str]) -> int:
@@ -282,8 +415,15 @@ def main(argv: List[str]) -> int:
         data, err = _load_text(path)
         if err:
             return 2
-        report = parse_qc_report(data)
+        prompt, perr = _prompt_text(args)
+        if perr:
+            return 2
+        report = parse_qc_report(
+            data, prompt=prompt, critic_enabled="--no-critic" not in args
+        )
         print(json.dumps(report, ensure_ascii=False))
+        if report["outcome"] == "unscored":
+            return EXIT_UNSCORED
         return 0 if report["ok"] else 1
     if cmd == "parse-critic":
         path = args[0] if args and not args[0].startswith("-") else None
@@ -302,7 +442,10 @@ def main(argv: List[str]) -> int:
         crit_data, crit_err = _load_text(critic_path)
         if rev_err or crit_err:
             return 2
-        reviewer = parse_qc_report(rev_data)
+        prompt, perr = _prompt_text(args)
+        if perr:
+            return 2
+        reviewer = parse_qc_report(rev_data, prompt=prompt)
         critic = parse_critic_report(crit_data)
         verdict = adjudicate_review(
             reviewer, critic, critic_enabled="--no-critic" not in args
@@ -313,6 +456,11 @@ def main(argv: List[str]) -> int:
                 ledger, verdict, reviewer_report=reviewer, critic_report=critic
             )
         print(json.dumps(verdict, ensure_ascii=False))
+        # ``adjudicate`` is the path a caller actually decides on, so the distinct
+        # non-measurement code has to be returned here too — otherwise an unscored review
+        # exits 1, identical to a measured rework demand (PR #244 review, defect 2).
+        if verdict.get("outcome") == "unscored":
+            return EXIT_UNSCORED
         return 1 if verdict["block"] else 0
     return 2
 
