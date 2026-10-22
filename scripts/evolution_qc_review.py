@@ -336,9 +336,22 @@ def record_critic_verdict(
     try:
         from evolution.lib.stage_gate import record_review_critic_verdict
 
+        # #257: carry the three-valued outcome into the ledger. Flattening to
+        # ``rework``/``proceed`` alone logs an *unscored* block — a reviewer that
+        # produced no measurable verdict at all — as a measured rework, which is the
+        # exact conflation #234 removed upstream. ``verdict`` keeps the legacy
+        # vocabulary for existing consumers; ``outcome`` makes the two cases
+        # distinguishable in the append-only ledger.
+        legacy_verdict = "rework" if verdict.get("block") else "proceed"
+        outcome = _s(verdict.get("outcome"))
+        if outcome not in _OUTCOMES:
+            # Unknown/absent outcome: derive two-valued rather than leak junk into the
+            # append-only ledger, which nothing downstream can repair.
+            outcome = "fail" if legacy_verdict == "rework" else "pass"
         record_review_critic_verdict(
             Path(ledger_file),
-            verdict="rework" if verdict.get("block") else "proceed",
+            verdict=legacy_verdict,
+            outcome=outcome,
             reviewer_ok=bool(reviewer_report.get("ok")),
             dissent=bool(critic_report.get("dissent")),
             grounded=bool(critic_report.get("grounded")),
