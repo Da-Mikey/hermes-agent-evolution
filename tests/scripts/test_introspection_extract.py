@@ -289,6 +289,66 @@ class TestFailureReasonClassification:
         assert s["tool_failures"] == {"read_file": 1}
         assert s["tool_failures_by_reason"] == {"read_file": {"file-not-found": 1}}
 
+    def test_skill_management_reasons_are_distinct(self, tmp_path):
+        """#253 — the self-improvement path must be diagnosable.
+
+        Before this slice a skill *lookup* miss was tagged ``file-not-found``
+        (that rule matches a bare "not found") and every write-guard refusal fell
+        into ``other``, so 9 of 10 skill failures were indistinguishable: the
+        caller could not tell "skill missing" from "edit rejected".
+        """
+        cases = [
+            ("Skill 'demo' not found in active profile 'default'.", "skill-not-found"),
+            ("Skill 'demo' not found for validation.", "skill-not-found"),
+            ("File 'reference.md' not found in skill 'demo'.", "skill-file-not-found"),
+            (
+                "Validation gate rejected auto-created skill 'x': bad frontmatter",
+                "skill-gate-rejected",
+            ),
+            (
+                "Refusing background curator update for pinned skill 'demo': "
+                "pinned skills are owner-owned",
+                "skill-curator-refused",
+            ),
+        ]
+        for i, (message, expected) in enumerate(cases):
+            p = _session(
+                tmp_path,
+                f"r{i}",
+                [_asst("skill_manage", "c1"), _tool("c1", _fail(message))],
+            )
+            s = scan_session(p)
+            assert s["tool_failures_by_reason"] == {
+                "skill_manage": {expected: 1}
+            }, message
+
+    def test_provenance_gate_rejection_is_its_own_reason(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "r2",
+            [
+                _asst("skill_manage", "c1"),
+                _tool("c1", _fail("Provenance gate rejected skill 'demo': untrusted source")),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {
+            "skill_manage": {"skill-gate-rejected": 1}
+        }
+
+    def test_generic_file_not_found_is_not_retagged_as_skill(self, tmp_path):
+        """The new skill rules must stay skill-scoped — no over-matching."""
+        p = _session(
+            tmp_path,
+            "r3",
+            [
+                _asst("write_file", "c1"),
+                _tool("c1", _fail("File not found: /tmp/whatever.txt")),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {"write_file": {"file-not-found": 1}}
+
     def test_permission_denied_reason(self, tmp_path):
         p = _session(
             tmp_path,

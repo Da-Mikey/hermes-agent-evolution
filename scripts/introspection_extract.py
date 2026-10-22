@@ -271,6 +271,25 @@ _PATCH_NO_MATCH_RE = re.compile(
     r"\b(could not find a match|could not find|cannot find a match)\b",
     re.IGNORECASE,
 )
+# Skill-management sub-categories (#253). The skill tool is the agent's own
+# self-improvement path, so an opaque failure there costs more than its count:
+# a *skill lookup* miss rendered as ``file-not-found`` (that rule matches a bare
+# "not found"), the skill's file miss as the same class, and every write-guard
+# refusal as the catch-all ``other``. Measured before this slice: 9 of 10 skill
+# failures were indistinguishable. These sit BEFORE the generic rules, so they
+# deliberately RE-TAG what fell there — the same re-tag discipline used for
+# write_file (#3468) and patch (#1501). Every pattern is skill-scoped on
+# purpose: a plain "File not found: x" must stay ``file-not-found``.
+_SKILL_NOT_FOUND_RE = re.compile(
+    r"\bskill\s+['\"`][^'\"`]+['\"`]\s+not\s+found\b", re.IGNORECASE
+)
+_SKILL_FILE_NOT_FOUND_RE = re.compile(
+    r"\bnot\s+found\s+in\s+skill\s+['\"`]", re.IGNORECASE
+)
+_SKILL_GATE_REJECTED_RE = re.compile(
+    r"\b(validation|provenance)\s+gate\s+rejected\b", re.IGNORECASE
+)
+_SKILL_CURATOR_REFUSED_RE = re.compile(r"\brefusing\s+background\s+curator\b", re.IGNORECASE)
 # write_file-specific sub-categories (#3468). The write refusal guards emit
 # canonical phrases that match NO generic regex, so 32/34 write_file failures
 # (94% per the 7d window) landed in the opaque 'other' bucket. These mirror the
@@ -396,6 +415,17 @@ def _classify_failure_reason(content: Any) -> Optional[str]:
         r"tool execution blocked by safety gate:", haystack, re.IGNORECASE
     ):
         return "safety-gate-blocked"
+    # #253 — skill management: the self-improvement path. Ordered ahead of the
+    # generic file/not-found rules, which match a bare "not found" and would
+    # otherwise render a skill *lookup* miss as a filesystem miss.
+    if _SKILL_NOT_FOUND_RE.search(haystack):
+        return "skill-not-found"
+    if _SKILL_FILE_NOT_FOUND_RE.search(haystack):
+        return "skill-file-not-found"
+    if _SKILL_GATE_REJECTED_RE.search(haystack):
+        return "skill-gate-rejected"
+    if _SKILL_CURATOR_REFUSED_RE.search(haystack):
+        return "skill-curator-refused"
     if _FILE_NOT_FOUND_RE.search(haystack):
         return "file-not-found"
     if _PERMISSION_RE.search(haystack):
