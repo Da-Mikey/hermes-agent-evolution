@@ -16,6 +16,7 @@ from evolution_qc_review import (  # noqa: E402
     build_qc_review_task,
     main,
     parse_qc_report,
+    record_critic_verdict,
 )
 
 _j = json.dumps
@@ -181,4 +182,55 @@ def test_cli_parse_prompt_file_feeds_the_fingerprint(tmp_path, capsys, monkeypat
     assert out["config"]["prompt_hash"] == build_config_fingerprint(
         "the real reviewer prompt", outcome="pass"
     )["prompt_hash"]
+
+
+def test_critic_ledger_keeps_unscored_distinct_from_measured_rework(tmp_path):
+    """#257: an unscored block must not be logged as a measured rework.
+
+    ``record_critic_verdict`` used to flatten the verdict to rework/proceed, so a
+    reviewer that produced no measurable verdict at all was indistinguishable in
+    the append-only ledger from a reviewer that measured a real failure — the exact
+    conflation #234 removed upstream. Both still block and both keep the legacy
+    ``rework`` vocabulary; ``outcome`` is what tells them apart.
+    """
+    ledger = tmp_path / "stage_gate.jsonl"
+    cases = [
+        ({"ok": False, "outcome": "unscored"}, "unscored"),  # nothing measurable
+        ({"ok": False, "outcome": "fail"}, "fail"),  # a measured failure
+    ]
+    for reviewer_report, expected in cases:
+        verdict = adjudicate_review(reviewer_report, {})
+        assert verdict["block"], "both cases must still block"
+        assert verdict["outcome"] == expected
+        record_critic_verdict(
+            str(ledger), verdict, reviewer_report=reviewer_report, critic_report={}
+        )
+
+    records = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert [r["verdict"] for r in records] == ["rework", "rework"]  # compat kept
+    assert [r["outcome"] for r in records] == ["unscored", "fail"]
+    assert (records[0]["verdict"], records[0]["outcome"]) != (
+        records[1]["verdict"],
+        records[1]["outcome"],
+    )
+
+
+def test_critic_ledger_derives_outcome_for_a_verdict_without_one(tmp_path):
+    """A verdict dict predating #234 has no ``outcome`` key — derive it, never crash."""
+    ledger = tmp_path / "stage_gate.jsonl"
+    record_critic_verdict(
+        str(ledger), {"block": True}, reviewer_report={}, critic_report={}
+    )
+    record_critic_verdict(
+        str(ledger), {"block": False}, reviewer_report={}, critic_report={}
+    )
+    # an outcome outside the three-valued set must not leak into the ledger either
+    record_critic_verdict(
+        str(ledger),
+        {"block": True, "outcome": "bogus"},
+        reviewer_report={},
+        critic_report={},
+    )
+    records = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert [r["outcome"] for r in records] == ["fail", "pass", "fail"]
 

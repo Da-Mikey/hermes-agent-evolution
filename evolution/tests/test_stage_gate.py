@@ -195,6 +195,55 @@ class TestReviewCriticLedger:
             grounded=False,
         )
 
+    def test_outcome_keeps_unscored_distinct_from_measured_rework(self, tmp_path):
+        """#257: an unscored block must not read as a measured rework in the ledger."""
+        import json
+
+        from evolution.lib.stage_gate import record_review_critic_verdict
+
+        ledger = tmp_path / "stage_gate.jsonl"
+        # same legacy verdict, different truth: non-measurement vs a real failure
+        record_review_critic_verdict(
+            ledger,
+            verdict="rework",
+            outcome="unscored",
+            reviewer_ok=False,
+            dissent=False,
+            grounded=False,
+        )
+        record_review_critic_verdict(
+            ledger,
+            verdict="rework",
+            outcome="fail",
+            reviewer_ok=False,
+            dissent=False,
+            grounded=False,
+        )
+        recs = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert [r["verdict"] for r in recs] == ["rework", "rework"]
+        assert [r["outcome"] for r in recs] == ["unscored", "fail"]
+        # the records differ by more than their timestamp
+        assert (recs[0]["verdict"], recs[0]["outcome"]) != (
+            recs[1]["verdict"],
+            recs[1]["outcome"],
+        )
+
+    def test_legacy_caller_omitting_outcome_still_records_one(self, tmp_path):
+        """Backward compatibility: callers predating #257 keep working two-valued."""
+        import json
+
+        from evolution.lib.stage_gate import record_review_critic_verdict
+
+        ledger = tmp_path / "stage_gate.jsonl"
+        record_review_critic_verdict(
+            ledger, verdict="rework", reviewer_ok=False, dissent=True, grounded=True
+        )
+        record_review_critic_verdict(
+            ledger, verdict="proceed", reviewer_ok=True, dissent=False, grounded=False
+        )
+        recs = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert [r["outcome"] for r in recs] == ["fail", "pass"]
+
 
 class TestGateRates:
     @staticmethod

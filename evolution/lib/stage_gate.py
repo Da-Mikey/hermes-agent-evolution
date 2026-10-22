@@ -217,6 +217,7 @@ def record_review_critic_verdict(
     ledger_file: Path,
     *,
     verdict: str,
+    outcome: str = "",
     reviewer_ok: bool,
     dissent: bool,
     grounded: bool,
@@ -232,17 +233,26 @@ def record_review_critic_verdict(
     (which filters on ``branch``) skips them rather than confusing critic
     verdicts with branch decisions. Never raises — instrumentation must not
     take a pipeline boundary down with it.
+
+    ``outcome`` is the three-valued truth (#257: ``pass``/``fail``/``unscored``)
+    while ``verdict`` keeps the legacy ``rework``/``proceed`` vocabulary. An
+    *unscored* block — a reviewer that produced no measurable verdict at all —
+    is logged with ``outcome="unscored"``, so it is never indistinguishable from
+    a measured rework in the ledger. Callers that omit ``outcome`` keep working:
+    it is derived two-valued from ``verdict``.
     """
     try:
         from datetime import datetime, timezone
 
         ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        measured_outcome = outcome or ("fail" if verdict == "rework" else "pass")
         with open(ledger_file, "a", encoding="utf-8") as fh:
             fh.write(
                 json.dumps(
                     {
                         "kind": "review_critic",
                         "verdict": verdict,
+                        "outcome": measured_outcome,
                         "reviewer_ok": bool(reviewer_ok),
                         "dissent": bool(dissent),
                         "grounded": bool(grounded),
