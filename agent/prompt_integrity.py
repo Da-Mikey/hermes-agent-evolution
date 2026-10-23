@@ -108,6 +108,56 @@ class IntegrityReport:
         return not self.drifts
 
 
+_ALERT_STATE_SUFFIX = ".last-alert.json"
+
+
+def _alert_state_path(home: Path) -> Path:
+    """Where the last *alerted* drift signature is remembered for this profile.
+
+    Beside the registry, because both share one home and one lifetime — this is one
+    small file per profile, not per process, so a cron run and an interactive run do not
+    each get to repeat the same warning (#271 logged 98 across processes).
+    """
+    rp = registry_path(home)
+    return rp.with_name(rp.name + _ALERT_STATE_SUFFIX)
+
+
+def drift_signature(report: IntegrityReport) -> str:
+    """Identity of a drift *condition*: which paths drifted and to what content.
+
+    Level-triggered logging repeats one sentence forever because the condition is
+    unchanged. This signature is what makes the alarm edge-triggered: a file that drifts
+    to *different* content is a new condition and does alarm again, while a file that
+    simply stays drifted does not.
+    """
+    parts = [
+        f"{rel}:{report.current.get(rel, 'missing')}" for rel in sorted(report.drifts)
+    ]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _load_alert_signature(home: Path) -> str:
+    """Last alerted signature, or ``""`` when absent/unreadable (fail-open)."""
+    try:
+        payload = json.loads(_alert_state_path(home).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    signature = payload.get("signature") if isinstance(payload, dict) else None
+    return signature if isinstance(signature, str) else ""
+
+
+def _store_alert_signature(home: Path, signature: str) -> None:
+    """Remember the alerted signature. Never raises: alerting state is not load-bearing."""
+    try:
+        path = _alert_state_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"signature": signature}), encoding="utf-8")
+    except OSError:  # pragma: no cover - defensive
+        logger.debug(
+            "Could not store prompt-integrity alert state at %s", _alert_state_path(home)
+        )
+
+
 def verify_integrity(
     home: Path,
     files: tuple[str, ...] = PROTECTED_FILES,
@@ -142,6 +192,14 @@ def verify_and_log(
 
     Fail-open: an unexpected exception returns an empty report (no alert) and
     logs at debug level, so integrity checking can never disrupt prompt load.
+
+    The drift warning is **edge-triggered** (#271): it fires when a drift condition
+    appears or changes, then stays silent while that same condition persists. It used
+    to fire on every read — 98 identical warnings for SOUL.md in one 24h window — and a
+    security warning that repeats without ever changing state is a retry loop with no
+    terminal outcome: the operator learns to ignore the line, which is the opposite of
+    what an integrity alarm is for. The *signal* is unchanged (``report.drifts`` is
+    always populated, and callers gate on it); only the repetition is suppressed.
     """
     try:
         report = verify_integrity(home, files)
@@ -150,6 +208,19 @@ def verify_and_log(
         return IntegrityReport()
     if report.established:
         logger.info("Established prompt-file integrity baseline for %s", home)
+    if report.ok:
+        # The condition cleared: forget the last alert so the next drift is news again.
+        if _load_alert_signature(home):
+            _store_alert_signature(home, "")
+        return report
+    signature = drift_signature(report)
+    if signature == _load_alert_signature(home):
+        logger.debug(
+            "Prompt-file integrity drift unchanged in %s (%s) — already alerted once",
+            home,
+            ",".join(sorted(report.drifts)),
+        )
+        return report
     for rel in report.drifts:
         logger.warning(
             "Prompt-file integrity drift detected for %r in %s — a long-lived "
@@ -158,4 +229,6 @@ def verify_and_log(
             rel,
             home,
         )
+    _store_alert_signature(home, signature)
     return report
+
