@@ -189,12 +189,89 @@ def _files_from_args(args: List[str]) -> List[str]:
     return [f.strip() for f in files_str.split(",") if f.strip()]
 
 
+def _diff_from_args(args: List[str]) -> str:
+    """Contents of ``--diff-file``, or ``""`` when absent/unreadable (#267).
+
+    A missing diff is not an error: it just leaves evidence verification
+    ``unmeasured``, which keeps the legacy declared-grounding rule rather than blocking
+    the run on a flag nobody passed yet.
+    """
+    path = _flag(args, "--diff-file")
+    if not path:
+        return ""
+    data, err = _load_text(path)
+    return "" if err else data
+
+
+def _digest_from_args(args: List[str]) -> Dict[str, str]:
+    """``{path: sha256}`` for every ``--digest PATH`` (repeatable, comma-separated).
+
+    Computed here rather than passed by the model: a digest the critic supplied would be
+    the same self-report problem in another costume.
+    """
+    digests: Dict[str, str] = {}
+    raw_values: List[str] = []
+    for i, arg in enumerate(args):
+        if arg == "--digest" and i + 1 < len(args):
+            raw_values.append(args[i + 1])
+        elif arg.startswith("--digest="):
+            raw_values.append(arg.split("=", 1)[1])
+    for raw in raw_values:
+        for part in raw.split(","):
+            candidate = part.strip()
+            if not candidate:
+                continue
+            p = Path(candidate)
+            try:
+                if not p.is_file():
+                    continue
+                digests[str(p)] = hashlib.sha256(p.read_bytes()).hexdigest()
+            except OSError:
+                continue
+    return digests
+
+
+_CRITIC_OUTPUT_FORMAT = (
+    "## Output Format\nReturn JSON:\n"
+    '- "dissent": bool — true ONLY if you found a concrete failure mode\n'
+    '- "evidence_ref": string — the file:line (`tools/x.py:41`) or diff hunk the '
+    "objection resolves to (empty when you do not dissent)\n"
+    '- "grounded": bool — true only if your objection cites specific evidence\n'
+    '- "failure_mode": string — the concrete failure mode (empty if none)\n'
+    '- "agreement_reason": string — why you could NOT object (empty if dissenting)\n'
+)
+
+# A diff this large stops being evidence and starts being a context problem.
+_MAX_CRITIC_DIFF_CHARS = 12000
+
+
+def _clip(text: str, limit: int) -> str:
+    text = _s(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n… (diff truncated for the critic prompt)"
+
+
+def _target_digest_block(target_digest: Optional[Dict[str, str]]) -> str:
+    """The ``## Target Digests`` section, or nothing when no digests were supplied."""
+    if not target_digest:
+        return ""
+    rows = "\n".join(
+        f"  - {path} sha256:{digest}" for path, digest in sorted(target_digest.items())
+    )
+    return f"## Target Digests\n{rows}\n\n"
+
+
 def build_critic_task(
-    summary: str,
+    summary: Optional[str],
     files: List[str],
     *,
     issue_number: int = 0,
     toolsets: Optional[List[str]] = None,
+    diff: str = "",
+    trace_ref: str = "",
+    target_digest: Optional[Dict[str, str]] = None,
+    claim_blind: bool = False,
 ) -> Dict[str, Any]:
     """Build a leaf-subagent adversarial critic task for delegate_task (#92).
 
@@ -203,34 +280,65 @@ def build_critic_task(
     mode. If it cannot construct such an objection, it must say so explicitly
     — the review then proceeds. This is the structured-disagreement pass that
     breaks reviewer/coder rubber-stamping (Adversarial Review, arXiv:2608.18167).
+
+    ``claim_blind=True`` (#267) withholds the worker's own success summary. Self-report
+    leakage is the defect: a judge handed the author's claim as its evidence grades the
+    claim, not the change — withholding it lifted dangerous-misreport recall by 43.4pp on
+    the same judge reading the same trace (arXiv:2610.29609). The blind pass therefore
+    gets the *artefact* (diff, trace reference, target digests, file list) and never the
+    claim. ``claim_blind=False`` keeps the legacy claim-aware prompt so both passes can be
+    run over one artefact and their disagreement scored (``--claim-blind``).
     """
     file_list = "\n".join(f"  - {f}" for f in files) if files else "  (no files listed)"
-    goal = (
-        "You are an adversarial code critic. The reviewer has APPROVED the "
-        "following implementation. Your job is to try to prove it WRONG.\n\n"
-        "Attempt to articulate ONE concrete, evidence-grounded failure mode: a "
-        "specific way this change breaks, regresses, or introduces a bug, tied "
-        "to the summary or a file below. Do NOT manufacture objections to seem "
-        "rigorous — a fabricated disagreement is as harmful as rubber-stamped "
-        "approval.\n\n"
-        f"## Summary\n{summary}\n\n"
-        f"## Files Changed\n{file_list}\n\n"
-        "## Output Format\nReturn JSON:\n"
-        '- "dissent": bool — true ONLY if you found a concrete failure mode\n'
-        '- "grounded": bool — true only if your objection cites specific evidence\n'
-        '- "failure_mode": string — the concrete failure mode (empty if none)\n'
-        '- "agreement_reason": string — why you could NOT object (empty if dissenting)\n'
-    )
+    if claim_blind:
+        framing = (
+            "You are an adversarial code critic. A change is under review. You have "
+            "NOT been told what its author claims it does: the diff, the tool-trace "
+            "reference and the file list are your only account of it.\n\n"
+            "Attempt to articulate ONE concrete, evidence-grounded failure mode: a "
+            "specific way this change breaks, regresses, or introduces a bug, tied "
+            "to the diff or a file below. Cite it in `evidence_ref`. Do NOT "
+            "manufacture objections to seem rigorous — a fabricated disagreement is "
+            "as harmful as rubber-stamped approval.\n\n"
+        )
+        evidence = (
+            "## Tool Trace Reference\n"
+            f"{trace_ref or '  (no trace reference supplied)'}\n\n"
+            f"## Diff Under Review\n{_clip(diff, _MAX_CRITIC_DIFF_CHARS) or '  (no diff supplied)'}\n\n"
+            f"{_target_digest_block(target_digest)}"
+            f"## Files Changed\n{file_list}\n\n"
+        )
+    else:
+        framing = (
+            "You are an adversarial code critic. The reviewer has APPROVED the "
+            "following implementation. Your job is to try to prove it WRONG.\n\n"
+            "Attempt to articulate ONE concrete, evidence-grounded failure mode: a "
+            "specific way this change breaks, regresses, or introduces a bug, tied "
+            "to the summary or a file below. Do NOT manufacture objections to seem "
+            "rigorous — a fabricated disagreement is as harmful as rubber-stamped "
+            "approval.\n\n"
+        )
+        evidence = (
+            "## Tool Trace Reference\n"
+            f"{trace_ref or '  (no trace reference supplied)'}\n\n"
+            f"## Diff Under Review\n{_clip(diff, _MAX_CRITIC_DIFF_CHARS) or '  (no diff supplied)'}\n\n"
+            f"{_target_digest_block(target_digest)}"
+            f"## Summary\n{_s(summary)}\n\n"
+            f"## Files Changed\n{file_list}\n\n"
+        )
+    goal = framing + evidence + _CRITIC_OUTPUT_FORMAT
     context = (
         f"You are the adversarial critic gate. Issue #{issue_number}. "
         "Only dissent when you can point to a concrete, evidence-grounded "
-        "failure mode; otherwise agree explicitly and explain why."
+        "failure mode; otherwise agree explicitly and explain why. "
+        "Your `evidence_ref` must resolve to a file:line or a diff hunk."
     )
     return {
         "goal": goal,
         "context": context,
         "toolsets": list(toolsets) if toolsets is not None else ["file", "search"],
         "role": "leaf",
+        "claim_blind": bool(claim_blind),
     }
 
 
@@ -246,6 +354,7 @@ def parse_critic_report(subagent_output: str) -> Dict[str, Any]:
         return {
             "dissent": False,
             "grounded": False,
+            "evidence_ref": "",
             "failure_mode": "",
             "agreement_reason": "",
             "ok": False,
@@ -258,9 +367,152 @@ def parse_critic_report(subagent_output: str) -> Dict[str, Any]:
     return {
         "dissent": dissent,
         "grounded": grounded,
+        "evidence_ref": _s(raw.get("evidence_ref")),
         "failure_mode": failure_mode,
         "agreement_reason": agreement_reason,
         "ok": ok,
+    }
+
+
+# ── Evidence verification: `grounded` checked, not declared (#267) ─────────
+# The critic used to declare its own grounding and the gate believed it, so the only
+# thing standing between a leaky success claim and a merged PR was the model's assertion
+# that it had evidence. These helpers make grounding a property of the *reference*: an
+# objection counts only when its `evidence_ref` resolves to a changed hunk in the diff or
+# to a file attested at a known target digest. Unresolvable evidence does not block.
+GROUNDING_VERIFIED = "verified"
+GROUNDING_UNGROUNDED = "ungrounded"
+GROUNDING_UNMEASURED = "unmeasured"
+
+_EVIDENCE_REF_RE = re.compile(
+    r"(?<![\w/.-])([\w./\\-]+\.[A-Za-z0-9_]+)(?::L?(\d+)(?:\s*[-–]\s*L?(\d+))?)?"
+)
+
+
+def _diff_line_ranges(diff: str) -> Dict[str, List[Tuple[int, int]]]:
+    """``{new_side_path: [(start, end), ...]}`` for every hunk in a unified diff.
+
+    New-side numbering is what a critic reading a file after the change will cite, so the
+    ranges are the ``+`` side of each hunk header. A pure-delete hunk has a zero-length new
+    side; it is still recorded (as a one-line window) so a critique of a deletion resolves.
+    """
+    ranges: Dict[str, List[Tuple[int, int]]] = {}
+    current: Optional[str] = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
+            current = m.group(2) if m else None
+            continue
+        if line.startswith("+++ "):
+            rest = line[4:].strip()
+            if rest.startswith("b/"):
+                current = rest[2:]
+            elif rest and rest != "/dev/null":
+                current = rest
+            continue
+        if line.startswith("@@") and current:
+            m = re.match(r"@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if m:
+                start = int(m.group(2))
+                count = int(m.group(3) or 1)
+                ranges.setdefault(current, []).append((
+                    start,
+                    start + max(count, 1) - 1,
+                ))
+    return ranges
+
+
+def _match_known_path(path: str, known: Any) -> Optional[str]:
+    """Resolve a critic-written path against known paths (exact, then suffix)."""
+    if path in known:
+        return path
+    for candidate in known:
+        if candidate.endswith("/" + path) or path.endswith("/" + candidate):
+            return candidate
+    return None
+
+
+def verify_evidence_ref(
+    evidence_ref: str,
+    *,
+    diff: str = "",
+    target_digest: Optional[Dict[str, str]] = None,
+) -> Tuple[str, str]:
+    """Does ``evidence_ref`` actually resolve? ``(status, detail)``.
+
+    Status is one of ``verified`` (it names a changed hunk or a digest-attested file),
+    ``ungrounded`` (verification material existed and the reference does not resolve —
+    the objection does not block) or ``unmeasured`` (no diff and no digests were supplied,
+    so nothing could be checked and the caller keeps the legacy behaviour).
+    """
+    ref = _s(evidence_ref).strip()
+    digests = target_digest or {}
+    if not ref:
+        if not diff and not digests:
+            return GROUNDING_UNMEASURED, "no evidence_ref and no verification material"
+        return GROUNDING_UNGROUNDED, "no evidence_ref supplied"
+    m = _EVIDENCE_REF_RE.search(ref)
+    if not m:
+        if not diff and not digests:
+            return GROUNDING_UNMEASURED, "no verification material supplied"
+        return GROUNDING_UNGROUNDED, f"evidence_ref names no file or hunk: {ref[:120]}"
+    path = m.group(1).lstrip("./")
+    line = int(m.group(2)) if m.group(2) else None
+    ranges = _diff_line_ranges(diff) if diff else {}
+    attested = _match_known_path(path, digests)
+    if attested is not None:
+        return GROUNDING_VERIFIED, f"{attested} is attested at its target digest"
+    in_diff = _match_known_path(path, ranges)
+    if in_diff is not None:
+        spans = ranges[in_diff]
+        if line is None:
+            return GROUNDING_VERIFIED, f"{in_diff} appears in the diff"
+        end = int(m.group(3)) if m.group(3) else line
+        for start, stop in spans:
+            if line >= start and end <= max(stop, start):
+                return GROUNDING_VERIFIED, f"{in_diff}:{line} falls in a changed hunk"
+        return (
+            GROUNDING_UNGROUNDED,
+            f"{in_diff}:{line} is outside every changed hunk in the diff",
+        )
+    if not diff and not digests:
+        return GROUNDING_UNMEASURED, "no verification material supplied"
+    return GROUNDING_UNGROUNDED, f"{path} is neither in the diff nor a target digest"
+
+
+def verify_critic_grounding(
+    critic_report: Dict[str, Any],
+    *,
+    diff: str = "",
+    target_digest: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Turn a critic report's self-declared ``grounded`` into a checked verdict (#267).
+
+    ``grounded_verified`` is true only when the critic dissented, claimed grounding, AND
+    its reference resolves. ``grounding_status == "unmeasured"`` means the caller supplied
+    no diff/digest, so the old declared-grounding behaviour is preserved rather than
+    silently widening the gate on absent evidence.
+    """
+    dissent = bool(critic_report.get("dissent"))
+    declared = bool(critic_report.get("grounded"))
+    ref = _s(critic_report.get("evidence_ref"))
+    if not dissent:
+        return {
+            "dissent": False,
+            "declared_grounded": declared,
+            "grounded_verified": False,
+            "grounding_status": "n/a",
+            "evidence_ref": ref,
+            "evidence_detail": "",
+        }
+    status, detail = verify_evidence_ref(ref, diff=diff, target_digest=target_digest)
+    return {
+        "dissent": True,
+        "declared_grounded": declared,
+        "grounded_verified": declared and status == GROUNDING_VERIFIED,
+        "grounding_status": status,
+        "evidence_ref": ref,
+        "evidence_detail": detail,
     }
 
 
@@ -269,6 +521,9 @@ def adjudicate_review(
     critic_report: Dict[str, Any],
     *,
     critic_enabled: bool = True,
+    diff: str = "",
+    target_digest: Optional[Dict[str, str]] = None,
+    blind_critic_report: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Deterministic reviewer-to-critic gate (#92).
 
@@ -277,6 +532,14 @@ def adjudicate_review(
     - reviewer ok + critic disabled → proceed.
     - reviewer ok + grounded dissent → block ("rework").
     - reviewer ok + no grounded objection → proceed.
+
+    Grounding is *verified*, not declared (#267): a dissent blocks only when its
+    ``evidence_ref`` resolves against ``diff``/``target_digest``. When neither is supplied
+    the check is ``unmeasured`` and the old declared-grounding rule stands, so an
+    unchanged caller never has its gate silently widened. ``blind_critic_report`` is the
+    claim-blind pass over the same artefact: supplying it makes the gate block if EITHER
+    pass blocks, and records whether the two disagreed (``blind_aware_disagreement``) —
+    a disagreement is the signal that the aware pass was reading the claim, not the code.
     """
     # An unscored reviewer is a non-measurement, not a judgement. It must still block —
     # never widen a gate on absent evidence — but it must not be reported as a measured
@@ -303,22 +566,68 @@ def adjudicate_review(
             "verdict": "proceed",
             "reason": "adversarial critic disabled",
         }
-    dissent = bool(critic_report.get("dissent"))
-    grounded = bool(critic_report.get("grounded"))
-    if dissent and grounded:
-        fm = _s(critic_report.get("failure_mode"))
-        return {
+
+    def _blocks(gate: Dict[str, Any]) -> bool:
+        """One pass blocks when it dissented AND its grounding survived checking."""
+        if not gate.get("dissent"):
+            return False
+        if gate.get("grounding_status") == GROUNDING_UNMEASURED:
+            return bool(gate.get("declared_grounded"))
+        return bool(gate.get("grounded_verified"))
+
+    gates: Dict[str, Dict[str, Any]] = {
+        "aware": verify_critic_grounding(
+            critic_report, diff=diff, target_digest=target_digest
+        )
+    }
+    if blind_critic_report is not None:
+        # #267: the claim-blind pass over the same artefact. Both are run and both are
+        # recorded; the gate blocks if either does, because withholding a claim should
+        # only ever add objections, never remove one already found.
+        gates["blind"] = verify_critic_grounding(
+            blind_critic_report, diff=diff, target_digest=target_digest
+        )
+    blocking_passes = [name for name, gate in gates.items() if _blocks(gate)]
+    disagreement = len(gates) == 2 and bool(_blocks(gates["aware"])) != bool(
+        _blocks(gates["blind"])
+    )
+    if blocking_passes:
+        primary = gates[blocking_passes[0]]
+        fm = _s(primary.get("failure_mode"))
+        if not fm and blocking_passes[0] == "blind":
+            fm = (
+                _s(blind_critic_report.get("failure_mode"))
+                if blind_critic_report
+                else ""
+            )
+        status = primary.get("grounding_status")
+        evidence = (
+            f" [{blocking_passes[0]} pass, evidence {status}: {primary.get('evidence_detail', '')[:120]}]"
+            if status in (GROUNDING_VERIFIED, GROUNDING_UNMEASURED)
+            else f" [{blocking_passes[0]} pass]"
+        )
+        verdict = {
             "block": True,
             "outcome": "fail",
             "verdict": "rework",
-            "reason": f"critic grounded objection: {fm[:200]}",
+            "reason": f"critic grounded objection{evidence}: {fm[:200]}",
+            "grounding": {name: gate for name, gate in gates.items()},
+            "blocking_passes": blocking_passes,
         }
-    return {
+        if disagreement:
+            verdict["blind_aware_disagreement"] = True
+        return verdict
+    verdict = {
         "block": False,
         "outcome": "pass",
         "verdict": "proceed",
         "reason": "no grounded objection from critic",
+        "grounding": {name: gate for name, gate in gates.items()},
+        "blocking_passes": [],
     }
+    if disagreement:
+        verdict["blind_aware_disagreement"] = True
+    return verdict
 
 
 def record_critic_verdict(
@@ -413,14 +722,24 @@ def main(argv: List[str]) -> int:
         return 0
     if cmd == "build-critic":
         summary = _flag(args, "--summary") or ""
-        if not _s(summary):
+        claim_blind = "--claim-blind" in args
+        # A claim-blind pass takes no summary at all — that is the point of it (#267).
+        if not _s(summary) and not claim_blind:
             return 2
         files = _files_from_args(args)
         try:
             issue_num = int(_flag(args, "--issue") or "0")
         except ValueError:
             issue_num = 0
-        task = build_critic_task(summary, files, issue_number=issue_num)
+        task = build_critic_task(
+            summary or None,
+            files,
+            issue_number=issue_num,
+            diff=_diff_from_args(args),
+            trace_ref=_flag(args, "--trace-ref") or "",
+            target_digest=_digest_from_args(args),
+            claim_blind=claim_blind,
+        )
         print(json.dumps(task, ensure_ascii=False))
         return 0
     if cmd == "parse":
@@ -460,8 +779,20 @@ def main(argv: List[str]) -> int:
             return 2
         reviewer = parse_qc_report(rev_data, prompt=prompt)
         critic = parse_critic_report(crit_data)
+        blind_path = _flag(args, "--blind-critic")
+        blind_critic = None
+        if blind_path:
+            blind_data, blind_err = _load_text(blind_path)
+            if blind_err:
+                return 2
+            blind_critic = parse_critic_report(blind_data)
         verdict = adjudicate_review(
-            reviewer, critic, critic_enabled="--no-critic" not in args
+            reviewer,
+            critic,
+            critic_enabled="--no-critic" not in args,
+            diff=_diff_from_args(args),
+            target_digest=_digest_from_args(args),
+            blind_critic_report=blind_critic,
         )
         ledger = _flag(args, "--ledger")
         if ledger:

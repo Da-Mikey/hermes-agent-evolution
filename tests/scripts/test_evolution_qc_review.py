@@ -13,10 +13,13 @@ from evolution_qc_review import (  # noqa: E402
     _record,
     adjudicate_review,
     build_config_fingerprint,
+    build_critic_task,
     build_qc_review_task,
     main,
+    parse_critic_report,
     parse_qc_report,
     record_critic_verdict,
+    verify_evidence_ref,
 )
 
 _j = json.dumps
@@ -233,4 +236,155 @@ def test_critic_ledger_derives_outcome_for_a_verdict_without_one(tmp_path):
     )
     records = [json.loads(line) for line in ledger.read_text().splitlines()]
     assert [r["outcome"] for r in records] == ["fail", "pass", "fail"]
+
+
+# ── #267: claim-blind critic pass + verified grounding ─────────────────────
+_SAMPLE_DIFF = (
+    "diff --git a/tools/x.py b/tools/x.py\n"
+    "--- a/tools/x.py\n"
+    "+++ b/tools/x.py\n"
+    "@@ -10,6 +10,8 @@ def f():\n"
+    "-    return 1\n"
+    "+    return 2\n"
+    "+    # a newly added comment line\n"
+)
+
+
+def _ok_reviewer():
+    return parse_qc_report('{"verdict": "pass", "has_blocking": false}')
+
+
+def _grounded_dissent(reference):
+    return parse_critic_report(
+        _j(
+            {
+                "dissent": True,
+                "grounded": True,
+                "evidence_ref": reference,
+                "failure_mode": "f() returns 2 now, callers assert 1",
+                "agreement_reason": "",
+            }
+        )
+    )
+
+
+def test_claim_blind_task_withholds_the_worker_summary():
+    """The leak is the point: a blind pass must not be told what the worker claims."""
+    task = build_critic_task(
+        "WORKER CLAIM: all tests pass, nothing else touched",
+        ["tools/x.py"],
+        diff=_SAMPLE_DIFF,
+        target_digest={"tools/x.py": "a" * 64},
+        claim_blind=True,
+    )
+    assert "WORKER CLAIM" not in task["goal"]
+    assert "## Summary" not in task["goal"]
+    assert "## Diff Under Review" in task["goal"]
+    assert "tools/x.py:12" not in task["goal"]  # no leak via the digest block
+    assert "sha256:" + "a" * 64 in task["goal"]
+    assert task["claim_blind"] is True
+
+
+def test_claim_aware_task_still_carries_the_summary():
+    """Legacy pass is unchanged, so both can be run over one artefact."""
+    task = build_critic_task(
+        "WORKER CLAIM: all tests pass", ["tools/x.py"], claim_blind=False
+    )
+    assert "WORKER CLAIM" in task["goal"]
+    assert "## Summary" in task["goal"]
+    assert task["claim_blind"] is False
+
+
+def test_evidence_ref_inside_a_changed_hunk_is_verified():
+    status, detail = verify_evidence_ref("tools/x.py:12", diff=_SAMPLE_DIFF)
+    assert status == "verified", detail
+    assert "changed hunk" in detail
+
+
+def test_evidence_ref_outside_every_hunk_is_ungrounded():
+    status, _ = verify_evidence_ref("tools/x.py:99", diff=_SAMPLE_DIFF)
+    assert status == "ungrounded"
+
+
+def test_evidence_ref_to_a_digest_attested_file_is_verified():
+    status, detail = verify_evidence_ref(
+        "tools/x.py:99", diff="", target_digest={"tools/x.py": "b" * 64}
+    )
+    assert status == "verified", detail
+    assert "target digest" in detail
+
+
+def test_evidence_ref_with_no_material_is_unmeasured():
+    assert verify_evidence_ref("tools/x.py:12")[0] == "unmeasured"
+    assert verify_evidence_ref("")[0] == "unmeasured"
+
+
+def test_ungrounded_dissent_does_not_block_when_evidence_is_checkable():
+    """The declared flag is no longer sufficient — the reference has to resolve."""
+    verdict = adjudicate_review(
+        _ok_reviewer(), _grounded_dissent("tools/x.py:99"), diff=_SAMPLE_DIFF
+    )
+    assert verdict["block"] is False
+    assert verdict["grounding"]["aware"]["grounding_status"] == "ungrounded"
+
+
+def test_verified_dissent_blocks_and_names_its_evidence():
+    verdict = adjudicate_review(
+        _ok_reviewer(), _grounded_dissent("tools/x.py:12"), diff=_SAMPLE_DIFF
+    )
+    assert verdict["block"] is True
+    assert verdict["blocking_passes"] == ["aware"]
+    assert verdict["grounding"]["aware"]["grounded_verified"] is True
+    assert "verified" in verdict["reason"]
+
+
+def test_declared_grounding_without_material_keeps_the_legacy_block():
+    """Never widen a gate on absent evidence: unmeasurable grounding still blocks."""
+    verdict = adjudicate_review(_ok_reviewer(), _grounded_dissent("tools/x.py:12"))
+    assert verdict["block"] is True
+    assert verdict["grounding"]["aware"]["grounding_status"] == "unmeasured"
+
+
+def test_blind_pass_adds_an_objection_the_aware_pass_missed():
+    """Disagreement is the signal that the aware pass was reading the claim."""
+    aware = parse_critic_report(
+        _j({"dissent": False, "grounded": False, "agreement_reason": "looks fine"})
+    )
+    verdict = adjudicate_review(
+        _ok_reviewer(),
+        aware,
+        diff=_SAMPLE_DIFF,
+        blind_critic_report=_grounded_dissent("tools/x.py:12"),
+    )
+    assert verdict["block"] is True
+    assert verdict["blocking_passes"] == ["blind"]
+    assert verdict["blind_aware_disagreement"] is True
+    assert "callers assert 1" in verdict["reason"]
+
+
+def test_both_passes_agreeing_records_no_disagreement():
+    aware = parse_critic_report(
+        _j({"dissent": False, "grounded": False, "agreement_reason": "looks fine"})
+    )
+    blind = parse_critic_report(
+        _j({"dissent": False, "grounded": False, "agreement_reason": "looks fine too"})
+    )
+    verdict = adjudicate_review(
+        _ok_reviewer(), aware, diff=_SAMPLE_DIFF, blind_critic_report=blind
+    )
+    assert verdict["block"] is False
+    assert "blind_aware_disagreement" not in verdict
+
+
+def test_cli_build_critic_claim_blind_needs_no_summary(capsys):
+    """A blind pass takes no summary, so the CLI must not demand one."""
+    assert main(["x", "build-critic", "--claim-blind", "--files", "tools/x.py"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["claim_blind"] is True
+    assert "## Summary" not in payload["goal"]
+
+
+def test_cli_build_critic_without_summary_or_blind_flag_is_usage_error():
+    assert main(["x", "build-critic", "--files", "tools/x.py"]) == 2
+
 
