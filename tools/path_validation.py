@@ -64,17 +64,24 @@ def suggest_nearby_paths(path: str, max_results: int = 5) -> List[str]:
     return [fp for _, fp in scored[:max_results]]
 
 
-def format_nearby_hint(path: str, nearby: List[str]) -> Optional[str]:
+def format_nearby_hint(
+    path: str, nearby: List[str], tool_name: str = "read_file"
+) -> Optional[str]:
     """Build a human hint for a stale *path* given *nearby* candidates.
 
     Returns ``None`` when *nearby* is empty. Mirrors the #1587 "did you
     mean?" inline-suggestion contract so the hint is visible in the tool
     error text, not a separate field.
+
+    ``tool_name`` names the tool that produced the hint. It defaults to
+    ``read_file`` (where #1587 introduced the message) but every other
+    producer must pass its own name — #282 found the text hard-coded to
+    ``read_file`` even when a shell command produced it.
     """
     if not nearby:
         return None
     return (
         f"File not found: {path}\n\n"
         f"Did you mean: {', '.join(nearby)}? "
-        "Re-run read_file with one of these paths instead of guessing."
+        f"Re-run {tool_name} with one of these paths instead of guessing."
     )

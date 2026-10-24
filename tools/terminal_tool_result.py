@@ -305,8 +305,15 @@ def finalize_foreground_result(
             result_dict[key] = value
     # #2242 — nearby-path hint for missing files, including the classified
     # command-not-found path that still names a path in the command/output.
-    from tools.terminal_tool import _nearby_missing_path_hint
-    hint = _nearby_missing_path_hint(command, output)
-    if hint:
-        result_dict["error"] = str(result_dict.get("error") or "") + "\n\n" + hint
+    # #282 — gate on a non-zero exit. This caller used to invoke the hint
+    # unconditionally, so a *successful* command whose output merely contained
+    # a phrase like "not found" (or a nested tool result naming a directory)
+    # had a hard "error" string stapled to a result reporting exit_code 0.
+    # `_apply_classified_enrichments` already scoped the same hint to classified
+    # non-zero exits; the foreground path must agree with it.
+    if returncode is not None and returncode != 0:
+        from tools.terminal_tool import _nearby_missing_path_hint
+        hint = _nearby_missing_path_hint(command, output)
+        if hint:
+            result_dict["error"] = str(result_dict.get("error") or "") + "\n\n" + hint
     return json.dumps(result_dict, ensure_ascii=False)
