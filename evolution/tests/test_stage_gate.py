@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from evolution.lib.stage_gate import (
     ACCEPT,
+    CANNOT_DETERMINE,
     DEFAULT_CONFIDENCE_THRESHOLD,
     REFINE,
     RESTART,
@@ -33,9 +34,16 @@ class TestAcceptBranch:
     def test_above_threshold_accepts(self):
         assert decide(_result(95, ["a.json"])).branch == ACCEPT
 
-    def test_accept_without_evidence_still_accepts(self):
-        """High confidence is sufficient on its own — evidence is not required."""
-        assert decide(_result(90)).branch == ACCEPT
+    def test_accept_without_evidence_is_cannot_determine(self):
+        """#281 — confidence cannot substitute for evidence.
+
+        This assertion used to be the opposite (``test_accept_without_evidence
+        _still_accepts``), which was exactly the defect: a boundary could mark
+        itself done on a confidence number and an empty evidence set.
+        """
+        d = decide(_result(90))
+        assert d.branch == CANNOT_DETERMINE
+        assert d.proceeds is False
 
     def test_accept_retains_evidence(self):
         d = decide(_result(90, ["a.json", "b.json"]))
@@ -91,7 +99,9 @@ class TestThresholdHandling:
 
     def test_threshold_clamped(self):
         assert decide(_result(100, ["a.json"]), threshold=500).branch == ACCEPT
-        assert decide(_result(0), threshold=-10).branch == ACCEPT
+        # #281 — evidence is required for ACCEPT, so cite one and keep asserting
+        # the clamp itself.
+        assert decide(_result(0, ["a.json"]), threshold=-10).branch == ACCEPT
 
     def test_confidence_clamped(self):
         sr = StageResult(confidence=1000, stage="s", evidence_pointers=["a"])
