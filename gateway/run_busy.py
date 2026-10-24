@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import time
+from pathlib import Path
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
@@ -29,6 +30,100 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# ── Busy-mode discard accounting (#283) ──────────────────────────────────────
+# The pending-queue discard branch used to log one WARNING per dropped event and
+# keep no count, so a nightly batch of ~100 lost Home Assistant events was
+# indistinguishable from healthy silence — the exact failure mode a
+# notice-things household agent cannot reconstruct afterwards. These counters
+# make the loss finite and visible: ONE edge-triggered WARNING when a session
+# starts dropping, ONE on recovery carrying the total, and a persisted state
+# field the freshness/escalation layer can read.
+#
+# Module-level because GatewayBusySessionMixin has no __init__ of its own; the
+# gateway event loop is single-threaded, so plain dicts are sufficient.
+_BUSY_DROP_STATE: Dict[str, Dict[str, Any]] = {}
+#: A window bounds how long "currently congested" stays true without a single
+#: successful enqueue — otherwise one evening's storm would keep a stale flag.
+_BUSY_DROP_WINDOW_SECONDS = 3600.0
+_BUSY_DROP_STATE_FILE = Path.home() / ".hermes" / "state" / "busy_queue_drops.json"
+
+
+def busy_drop_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Per-session busy-queue discard counters, for monitors and tests (#283)."""
+    return {key: dict(val) for key, val in _BUSY_DROP_STATE.items()}
+
+
+def _record_busy_drop(session_key: str, cap: int) -> Dict[str, Any]:
+    """Count one discarded follow-up; returns the session's state after it."""
+    now = time.time()
+    state = _BUSY_DROP_STATE.get(session_key)
+    if state is None or now - state["window_started"] >= _BUSY_DROP_WINDOW_SECONDS:
+        state = {
+            "window_started": now,
+            "dropped": 0,
+            "last_drop": now,
+            "cap": cap,
+        }
+        _BUSY_DROP_STATE[session_key] = state
+    state["dropped"] += 1
+    state["last_drop"] = now
+    return state
+
+
+def _persist_busy_drop_summary(
+    session_key: str, dropped: int, window_seconds: float
+) -> None:
+    """Persist one recovery summary so the dead-man layer can see the loss.
+
+    Written only on a transition (recovery), never per drop — instrumentation
+    must not turn a congested gateway into a disk-write storm. Never raises: a
+    monitoring artefact must never take the delivery path down with it.
+    """
+    try:
+        payload: Dict[str, Any] = {}
+        try:
+            existing = json.loads(_BUSY_DROP_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                payload = existing
+        except (OSError, ValueError):
+            payload = {}
+        payload[session_key] = {
+            "dropped": dropped,
+            "window_seconds": round(window_seconds, 1),
+            "recovered_at": time.time(),
+        }
+        _BUSY_DROP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _BUSY_DROP_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, _BUSY_DROP_STATE_FILE)
+    except OSError:
+        pass
+
+
+def _note_busy_acceptance(session_key: str) -> None:
+    """Clear a session's discard state on the first follow-up that is accepted.
+
+    This is the recovery edge: the queue has drained enough to take an event
+    again, so report what was lost while it could not.
+    """
+    state = _BUSY_DROP_STATE.pop(session_key, None)
+    if not state:
+        return
+    dropped = int(state.get("dropped", 0))
+    if dropped <= 0:
+        return
+    window = max(0.0, time.time() - float(state.get("window_started", time.time())))
+    logger.warning(
+        "Busy-mode queue recovered for session %s — %d follow-up event(s) were "
+        "discarded while the pending queue was at cap (%d) over %.0fs. These "
+        "events were lost, not deferred.",
+        session_key,
+        dropped,
+        int(state.get("cap", 0)),
+        window,
+    )
+    _persist_busy_drop_summary(session_key, dropped, window)
 
 
 def _strip_slot(text: str, slot: str) -> Optional[str]:
@@ -396,16 +491,32 @@ class GatewayBusySessionMixin:
                 merge_text=event.message_type == MessageType.TEXT,
             )
             event._gateway_accepted = True
+            _note_busy_acceptance(session_key)
             return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
-            logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
-                session_key, self._BUSY_QUEUE_MAX_PENDING,
-            )
+            # #283 — count the loss and log ONE line at the edge, not one per
+            # event. The events are discarded permanently; the count is what
+            # makes that finite and reportable.
+            drop_state = _record_busy_drop(session_key, self._BUSY_QUEUE_MAX_PENDING)
+            dropped = int(drop_state["dropped"])
+            if dropped == 1:
+                logger.warning(
+                    "Busy-mode follow-up dropped for session %s — pending queue at cap (%d). "
+                    "Further drops in this window are counted, not logged; a recovery line "
+                    "reports the total.",
+                    session_key, self._BUSY_QUEUE_MAX_PENDING,
+                )
+            else:
+                logger.debug(
+                    "Busy-mode follow-up dropped for session %s — %d discarded in this window "
+                    "(pending queue at cap %d).",
+                    session_key, dropped, self._BUSY_QUEUE_MAX_PENDING,
+                )
             return
 
         self._enqueue_fifo(session_key, event, adapter)
+        _note_busy_acceptance(session_key)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
