@@ -465,6 +465,24 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _harm_gate_trusts_private_hosts() -> bool:
+    """Opt-in: treat our own LAN as on-premise rather than "off-machine".
+
+    security.harm_gate.trust_private_hosts. Default False keeps the upstream
+    posture (a LAN destination scores as exfiltration); a household that probes
+    its own devices turns it on. Fail-closed: an unreadable config means False.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        section = cfg.get("security") if isinstance(cfg, dict) else None
+        harm_gate = section.get("harm_gate") if isinstance(section, dict) else None
+        return bool(harm_gate.get("trust_private_hosts")) if isinstance(harm_gate, dict) else False
+    except Exception:
+        return False
+
+
 def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[str]:
     """Score a pre-execution call with the AgentProcessBench harm rules."""
     name = str(function_name or "").lower()
@@ -475,7 +493,9 @@ def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[
         return None
     try:
         from evolution.lib.agent_process_bench import harm_verdict_for_tool_call
-        return harm_verdict_for_tool_call(name, function_args)
+        return harm_verdict_for_tool_call(
+            name, function_args, trust_private_hosts=_harm_gate_trusts_private_hosts()
+        )
     except Exception:
         return None
 

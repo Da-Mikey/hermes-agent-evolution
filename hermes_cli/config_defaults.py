@@ -1779,6 +1779,14 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        # Pre-execution harm gate (evolution/lib/agent_process_bench.py). The gate's
+        # exfiltration arm matches a network verb plus a URL, and a LAN destination
+        # can never earn the public-fetch exemption — so on a household LAN every
+        # probe of our own devices (camera, inverter, HA, printers) scored 1.0 and was
+        # refused. True treats RFC1918/link-local destinations as on-premise; a
+        # command that can carry local bytes into the request (upload/data/form
+        # flags, substitution, redirection) is still refused. False = upstream posture.
+        "harm_gate": {"trust_private_hosts": False},
         "website_blocklist": {"enabled": False, "domains": [], "shared_files": []},
         # IDs of supply-chain advisories the user has read and acted on; acked ones stop the startup
         # banner. Add via `hermes doctor --ack <id>`; remove by editing the list. Catalog:

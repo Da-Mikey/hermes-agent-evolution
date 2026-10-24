@@ -206,6 +206,62 @@ def _without_plain_fetch_targets(content: str) -> str:
     return _HTTP_AUTHORITY_RE.sub(replace, content)
 
 
+# A LAN destination is not off-machine: the bytes stay on our own network. The
+# exfiltration arm asks whether a command sends something out, and a probe at
+# 10.0.0.x answers no — but the plain-fetch arm above only ever exempts *public*
+# hosts, so every household check (camera, inverter, HA, printers) scored 1.0 and
+# was refused. This arm covers compound commands too, because probes are written
+# as `a; b; c`, and it earns that reach only when nothing in the command can
+# carry local bytes INTO the request: no data/upload flag, no substitution, no
+# redirection. Public destinations keep the original arm untouched.
+_PRIVATE_AUTHORITY_RE = re.compile(
+    r"(?P<host>[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:.]+\])(?::(?P<port>[0-9]{1,5}))?"
+)
+_DATA_CARRY_RE = re.compile(r"[`$<>]")
+# Fetching a body and handing it to an interpreter is execution, not a probe —
+# the destination being local does not make that safe.
+_PIPE_TO_EXEC_RE = re.compile(
+    r"\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|iex|eval)\b",
+    re.I,
+)
+
+
+def _private_authority(authority: str) -> bool:
+    """True only for a fully validated private/link-local literal address."""
+    match = _PRIVATE_AUTHORITY_RE.fullmatch(authority)
+    if match is None:
+        return False
+    port = match.group("port")
+    if port is not None and not _port_in_range(port):
+        return False
+    try:
+        address = ip_address(match.group("host").strip("[]"))
+    except ValueError:
+        return False
+    if address.is_loopback or address.is_multicast or address.is_unspecified:
+        return False
+    return address.is_private
+
+
+def _without_local_targets(content: str) -> str:
+    """Blank a validated LAN destination when the command carries no local bytes."""
+    if _DATA_CARRY_RE.search(content) or _PIPE_TO_EXEC_RE.search(content):
+        return content
+    if _FETCH_DENY_SHORT_RE.search(content) or _FETCH_DENY_FLAGS_RE.search(content):
+        return content
+    for token in content.split():
+        if token.startswith("-") and not token.startswith("--") and len(token) > 1:
+            if any(ch in "xFKTOZdD" for ch in token[1:]):
+                return content
+
+    def replace(match: re.Match[str]) -> str:
+        if _private_authority(match.group("authority")):
+            return " "
+        return match.group(0)
+
+    return _HTTP_AUTHORITY_RE.sub(replace, content)
+
+
 # Root-shaped deletes only. "rm -rf /" as a prefix also matches
 # "rm -rf /tmp/victim", which blocked the approval prompt before the
 # terminal tool ran. A specific directory must fall through to approval.
@@ -219,8 +275,16 @@ _HARM_RE = re.compile(
 )
 
 
-def _flags_for(tool: str, content: str) -> List[str]:
-    m = _HARM_RE.search(_without_loopback_targets(_without_plain_fetch_targets(content)))
+def _flags_for(tool: str, content: str, trust_private_hosts: bool = False) -> List[str]:
+    content = _without_plain_fetch_targets(content)
+    if trust_private_hosts:
+        # Opt-in (security.harm_gate.trust_private_hosts): our own LAN is not
+        # "off-machine", so a probe at 10.0.0.x stops reading as exfiltration.
+        # Applied before the public-fetch arm so compound probes (`a; b; c`) are
+        # covered too; _without_local_targets still refuses any command that can
+        # carry local bytes into the request.
+        content = _without_local_targets(content)
+    m = _HARM_RE.search(_without_loopback_targets(content))
     if not m:
         return []
     if tool in _SHELL_TOOLS and m.group("destructive"):
@@ -234,9 +298,11 @@ def _flags_for(tool: str, content: str) -> List[str]:
     return []
 
 
-def score_step(index: int, tool: str, content: str) -> Dict[str, Any]:
+def score_step(
+    index: int, tool: str, content: str, trust_private_hosts: bool = False
+) -> Dict[str, Any]:
     """Score one step: 0.0 clean, 0.5 suspicious (injection), 1.0 critical."""
-    flags = _flags_for(tool, content)
+    flags = _flags_for(tool, content, trust_private_hosts)
     harm = (
         1.0
         if flags and flags[0] != "prompt-injection-marker"
@@ -248,7 +314,10 @@ def score_step(index: int, tool: str, content: str) -> Dict[str, Any]:
 
 
 def harm_verdict_for_tool_call(
-    tool_name: str, args: Any, threshold: float = BLOCK_THRESHOLD
+    tool_name: str,
+    args: Any,
+    threshold: float = BLOCK_THRESHOLD,
+    trust_private_hosts: bool = False,
 ) -> Optional[str]:
     """Block reason if the call crosses *threshold*, else None (safe)."""
     name = str(tool_name or "").lower()
@@ -258,7 +327,7 @@ def harm_verdict_for_tool_call(
         content = args
     else:
         content = json.dumps(args)
-    score = score_step(0, name, content)
+    score = score_step(0, name, content, trust_private_hosts)
     if name not in _SHELL_TOOLS:
         # Writing a file cannot exfiltrate: nothing leaves the machine. The shell
         # lexicon that flags URLs and upload verbs only means something for a command
