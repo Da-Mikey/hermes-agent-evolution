@@ -1786,7 +1786,12 @@ DEFAULT_CONFIG = {
         # refused. True treats RFC1918/link-local destinations as on-premise; a
         # command that can carry local bytes into the request (upload/data/form
         # flags, substitution, redirection) is still refused. False = upstream posture.
-        "harm_gate": {"trust_private_hosts": False},
+        "harm_gate": {
+            # "full" = upstream. "destructive-only" keeps only irreversible-harm blocking.
+            # "off" = the tirith scanner and the approval layer are the guards.
+            "mode": "full",
+            "trust_private_hosts": False,
+        },
         "website_blocklist": {"enabled": False, "domains": [], "shared_files": []},
         # IDs of supply-chain advisories the user has read and acted on; acked ones stop the startup
         # banner. Add via `hermes doctor --ack <id>`; remove by editing the list. Catalog:

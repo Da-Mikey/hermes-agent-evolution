@@ -465,22 +465,33 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
-def _harm_gate_trusts_private_hosts() -> bool:
-    """Opt-in: treat our own LAN as on-premise rather than "off-machine".
+_HARM_GATE_MODES = ("full", "destructive-only", "off")
+_DESTRUCTIVE_ONLY_ARMS = frozenset({"destructive-command"})
 
-    security.harm_gate.trust_private_hosts. Default False keeps the upstream
-    posture (a LAN destination scores as exfiltration); a household that probes
-    its own devices turns it on. Fail-closed: an unreadable config means False.
+
+def _harm_gate_policy() -> tuple:
+    """(mode, trust_private_hosts) from security.harm_gate; fail-closed to "full".
+
+    "full" is the upstream posture. "destructive-only" keeps the one arm that
+    names irreversible harm and drops the lexical ones — a regex cannot tell a
+    household probe from a leak, and a gate that cries wolf teaches its operator
+    to ignore refusals instead of reading them. "off" leaves the independent
+    tirith scanner and the approval layer as the guards.
     """
     try:
         from hermes_cli.config import load_config
 
         cfg = load_config() or {}
         section = cfg.get("security") if isinstance(cfg, dict) else None
-        harm_gate = section.get("harm_gate") if isinstance(section, dict) else None
-        return bool(harm_gate.get("trust_private_hosts")) if isinstance(harm_gate, dict) else False
+        gate = section.get("harm_gate") if isinstance(section, dict) else None
+        if not isinstance(gate, dict):
+            return "full", False
+        mode = str(gate.get("mode") or "full").strip().lower()
+        if mode not in _HARM_GATE_MODES:
+            mode = "full"
+        return mode, bool(gate.get("trust_private_hosts"))
     except Exception:
-        return False
+        return "full", False
 
 
 def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[str]:
@@ -491,10 +502,17 @@ def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[
         and any(k in function_args for k in ("path", "file_path", "filename", "command"))
     ):
         return None
+    mode, trust_private = _harm_gate_policy()
+    if mode == "off":
+        return None
+    arms = _DESTRUCTIVE_ONLY_ARMS if mode == "destructive-only" else None
     try:
         from evolution.lib.agent_process_bench import harm_verdict_for_tool_call
         return harm_verdict_for_tool_call(
-            name, function_args, trust_private_hosts=_harm_gate_trusts_private_hosts()
+            name,
+            function_args,
+            trust_private_hosts=trust_private,
+            arms=arms,
         )
     except Exception:
         return None

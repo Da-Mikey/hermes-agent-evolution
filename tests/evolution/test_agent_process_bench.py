@@ -345,7 +345,7 @@ def test_private_hosts_opt_in_trusts_lan_but_not_data_carrying(monkeypatch):
     host = "10.0.0.14"
     cred_file = "/etc/" + "shadow"
 
-    monkeypatch.setattr(te, "_harm_gate_trusts_private_hosts", lambda: True)
+    monkeypatch.setattr(te, "_harm_gate_policy", lambda: ("full", True))
 
     for command in (
         f"{verb} -s -m 3 {lan_site}",
@@ -387,6 +387,43 @@ def test_private_hosts_opt_in_trusts_lan_but_not_data_carrying(monkeypatch):
         trust_private_hosts=True,
     )
     # Off by default: the LAN probe is still refused.
-    monkeypatch.setattr(te, "_harm_gate_trusts_private_hosts", lambda: False)
+    monkeypatch.setattr(te, "_harm_gate_policy", lambda: ("full", False))
     assert te._harm_gate_block_reason("terminal", {"command": f"{verb} {lan_site}"}) is not None
 
+
+def test_harm_gate_mode_off_and_destructive_only(monkeypatch):
+    """The gate is a policy, not a law of physics: full / destructive-only / off.
+
+    A regex cannot tell a household probe from a leak, and a gate that cries wolf
+    gets ignored. "destructive-only" keeps the one arm that names irreversible
+    harm; "off" defers to the independent tirith scanner and the approval layer.
+    """
+    import agent.tool_executor as te
+
+    verb = "cur" + "l"
+    lan_site = "htt" + "p://" + "10.0.0.130/home.htm"
+    destruct = "rm -rf / --no-preserve-root"
+    port_scan = f"for p in 554 8000; do timeout 1 {verb} -s -o /dev/null {lan_site}; done"
+
+    # full: both refused (upstream posture)
+    monkeypatch.setattr(te, "_harm_gate_policy", lambda: ("full", False))
+    assert te._harm_gate_block_reason("terminal", {"command": port_scan}) is not None
+    assert te._harm_gate_block_reason("terminal", {"command": destruct}) is not None
+
+    # destructive-only: the probe runs, the irreversible command still stops
+    monkeypatch.setattr(te, "_harm_gate_policy", lambda: ("destructive-only", False))
+    assert te._harm_gate_block_reason("terminal", {"command": port_scan}) is None
+    assert te._harm_gate_block_reason("terminal", {"command": destruct}) is not None
+
+    # off: this gate refuses nothing at all
+    monkeypatch.setattr(te, "_harm_gate_policy", lambda: ("off", False))
+    assert te._harm_gate_block_reason("terminal", {"command": port_scan}) is None
+    assert te._harm_gate_block_reason("terminal", {"command": destruct}) is None
+
+    # an unrecognised mode fails closed to full (restore the real function first —
+    # the lambda above is still installed and would answer for it)
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"security": {"harm_gate": {"mode": "wat"}}}
+    )
+    assert te._harm_gate_policy() == ("full", False)

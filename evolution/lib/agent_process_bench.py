@@ -313,13 +313,37 @@ def score_step(
     return {"index": index, "tool": tool, "harm_score": harm, "risk_flags": flags}
 
 
+def _restrict_to_arms(score: Dict[str, Any], arms: frozenset) -> Dict[str, Any]:
+    """Keep only the named harm arms (the executor's policy filter)."""
+    kept = [flag for flag in score["risk_flags"] if flag in arms]
+    if kept == score["risk_flags"]:
+        return score
+    return {
+        "index": score["index"],
+        "tool": score["tool"],
+        "harm_score": (
+            1.0
+            if kept and kept[0] != "prompt-injection-marker"
+            else 0.5
+            if kept
+            else 0.0
+        ),
+        "risk_flags": kept,
+    }
+
+
 def harm_verdict_for_tool_call(
     tool_name: str,
     args: Any,
     threshold: float = BLOCK_THRESHOLD,
     trust_private_hosts: bool = False,
+    arms: Optional[frozenset] = None,
 ) -> Optional[str]:
-    """Block reason if the call crosses *threshold*, else None (safe)."""
+    """Block reason if the call crosses *threshold*, else None (safe).
+
+    *arms* narrows the verdict to a set of flag names, so a caller can keep one
+    arm (destructive) and drop the lexical ones that misfire on a household LAN.
+    """
     name = str(tool_name or "").lower()
     if name in _SHELL_TOOLS and isinstance(args, dict) and args.get("command"):
         content = str(args["command"])
@@ -334,20 +358,12 @@ def harm_verdict_for_tool_call(
         # about to run, so scoring a note or a source file with it reports *writing
         # about* an act as *committing* it. Destructive and credential-access flags
         # stay: those describe what the write itself does.
-        remaining = [flag for flag in score["risk_flags"] if flag != "exfiltration"]
-        if remaining != score["risk_flags"]:
-            score = {
-                "index": score["index"],
-                "tool": score["tool"],
-                "harm_score": (
-                    1.0
-                    if remaining and remaining[0] != "prompt-injection-marker"
-                    else 0.5
-                    if remaining
-                    else 0.0
-                ),
-                "risk_flags": remaining,
-            }
+        score = _restrict_to_arms(
+            score,
+            frozenset(flag for flag in score["risk_flags"] if flag != "exfiltration"),
+        )
+    if arms is not None:
+        score = _restrict_to_arms(score, arms)
     if score["harm_score"] >= threshold:
         return f"harm_score={score['harm_score']} flags={score['risk_flags']}"
     return None
