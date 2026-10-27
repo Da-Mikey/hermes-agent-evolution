@@ -64,6 +64,28 @@ PROMOTE = "promote"
 BLOCK = "block"
 
 
+def _load_score_edit():
+    """Import the headroom scorer, or ``None`` when ``evolution.lib`` is absent.
+
+    The gate is a standalone script under ``scripts/`` and is also imported by
+    ``evolution_merge_gate``; in both cases the repo root has to be on
+    ``sys.path`` for ``evolution.lib`` to resolve. A deploy that ships only
+    ``scripts/`` still gets a working gate — the headroom column is additive
+    evidence and must never be able to change or suppress the verdict (#208).
+    """
+    try:
+        from evolution.lib.headroom_score import score_edit  # noqa: E402
+    except ImportError:
+        root = str(Path(__file__).resolve().parent.parent)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        try:
+            from evolution.lib.headroom_score import score_edit  # noqa: E402
+        except ImportError:
+            return None
+    return score_edit
+
+
 @dataclass
 class FlipTable:
     """Per-probe outcome deltas between two runs of the same probe set."""
@@ -89,6 +111,42 @@ class FlipTable:
     def inconclusive(self) -> List[str]:
         return self.ids_in(INCONCLUSIVE)
 
+    def pass_rates(self) -> tuple[Dict[str, float], Dict[str, float]]:
+        """Reconstruct before/after pass rates (0.0/1.0) from the cells.
+
+        The table is already a lossless summary of the two runs for every
+        comparable probe: P->P and P->F passed before, P->P and F->P pass
+        after. Probes that are missing or inconclusive in either run are
+        excluded — averaging an absent sample in as a zero is the defect
+        ``headroom_score`` exists to avoid.
+        """
+        before: Dict[str, float] = {}
+        after: Dict[str, float] = {}
+        for pid, cell in self.cells.items():
+            if cell in (MISSING_AFTER, MISSING_BEFORE, INCONCLUSIVE):
+                continue
+            before[pid] = 1.0 if cell in (HELD, REGRESSION) else 0.0
+            after[pid] = 1.0 if cell in (HELD, FIX) else 0.0
+        return before, after
+
+    def metrics(self) -> Optional[Dict[str, Any]]:
+        """Headroom-normalised score for this edit, or ``None`` if unavailable.
+
+        The primary column is the mean fraction of the remaining gap the edit
+        closed (#208, RSIGym RSI-index shape); ``raw_delta`` is retained beside
+        it as the secondary column so absolute movement stays auditable. The
+        promotion rule is deliberately still driven by P->F counts — the issue
+        requires a backtest of archived candidates before that default flips.
+        """
+        score_edit = _load_score_edit()
+        if score_edit is None:
+            return None
+        before, after = self.pass_rates()
+        try:
+            return score_edit(before, after).to_dict()
+        except (TypeError, ValueError):  # defensive: never let a metric abort a gate
+            return None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -105,6 +163,7 @@ class FlipTable:
                     INCONCLUSIVE,
                 )
             },
+            "metrics": self.metrics(),
         }
 
 
@@ -325,6 +384,14 @@ def format_table(table: FlipTable, verdict: FlipVerdict) -> str:
         ids = table.ids_in(cell)
         if ids:
             lines.append(f"  {cell}: {', '.join(ids)}")
+    metrics = table.metrics()
+    if metrics is not None:
+        lines.append(
+            f"  headroom score {metrics['headroom_score']:+.3f} "
+            f"(fraction of remaining gap closed; raw delta "
+            f"{metrics['raw_delta']:+.3f} over {metrics['tasks_scored']} scorable "
+            f"probe(s))"
+        )
     return "\n".join(lines)
 
 
