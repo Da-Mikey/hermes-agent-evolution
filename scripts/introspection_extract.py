@@ -615,6 +615,18 @@ def scan_messages(messages) -> Dict[str, Any]:
     tool_failures_by_reason: Dict[
         str, Dict[str, int]
     ] = {}  # tool -> reason -> count (#1325)
+    # Per-tool CALL counts (#317) — the denominator a failure *rate* needs.
+    # Two independent observations are kept because neither alone is complete:
+    #   * declared — tool calls the assistant asked for (a call that crashed
+    #     before producing a result still counts as an attempt);
+    #   * results  — tool-result rows actually observed (a result whose
+    #     originating assistant turn fell outside the scanned slice still
+    #     proves a call happened).
+    # ``tool_calls`` is the per-tool MAX of the two, which also guarantees
+    # failures[tool] <= calls[tool] (every failure is one result row) so a
+    # published rate can never exceed 1.0.
+    calls_declared: Counter = Counter()
+    call_results: Counter = Counter()
     timeouts = 0
     refusals = 0
     refusals_recovered = 0  # refusals that proposed an alternative (#1366)
@@ -635,6 +647,7 @@ def scan_messages(messages) -> Dict[str, Any]:
                     nm = tc["function"].get("name")
                     if nm:
                         names.append(nm)
+                        calls_declared[nm] += 1
                         if tc.get("id"):
                             id_to_tool[tc["id"]] = nm
             # consecutive same-single-tool run tracking
@@ -656,6 +669,7 @@ def scan_messages(messages) -> Dict[str, Any]:
         elif role == "tool":
             content = obj.get("content")
             tool = id_to_tool.get(obj.get("tool_call_id"), "unknown")
+            call_results[tool] += 1
             failed = _tool_result_failed(content)
             if failed:
                 tool_failures[tool] += 1
@@ -673,9 +687,14 @@ def scan_messages(messages) -> Dict[str, Any]:
                 timeouts += 1
 
     repeated = {t: n for t, n in max_runs.items() if n >= _REPEAT_THRESHOLD}
+    tool_calls = {
+        tool: max(calls_declared[tool], call_results[tool])
+        for tool in set(calls_declared) | set(call_results)
+    }
     return {
         "tool_failures": dict(tool_failures),
         "tool_failures_by_reason": tool_failures_by_reason,
+        "tool_calls": tool_calls,
         "timeouts": timeouts,
         "refusals": refusals,
         "refusals_with_recovery": refusals_recovered,
@@ -735,6 +754,32 @@ def _fresh(path: Path, cutoff: float) -> bool:
         return False
 
 
+def _assert_rate_bounds(
+    failure_rate: Dict[str, float],
+    failure_rate_by_reason: Dict[str, Dict[str, float]],
+) -> None:
+    """Hard-fail the digest if any published rate is outside [0, 1] (#317).
+
+    A rate above 1.0 is not a curiosity — it means the denominator is wrong
+    (the pre-#317 bug reported 0.70 for a tool failing 8% of the time). Failing
+    loudly here keeps a bad denominator from silently mis-ranking the whole
+    introspection stage, which is the input to every downstream priority score.
+    """
+    for tool, rate in failure_rate.items():
+        if not 0.0 <= rate <= 1.0:
+            raise ValueError(
+                f"introspection digest rate out of bounds for tool {tool!r}: "
+                f"{rate!r} (denominator is per-tool call count — #317)"
+            )
+    for tool, reasons in failure_rate_by_reason.items():
+        for reason, rate in reasons.items():
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(
+                    f"introspection digest reason rate out of bounds for "
+                    f"{tool}:{reason}: {rate!r} (per-tool call denominator — #317)"
+                )
+
+
 def build_digest(
     sessions_dir: Path, window_days: int = 7, now: float | None = None
 ) -> Dict[str, Any]:
@@ -744,6 +789,7 @@ def build_digest(
     failures_by_reason: Dict[
         str, Dict[str, int]
     ] = {}  # tool -> reason -> count (#1325)
+    calls: Counter = Counter()  # tool -> call count, the rate denominator (#317)
     timeouts = 0
     refusals = 0
     refusals_recovered = 0  # subset of refusals that offered a path forward (#1366)
@@ -755,6 +801,7 @@ def build_digest(
     def _aggregate(s: Dict[str, Any]) -> None:
         nonlocal timeouts, refusals, refusals_recovered
         failures.update(s.get("tool_failures", {}))
+        calls.update(s.get("tool_calls", {}))
         # Sub-classified failures (#1325) — merge per-tool reason counters so
         # the digest surfaces the dominant failure mode per tool, breaking the
         # fix→regress→refile treadmill where one mode's fix is blamed for another.
@@ -841,12 +888,16 @@ def build_digest(
                     scanned += 1
                     _aggregate(_state_db_session_signals(msgs))
 
-    # Normalize raw counts by session volume so growing volume does not inflate
-    # the absolute failure counts (issue #1324 — false "regressed" verdicts).
-    # Rate = failures[tool] / sessions_scanned (0 when nothing scanned).
+    # Per-call failure rate (#317). The denominator is the number of CALLS to
+    # that tool, not the number of sessions scanned: a tool that is called 20
+    # times in one session used to report 20 / sessions, which exceeded 1.0 on
+    # real data (terminal 0.70, ha_get_state 0.62 against true 8.0% / 9.7%) and
+    # inflated every downstream priority score. A rate is only quotable next to
+    # its base, so ``tool_calls`` is published alongside ``tool_failures``.
     tool_failures = dict(failures.most_common())
+    tool_calls = dict(sorted(calls.items()))
     failure_rate = {
-        tool: (count / scanned if scanned else 0.0)
+        tool: (count / tool_calls[tool] if tool_calls.get(tool) else 0.0)
         for tool, count in tool_failures.items()
     }
     # Reason-scoped rate (issue #1325 — corrected fix). PR #1336 added reason
@@ -856,11 +907,14 @@ def build_digest(
     # dominated by an UNAFFECTED reason (read_file:timeout) → "no-signal".
     # Exposing the per-(tool,reason) rate gives the verification loop a target
     # that moves only when the targeted reason moves, breaking the treadmill.
+    # Same denominator as above — per tool CALL, not per session (#317).
     failure_rate_by_reason: Dict[str, Dict[str, float]] = {}
     for tool, reasons in failures_by_reason.items():
         failure_rate_by_reason[tool] = {
-            reason: (n / scanned if scanned else 0.0) for reason, n in reasons.items()
+            reason: (n / tool_calls[tool] if tool_calls.get(tool) else 0.0)
+            for reason, n in reasons.items()
         }
+    _assert_rate_bounds(failure_rate, failure_rate_by_reason)
     spiral_depth_per_session = {
         tool: round((meta["max_consecutive"] / scanned if scanned else 0.0), 4)
         for tool, meta in repeated.items()
@@ -875,9 +929,16 @@ def build_digest(
     return {
         "window_days": window_days,
         "sessions_scanned": scanned,
+        # Which denominator the published rates use (#317). Stored in the
+        # realized-impact ledger so a baseline recorded under one basis is
+        # never compared against a current rate computed under another.
+        "failure_rate_basis": "per_tool_call",
         "signals": {
             "tool_failures": tool_failures,
             "tool_failures_by_reason": failures_by_reason,
+            # Denominator of every published rate (#317). A rate must never be
+            # quoted without its base, so both are emitted together.
+            "tool_calls": tool_calls,
             "failure_rate": failure_rate,
             "failure_rate_by_reason": failure_rate_by_reason,
             "spiral_depth_per_session": spiral_depth_per_session,
