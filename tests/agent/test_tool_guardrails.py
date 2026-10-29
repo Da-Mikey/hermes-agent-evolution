@@ -1778,3 +1778,106 @@ def test_a_real_tool_error_is_still_a_failure():
     assert _detect_tool_failure("read_file", real)[0] is True
     # The marker is only honoured as the literal boolean, never as truthy prose.
     assert classify_tool_failure("read_file", '{"error": "x", "guardrail_refusal": "yes"}')[0] is True
+
+
+# #315 — a result that declares its own verdict as non-retryable used to be
+# re-dispatched verbatim (268 observed dispatches): the verdict was only
+# appended to the payload as a warning line, and the per-turn exact-failure
+# counter is reset by reset_for_turn, so a replay that happened once per API
+# turn never reached exact_failure_block_after.
+_MISSING_FILE_RESULT = json.dumps(
+    {"success": False, "error": "File not found: /nope/missing.txt"}
+)
+_MISSING_FILE_ARGS = {"path": "/nope/missing.txt"}
+
+
+def _non_retryable_guardrail_controller(**overrides):
+    return ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, **overrides)
+    )
+
+
+def test_declared_non_retryable_verdict_refuses_identical_redispatch_across_turns():
+    controller = _non_retryable_guardrail_controller()
+
+    assert controller.before_call("read_file", _MISSING_FILE_ARGS).action == "allow"
+    controller.after_call(
+        "read_file", _MISSING_FILE_ARGS, _MISSING_FILE_RESULT, failed=True
+    )
+
+    controller.reset_for_turn()  # the replay sits in the next API turn
+    blocked = controller.before_call("read_file", _MISSING_FILE_ARGS)
+
+    assert blocked.action == "block"
+    assert blocked.code == "repeated_exact_failure_block"
+    assert "not_found" in blocked.message
+    assert blocked.tool_name == "read_file"
+    # The refusal itself is counted, so the 268-dispatch replay is visible.
+    second = controller.before_call("read_file", _MISSING_FILE_ARGS)
+    assert second.action == "block"
+    assert second.count == blocked.count + 1
+
+
+def test_declared_non_retryable_verdict_does_not_disable_a_retryable_verdict():
+    controller = _non_retryable_guardrail_controller()
+    timeout = json.dumps({"success": False, "error": "Timeout after 30s"})
+
+    controller.after_call("read_file", _MISSING_FILE_ARGS, timeout, failed=True)
+    controller.reset_for_turn()
+
+    assert controller.before_call("read_file", _MISSING_FILE_ARGS).action == "allow"
+
+
+def test_heuristic_failure_bucket_is_not_treated_as_a_declared_verdict():
+    """persistent_error/unknown are text-heuristic catch-alls — every generic
+    {"error": ...} payload lands there, so blocking on them would refuse
+    legitimate retries. Only named deterministic categories are recorded."""
+    controller = _non_retryable_guardrail_controller()
+
+    controller.after_call(
+        "read_file", _MISSING_FILE_ARGS, '{"error": "boom"}', failed=True
+    )
+    controller.reset_for_turn()
+
+    assert controller.before_call("read_file", _MISSING_FILE_ARGS).action == "allow"
+
+
+def test_declared_non_retryable_block_is_configurable():
+    controller = _non_retryable_guardrail_controller(non_retryable_exact_block=False)
+
+    controller.after_call(
+        "read_file", _MISSING_FILE_ARGS, _MISSING_FILE_RESULT, failed=True
+    )
+    controller.reset_for_turn()
+
+    assert controller.before_call("read_file", _MISSING_FILE_ARGS).action == "allow"
+
+
+def test_changed_arguments_are_not_refused_by_a_declared_verdict():
+    controller = _non_retryable_guardrail_controller()
+
+    controller.after_call(
+        "read_file", _MISSING_FILE_ARGS, _MISSING_FILE_RESULT, failed=True
+    )
+    controller.reset_for_turn()
+
+    other = controller.before_call("read_file", {"path": "/nope/other.txt"})
+    assert other.action == "allow"
+
+
+def test_landed_mutation_clears_a_declared_verdict():
+    """A successful mutation means the state the verdict described may have
+    changed, so the next identical call is a new experiment, not a replay."""
+    controller = _non_retryable_guardrail_controller()
+
+    controller.after_call(
+        "read_file", _MISSING_FILE_ARGS, _MISSING_FILE_RESULT, failed=True
+    )
+    controller.after_call(
+        "write_file",
+        {"path": "/nope/missing.txt"},
+        json.dumps({"bytes_written": 12}),
+        failed=False,
+    )
+
+    assert controller.before_call("read_file", _MISSING_FILE_ARGS).action == "allow"
