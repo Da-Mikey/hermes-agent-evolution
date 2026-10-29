@@ -1,10 +1,12 @@
 """Tests for scripts/evolution_realized_impact.py — post-merge realized-impact loop."""
 
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+import evolution_realized_impact as mod  # noqa: E402
 from evolution_realized_impact import (  # noqa: E402
     append_ledger_record,
     classify_verdict_by_rate,
@@ -34,6 +36,12 @@ def _verdict(issue, verdict, verified_at="2026-06-20", note=""):
         "verified_at": verified_at,
         "note": note,
     }
+
+
+# A failure rate may only be compared with another measured on the same basis
+# (#320). ``per_session`` here; the introspection digest now publishes
+# ``per_tool_call``.
+_BASIS = "per_session"
 
 
 class TestLoadLedger:
@@ -142,7 +150,9 @@ class TestComputeRealized:
         # 2 confirmed + 3 regressed → 2/5 = 40% < 50%, ≥3 measured → flag fires.
         # Real regressions still count against the rate.
         recs = [_merge(i, "2026-06-01") | _verdict(i, "confirmed") for i in range(1, 3)]
-        recs += [_merge(i, "2026-06-02") | _verdict(i, "regressed") for i in range(10, 13)]
+        recs += [
+            _merge(i, "2026-06-02") | _verdict(i, "regressed") for i in range(10, 13)
+        ]
         h = compute_realized(recs, today="2026-06-30")
         assert h["verified"] == 5
         assert h["confirmed"] == 2
@@ -221,6 +231,7 @@ class TestComputeRealized:
         # When maturity_days is 0, None/corrupt dates still do not count as mature
         h0 = compute_realized(recs, today="2026-06-30", maturity_days=0)
         assert h0["merged_tracked"] == 0
+
 
 class TestFormat:
     def test_format_includes_rate_and_tail(self):
@@ -359,9 +370,18 @@ class TestShouldCloseIssue:
         should, reason = should_close_issue(recs, 1, "2026-06-17")
         assert should is False and "no-signal" in reason
 
-    def test_not_tracked_closes(self):
+    def test_no_merge_record_holds(self):
+        # #320: absence of a merge record is not a passing signal. Only a
+        # DIFFERENT issue is in the ledger, so this one has nothing to verify.
         should, reason = should_close_issue([_merge(2, "2026-06-01")], 1, "2026-06-17")
-        assert should is True and "not tracked" in reason
+        assert should is False and "no merge record" in reason
+
+    def test_empty_ledger_holds(self):
+        # The live defect measured on 2026-10-29: 0 of 1 ledger lines carried an
+        # ``issue`` key (the one line was the integration stage's change record),
+        # so this returned CLOSE for every issue, merged or not.
+        should, reason = should_close_issue([], 123, "2026-10-29")
+        assert should is False and "no merge record" in reason
 
     def test_recent_unverified_awaits(self):
         recs = [_merge(1, "2026-06-15")]
@@ -424,7 +444,12 @@ class TestClassifyVerdictByRate:
 class TestRateNormalizedCloseGate:
     def _recs(self, baseline):
         return [
-            {"issue": 1, "merged_at": "2026-06-01", "baseline_failure_rate": baseline}
+            {
+                "issue": 1,
+                "merged_at": "2026-06-01",
+                "baseline_failure_rate": baseline,
+                "baseline_failure_rate_basis": _BASIS,
+            }
             | _verdict(1, "regressed")
         ]
 
@@ -432,14 +457,22 @@ class TestRateNormalizedCloseGate:
         # Raw count grew, but rate held/fell -> close (not a real regression).
         recs = self._recs(baseline=8.0)
         should, reason = should_close_issue(
-            recs, 1, "2026-06-17", current_failure_rate=7.1
+            recs,
+            1,
+            "2026-06-17",
+            current_failure_rate=7.1,
+            current_failure_rate_basis=_BASIS,
         )
         assert should is True and "#1324" in reason
 
     def test_real_rate_increase_blocks_close(self):
         recs = self._recs(baseline=5.0)
         should, reason = should_close_issue(
-            recs, 1, "2026-06-17", current_failure_rate=7.0
+            recs,
+            1,
+            "2026-06-17",
+            current_failure_rate=7.0,
+            current_failure_rate_basis=_BASIS,
         )
         assert should is False and "regressed" in reason
 
@@ -450,6 +483,92 @@ class TestRateNormalizedCloseGate:
             recs, 1, "2026-06-17", current_failure_rate=7.0
         )
         assert should is False
+
+
+class TestRateBasisGuard:
+    """#320 — a rate may only be re-checked against a baseline on the same basis.
+
+    ``record-merge`` stores failures/SESSION; the post-#318 introspection digest
+    publishes per-tool-CALL rates. A delta across the two is meaningless, and
+    here a meaningless delta CLEARS a regression — so the gate must refuse."""
+
+    @staticmethod
+    def _recs(baseline=8.0, basis: str | None = _BASIS):
+        rec = {
+            "issue": 1,
+            "merged_at": "2026-06-01",
+            "baseline_failure_rate": baseline,
+        }
+        if basis is not None:
+            rec["baseline_failure_rate_basis"] = basis
+        return [rec | _verdict(1, "regressed")]
+
+    def test_baseline_with_no_basis_holds(self):
+        # The override would clear the regression; with no declared basis it
+        # must NOT run, and the recorded verdict stands.
+        should, reason = should_close_issue(
+            self._recs(basis=None),
+            1,
+            "2026-06-17",
+            current_failure_rate=7.1,
+            current_failure_rate_basis=_BASIS,
+        )
+        assert should is False
+        assert "NOT comparable" in reason and "no failure-rate basis" in reason
+
+    def test_current_rate_with_no_basis_holds(self):
+        should, reason = should_close_issue(
+            self._recs(),
+            1,
+            "2026-06-17",
+            current_failure_rate=7.1,
+        )
+        assert should is False
+        assert "NOT comparable" in reason and "current rate declares no basis" in reason
+
+    def test_mismatched_basis_holds(self):
+        # per-session baseline vs per-tool-call current rate: the exact pairing
+        # #318's digest introduced.
+        should, reason = should_close_issue(
+            self._recs(basis="per_session"),
+            1,
+            "2026-06-17",
+            current_failure_rate=7.1,
+            current_failure_rate_basis="per_tool_call",
+        )
+        assert should is False
+        assert "basis mismatch" in reason
+
+    def test_matching_basis_allows_the_override(self):
+        # Control: same inputs as above but a matching basis -> override runs.
+        should, reason = should_close_issue(
+            self._recs(basis="per_session"),
+            1,
+            "2026-06-17",
+            current_failure_rate=7.1,
+            current_failure_rate_basis="per_session",
+        )
+        assert should is True and "#1324" in reason
+
+
+class TestRecordMergeBasis:
+    def test_basis_stored_with_baseline(self, tmp_path):
+        f = tmp_path / "ledger.jsonl"
+        record_merge(
+            f,
+            5,
+            "2026-06-01",
+            0.8,
+            "fix",
+            baseline_failure_rate=3.5,
+            baseline_failure_rate_basis="per_tool_call",
+        )
+        assert load_ledger(f)[0]["baseline_failure_rate_basis"] == "per_tool_call"
+
+    def test_basis_omitted_keeps_legacy_shape(self, tmp_path):
+        f = tmp_path / "ledger.jsonl"
+        record_merge(f, 5, "2026-06-01", 0.8, "fix", baseline_failure_rate=3.5)
+        assert "baseline_failure_rate_basis" not in load_ledger(f)[0]
 
 
 class TestRecordMergeBaseline:
@@ -544,9 +663,14 @@ class TestReasonScopedCloseGate:
         assert should is False
 
     def test_no_reason_baseline_falls_back_to_aggregate(self, tmp_path):
-        # Legacy record: aggregate tool-rate path still applies.
+        # Legacy record: aggregate tool-rate path still applies (same basis).
         recs = [
-            {"issue": 1, "merged_at": "2026-06-01", "baseline_failure_rate": 5.0}
+            {
+                "issue": 1,
+                "merged_at": "2026-06-01",
+                "baseline_failure_rate": 5.0,
+                "baseline_failure_rate_basis": _BASIS,
+            }
             | _verdict(1, "regressed")
         ]
         should, _ = should_close_issue(
@@ -555,5 +679,126 @@ class TestReasonScopedCloseGate:
             "2026-06-17",
             current_failure_rate=2.0,
             current_failure_rate_by_reason={"read_file:file-not-found": 0.1},
+            current_failure_rate_basis=_BASIS,
         )
         assert should is True  # rate fell → close via aggregate path
+
+
+class TestReconcileMergesCli:
+    """#320 — every PR the integration stage merged must carry a merge record.
+
+    Without this check an unrecorded merge is invisible: the close gate has
+    nothing to read for that issue and the change is never measured."""
+
+    @staticmethod
+    def _profile(tmp_path, merged, ledger_lines=()):
+        (tmp_path / "realized").mkdir(parents=True, exist_ok=True)
+        ledger = tmp_path / "realized" / "ledger.jsonl"
+        ledger.write_text(
+            "".join(line + "\n" for line in ledger_lines), encoding="utf-8"
+        )
+        (tmp_path / "integration").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "integration" / "2026-10-28.json").write_text(
+            json.dumps({"date": "2026-10-28", "merged": merged}), encoding="utf-8"
+        )
+        return ledger
+
+    def test_missing_merge_records_fail(self, tmp_path, monkeypatch, capsys):
+        self._profile(
+            tmp_path,
+            [
+                {"pr": 318, "issue": "317"},
+                {"pr": 305, "issue": "275"},
+                {"pr": 304, "issue": "267"},
+            ],
+            [
+                # The integration stage's change record: no ``issue`` key, so
+                # every reader ignores it — this is the live 2026-10-29 state.
+                json.dumps({"change_id": "evolution/issue-432", "pr_number": 436}),
+            ],
+        )
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        rc = mod.main([_PROG, "reconcile-merges", "2026-10-28"])
+        out = capsys.readouterr()
+        assert rc == 1
+        assert "RECONCILE FAIL" in out.out
+        assert "#317" in out.out and "#275" in out.out and "#267" in out.out
+        assert "no 'issue' key" in out.err
+
+    def test_all_recorded_passes(self, tmp_path, monkeypatch, capsys):
+        ledger = self._profile(
+            tmp_path, [{"pr": 318, "issue": "317"}, {"pr": 305, "issue": "275"}]
+        )
+        record_merge(ledger, 317, "2026-10-28", 0.8, "fix a")
+        record_merge(ledger, 275, "2026-10-28", 0.7, "fix b")
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        rc = mod.main([_PROG, "reconcile-merges", "2026-10-28"])
+        out = capsys.readouterr()
+        assert rc == 0
+        assert "all 2 merged PR(s) carry a merge record" in out.out
+
+    def test_partial_records_still_fail(self, tmp_path, monkeypatch, capsys):
+        ledger = self._profile(
+            tmp_path, [{"pr": 318, "issue": "317"}, {"pr": 305, "issue": "275"}]
+        )
+        record_merge(ledger, 317, "2026-10-28", 0.8, "fix a")
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        rc = mod.main([_PROG, "reconcile-merges", "2026-10-28"])
+        out = capsys.readouterr()
+        assert rc == 1
+        assert "1 of 2 merged PR(s)" in out.out and "#275" in out.out
+
+    def test_absent_integration_record_is_not_a_failure(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / "realized").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        rc = mod.main([_PROG, "reconcile-merges", "2026-01-01"])
+        assert rc == 0
+        assert "nothing to reconcile" in capsys.readouterr().out
+
+
+class TestCheckCloseCliHoldsWithoutRecord:
+    def test_check_close_no_ledger_record_holds(self, tmp_path, monkeypatch, capsys):
+        # The live defect: with no issue-keyed ledger line, check-close used to
+        # print CLOSE and exit 0 for every issue.
+        (tmp_path / "realized").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "realized" / "ledger.jsonl").write_text(
+            json.dumps({"change_id": "evolution/issue-432", "pr_number": 436}) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        rc = mod.main([_PROG, "check-close", "317", "2026-10-29"])
+        out = capsys.readouterr()
+        assert rc == 1
+        assert "HOLD" in out.out and "no merge record" in out.out
+
+    def test_check_close_refuses_cross_basis_override(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / "realized").mkdir(parents=True, exist_ok=True)
+        ledger = tmp_path / "realized" / "ledger.jsonl"
+        record_merge(
+            ledger,
+            317,
+            "2026-06-01",
+            0.8,
+            "fix",
+            baseline_failure_rate=8.0,
+            baseline_failure_rate_basis="per_session",
+        )
+        record_verdict(ledger, 317, "regressed", "2026-06-10", "worse")
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        rc = mod.main([
+            _PROG,
+            "check-close",
+            "317",
+            "2026-06-17",
+            "--current-rate",
+            "0.02",
+            "--current-rate-basis",
+            "per_tool_call",
+        ])
+        out = capsys.readouterr()
+        assert rc == 1
+        assert "HOLD" in out.out and "NOT comparable" in out.out

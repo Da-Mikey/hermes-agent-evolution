@@ -23,6 +23,14 @@ Lines with the same ``issue`` are folded (latest verdict wins; merge metadata
 kept). A change is "matured" once ``maturity_days`` have passed since merge — only
 then is the absence of a verdict a problem (the verification step didn't run).
 
+Gate semantics (#320). ``check-close`` fails CLOSED: an issue with no merge
+record never closes, because a missing record means nothing was measured — not
+that the fix worked. ``reconcile-merges <date>`` checks the ledger against the
+integration stage's ``merged`` list and exits 1 when a merged PR has no record.
+A rate is only compared with one measured on the same basis
+(``failure_rate_basis``); an unknown or mismatched basis disables the
+rate-normalization override and the recorded verdict stands.
+
 Pure functions + explicit IO so it is import-safe and unit-testable.
 """
 
@@ -102,6 +110,7 @@ def record_merge(
     target: str,
     baseline_failure_rate: Optional[float] = None,
     baseline_failure_rate_by_reason: Optional[Dict[str, float]] = None,
+    baseline_failure_rate_basis: Optional[str] = None,
 ) -> None:
     """Record a merge event in the realized-impact ledger.
 
@@ -124,6 +133,11 @@ def record_merge(
         rec["baseline_failure_rate"] = baseline_failure_rate
     if baseline_failure_rate_by_reason:
         rec["baseline_failure_rate_by_reason"] = baseline_failure_rate_by_reason
+    if baseline_failure_rate_basis:
+        # Which denominator the baseline rates were measured over (#320).
+        # ``should_close_issue`` refuses to compare against a current rate on a
+        # different basis, so this must travel with the numbers it describes.
+        rec["baseline_failure_rate_basis"] = baseline_failure_rate_basis
     append_ledger_record(ledger_file, rec)
 
 
@@ -194,6 +208,30 @@ def signal_verified(records: List[Dict[str, Any]], issue: int) -> bool:
     return False
 
 
+def _rate_basis_problem(
+    baseline_basis: Optional[str], current_basis: Optional[str]
+) -> Optional[str]:
+    """Why two failure rates may NOT be compared, or None when they share a basis.
+
+    ``None`` (unknown) is a problem, not a wildcard. A merge record stores a
+    failures/SESSION baseline; the post-#318 introspection digest reports
+    per-tool-CALL rates. A delta across two bases has no meaning, so the close
+    gate refuses to compute one rather than re-checking a verdict on it (#320).
+    """
+    if not baseline_basis:
+        return (
+            "the merge record declares no failure-rate basis, so its baseline "
+            "cannot be matched to the current rate"
+        )
+    if not current_basis:
+        return "the current rate declares no basis"
+    if baseline_basis != current_basis:
+        return (
+            f"basis mismatch: baseline {baseline_basis!r} vs current {current_basis!r}"
+        )
+    return None
+
+
 def should_close_issue(
     records: List[Dict[str, Any]],
     issue: int,
@@ -202,6 +240,7 @@ def should_close_issue(
     current_failure_rate: Optional[float] = None,
     current_failure_rate_by_reason: Optional[Dict[str, float]] = None,
     regression_threshold: float = 0.20,
+    current_failure_rate_basis: Optional[str] = None,
 ) -> tuple:
     """Gate for closing an issue after a fix PR merges.
 
@@ -210,6 +249,9 @@ def should_close_issue(
     - the merge is older than ``maturity_days`` AND no verdict exists (the
       verification step didn't run — close with a note that it was never
       verified, rather than leaving it open indefinitely).
+
+    An issue with NO merge record at all never closes: absence of a record is
+    absence of evidence, not a passing signal (#320).
 
     If the verdict is "no-signal" or "regressed", returns ``(False, reason)``
     so the issue stays open for a focused regression — this is the core fix
@@ -237,7 +279,21 @@ def should_close_issue(
             break
 
     if rec is None:
-        return True, "not tracked in ledger — no signal to verify"
+        # Fail CLOSED (#320). Absence of a merge record is not evidence the fix
+        # worked — it is evidence nothing was measured. This branch used to
+        # return True, and on a host whose ledger held no issue-keyed lines it
+        # closed EVERY issue, including one whose fix had merged the day before,
+        # because the integration stage writes its change records into the same
+        # path in a schema with no ``issue`` key (``load_ledger`` drops those).
+        # The merge record is created by ``record-merge``; when it is missing the
+        # gate must say so instead of reading the gap as permission.
+        return (
+            False,
+            "no merge record in the realized ledger for this issue, so there is "
+            "no signal to verify. Record the merge first "
+            "(record-merge <issue> <date> <predicted_impact> <target>), then "
+            "verify the signal.",
+        )
 
     verdict = rec.get("verdict")
     if verdict in VERDICTS_GOOD:
@@ -287,13 +343,31 @@ def should_close_issue(
 
     # Rate-normalization override: a "regressed" verdict from a raw-count
     # comparison is a false alarm if the per-session rate held or fell (#1324).
+    baseline_rate = rec.get("baseline_failure_rate")
     if (
         verdict == "regressed"
         and current_failure_rate is not None
-        and rec.get("baseline_failure_rate") is not None
+        and baseline_rate is not None
     ):
+        # Basis guard (#320). Two rates may only be compared when they share a
+        # basis. The merge record stores failures/session; after #318 the
+        # introspection digest publishes per-tool-CALL rates and stamps
+        # ``failure_rate_basis: "per_tool_call"``. A delta across bases has no
+        # meaning, and here a meaningless delta CLEARS a regression — so an
+        # unknown or differing basis disables the override and the recorded
+        # verdict stands (fail closed).
+        problem = _rate_basis_problem(
+            rec.get("baseline_failure_rate_basis"), current_failure_rate_basis
+        )
+        if problem:
+            return (
+                False,
+                f"rates NOT comparable — {problem}; keeping the recorded "
+                f"verdict ({verdict}) instead of re-checking it on a different "
+                f"basis (#320).",
+            )
         rate_verdict = classify_verdict_by_rate(
-            rec.get("baseline_failure_rate"),
+            baseline_rate,
             current_failure_rate,
             regression_threshold=regression_threshold,
         )
@@ -357,6 +431,7 @@ def compute_realized(
     that made the rate crater from ~55% to 20% in five merges' time on real
     data. Filtering first gives a stable, apples-to-apples sample.
     """
+
     def _is_mature(r: Dict[str, Any]) -> bool:
         days = _days_between(r.get("merged_at"), today)
         return days is not None and days >= maturity_days
@@ -377,9 +452,7 @@ def compute_realized(
 
     # Every window entry is mature by construction, so any without ANY verdict
     # is matured-but-unverified — the verification step never recorded one.
-    matured_unverified = [
-        r for r in window if r.get("verdict") not in VERDICTS_ANY
-    ]
+    matured_unverified = [r for r in window if r.get("verdict") not in VERDICTS_ANY]
 
     realized_rate = (len(confirmed) / len(verdicted)) if verdicted else None
 
@@ -451,6 +524,43 @@ def _evolution_dir() -> Path:
     )
 
 
+def _flag_value(args: List[str], flag: str) -> Optional[str]:
+    """Value following ``flag`` in ``args``, or None (missing flag/value)."""
+    if flag not in args:
+        return None
+    i = args.index(flag)
+    if i + 1 >= len(args):
+        return None
+    return args[i + 1]
+
+
+def _foreign_ledger_lines(ledger_file: Path) -> int:
+    """Count ledger lines that are not realized-impact records (#320).
+
+    ``load_ledger`` drops any line without an ``issue`` key, which is correct —
+    it must never crash the pipeline on a foreign line. But silently dropping
+    them hid the fact that this path has TWO writers: the integration stage
+    writes change records here (``change_id``/``commit``/``pr_number``) and they
+    are invisible to every reader. Counting them makes the schema collision
+    auditable instead of inferred.
+    """
+    if not ledger_file.exists():
+        return 0
+    foreign = 0
+    for ln in ledger_file.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except (json.JSONDecodeError, ValueError):
+            foreign += 1
+            continue
+        if not isinstance(rec, dict) or "issue" not in rec:
+            foreign += 1
+    return foreign
+
+
 def main(argv: List[str]) -> int:
     evolution_dir = _evolution_dir()
     ledger_file = evolution_dir / "realized" / "ledger.jsonl"
@@ -467,18 +577,31 @@ def main(argv: List[str]) -> int:
             print(
                 "usage: evolution_realized_impact.py record-merge "
                 "<issue> <YYYY-MM-DD> <predicted_impact> <target> "
-                "[baseline_failure_rate]",
+                "[baseline_failure_rate] [--basis <failures/session|per_tool_call>]",
                 file=sys.stderr,
             )
             return 2
         baseline_rate = None
         # Optional 6th positional arg: baseline failures/session at merge (#1324).
-        if len(args) > 5:
+        if len(args) > 5 and not args[5].startswith("--"):
             try:
                 baseline_rate = float(args[5])
             except ValueError:
                 baseline_rate = None
-        record_merge(ledger_file, issue, merged_at, predicted, target, baseline_rate)
+        # ``--basis`` names the denominator the baseline was measured over
+        # (#320). Without it the close gate cannot re-check a verdict by rate,
+        # because a per-session baseline is not comparable to the per-tool-call
+        # rate the introspection digest now publishes.
+        basis = _flag_value(args, "--basis")
+        record_merge(
+            ledger_file,
+            issue,
+            merged_at,
+            predicted,
+            target,
+            baseline_rate,
+            baseline_failure_rate_basis=basis,
+        )
         print(f"[realized-impact] recorded merge for issue #{issue}")
         return 0
 
@@ -532,11 +655,85 @@ def main(argv: List[str]) -> int:
                     current_rate = None
         records = load_ledger(ledger_file)
         should, reason = should_close_issue(
-            records, issue, today, current_failure_rate=current_rate
+            records,
+            issue,
+            today,
+            current_failure_rate=current_rate,
+            current_failure_rate_basis=_flag_value(args, "--current-rate-basis"),
         )
         verdict = "CLOSE" if should else "HOLD"
         print(f"[realized-impact] #{issue} {verdict}: {reason}")
         return 0 if should else 1
+
+    # Subcommand: reconcile the ledger against the integration stage (#320).
+    # Every PR the integration stage lists under ``merged`` must have a ledger
+    # line whose ``issue`` matches, or the close gate has nothing to read for it
+    # and the merge goes unmeasured. Exit 1 lists the gaps.
+    if args and args[0] == "reconcile-merges":
+        date = args[1] if len(args) > 1 else None
+        if not date:
+            print(
+                "usage: evolution_realized_impact.py reconcile-merges <YYYY-MM-DD>",
+                file=sys.stderr,
+            )
+            return 2
+        integ_file = evolution_dir / "integration" / f"{date}.json"
+        if not integ_file.exists():
+            print(
+                f"[realized-impact] no integration record for {date} "
+                f"({integ_file}) — nothing to reconcile"
+            )
+            return 0
+        try:
+            integ = json.loads(integ_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            print(f"[realized-impact] cannot read {integ_file}: {exc}", file=sys.stderr)
+            return 2
+
+        merged = integ.get("merged") or []
+        recorded = set()
+        for r in load_ledger(ledger_file):
+            try:
+                recorded.add(int(str(r.get("issue")).lstrip("#")))
+            except (TypeError, ValueError):
+                continue
+
+        missing = []
+        for entry in merged:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("issue")
+            if raw is None:
+                continue
+            try:
+                num = int(str(raw).lstrip("#"))
+            except (TypeError, ValueError):
+                continue
+            if num not in recorded:
+                missing.append((num, entry.get("pr")))
+
+        foreign = _foreign_ledger_lines(ledger_file)
+        if foreign:
+            # Not fatal: it is the integration stage's schema, not a lost merge
+            # record. Surfaced so the two-writer collision is visible.
+            print(
+                f"[realized-impact] WARNING: {foreign} ledger line(s) carry no "
+                f"'issue' key (foreign schema — ignored by every reader)",
+                file=sys.stderr,
+            )
+
+        if missing:
+            print(
+                f"[realized-impact] RECONCILE FAIL {date}: {len(missing)} of "
+                f"{len(merged)} merged PR(s) have NO merge record in the ledger: "
+                + ", ".join(f"#{n} (PR {pr})" for n, pr in missing)
+            )
+            return 1
+        print(
+            f"[realized-impact] reconciled {date}: all {len(merged)} merged PR(s) "
+            f"carry a merge record"
+        )
+        return 0
 
     last = 30
     if "--last" in args:
