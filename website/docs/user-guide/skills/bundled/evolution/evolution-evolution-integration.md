@@ -343,7 +343,7 @@ PROFILE_SKILLS="${HERMES_HOME:-$HOME/.hermes}/skills/evolution"
 python3 scripts/evolution_realized_impact.py record-merge \
   <#> "<YYYY-MM-DD>" "<the issue's analysis impact 0..1>" \
   "<one line: the concrete problem this was meant to fix>" \
-  "<baseline_failure_rate>"
+  "<baseline_failure_rate>" --basis per_tool_call
 ```
    `predicted_impact` is the impact the analysis stage assigned the issue; `target`
    is what "done" means for it. introspection later appends a `verdict` line for
@@ -358,6 +358,25 @@ python3 scripts/evolution_realized_impact.py record-merge \
    rate. Omit it and the verdict falls back to comparing raw counts, which rise
    with session volume alone and manufacture false `regressed` verdicts — the
    exact bug #1324 fixed in the scripts.
+
+   **Pass `--basis` whenever you pass a rate (#320).** It names the denominator
+   the baseline was measured over (`per_session` or `per_tool_call`). The
+   introspection digest publishes per-tool-CALL rates, so `per_tool_call` is
+   usually right now. The close gate refuses to re-check a verdict by rate when
+   either side's basis is unknown or the two differ — comparing a per-session
+   baseline to a per-call current rate yields a meaningless delta, and a
+   meaningless delta here can *clear* a regression.
+
+7. **Reconcile the ledger before you finish** (#320). Confirm every PR you merged
+   this cycle actually produced a merge record, and say so in your report:
+```bash
+python3 scripts/evolution_realized_impact.py reconcile-merges "<YYYY-MM-DD>"
+```
+   Exit 0 means every PR listed under `merged` in
+   `~/.hermes/evolution/integration/<date>.json` carries a ledger line. Exit 1
+   names the gaps — record those merges before closing the cycle. An unrecorded
+   merge is invisible to the realized-impact loop, and the close gate now HOLDS
+   an issue it has no merge record for rather than passing it.
 
 ## What to NEVER merge
 
