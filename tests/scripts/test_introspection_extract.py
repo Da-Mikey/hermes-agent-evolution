@@ -270,6 +270,69 @@ class TestInformationalExitCodeMeaning:
         assert s["tool_failures_by_reason"] == {"terminal": {"timeout": 1}}
 
 
+class TestDomainNotFoundReasons:
+    """#250 — a miss in a tool's own namespace is not a filesystem miss.
+
+    Before this, the taxonomy was text-only with the generic filesystem rule
+    ordered first, so every failure of the home-automation state lookup was
+    recorded as ``file-not-found``: 148 failures in one window, 100% of that
+    tool's failures. The reliability signal that per-tool ranking and the
+    circuit breaker consume was therefore wrong, and the residual UX defect
+    became invisible after its own fix was closed.
+    """
+
+    @pytest.mark.parametrize(
+        "tool,message,reason",
+        [
+            ("ha_get_state", "Entity not found: sensor.gate_battery", "entity-not-found"),
+            ("ha_get_state", "Unknown entity: sensor.does_not_exist", "entity-not-found"),
+            ("ha_call_service", "Service not found: light.turn_on", "service-not-found"),
+            ("ha_get_state", "Authentication failed: invalid token", "domain-auth-denied"),
+            ("ha_get_state", "Node is unavailable: offline", "domain-unavailable"),
+        ],
+    )
+    def test_domain_failures_are_not_recorded_as_file_not_found(
+        self, tmp_path, tool, message, reason
+    ):
+        p = _session(
+            tmp_path,
+            "domain",
+            [
+                _asst(tool, "c1"),
+                _tool("c1", json.dumps({"error": message})),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {tool: 1}
+        assert s["tool_failures_by_reason"] == {tool: {reason: 1}}
+
+    def test_filesystem_tool_keeps_file_not_found(self, tmp_path):
+        """The regression that matters: a real path miss still reads as one."""
+        p = _session(
+            tmp_path,
+            "fs",
+            [
+                _asst("read_file", "c1"),
+                _tool(
+                    "c1",
+                    json.dumps({"error": "No such file or directory: /tmp/missing.txt"}),
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {"read_file": {"file-not-found": 1}}
+
+    def test_no_tool_name_preserves_previous_behaviour(self):
+        """Legacy callers pass content only and must not be re-classified."""
+        from introspection_extract import _classify_failure_reason
+
+        content = json.dumps({"error": "Entity not found: sensor.gate_battery"})
+        assert _classify_failure_reason(content) == "file-not-found"
+        assert (
+            _classify_failure_reason(content, "ha_get_state") == "entity-not-found"
+        )
+
+
 class TestFailureReasonClassification:
     """#1325 — failures are sub-classified by reason so the introspection loop
     attributes regressions to the actual mode, not just the tool name. Stops the

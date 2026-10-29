@@ -360,7 +360,56 @@ _BRIDGE_INVALID_ARGS_RE = re.compile(
 )
 
 
-def _classify_failure_reason(content: Any) -> Optional[str]:
+# #250 — domain not-found. The generic ``_FILE_NOT_FOUND_RE`` matches a bare
+# "not found", so a *name* miss in a non-filesystem namespace was recorded as a
+# path error. Home automation is the dominant victim: 148 failures in one 7-day
+# window, 24.1% of that tool's calls, 100% of its failures mislabelled. These
+# patterns only apply to a tool whose family is known — text alone cannot tell
+# an entity id from a path, so an unknown tool keeps the previous behaviour.
+_ENTITY_NOT_FOUND_RE = re.compile(
+    r"\b(?:unknown entity|entity not found|entity_id is invalid)\b"
+    r"|\b(?:entity|entities|entity_id|device|device_id)\b[^\n]{0,80}?"
+    r"\b(?:not found|not registered|does not exist|unknown|invalid|not a valid|no state)\b",
+    re.IGNORECASE,
+)
+_SERVICE_NOT_FOUND_RE = re.compile(
+    r"\bservice not found\b"
+    r"|\b(?:service|action)\b[^\n]{0,80}?"
+    r"\b(?:not found|not registered|does not exist|unknown|invalid)\b",
+    re.IGNORECASE,
+)
+_DOMAIN_AUTH_RE = re.compile(
+    r"\b(?:unauthorized|unauthenticated|authentication failed|"
+    r"invalid (?:token|api[_ ]?key|bearer)|401|403)\b",
+    re.IGNORECASE,
+)
+_DOMAIN_UNAVAILABLE_RE = re.compile(
+    r"\b(?:unavailable|not available|could not connect|connection refused|"
+    r"not connected|offline)\b",
+    re.IGNORECASE,
+)
+
+# Tool-family hints, matched on the lowercased tool name. A tool whose name does
+# not match a listed prefix classifies exactly as it did before #250.
+_HOME_AUTOMATION_TOOL_PREFIXES = ("ha_", "hass_", "home_assistant", "home-assistant")
+
+
+def _tool_domain(tool_name: Optional[str]) -> Optional[str]:
+    """Coarse tool family used to disambiguate "not found" (#250).
+
+    Returns ``"home-automation"`` for the Home Assistant tool family, else
+    ``None``. Prefix matching (not equality) because the family ships several
+    verbs over one namespace: ha_get_state, ha_call_service, ha_list_entities.
+    """
+    name = (tool_name or "").strip().lower()
+    if not name:
+        return None
+    if name.startswith(_HOME_AUTOMATION_TOOL_PREFIXES):
+        return "home-automation"
+    return None
+
+
+def _classify_failure_reason(content: Any, tool_name: Optional[str] = None) -> Optional[str]:
     """Sub-classify a *failed* tool result into a coarse reason tag (issue #1325).
 
     Returns ``None`` when ``content`` is NOT a failure (so callers gate on this
@@ -368,6 +417,15 @@ def _classify_failure_reason(content: Any) -> Optional[str]:
     taxonomy tags below. Classification is best-effort keyword/field matching
     over the structured envelope only — never over raw user content — so it
     inherits the no-raw-text contract from ``_tool_result_failed``.
+
+    #250 — ``tool_name`` makes the taxonomy *tool-aware*. Text alone cannot tell
+    an entity id from a filesystem path, so a bare "not found" from a non-filesystem
+    domain tool was recorded as ``file-not-found``: for the home-automation state
+    lookup 148 failures in one window, 100% of that tool's failures, were
+    mislabelled and therefore invisible to the reliability signal that per-tool
+    ranking and the circuit breaker consume. When the tool's family is known, its
+    domain rules run ahead of the generic filesystem rule. Callers that pass no
+    tool name get exactly the previous behaviour.
     """
     data = content
     if isinstance(data, (str, bytes)):
@@ -426,6 +484,23 @@ def _classify_failure_reason(content: Any) -> Optional[str]:
         return "skill-gate-rejected"
     if _SKILL_CURATOR_REFUSED_RE.search(haystack):
         return "skill-curator-refused"
+    # #250 — domain-first. A miss in the tool's OWN namespace is not a path miss.
+    # These rules sit ahead of the generic filesystem rule (which matches a bare
+    # "not found") and only fire when the tool family is known, so no tool that
+    # is not in a listed family changes classification. Ordered most specific
+    # first: not-found in the namespace, then the service namespace, then auth,
+    # then availability. "timed out" is deliberately absent from the availability
+    # pattern so timeouts keep their own tag.
+    domain = _tool_domain(tool_name)
+    if domain == "home-automation":
+        if _ENTITY_NOT_FOUND_RE.search(haystack):
+            return "entity-not-found"
+        if _SERVICE_NOT_FOUND_RE.search(haystack):
+            return "service-not-found"
+        if _DOMAIN_AUTH_RE.search(haystack):
+            return "domain-auth-denied"
+        if _DOMAIN_UNAVAILABLE_RE.search(haystack):
+            return "domain-unavailable"
     if _FILE_NOT_FOUND_RE.search(haystack):
         return "file-not-found"
     if _PERMISSION_RE.search(haystack):
@@ -677,7 +752,7 @@ def scan_messages(messages) -> Dict[str, Any]:
                 # attribute regressions to the actual cause (#1325) — a fix for
                 # ``read_file:file-not-found`` should not be credited for
                 # ``read_file:timeout``.
-                reason = _classify_failure_reason(content)
+                reason = _classify_failure_reason(content, tool)
                 if reason is not None:
                     tool_failures_by_reason.setdefault(tool, {})
                     tool_failures_by_reason[tool][reason] = (
