@@ -193,6 +193,14 @@ def _browser_cdp_private_guard(*, task_id: str, method: str, params: Dict[str, A
             literal = probe(bt, params or {})
             if literal:
                 return _blocked(template.format(literal), method)
+        # The metadata floor is unconditional in THIS branch too: an unlisted method
+        # (``Network.loadNetworkResource``, ``Fetch.continueRequest``) must not reach the
+        # metadata endpoint from an otherwise-public page (upstream f4aa77a467).
+        from tools.url_safety import is_always_blocked_url
+        metadata = next((u for u in _param_url_literals(params or {}, method)
+                         if is_always_blocked_url(u)), None)
+        if metadata:
+            return _blocked(f"Blocked: CDP {method} targets a cloud metadata endpoint ({metadata}).", method)
         if method not in _CDP_PRIVATE_PAGE_ALLOWED_METHODS:
             blocked_url = policy._current_page_private_url(task_id)
             if blocked_url:

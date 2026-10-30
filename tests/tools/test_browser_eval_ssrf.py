@@ -342,3 +342,18 @@ def test_raw_cdp_typing_a_metadata_url_is_not_refused(monkeypatch):
     monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda _tid: False)
     assert browser_cdp_tool._browser_cdp_private_guard(
         task_id="t-1", method="Input.insertText", params={"text": METADATA_URL}) is None
+
+
+def test_raw_cdp_blocks_metadata_for_unlisted_methods_even_with_the_guard_on(monkeypatch):
+    """Guard ON used to check only the page URL, so an unlisted method could preload a
+    metadata host from a public page (upstream f4aa77a467). The floor is unconditional.
+
+    The floor fires before the page-URL probe, so no live browser is needed here.
+    """
+    from tools import browser_cdp_tool
+
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda _tid: True)
+    blocked = browser_cdp_tool._browser_cdp_private_guard(
+        task_id="t-1", method="Network.loadNetworkResource",
+        params={"url": METADATA_URL, "frameId": "f-1"})
+    assert blocked is not None and "cloud metadata" in str(blocked)
