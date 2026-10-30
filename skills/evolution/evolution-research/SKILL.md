@@ -42,9 +42,34 @@ earns its place only if it moves us ahead of the field on one of the three goals
 - https://github.com/TransformerOptimus/SuperAGI
 - https://github.com/e2b-dev/agent-evaluations
 
-### arXiv
+### arXiv — read the parsed listing, never an extractor dump (#299)
+
 Categories: cs.AI, cs.LG, cs.CL
 Keywords: "agent", "autonomous", "LLM tool use", "multi-agent"
+
+The research preflight (`scripts/evolution_research_web_gate.sh`, runs before
+you) fetches each category's `/new` listing and parses it with the source-aware
+parser `scripts/evolution_arxiv_listing.py`, asserting the parsed counts against
+every page's own `/new` block totals before wake.
+
+- **Read the parsed file FIRST**: `read_file` on
+  `~/.hermes/evolution/research/raw/{date}.jsonl` (one JSON object per paper).
+  Fields: `id`, `title`, `submitted`, `announced`, `listing_category`,
+  `categories`, `primary_category`, `abstract`, `comments`, `authors`,
+  `section`, `url`. Quote the `id` verbatim — it is the locator the analysis and
+  implementation stages need, and the reason this probe exists.
+- `submitted` is `null` on listing pages (they carry only the announcement
+  date). Use it when present; otherwise cite `announced` and say so.
+- **Do NOT send a listing page through `web_extract` while that file exists.**
+  The generic extractor strips ids and abstracts (~200 bytes, zero ids measured
+  on a listing page) — that is exactly what forced two cycles of "abstracts
+  only" reporting and a second arXiv-API round trip per shortlisted paper.
+- **Fallback (restricted egress / probe failure)**: read
+  `~/.hermes/evolution/research/raw/{date}.error.txt` first — it says why the
+  parse was discarded. Then use `web_extract` on
+  `https://arxiv.org/list/<cat>/new` as the documented fallback, note
+  `instrument: web_extract` in the report, and do not claim reconciled counts
+  you did not reconcile.
 
 ### News and discussions
 - Hacker News AI threads

@@ -74,6 +74,50 @@ fi
 # Web is fine — clear any previous degraded flag so the signal is stateful.
 rm -f "$FLAG" 2>/dev/null
 
+# #299: fetch and source-aware-parse the arXiv /new listings ONCE, here, before
+# the agent wakes. This gate is the real pre-agent code path for the research
+# stage, which has only the web+file toolsets and therefore cannot fetch a
+# listing itself. The JSONL below is what the skill reads INSTEAD of pushing the
+# listing through the generic web extractor — that extractor returns ~200 bytes
+# and no paper ids for a listing page, which is why two consecutive cycles had
+# to declare "abstracts only".
+#
+# Reconciliation is asserted in-stage (--assert-reconcile): the parsed per-
+# category counts must equal the page's own /new block totals. On mismatch we
+# discard the parse, drop a reason sidecar and continue with the documented
+# extractor fallback rather than proceeding on a silent partial parse.
+ARXIV_RAW_DIR="$RESEARCH_DIR/raw"
+ARXIV_JSONL="$ARXIV_RAW_DIR/$DATE.jsonl"
+ARXIV_ERR="$ARXIV_RAW_DIR/$DATE.error.txt"
+ARXIV_PROBE="$SCRIPT_DIR/evolution_arxiv_listing.py"
+PYBIN="${HERMES_PYTHON:-python3}"
+
+if [ -f "$ARXIV_PROBE" ] && command -v "$PYBIN" >/dev/null 2>&1; then
+    mkdir -p "$ARXIV_RAW_DIR"
+    if "$PYBIN" "$ARXIV_PROBE" \
+        --categories "${EVOLUTION_ARXIV_CATEGORIES:-cs.AI,cs.LG,cs.CL}" \
+        --out "$ARXIV_JSONL" \
+        --assert-reconcile \
+        >"$ARXIV_RAW_DIR/.probe.log" 2>&1; then
+        rm -f "$ARXIV_ERR" 2>/dev/null
+        echo "evolution research web-gate: arXiv listings parsed -> $ARXIV_JSONL ($(wc -l <"$ARXIV_JSONL" | tr -d ' ') records, ids+abstracts)"
+    else
+        _rc=$?
+        rm -f "$ARXIV_JSONL" 2>/dev/null
+        {
+            echo "arXiv listing probe FAILED for $DATE at $STAMP (exit $_rc)."
+            echo "The parsed listing was DISCARDED — no partial parse is trusted."
+            echo "Fallback: read the listings with web_extract (generic extractor),"
+            echo "and state in the report that ids/abstracts may not survive it."
+            echo "--- probe output ---"
+            cat "$ARXIV_RAW_DIR/.probe.log" 2>/dev/null
+        } >"$ARXIV_ERR"
+        cat "$ARXIV_ERR"
+    fi
+else
+    echo "evolution research web-gate: arXiv listing probe unavailable ($ARXIV_PROBE) — research must use the web_extract fallback"
+fi
+
 # Fall through to the standard write-access gate, which prints its own status
 # line(s) and the final {"wakeAgent": true|false} JSON.
 if [ -f "$SCRIPT_DIR/evolution_access_gate.sh" ]; then
