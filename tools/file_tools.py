@@ -44,14 +44,16 @@ from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
     _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal,
-    write_failure_reason)
+    write_failure_reason, STALE_ON_DISK)
+from tools.file_write_merge import (
+    merge_conflict_payload, merge_success_note, recover_stale_write)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
     _file_metadata, _file_version,
     _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _patch_failure_lock,
     _patch_failure_tracker, _read_tracker, _read_tracker_lock, _record_not_found,
-    _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp,
-    _get_patch_failure_count)
+    _record_patch_failure, _reset_patch_failures, _store_merge_base, _task_data,
+    _update_read_timestamp, _get_patch_failure_count, forget_merge_base)
 
 logger = logging.getLogger(__name__)
 
@@ -990,6 +992,15 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     except Exception:
         logger.debug("file_state.record_read failed", exc_info=True)
 
+    if complete and version is not None:
+        # #252 — keep the exact bytes this task just saw, so a later write whose
+        # precondition went stale can be re-read and three-way merged at the call
+        # site (write_file_tool) instead of hard-refused.
+        try:
+            _store_merge_base(resolved_str, task_id, version)
+        except Exception:
+            logger.debug("merge-base capture failed", exc_info=True)
+
     if complete:
         try:
             # Background-review read-before-write guard integration (#61521): when the self-improvement
@@ -1364,6 +1375,30 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
     )
 
 
+def _attempt_stale_write_merge(
+    path: str, resolved: str | None, task_id: str, content: str, blocker
+) -> "tuple[str, dict] | dict | None":
+    """Re-read + three-way merge for a stale write precondition (#252).
+
+    Returns ``(merged_content, note)`` when the intended change replayed cleanly
+    onto the current on-disk content, a conflict payload dict when the two sides
+    edited the same region, and ``None`` when no merge applies — the caller then
+    keeps its existing refusal unchanged.
+
+    Only ``stale_on_disk`` merges: ``not_fully_read`` means this task never saw
+    the whole file, and merging onto bytes it never saw would silently drop the
+    part it did not read, so that class keeps its read-it-all remedy.
+    """
+    if getattr(blocker, "reason_class", None) != STALE_ON_DISK:
+        return None
+    outcome = recover_stale_write(resolved, task_id, content)
+    if outcome is None:
+        return None
+    if not outcome.ok:
+        return merge_conflict_payload(path, resolved, outcome, blocker_message=str(blocker))
+    return outcome.content, merge_success_note(outcome)
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1403,14 +1438,32 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # changed since, is refused HERE — before the write — instead of
             # warning after the clobber (#65604). Nothing below runs.
             blocker = _stale_overwrite_blocker(path, _resolved, task_id)
+            stale_merge_note = None
             if blocker:
-                return json.dumps(_stale_write_refusal(path, blocker, _resolved), ensure_ascii=False)
+                # #252 — a stale precondition is usually still satisfiable: the
+                # file changed under us, but the change we mean to make rarely
+                # touches the same lines. Re-read, three-way merge our intended
+                # content onto what is on disk now, and carry on. Only a real
+                # conflict (or no recorded base) still refuses.
+                recovered = _attempt_stale_write_merge(
+                    path, _resolved, task_id, content, blocker)
+                if isinstance(recovered, dict):
+                    return json.dumps(recovered, ensure_ascii=False)
+                if isinstance(recovered, tuple):
+                    content, stale_merge_note = recovered
+                else:
+                    return json.dumps(
+                        _stale_write_refusal(path, blocker, _resolved), ensure_ascii=False)
             warnings = _edit_warnings([path], path_to_resolved, task_id)
             rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
             result = _get_file_ops(task_id).write_file(_resolved or path, content)
             result_dict = result.to_dict()
+            if stale_merge_note:
+                result_dict["stale_merge"] = stale_merge_note
+                result_dict["_warning"] = stale_merge_note["message"]
             if warnings:
-                result_dict["_warning"] = warnings[0]
+                result_dict["_warning"] = " | ".join(
+                    [result_dict.get("_warning", ""), warnings[0]]).strip(" |")
             if rewrite_hint and not result_dict.get("error"):
                 result_dict["hint"] = rewrite_hint
             if _resolved:
@@ -1425,6 +1478,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     # Own write = current whole-file content: consecutive
                     # same-task writes stay unblocked. patch never does this.
                     _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
+                    # The recorded merge base described the PREVIOUS bytes; the
+                    # next full read re-captures the new ones (#252).
+                    forget_merge_base(_resolved, task_id)
                 _note_edited(task_id, [path], path_to_resolved, session_id)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
