@@ -140,9 +140,15 @@ def test_partial_read_is_not_fully_read(existing, tmp_path):
 
 
 def test_external_change_is_stale_on_disk(existing):
+    """A drift the intended write cannot be replayed onto still refuses.
+
+    (A drift on lines the write does NOT touch is now merged automatically —
+    see ``tests/tools/test_stale_write_merge.py``; the #217 contract pinned
+    here is the class and its ONE remedy when the write really is blocked.)
+    """
     assert "error" not in json.loads(read_file_tool(existing, task_id="t-217-drift"))
-    with open(existing, "a") as fh:
-        fh.write("someone else appended\n")
+    with open(existing, "w") as fh:
+        fh.write("someone else's line\n")
 
     refused = json.loads(write_file_tool(existing, "x\n", task_id="t-217-drift"))
     assert refused.get("stale_write_blocked"), refused
