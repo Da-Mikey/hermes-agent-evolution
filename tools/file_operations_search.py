@@ -372,7 +372,11 @@ class SearchMixin:
         try:
             proc = subprocess.Popen(
                 args, cwd=cwd, env=_make_run_env(self.env.env), stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                # #330: the file-list path cannot merge stderr into stdout (that
+                # stream is parsed as filenames), so give it its own pipe and
+                # report it as ExecuteResult.stderr instead of discarding it.
+                stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
                 start_new_session=True)
         except OSError as exc:
             return ExecuteResult(stdout=f"rg: {exc}", exit_code=2)
@@ -394,6 +398,30 @@ class SearchMixin:
 
         drainer = threading.Thread(target=_drain, daemon=True)
         drainer.start()
+        # #330: stderr rides its own pipe (see Popen). Drain it on a thread so a
+        # chatty rg cannot deadlock the child on a full pipe buffer, and cap what
+        # we keep — this is a diagnostic, not a transcript.
+        err_chunks: List[bytes] = []
+        err_kept = 0
+
+        def _drain_err() -> None:
+            nonlocal err_kept
+            if proc.stderr is None:
+                return
+            try:
+                for raw in proc.stderr:
+                    if err_kept < 8192:
+                        err_chunks.append(raw)
+                        err_kept += len(raw)
+            except (ValueError, OSError):
+                pass
+
+        if not merge_stderr:
+            threading.Thread(target=_drain_err, daemon=True).start()
+
+        def _err_text() -> str:
+            return b"".join(err_chunks).decode("utf-8", errors="replace").strip()
+
         deadline = time.monotonic() + timeout
         exit_code: Optional[int] = None
         while True:
@@ -447,7 +475,8 @@ class SearchMixin:
             return ExecuteResult(stdout=stdout + "\n[Command interrupted]", exit_code=130)
         # A killed-at-bound rg reports a signal (negative returncode); head would have
         # left the pipeline at 0 unless rg itself already failed.
-        return ExecuteResult(stdout=stdout, exit_code=0 if bounded.is_set() else proc.returncode)
+        return ExecuteResult(stdout=stdout, exit_code=0 if bounded.is_set() else proc.returncode,
+                             stderr=_err_text())
 
     def _run_rg_bounded(self, words: List[str], fetch_limit: int, timeout: int, *,
                         merge_stderr: bool = False, native_ok: bool = True,
@@ -892,7 +921,25 @@ class SearchMixin:
                 return SearchResult(error=(
                     "Exact modification-time order failed; ripgrep 14+ is "
                     "required. Upgrade ripgrep or use order='discovery'."))
-            return SearchResult(error="File search failed while running ripgrep.")
+            # #330: say WHY, and carry the exit code. "File search failed while
+            # running ripgrep." with no status and no diagnostics was both
+            # undiagnosable and classified as a dead end, so the model could not
+            # tell a bad glob from an unreadable root from a broken binary — or
+            # know that a corrected retry would work. The native transport now
+            # captures stderr on its own pipe (the shell transport cannot: its
+            # stdout is the filename stream), so use it when it is there.
+            detail = (result.stderr or "").strip()
+            detail = "\n".join(detail.splitlines()[:6])[:800]
+            if detail:
+                message = (f"File search failed while running ripgrep "
+                           f"(exit code {result.exit_code}). ripgrep reported:\n{detail}")
+            else:
+                message = (
+                    f"File search failed while running ripgrep "
+                    f"(exit code {result.exit_code}). ripgrep produced no diagnostics on "
+                    "this transport — check that the path exists and is searchable, then "
+                    "retry with a narrower path or glob.")
+            return SearchResult(error=message)
         return SearchResult(
             files=all_files[offset:offset + limit], total_count=len(all_files),
             truncated=len(all_files) > offset + limit or bool(limit_reason), limit_reason=limit_reason)
