@@ -70,11 +70,24 @@ def test_foreign_process_tick_persists_owning_profile_offset(
         reset_hermes_home_override(token)
 
     next_run = datetime.fromisoformat(job["next_run_at"])
-    expected_offset = datetime.now(ZoneInfo("America/New_York")).utcoffset()
+    # Derive the expectation from the INSTANT being asserted, not from "now".
+    # The next 0 14 * * * can sit on the far side of a DST boundary from today
+    # (e.g. 2026-11-01 is EST while the run date is still EDT), so sampling
+    # New York's current offset made this assertion true for only part of the
+    # year — the persisted offset was correct and the test was wrong (#334).
+    ny = ZoneInfo("America/New_York")
+    expected_offset = next_run.astimezone(ny).utcoffset()
     assert next_run.utcoffset() == expected_offset, (
         f"next_run_at {job['next_run_at']} persisted with foreign offset "
         f"{next_run.utcoffset()} instead of the owning profile's "
         f"{expected_offset} — fires (offset delta) early (#97905)"
+    )
+    # The bug this pins stored 14:00 in the BACKEND's zone; prove the persisted
+    # offset is not the foreign process timezone (UTC here), so a 14:00+00:00
+    # regression still fails even though it is "an" offset.
+    assert next_run.utcoffset() != datetime.now(ZoneInfo("UTC")).utcoffset(), (
+        f"next_run_at {job['next_run_at']} carries the backend process's own "
+        "offset, not the owning profile's (#97905)"
     )
     # And the wall clock honors the cron expression in the profile's zone.
     assert (next_run.hour, next_run.minute) == (14, 0)
