@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +17,17 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 import evolution_dream_contradiction_scan as runner  # noqa: E402
+
+
+# Timestamps are DERIVED from the clock (issue #334). The scanner ignores an
+# older note beyond MAX_OLDER_AGE_DAYS (90d) by design, so hardcoded August
+# literals silently aged out of the window and the scan legitimately found
+# nothing — red-screening main long after the test was written.
+_TS_BASE = datetime.now(timezone.utc).replace(
+    hour=0, minute=0, second=0, microsecond=0
+)
+TS0 = (_TS_BASE - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+TS1 = (_TS_BASE - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _write_note(root: Path, note_id: str, title: str, created_at: str) -> None:
@@ -45,8 +57,8 @@ def _argv(tmp_path: Path, report: Path, *extra: str) -> list[str]:
 
 
 def test_main_dry_run_writes_report_no_deprecation(tmp_path: Path) -> None:
-    _write_note(tmp_path, "n1", "Tool X failure", "2026-08-01T00:00:00Z")
-    _write_note(tmp_path, "n2", "Tool X failure", "2026-08-02T00:00:00Z")
+    _write_note(tmp_path, "n1", "Tool X failure", TS0)
+    _write_note(tmp_path, "n2", "Tool X failure", TS1)
     report = tmp_path / "out" / "report.json"
     code = runner.main(_argv(tmp_path, report, "--dry-run"))
     assert code == 0
@@ -62,8 +74,8 @@ def test_main_dry_run_writes_report_no_deprecation(tmp_path: Path) -> None:
 
 
 def test_main_applies_deprecations(tmp_path: Path) -> None:
-    _write_note(tmp_path, "n1", "Tool X failure", "2026-08-01T00:00:00Z")
-    _write_note(tmp_path, "n2", "Tool X failure", "2026-08-02T00:00:00Z")
+    _write_note(tmp_path, "n1", "Tool X failure", TS0)
+    _write_note(tmp_path, "n2", "Tool X failure", TS1)
     report = tmp_path / "out" / "report.json"
     code = runner.main(_argv(tmp_path, report))
     assert code == 0
