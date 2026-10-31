@@ -200,6 +200,35 @@ class TestBuildPersistedMessage:
         assert "first 100 chars..." in msg
         assert "..." in msg  # has_more indicator
 
+    def test_does_not_promise_a_copy_the_pruner_deletes(self):
+        """#329: the block must not tell the model a copy survives the session.
+
+        ``cleanup_spillover_cache`` deletes spillovers older than
+        ``SPILLOVER_MAX_AGE_HOURS``, while this block persists in the transcript
+        for the whole session. Wording that promised the file was there ("the
+        full result is already on disk" + "do NOT re-request") turned a pruned
+        file into a dead end, so the retention window and the re-run recovery
+        path must both be stated.
+        """
+        from tools.tool_result_storage import SPILLOVER_MAX_AGE_HOURS
+
+        msg = _build_persisted_message(
+            preview="preview", has_more=False, original_size=50_000,
+            file_path="/tmp/hermes-results/test123.txt",
+        )
+        # The pruner's window is named, so the promise is bounded and visible.
+        assert f"pruned after {SPILLOVER_MAX_AGE_HOURS} hours" in msg
+        # ...and it admits the file may already be gone later.
+        assert "may therefore be gone" in msg
+        # Re-running is the documented recovery path when the copy is missing.
+        assert "re-run the original command" in msg
+        # The old unconditional promise is gone.
+        assert "already on disk" not in msg
+        assert "do NOT re-request" not in msg
+        # The parseable pointer line keeps its exact shape (#329 must not break
+        # extract_persisted_path or the reference-stubbing guard).
+        assert "\nFull output saved to: /tmp/hermes-results/test123.txt\n" in msg
+
 
 
 
