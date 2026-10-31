@@ -102,8 +102,18 @@ def test_load_records_skips_malformed(tmp_path: Path) -> None:
 
 # --- Contradiction scanner over the tqmemory store (issue #48, slice 1) -----
 
-TS0 = "2026-08-01T00:00:00Z"
-TS1 = "2026-08-02T00:00:00Z"
+# Timestamps are DERIVED from the clock, never hardcoded. The scanner ignores
+# an older note beyond ``MAX_OLDER_AGE_DAYS`` (90d) by design, so a frozen
+# literal reads as "fresh" the day it is written and then returns zero
+# proposals for every run after it ages out — which is how this file
+# red-screened main on 2026-10-31 (issue #334). Anchoring the pair to today
+# keeps it inside the window permanently without weakening any assertion.
+_TS_BASE = datetime.now(timezone.utc).replace(
+    hour=0, minute=0, second=0, microsecond=0
+)
+TS0 = (_TS_BASE - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+TS1 = (_TS_BASE - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+TS2 = _TS_BASE.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _tq(
@@ -174,7 +184,7 @@ def test_scan_three_active_newest_wins_for_all() -> None:
     notes = [
         _tq("n1", "Tool X failure", TS0),
         _tq("n2", "Tool X failure", TS1),
-        _tq("n3", "Tool X failure", "2026-08-03T00:00:00Z"),
+        _tq("n3", "Tool X failure", TS2),
     ]
     props = scan_tqmemory_contradictions(notes)
     assert len(props) == 2
