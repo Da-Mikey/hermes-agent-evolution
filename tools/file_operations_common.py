@@ -423,6 +423,11 @@ class ExecuteResult:
     # the command never ran, so the verdict is about the working directory, not
     # the requested path (callers must neither cache it nor blame the path).
     cwd_error: str = ""
+    # Diagnostics captured SEPARATELY from stdout (#330). The file-list search
+    # path parses stdout as filenames, so it cannot merge stderr into it the way
+    # the content-search path does; without this field the reason for a failure
+    # was discarded and only "File search failed while running ripgrep." survived.
+    stderr: str = ""
 
 
 # ---------------------------------------------------------------------------
