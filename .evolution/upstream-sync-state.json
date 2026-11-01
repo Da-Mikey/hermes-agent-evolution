@@ -5,7 +5,7 @@
   "our_version": "0.16.0",
   "synced_at": "2026-06-13",
   "deferred": [],
-  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it \u2014 so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review.",
+  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it — so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review.",
   "release_sync": {
     "mode": "release-track",
     "integrated_tag": "v2026.9.24",
@@ -14,7 +14,83 @@
     "merge_commit": "3f3ee4a1a0a703f9161d12d82161ffa25e917046",
     "merged_at": "2026-09-29T17:47:15Z",
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
-    "checked_at": "2026-10-01",
-    "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin)."
+    "checked_at": "2026-11-01",
+    "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin).",
+    "latest_checked_tag": "v0.22.5",
+    "latest_checked_date": "2026-10-22",
+    "latest_checked_version": "0.22.5",
+    "divergence": {
+      "behind_v0.22.5": 16231,
+      "ahead_of_v0.22.5": 1623,
+      "upstream_files_changed_since_v2026.9.24": 13049,
+      "our_files_changed_since_v2026.9.24": 1437,
+      "conflicting_files": 246,
+      "_evidence": "[verified: test] 2026-11-01 re-probe: isolated throwaway worktree (`git worktree add --detach /tmp/wt-sync-probe-v0225 origin/main` -> `git merge --no-commit --no-ff v0.22.5` -> count `git diff --name-only --diff-filter=U`, then `merge --abort` + worktree removed). Live command output, not a carried-forward number."
+    },
+    "decision": "defer-full-merge",
+    "decision_rationale": "[verified: test] A v0.22.5 merge collides on 437 files (of 13049 upstream-changed vs our 1437). That is far past the skill's 'code conflicts + 400+ behind -> Skip' threshold and is exactly the unreviewable wholesale merge the skill forbids. Merge-base(main,v0.22.5)=f97608f (the v0.21.5 release commit), so the ancestry is clean and a future full merge is still possible - this is a cost judgement, not a broken fork.",
+    "security_status": {
+      "code_backports_open_prs": [
+        {
+          "pr": 191,
+          "covers": "v0.21.6 security fixes",
+          "ci": "all required checks pass"
+        },
+        {
+          "pr": 264,
+          "covers": "v0.22.5 revoked allowlist entries + Desktop plugin gate",
+          "ci": "all required checks pass"
+        },
+        {
+          "pr": 276,
+          "covers": "v0.22.5 plugin gate on websockets + every served profile",
+          "ci": "all required checks pass"
+        },
+        {
+          "pr": 294,
+          "covers": "v0.22.5 dependency CVEs: Pillow 13.0.0, simple-git 4.0.2, nanoid 3.3.20",
+          "ci": "opened 2026-10-26, CI pending"
+        },
+        {
+          "pr": 324,
+          "covers": "post-v0.22.5 raw-CDP cloud-metadata floor (upstream 09660feb36 set)",
+          "ci": "checked 2026-11-01"
+        }
+      ],
+      "deferred_cves_not_yet_backported": [
+        {
+          "package": "webpack-dev-middleware",
+          "fix": "7.4.6",
+          "severity": "high",
+          "why": "website/ own lockfile, docs-site dev dep - no runtime exposure"
+        },
+        {
+          "package": "postcss-selector-parser",
+          "fix": "7.1.6",
+          "severity": "medium",
+          "why": "website/ own lockfile, docs-site dev dep"
+        },
+        {
+          "package": "katex",
+          "fix": "0.18.4",
+          "severity": "low",
+          "why": "0.16->0.18 jump across apps/desktop + apps/bootstrap-installer; needs review"
+        },
+        {
+          "package": "oauthlib",
+          "fix": "4.0.0",
+          "severity": "medium",
+          "why": "we pin google-auth-oauthlib, a different package; confirm real exposure first"
+        }
+      ],
+      "_evidence": "[verified: test] gh pr view/checks; grep of pyproject.toml + package-lock.json at 083f2441a6",
+      "live_check_2026_11_01": "PR 191: ALL GREEN; PR 264: ALL GREEN; PR 276: ALL GREEN; PR 294: ALL GREEN; PR 324: ALL GREEN; ",
+      "_carry_note": "47 security-keyword commits in the v2026.9.24..v0.22.5 window were enumerated and reviewed by the 2026-10-26 run; the five open backport PRs above are what that review produced. No new upstream release has been published since v0.22.5 (2026-10-23), so no new backport is owed this run."
+    },
+    "stale_artifacts": [
+      "local branch sync/upstream-release-v0.22.2 is an EMPTY stub (0 commits ahead of main, created-from-origin/main, worktree pruned) - safe to delete; `git branch -D` is blocked by the cron safety scanner so it was left in place"
+    ],
+    "decision_reviewed_at": "2026-11-01",
+    "decision_review_note": "Re-measured 2026-11-01: 246 conflicting files / ~636 hunks (was 437 on 2026-10-26). The count FELL because our main advanced between the two probes and some collisions resolved relationally - the deferral is unchanged, because 246 files still collide across core paths (tools/ agent/ hermes_cli/ gateway/ cron/) and the window is still 16231 commits / 13049 files. That remains past the skill's 'code conflicts + 400+ behind -> Skip' threshold and is still the unreviewable wholesale merge the skill forbids. Merge-base(main, v0.22.5) stays the v0.21.5 release commit, so a future full merge remains possible: this is a cost judgement, not a broken fork."
   }
 }
