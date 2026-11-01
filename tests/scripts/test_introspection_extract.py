@@ -829,6 +829,166 @@ class TestFailureReasonClassification:
         }
 
 
+class TestExpectedRefusals:
+    """#331 — a designed safety refusal is a decision, not a defect.
+
+    The question gate, the safety scan and the loop guard all refuse calls on
+    purpose, and each refusal arrives as an ``{"error": ...}`` envelope. Before
+    this change the taxonomy counted them as tool failures: 17.6% of all
+    recorded failures and 30.2% of terminal ones in the window ending
+    2026-10-31, plus 81% of the ``oneshot`` probe harness's 22% rate.
+    """
+
+    QUESTION_GATE = (
+        "QUESTION ASKED — the tool you just tried is WORK, not investigation. "
+        "The user asked a question; answer it before doing work."
+    )
+
+    @staticmethod
+    def _err(message, **extra):
+        return json.dumps({"error": message, **extra}, ensure_ascii=False)
+
+    def test_question_gate_refusal_is_netted_out_of_the_published_rate(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_gate",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", self._err(self.QUESTION_GATE)),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"question_gate": 1}
+        # The gross figure still proves the refusal happened …
+        assert d["signals"]["tool_failures_gross"] == {"terminal": 1}
+        assert d["signals"]["failure_rate_gross"] == {"terminal": 1.0}
+        # … while the published failure signal no longer blames the tool.
+        assert d["signals"]["tool_failures"] == {}
+        assert d["signals"]["failure_rate"] == {}
+        # The basis changed, so an old baseline is never compared against it.
+        assert d["failure_rate_basis"] == "per_tool_call_excluding_expected_refusals"
+        assert d["failure_rate_basis_gross"] == "per_tool_call"
+
+    def test_real_failure_still_counts_beside_a_refusal(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_mix",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", _fail("no such file or directory")),
+                _asst("terminal", "c2"),
+                _tool("c2", self._err(self.QUESTION_GATE)),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+        assert d["signals"]["tool_failures_gross"] == {"terminal": 2}
+        # The defect rate is halved, not zeroed: 1 genuine failure / 2 calls.
+        assert d["signals"]["failure_rate"] == {"terminal": 0.5}
+        assert d["signals"]["tool_failures_by_reason"] == {
+            "terminal": {"file-not-found": 1}
+        }
+        assert d["signals"]["tool_failures_by_reason_gross"]["terminal"][
+            "file-not-found"
+        ] == 1
+        assert d["signals"]["refusals_by_class"] == {"question_gate": 1}
+
+    def test_safety_scan_refusal_is_classed_security_scan(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_scan",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err(
+                        "tool execution blocked by safety gate: harm_score=1.0",
+                        reason="safety-gate-blocked",
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"security_scan": 1}
+        assert d["signals"]["tool_failures"] == {}
+
+    def test_loop_guard_block_is_a_refusal(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_guard",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err(
+                        "[loop-guard] Do not retry or bypass this safety refusal "
+                        "with another tool."
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"loop_guard": 1}
+        assert d["signals"]["tool_failures"] == {}
+
+    def test_loop_guard_diagnostic_is_still_a_failure(self, tmp_path):
+        """The guard also emits DIAGNOSTICS that accompany a real failure.
+        Only its blocking phrasing is a refusal — a marker-only rule would hide
+        the defect it was reporting."""
+        _session(
+            tmp_path,
+            "s_diag",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err("[loop-guard] Re-issued `terminal` 4 times; try a different tool."),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {}
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+
+    def test_prose_mentioning_refusal_is_not_a_refusal(self, tmp_path):
+        """Structured fields only: a failing command whose output merely talks
+        about refusing must keep counting as a defect."""
+        _session(
+            tmp_path,
+            "s_prose",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    _term(
+                        "grep: no refusal markers in this file",
+                        exit_code=2,
+                        error="grep failed",
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {}
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+
+    def test_scan_session_surfaces_the_class_breakdown(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "s_scan_keys",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", self._err(self.QUESTION_GATE)),
+            ],
+        )
+        s = scan_session(p)
+        assert s["refusals_by_class"] == {"question_gate": 1}
+        assert s["tool_failures_expected_refusal"] == {"terminal": 1}
+        # Gross per-session failure count is unchanged — the split happens in
+        # build_digest, so existing consumers of scan_session see no surprise.
+        assert s["tool_failures"] == {"terminal": 1}
+
+
 class TestBuildDigest:
     def test_window_excludes_old_sessions(self, tmp_path):
         _session(

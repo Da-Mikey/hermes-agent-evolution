@@ -136,6 +136,51 @@ _REFUSAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- designed-refusal families (#331) ----------------------------------------
+# Several safety mechanisms in this harness refuse a call BY DESIGN: the
+# question gate stops a WORK call attempted while the user asked a question,
+# the safety/harm scan blocks a dangerous command, the loop guard stops a
+# repetition it has already diagnosed. Each refusal is emitted as a tool
+# result whose envelope structurally says "error", so the failure taxonomy
+# counted a *decision* as a *defect*: in the 7-day window ending 2026-10-31,
+# 223 of 1,264 recorded failures (17.6%) were question-gate refusals — 209 of
+# 692 terminal failures (30.2%) — and 81% of the ``oneshot`` source's 22%
+# failure rate, a probe harness whose whole job is to ask a question and check
+# that the WORK call is refused. Fix (parts 1-2 of the issue): detect the
+# families by the gates' OWN message constants, give them a first-class
+# ``expected-refusal`` bucket with per-class detail, and keep them out of the
+# published failure rate while still reporting them as ``refusals_by_class`` so
+# the behaviour stays visible and auditable.
+#
+# Matching is deliberately anchored on distinctive gate phrasing rather than a
+# bare "refus" word: a genuine failure whose stderr merely mentions a refusal
+# must still count. The question-gate constant lives in the local hook
+# (``~/.hermes/agent-hooks/skill-route-gate.py``, ``ANSWER_FIRST_MESSAGE``);
+# its wording is pinned here as a regex because the digest must not import a
+# host-local hook.
+_QUESTION_GATE_RE = re.compile(
+    r"(question asked\s*[—\-:]+\s*the tool you just tried is work"
+    r"|the user asked a question[.!]?\s*answer it"
+    r"|answer first[,:]?\s*the tool you just tried is work)",
+    re.IGNORECASE,
+)
+_SECURITY_SCAN_RE = re.compile(
+    r"(tool execution blocked by safety gate"
+    r"|blocked by (?:the )?(?:safety|security) (?:gate|scan)"
+    r"|harm_score\s*=\s*1(?:\.0+)?[^\n]{0,120}\bblock)",
+    re.IGNORECASE,
+)
+# The loop guard emits both diagnostics (which accompany a REAL failure and must
+# keep counting) and outright blocks. Only the blocking phrasing is a refusal,
+# so the marker alone is not enough — see ``_expected_refusal_class``.
+_LOOP_GUARD_MARK = "[loop-guard]"
+_LOOP_GUARD_BLOCK_RE = re.compile(
+    r"(do not retry|do not bypass|stop and re-read|pause and re-read"
+    r"|end your turn|without resolving the task|blocked operation)",
+    re.IGNORECASE,
+)
+_EXPECTED_REFUSAL_CLASSES = ("question_gate", "security_scan", "loop_guard")
+
 # --- refusal-recovery detection (issue #1366, Child B of #1327) --------------
 # #1356 told the agent to propose an alternative path before refusing for a
 # missing capability. _REFUSAL_RE alone cannot tell whether it did: "I can't do
@@ -406,6 +451,57 @@ def _tool_domain(tool_name: Optional[str]) -> Optional[str]:
         return None
     if name.startswith(_HOME_AUTOMATION_TOOL_PREFIXES):
         return "home-automation"
+    return None
+
+
+def _expected_refusal_class(content: Any) -> Optional[str]:
+    """Name the designed-refusal family a result belongs to (#331).
+
+    Returns one of ``_EXPECTED_REFUSAL_CLASSES`` when the envelope is a
+    deliberate safety refusal — the question gate stopping a WORK call while a
+    question is open, the safety scan blocking a harmful command, the loop
+    guard blocking a repetition it already diagnosed — else ``None``.
+
+    Reads structured fields only (``error``/``status``/``output``/``stderr``/
+    ``reason``), inheriting the no-raw-text contract from
+    ``_tool_result_failed``: a page of prose that happens to contain the word
+    "refused" can never be mistaken for a gate decision.
+
+    Note this is a *taxonomy* helper, not a failure classifier: it answers
+    "if this is a failure, is it a decision or a defect?" and leaves
+    ``_classify_failure_reason``'s reason tags untouched, because those tags
+    (``safety-gate-blocked`` among them) are pinned by existing contracts and
+    consumed elsewhere.
+    """
+    data = content
+    if isinstance(data, (str, bytes)):
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+        stripped = text.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            return None  # not a structured envelope → never guess a refusal
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            return None
+    if not isinstance(data, dict):
+        return None
+
+    hints: List[str] = []
+    for key in ("error", "status", "output", "stderr", "reason"):
+        v = data.get(key)
+        if isinstance(v, str) and v:
+            hints.append(v)
+    haystack = " ".join(hints)
+
+    # The harm/safety gate stamps a machine-readable reason; trust it first.
+    if data.get("reason") == "safety-gate-blocked":
+        return "security_scan"
+    if _QUESTION_GATE_RE.search(haystack):
+        return "question_gate"
+    if _SECURITY_SCAN_RE.search(haystack):
+        return "security_scan"
+    if _LOOP_GUARD_MARK in haystack and _LOOP_GUARD_BLOCK_RE.search(haystack):
+        return "loop_guard"
     return None
 
 
@@ -690,6 +786,13 @@ def scan_messages(messages) -> Dict[str, Any]:
     tool_failures_by_reason: Dict[
         str, Dict[str, int]
     ] = {}  # tool -> reason -> count (#1325)
+    # Designed refusals (#331) — counted separately so a safety decision is
+    # never published as unreliability. Per TOOL (the digest needs it to state a
+    # net rate beside the gross one) and per CLASS (so the behaviour stays
+    # visible and auditable instead of merely disappearing from the rate).
+    tool_expected_refusals: Counter = Counter()
+    refusals_by_class: Counter = Counter()
+    expected_refusal_by_reason: Dict[str, Dict[str, int]] = {}
     # Per-tool CALL counts (#317) — the denominator a failure *rate* needs.
     # Two independent observations are kept because neither alone is complete:
     #   * declared — tool calls the assistant asked for (a call that crashed
@@ -758,6 +861,14 @@ def scan_messages(messages) -> Dict[str, Any]:
                     tool_failures_by_reason[tool][reason] = (
                         tool_failures_by_reason[tool].get(reason, 0) + 1
                     )
+                # Is this failure a DECISION rather than a defect? (#331)
+                refusal_class = _expected_refusal_class(content)
+                if refusal_class is not None:
+                    tool_expected_refusals[tool] += 1
+                    refusals_by_class[refusal_class] += 1
+                    if reason is not None:
+                        _by_reason = expected_refusal_by_reason.setdefault(tool, {})
+                        _by_reason[reason] = _by_reason.get(reason, 0) + 1
             if failed and isinstance(content, str) and _TIMEOUT_RE.search(content):
                 timeouts += 1
 
@@ -769,6 +880,11 @@ def scan_messages(messages) -> Dict[str, Any]:
     return {
         "tool_failures": dict(tool_failures),
         "tool_failures_by_reason": tool_failures_by_reason,
+        # (#331) The subset of the above that is a designed safety refusal, plus
+        # the per-class breakdown the digest republishes as ``refusals_by_class``.
+        "tool_failures_expected_refusal": dict(tool_expected_refusals),
+        "refusals_by_class": dict(refusals_by_class),
+        "expected_refusal_by_reason": expected_refusal_by_reason,
         "tool_calls": tool_calls,
         "timeouts": timeouts,
         "refusals": refusals,
@@ -864,6 +980,12 @@ def build_digest(
     failures_by_reason: Dict[
         str, Dict[str, int]
     ] = {}  # tool -> reason -> count (#1325)
+    # Designed refusals (#331) — the part of ``failures`` that is a safety
+    # DECISION, not a defect. Kept per tool and per reason so every published
+    # rate can be stated net while the gross figure stays auditable.
+    refusals_by_tool: Counter = Counter()
+    refusals_by_class: Counter = Counter()
+    refusal_reasons: Dict[str, Dict[str, int]] = {}
     calls: Counter = Counter()  # tool -> call count, the rate denominator (#317)
     timeouts = 0
     refusals = 0
@@ -886,6 +1008,15 @@ def build_digest(
             bucket = failures_by_reason.setdefault(tool, {})
             for reason, n in reasons.items():
                 bucket[reason] = bucket.get(reason, 0) + int(n)
+        # (#331) designed-refusal bookkeeping, merged the same way.
+        refusals_by_tool.update(s.get("tool_failures_expected_refusal", {}))
+        refusals_by_class.update(s.get("refusals_by_class", {}))
+        for tool, reasons in s.get("expected_refusal_by_reason", {}).items():
+            if not isinstance(reasons, dict):
+                continue
+            rbucket = refusal_reasons.setdefault(tool, {})
+            for reason, n in reasons.items():
+                rbucket[reason] = rbucket.get(reason, 0) + int(n)
         timeouts += s.get("timeouts", 0)
         refusals += s.get("refusals", 0)
         refusals_recovered += s.get("refusals_with_recovery", 0)
@@ -969,11 +1100,37 @@ def build_digest(
     # real data (terminal 0.70, ha_get_state 0.62 against true 8.0% / 9.7%) and
     # inflated every downstream priority score. A rate is only quotable next to
     # its base, so ``tool_calls`` is published alongside ``tool_failures``.
-    tool_failures = dict(failures.most_common())
+    tool_failures_gross = dict(failures.most_common())
     tool_calls = dict(sorted(calls.items()))
+    # (#331) Net = gross minus designed refusals, and the net figure is the
+    # headline. A question-gate refusal ("you were asked a question, that tool
+    # is WORK") says nothing about whether `terminal` works; publishing it as a
+    # terminal failure ranked the tool at 7.50% when its real defect rate was
+    # 5.24% and made 81% of the `oneshot` harness's failure rate an artefact of
+    # the gate it deliberately probes. Gross stays published beside it so the
+    # split is auditable and a genuine rise in refusals cannot hide.
+    tool_failures: Dict[str, int] = {}
+    for tool, count in tool_failures_gross.items():
+        net = count - refusals_by_tool.get(tool, 0)
+        if net > 0:
+            tool_failures[tool] = net
+    failures_by_reason_net: Dict[str, Dict[str, int]] = {}
+    for tool, reasons in failures_by_reason.items():
+        excluded = refusal_reasons.get(tool, {})
+        kept = {
+            reason: n - excluded.get(reason, 0)
+            for reason, n in reasons.items()
+            if n - excluded.get(reason, 0) > 0
+        }
+        if kept:
+            failures_by_reason_net[tool] = kept
     failure_rate = {
         tool: (count / tool_calls[tool] if tool_calls.get(tool) else 0.0)
         for tool, count in tool_failures.items()
+    }
+    failure_rate_gross = {
+        tool: (count / tool_calls[tool] if tool_calls.get(tool) else 0.0)
+        for tool, count in tool_failures_gross.items()
     }
     # Reason-scoped rate (issue #1325 — corrected fix). PR #1336 added reason
     # *counts* (tool_failures_by_reason) but the realized-impact gate still
@@ -984,7 +1141,7 @@ def build_digest(
     # that moves only when the targeted reason moves, breaking the treadmill.
     # Same denominator as above — per tool CALL, not per session (#317).
     failure_rate_by_reason: Dict[str, Dict[str, float]] = {}
-    for tool, reasons in failures_by_reason.items():
+    for tool, reasons in failures_by_reason_net.items():
         failure_rate_by_reason[tool] = {
             reason: (n / tool_calls[tool] if tool_calls.get(tool) else 0.0)
             for reason, n in reasons.items()
@@ -1007,14 +1164,27 @@ def build_digest(
         # Which denominator the published rates use (#317). Stored in the
         # realized-impact ledger so a baseline recorded under one basis is
         # never compared against a current rate computed under another.
-        "failure_rate_basis": "per_tool_call",
+        # #331 changed the BASIS: published failures/rates now EXCLUDE designed
+        # safety refusals, so a baseline taken before that change is not
+        # comparable. The previous basis is published as ``_gross`` alongside
+        # its own failures/rate figures.
+        "failure_rate_basis": "per_tool_call_excluding_expected_refusals",
+        "failure_rate_basis_gross": "per_tool_call",
         "signals": {
+            # NET of designed refusals (#331) — the headline figures.
             "tool_failures": tool_failures,
-            "tool_failures_by_reason": failures_by_reason,
+            "tool_failures_by_reason": failures_by_reason_net,
+            # GROSS, unchanged in meaning: every recorded failure including the
+            # refusals. Kept so the exclusion can be audited and so a rise in
+            # gate activity is still visible rather than silently netted away.
+            "tool_failures_gross": tool_failures_gross,
+            "tool_failures_by_reason_gross": failures_by_reason,
+            "refusals_by_class": dict(refusals_by_class.most_common()),
             # Denominator of every published rate (#317). A rate must never be
             # quoted without its base, so both are emitted together.
             "tool_calls": tool_calls,
             "failure_rate": failure_rate,
+            "failure_rate_gross": failure_rate_gross,
             "failure_rate_by_reason": failure_rate_by_reason,
             "spiral_depth_per_session": spiral_depth_per_session,
             "timeouts": timeouts,
