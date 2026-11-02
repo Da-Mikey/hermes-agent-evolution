@@ -28,6 +28,19 @@ an abstract. A mismatch is a hard, loud failure — the stage never proceeds on 
 silent partial parse (that failure mode is exactly how the HTML structure was
 mis-read twice, caught only by ad-hoc reconciliation against printed counts).
 
+DATES
+-----
+A listing page carries exactly **one** clock: the announcement date of the
+section it was read from, emitted as ``announced`` on every record. It does
+**not** carry a per-paper submission timestamp, so there is deliberately no
+``submitted`` key on the record (#339): the old key was hardcoded to ``None``
+on all 772 records of a real snapshot, and a present-but-null field fails
+silently — a downstream filter keyed on it selects nothing and "no new work"
+becomes indistinguishable from "the field is dead". A missing key raises on
+access instead. When a submission date is genuinely needed, fetch it from the
+arXiv API record for ``id`` and store it under its own name; never back-fill it
+here from ``announced``.
+
 FETCH
 -----
 ``fetch_listing`` uses ``urllib`` with a browser User-Agent and an explicit
@@ -310,7 +323,6 @@ def _parse_entry(
     return {
         "id": paper_id,
         "title": title,
-        "submitted": None,
         "announced": announced,
         # The category whose /new listing we read (the paper may be a cross-list
         # or a replacement announced there), plus every subject code on the page.
