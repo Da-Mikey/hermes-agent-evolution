@@ -54,6 +54,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_constants import get_hermes_home
 
+# The runtime appends its OWN guidance to the same string it hands back
+# (``agent/tool_guardrails.append_toolguard_guidance``): a "Tool loop warning" /
+# "Tool loop hard stop" line, optionally followed by a "Fallback directive"
+# line. Those trailers belong to the runtime, not to the tool's envelope — and
+# a trailer on the tail of a genuine ``{"error": …}`` envelope used to hide the
+# failure entirely, because the envelope test below saw a trailing ``]``
+# instead of ``}`` (#337). Strip them BEFORE the envelope test, repeatedly: a
+# warning and a fallback directive stack. The match is anchored to the END of
+# the string and starts at a newline, so it can never eat into the envelope.
+_RUNTIME_TRAILER_RE = re.compile(
+    r"\n+\[(?:Tool loop (?:warning|hard stop)|Fallback directive):.*\]\s*\Z",
+    re.DOTALL,
+)
+
+
+def _strip_runtime_trailers(text: str) -> str:
+    """Remove runtime-appended guidance lines from the tail of a tool result."""
+    while True:
+        without = _RUNTIME_TRAILER_RE.sub("", text).strip()
+        if without == text:
+            return without
+        text = without
+
 
 def _tool_result_failed(content: Any) -> bool:
     """Structural failure classifier for a tool result (issue #347).
@@ -86,11 +109,19 @@ def _tool_result_failed(content: Any) -> bool:
     string body — is NOT counted: we no longer guess from content. This trades
     a few genuinely-plain-string failures (rare; tools emit JSON envelopes) for
     eliminating the false-positive flood, exactly as the issue prescribes.
+
+    The runtime's own ``[Tool loop warning: …]`` / ``[Fallback directive: …]``
+    trailers are stripped from the tail first (#337). They are appended to the
+    same string, so without the strip a warned ``{"error": …}`` envelope ended
+    in ``]``, failed the envelope test, and was scored as healthy — which made
+    the loop guard look like it only ever fired on good calls.
     """
     data = content
     if isinstance(data, (str, bytes)):
         text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
-        stripped = text.strip()
+        # Runtime guidance is appended to the SAME string; it is not part of the
+        # tool's envelope, and left in place it hid every warned real failure.
+        stripped = _strip_runtime_trailers(text.strip())
         if not (stripped.startswith("{") and stripped.endswith("}")):
             return False  # not a JSON envelope → no authoritative status → don't guess
         try:
