@@ -270,6 +270,111 @@ class TestInformationalExitCodeMeaning:
         assert s["tool_failures_by_reason"] == {"terminal": {"timeout": 1}}
 
 
+_LOOP_WARNING = (
+    "\n\n[Tool loop warning: repeated_exact_failure_warning; count=3; "
+    "tool_call failed 3 consecutive times with identical arguments. "
+    "Change the arguments, switch tool, or stop and report the blocker.]"
+)
+_FALLBACK = (
+    "\n[Fallback directive: use search_files instead of read_file for a directory]"
+)
+_HARD_STOP = (
+    "\n\n[Tool loop hard stop: repeated_exact_failure_warning; count=5; "
+    "identical call repeated 5 times.]"
+)
+
+
+class TestRuntimeAppendedTrailer:
+    """#337 regression: runtime guidance is appended to the SAME string.
+
+    ``append_toolguard_guidance`` puts a ``[Tool loop warning: …]`` (and
+    optionally a ``[Fallback directive: …]``) on the tail of whatever the tool
+    returned. The old envelope test required the string to END in ``}``, so a
+    warned genuine ``{"error": …}`` envelope ended in ``]``, was taken for plain
+    text, and was scored healthy — 10 warned results, 0 counted as failures.
+    """
+
+    def test_warned_error_envelope_still_counts(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "warned_error",
+            [
+                _asst("tool_call", "c1"),
+                _tool("c1", _fail("tool_call requires 'calls'") + _LOOP_WARNING),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {"tool_call": 1}
+
+    def test_warning_plus_fallback_directive_still_counts(self, tmp_path):
+        """The two trailers stack; both must be stripped, not just the last."""
+        p = _session(
+            tmp_path,
+            "warned_fallback",
+            [
+                _asst("write_file", "c1"),
+                _tool(
+                    "c1",
+                    _fail("Refusing to overwrite without a fresh read")
+                    + _LOOP_WARNING
+                    + _FALLBACK,
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {"write_file": 1}
+
+    def test_hard_stop_trailer_still_counts(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "hard_stop",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", _term("boom", exit_code=2) + _HARD_STOP),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {"terminal": 1}
+
+    def test_successful_envelope_with_warning_is_not_a_failure(self, tmp_path):
+        """The suffix must not become a failure signal in the other direction."""
+        p = _session(
+            tmp_path,
+            "warned_ok",
+            [
+                _asst("read_file", "c1"),
+                _tool("c1", _ok(content="42 lines") + _LOOP_WARNING),
+                _asst("terminal", "c2"),
+                _tool("c2", _term("all good", exit_code=0) + _LOOP_WARNING),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {}
+
+    def test_plain_text_with_warning_is_not_guessed(self, tmp_path):
+        """Stripping the trailer must not turn a plain body into a guess: an
+        unenveloped result stays uncounted (the #331 invariant)."""
+        p = _session(
+            tmp_path,
+            "plain_warned",
+            [
+                _asst("read_file", "c1"),
+                _tool("c1", "Error: could not read that file" + _LOOP_WARNING),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {}
+
+    def test_trailer_inside_error_text_is_not_truncated(self):
+        """A bracket inside the envelope body must survive: the strip is
+        anchored to trailing guidance lines only."""
+        from introspection_extract import _strip_runtime_trailers
+
+        body = '{"error": "bad [value] in field"}'
+        assert _strip_runtime_trailers(body + _LOOP_WARNING) == body
+        assert _strip_runtime_trailers(body) == body
+
+
 class TestDomainNotFoundReasons:
     """#250 — a miss in a tool's own namespace is not a filesystem miss.
 
