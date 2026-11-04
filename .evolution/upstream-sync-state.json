@@ -16,24 +16,29 @@
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
     "checked_at": "2026-11-01",
     "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin).",
-    "latest_checked_tag": "v0.22.6",
-    "latest_checked_date": "2026-11-02",
-    "latest_checked_version": "0.22.6",
+    "latest_checked_tag": "v0.22.7",
+    "latest_checked_date": "2026-11-03",
+    "latest_checked_version": "0.22.7",
     "divergence": {
       "behind_v0.22.5": 16231,
       "ahead_of_v0.22.5": 1624,
       "upstream_files_changed_since_v2026.9.24": 13049,
       "our_files_changed_since_v2026.9.24": 1437,
-      "conflicting_files": 258,
-      "re_measured_at": "2026-11-03",
-      "re_measured_note": "2026-11-03 live probe of the NEW release: detached worktree at tag v0.22.6, `git merge --no-commit --no-ff origin/main` -> 258 conflicted files / ~695 hunks / 1458 files differing between our main and the tag. Up from 246 conflicts (v0.22.5, 2026-11-02), i.e. one patch release added 12 more colliding files. Counts are re-derived from git state every run, never carried.",
-      "_evidence": "[verified: test] 2026-11-03 probe output, live: worktree add --detach <scratch>/wt-probe-v0226 v0.22.6 -> merge --no-commit --no-ff origin/main (exit 1) -> `git diff --name-only --diff-filter=U | wc -l` = 258, hunk count from `grep -c '^<<<<<<<'` across conflicted files = 695, `git status --porcelain | wc -l` = 1458, then merge --abort. Top conflict areas: .github/workflows 33, tests/tools 19, tests/agent 9, tests/hermes_cli 7, tests/gateway 5, tests/e2e 4, tests/cron 4, plugins/memory 4, gateway/platforms 3, tools/environments 3.",
+      "conflicting_files": 259,
+      "re_measured_at": "2026-11-04",
+      "re_measured_note": "2026-11-04 live probe of v0.22.7: detached worktree at the tag, `git merge --no-commit --no-ff origin/main` -> 259 conflicted files (`git diff --name-only --diff-filter=U`), 1458 changed entries, then merge --abort (clean). Trend across releases: 246 (v0.22.5) -> 258 (v0.22.6) -> 259 (v0.22.7), i.e. the collision set is flat, roughly one new file per patch release.",
+      "_evidence": "[verified: test] 2026-11-04, live: worktree add --detach <scratch>/wt-probe-v0227 v0.22.7 -> merge --no-commit --no-ff origin/main (exit 1) -> conflicted files 259; top areas: tools 44, .github/workflows 33, agent 30, hermes_cli 20, tests/tools 19, gateway 11, cron 10, tests/agent 9; then merge --abort, worktree clean.",
       "behind_v0.22.6": 19713,
       "ahead_of_v0.22.6": 1624,
       "conflicting_files_v0_22_5": 246,
       "conflicting_hunks": 695,
       "files_differing_main_vs_v0_22_6": 1458,
-      "release_window_commits_v0_22_5_to_v0_22_6": 3482
+      "release_window_commits_v0_22_5_to_v0_22_6": 3482,
+      "behind_v0.22.7": 20302,
+      "ahead_of_v0.22.7": 1624,
+      "conflicting_files_v0_22_7": 259,
+      "files_changing_on_merge_v0_22_7": 1458,
+      "_measurement_warning": "Do NOT use `git merge-tree --write-tree --name-only` as a conflict count: it reports differing-file counts, not conflicts (916 for v0.22.5 against a real-merge 246, and 943 for both v0.22.6 and v0.22.7). Only a real `git merge --no-commit` in a throwaway worktree gives the comparable number."
     },
     "decision": "defer-full-merge",
     "decision_rationale": "[verified: test] A v0.22.5 merge collides on 246 files (of 13049 upstream-changed vs our 1437). That is far past the skill's 'code conflicts + 400+ behind -> Skip' threshold and is exactly the unreviewable wholesale merge the skill forbids. Merge-base(main,v0.22.5)=f97608f (the v0.21.5 release commit), so the ancestry is clean and a future full merge is still possible - this is a cost judgement, not a broken fork.",
@@ -63,6 +68,13 @@
           "pr": 324,
           "covers": "post-v0.22.5 raw-CDP cloud-metadata floor (upstream 09660feb36 set)",
           "ci": "checked 2026-11-01"
+        },
+        {
+          "pr": 346,
+          "covers": "v0.22.7 approval gate: an approved rule must not hide a credential upload (8f6bb36594) + credential-upload rule only counts curl/wget upload flags (1edc01f1c7)",
+          "ci": "not yet run on the branch at assessment time; local: 24/24 security tests pass, 0 new failures vs an origin/main baseline across the 34 files touching the changed symbols",
+          "branch": "sync/upstream-approval-backport-20261104",
+          "opened_at": "2026-11-04"
         }
       ],
       "deferred_cves_not_yet_backported": [
@@ -109,7 +121,20 @@
           "note": "left un-picked deliberately: five security backports already sit unmerged, so a sixth adds queue, not safety"
         }
       ],
-      "_carry_note_2026_11_03": "v0.22.6 (published 2026-11-02T17:18Z, after the 2026-11-02 08:18 run) is the first new release since v0.22.5. Its window carries 3482 commits (release notes: 3448 non-merge, 776 PRs, 4316 files). A subject-level sweep for CVE/security/injection/traversal/escape found the approval-display set above as the only new code-level candidate; the rest were plugin-catalog re-pins (airlock 0.2.2/0.2.3) and correctness fixes. No upstream PR carries a `security` label in this window (label query returned empty), so classification here is by commit subject plus diff inspection, not by upstream triage."
+      "_carry_note_2026_11_03": "v0.22.6 (published 2026-11-02T17:18Z, after the 2026-11-02 08:18 run) is the first new release since v0.22.5. Its window carries 3482 commits (release notes: 3448 non-merge, 776 PRs, 4316 files). A subject-level sweep for CVE/security/injection/traversal/escape found the approval-display set above as the only new code-level candidate; the rest were plugin-catalog re-pins (airlock 0.2.2/0.2.3) and correctness fixes. No upstream PR carries a `security` label in this window (label query returned empty), so classification here is by commit subject plus diff inspection, not by upstream triage.",
+      "latest_release_window_security_review": {
+        "window": "v0.22.6..v0.22.7 (589 commits, 174 PRs)",
+        "advisories_published": "none (GitHub security-advisories API returned an empty set)",
+        "cve_tagged_commits": "none",
+        "credible_hardening": [
+          "8f6bb36594 fix(approval): an approved rule no longer hides a credential upload",
+          "1edc01f1c7 fix(approval): credential-upload rule only counts curl/wget upload flags",
+          "0d76bdb14d fix(relay): scrub echoed bearers (relay surface not enabled on this fork)",
+          "c305aedf56 plugin-catalog: bubblewrap 1.3.0 (catalog pin, no local code)"
+        ],
+        "note": "Only the two approval commits touch code this fork runs; both are carried by PR #346.",
+        "checked_at": "2026-11-04"
+      }
     },
     "stale_artifacts": [
       "local branch sync/upstream-release-v0.22.2 is an EMPTY stub (0 commits ahead of main, created-from-origin/main, worktree pruned) - safe to delete; `git branch -D` is blocked by the cron safety scanner so it was left in place"
@@ -119,6 +144,7 @@
     "decision_review_note_2026_11_02": "Re-probed live 2026-11-02 against origin/main ce73fa8d6a: 246 conflicting files / 636 hunks / 13049 touched, re-derived from git state rather than carried from 2026-11-01. No upstream release has been published since v0.22.5 (2026-10-23), so there is no bounded release to merge; decision unchanged: defer-full-merge. Stale 437-file figure in decision_rationale corrected to the live 246.",
     "latest_checked_commit": "f0d94882e89ab8d4098b5bb2f166adfb9ee0a0ab",
     "latest_checked_published_at": "2026-11-02T17:18:36Z",
-    "decision_review_note_2026_11_03": "New release v0.22.6 measured live today: 258 conflicting files / ~695 hunks, against a window of 19713 commits behind and 1624 ahead. The conflict count went UP from 246, so the one patch release did not move us closer to a mergeable state. Still far past the skill's 'code conflicts + 400+ behind -> Skip' threshold, and still exactly the unreviewable wholesale merge the skill forbids. Decision unchanged: defer-full-merge, cherry-pick security only. Divergence is a cost judgement, not a broken fork: merge-base(main, v0.22.6) remains the v0.21.5 release commit."
+    "decision_review_note_2026_11_03": "New release v0.22.6 measured live today: 258 conflicting files / ~695 hunks, against a window of 19713 commits behind and 1624 ahead. The conflict count went UP from 246, so the one patch release did not move us closer to a mergeable state. Still far past the skill's 'code conflicts + 400+ behind -> Skip' threshold, and still exactly the unreviewable wholesale merge the skill forbids. Decision unchanged: defer-full-merge, cherry-pick security only. Divergence is a cost judgement, not a broken fork: merge-base(main, v0.22.6) remains the v0.21.5 release commit.",
+    "assessed_at": "2026-11-04"
   }
 }
