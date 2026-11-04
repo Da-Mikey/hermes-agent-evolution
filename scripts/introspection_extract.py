@@ -167,6 +167,13 @@ _QUESTION_GATE_RE = re.compile(
 _SECURITY_SCAN_RE = re.compile(
     r"(tool execution blocked by safety gate"
     r"|blocked by (?:the )?(?:safety|security) (?:gate|scan)"
+    # The scan's OWN envelope (#343): the gate prefixes its verdict with the
+    # literal "BLOCKED: Security scan" and then a bracketed finding list, e.g.
+    # "BLOCKED: Security scan — [MEDIUM] URL uses raw IP address 10.0.0.12".
+    # Both branches above require the preposition "by", so 92 error envelopes
+    # carrying this literal were scored as tool defects (11.8% of net failures)
+    # instead of designed refusals.
+    r"|blocked:\s*(?:the\s+)?(?:security|safety)[\s_-]*scan"
     r"|harm_score\s*=\s*1(?:\.0+)?[^\n]{0,120}\bblock)",
     re.IGNORECASE,
 )
