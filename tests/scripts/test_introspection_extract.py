@@ -912,6 +912,55 @@ class TestExpectedRefusals:
         assert d["signals"]["refusals_by_class"] == {"security_scan": 1}
         assert d["signals"]["tool_failures"] == {}
 
+    def test_blocked_prefix_envelope_is_classed_security_scan(self, tmp_path):
+        """#343 — the scan's OWN "BLOCKED: Security scan" envelope.
+
+        This is the literal the gate emits (verbatim from the live corpus:
+        ``errors.log`` → "Tool terminal returned error: BLOCKED: Security scan
+        — [MEDIUM] URL uses raw IP address 10.0.0.12 …"). Every regex branch
+        before #343 required the preposition "by", so all 92 structured
+        envelopes carrying it scored as tool defects.
+        """
+        _session(
+            tmp_path,
+            "s_scan_prefix",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err(
+                        "Tool terminal returned error: BLOCKED: Security scan — "
+                        "[MEDIUM] URL uses raw IP address 10.0.0.12; "
+                        "[HIGH] Schemeless URL in sink context"
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"security_scan": 1}
+        # Still recorded grossly — the refusal happened and must stay visible.
+        assert d["signals"]["tool_failures_gross"] == {"terminal": 1}
+        # …but it is a decision, not a defect, so it leaves the published rate.
+        assert d["signals"]["tool_failures"] == {}
+
+    def test_a_plain_security_scan_mention_is_not_a_refusal(self, tmp_path):
+        """#343 guard — the new branch must not swallow ordinary failures.
+
+        A failure that merely *talks about* a security scan is still a defect;
+        only the gate's own "BLOCKED:" prefix marks a decision.
+        """
+        _session(
+            tmp_path,
+            "s_scan_word",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", _fail("scheduled security scan failed: timeout")),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {}
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+
     def test_loop_guard_block_is_a_refusal(self, tmp_path):
         _session(
             tmp_path,
