@@ -47,9 +47,10 @@ def test_parse_listing_keeps_ids_and_abstracts(listing_html: str):
     # The listing announcement date is carried on every record.
     assert page.announced == "2026-10-30"
     assert {record["announced"] for record in page.records} == {"2026-10-30"}
-    # `submitted` is honestly null: a listing page carries no per-paper
-    # submission timestamp (use the arXiv API record when the exact time matters).
-    assert {record["submitted"] for record in page.records} == {None}
+    # `submitted` is deliberately ABSENT, not null (#339): a listing page carries
+    # no per-paper submission timestamp, and a present-but-null key would let a
+    # downstream date filter select nothing silently. Absence raises on access.
+    assert all("submitted" not in record for record in page.records)
     assert all(record["source"] == "arxiv-listing" for record in page.records)
     assert page.problems == []
 
