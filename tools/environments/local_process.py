@@ -19,6 +19,22 @@ def spawn_owned_process(args, **kwargs):
     return LocalProcessHandle(args, **kwargs)
 
 
+# #347 — the lifetime owner can die before it reports READY (fork/exec
+# pressure, fd exhaustion, a transient vfork failure). Nothing has been
+# dispatched at that point, so the spawn is safe to replay exactly once; the
+# payload of the tool call has not run and cannot run twice.
+_OWNER_STARTUP_ATTEMPTS = 2
+_OWNER_STARTUP_RETRY_DELAY = 0.05
+
+
+class _OwnerStartupRace(RuntimeError):
+    """The lifetime owner died before READY — the workload never dispatched.
+
+    Subclasses :class:`RuntimeError`, so ``str()`` keeps the historical message
+    and any existing ``except RuntimeError`` caller behaves exactly as before.
+    """
+
+
 class LocalProcessHandle:
     """Popen-like workload status backed by a private, live process-group owner.
 
@@ -36,6 +52,26 @@ class LocalProcessHandle:
         self._owner_failed = False
         self._cleanup_pending = False
         self._cleanup_incomplete = False
+        self._open_with_retry(args, kwargs)
+
+    def _open_with_retry(self, args, kwargs):
+        """Spawn the lifetime owner, replaying ONCE if it dies before READY."""
+        for attempt in range(1, _OWNER_STARTUP_ATTEMPTS + 1):
+            try:
+                self._open_once(args, kwargs)
+                return
+            except _OwnerStartupRace as exc:
+                if attempt >= _OWNER_STARTUP_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "Local process owner did not start (%s); replaying the spawn once",
+                    exc,
+                )
+                time.sleep(_OWNER_STARTUP_RETRY_DELAY)
+
+    def _open_once(self, args, kwargs):
+        """Spawn the owner and complete the READY/STARTED handshake."""
+        self._buffer = b""  # a failed attempt leaves partial bytes behind
         parent, child = socket.socketpair()
         self._control = parent
         self._owner = None
@@ -48,8 +84,9 @@ class LocalProcessHandle:
             self.pid = self._owner.pid
             self.stdin, self.stdout, self.stderr = self._owner.stdin, self._owner.stdout, self._owner.stderr
             parent.settimeout(5)
-            if self._startup_line() != b"READY":
-                raise RuntimeError("Local process owner failed to initialize")
+            if self._startup_line(retryable=True) != b"READY":
+                raise _OwnerStartupRace("Local process owner failed to initialize")
+
             if os.getpgid(self.pid) != self.pid or self.pid == os.getpgrp():
                 raise RuntimeError("Local process owner lacks a private process group")
             parent.sendall(b"S")
@@ -67,11 +104,20 @@ class LocalProcessHandle:
         finally:
             child.close()
 
-    def _startup_line(self):
+    def _startup_line(self, *, retryable=False):
+        """Read the next handshake line from the owner.
+
+        ``retryable`` marks the pre-dispatch window: a control socket that
+        closes there proves the spawn never reached the workload, so the caller
+        may replay it (#347). Once ``S`` has been written the workload may
+        already be running and a second attempt would execute it twice, so that
+        path stays a plain :class:`RuntimeError`.
+        """
         while b"\n" not in self._buffer:
             chunk = self._control.recv(256)
             if not chunk:
-                raise RuntimeError("Local process owner exited during startup")
+                message = "Local process owner exited during startup"
+                raise (_OwnerStartupRace(message) if retryable else RuntimeError(message))
             self._buffer += chunk
         line, self._buffer = self._buffer.split(b"\n", 1)
         return line

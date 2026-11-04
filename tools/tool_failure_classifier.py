@@ -314,6 +314,20 @@ _BUILTIN_RULES: list[_Rule] = [
     _rule(r"no route to host", ToolFailureCategory.transient_network),
     _rule(r"temporarily unavailable", ToolFailureCategory.transient_network),
     _rule(r"connection timed out", ToolFailureCategory.transient_network),
+    # #347 — the owned-process supervisor died before the workload dispatched.
+    # That is local resource contention (fork/exec pressure, fd exhaustion, a
+    # transient vfork failure), not a defect in the tool or its arguments, and
+    # ``LocalProcessHandle`` already replays the spawn once. Stamping it
+    # ``persistent_error`` made it non-retryable AND fed the failure breaker,
+    # so one exhausted host killed a whole run. It stays retryable — and the
+    # dispatch-phase failures are deliberately NOT included: once the command
+    # has been handed over, a retry could execute it twice.
+    _rule(
+        r"local process owner (?:exited|failed) during startup"
+        r"|local process owner failed to initialize",
+        ToolFailureCategory.transient_network,
+        should_retry=True,
+    ),
     # Generic timeout.
     _rule(r"timed out", ToolFailureCategory.timeout),
     _rule(r"\btimeout\b", ToolFailureCategory.timeout),
