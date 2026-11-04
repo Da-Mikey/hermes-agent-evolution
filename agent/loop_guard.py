@@ -146,6 +146,17 @@ _NON_RETRYABLE_BY_TOOL: dict[str, frozenset[str]] = {
     # the global _NON_RETRYABLE set, so it is not duplicated here.)
     "process": frozenset({"session_not_found", "invalid_action", "process_exited"}),
     "process_manage": frozenset({"session_not_found", "invalid_action", "process_exited"}),
+    # #338 — ha_get_state entity ids. Second-most-called tool in this deployment
+    # (3,351 calls / 7 days) and 100% of its 297 failures are one class: an
+    # entity id that does not exist, retried with IDENTICAL arguments (worst
+    # single session: 55 consecutive lookups of `light.word_clock`, then 54, 53,
+    # 43 on other ids). The tool's own error already lists the closest known
+    # ids, so the recovery is "use one of the candidates", never "ask again" —
+    # an id that is absent now will be absent on the next identical call within
+    # the same turn. Non-retryable bounds the spiral at the 2-call threshold
+    # instead of allowing 55. (Home Assistant is read at that moment; a stale or
+    # renamed entity is fixed by the candidate list, not by repeating the call.)
+    "ha_get_state": frozenset({"not_found"}),
 }
 
 

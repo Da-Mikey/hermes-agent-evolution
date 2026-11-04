@@ -91,6 +91,39 @@ class TestPatchNotFoundNonRetryable:
         assert n is not None and "read_file" in n  # patch hint: re-read target
 
 
+class TestHaGetStateNotFoundNonRetryable:
+    """#338 — a nonexistent entity id is deterministic for ``ha_get_state``.
+
+    Measured over 7 days: 3,351 calls, 297 failures, **all** of the same class,
+    retried with identical arguments (55 identical lookups of one id, then 54,
+    53, 43 in the same session). The tool's error already names the closest
+    known ids, so the recovery is "use a candidate" — repeating the call cannot
+    succeed, and the guard had no entry to bound it.
+    """
+
+    MESSAGE = (
+        "{\"error\": \"Entity 'light.word_clock' not found — closest known IDs: "
+        "device_tracker.wled_word_clock, switch.word_clock_freeze\"}"
+    )
+
+    def test_not_found_is_non_retryable(self):
+        assert _is_non_retryable("ha_get_state", "not_found")
+
+    def test_two_not_found_trips_hard_stop(self):
+        n = maybe_nudge(_fail_run("ha_get_state", 2, self.MESSAGE))
+        assert n is not None and "non-retryable" in n and "not_found" in n
+
+    def test_two_not_found_warrants_cron_hard_stop(self):
+        assert run_warrants_cron_hard_stop(_fail_run("ha_get_state", 2, self.MESSAGE))
+
+    def test_single_not_found_is_quiet(self):
+        assert maybe_nudge(_fail_run("ha_get_state", 1, self.MESSAGE)) is None
+
+    def test_other_failure_classes_stay_retryable(self):
+        # Only ``not_found`` is deterministic here; a transport blip is not.
+        assert not _is_non_retryable("ha_get_state", "connection_error")
+
+
 class TestTerminalNotFoundRemainsRetryable:
     def test_two_not_found_falls_through_to_generic_fail(self):
         n = maybe_nudge(
