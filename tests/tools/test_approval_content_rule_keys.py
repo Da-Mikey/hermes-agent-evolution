@@ -26,6 +26,13 @@ _ENV = ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERM
 @pytest.fixture(autouse=True)
 def _manual_mode_and_clean_state(monkeypatch):
     monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+    # A test earlier in the same process may have called clear_session_vars() (the gateway tests
+    # do in their teardown), which pins the session ContextVars to "" — "explicitly cleared", so
+    # get_session_env() stops falling back to os.environ and this test's HERMES_CRON_SESSION never
+    # reaches _is_cron_approval_context(). Reset to "never bound here" so the env fallback behaves
+    # as it does in a fresh process.
+    from gateway.session_context import reset_session_vars
+    reset_session_vars()
     for name in _ENV:
         monkeypatch.delenv(name, raising=False)
     approval_module._session_approved.clear()
