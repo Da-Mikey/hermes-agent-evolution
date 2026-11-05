@@ -468,6 +468,12 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
 _HARM_GATE_MODES = ("full", "destructive-only", "off")
 _DESTRUCTIVE_ONLY_ARMS = frozenset({"destructive-command"})
 
+# #353 — fallback for the [CIRCUIT_BREAKER] diagnostic when the tracker event
+# carries no strategy recommendation. The tracker does publish one
+# (`strategy_recommendation`), but reading a missing key used to raise KeyError
+# into a debug-level `except`, which silently suppressed the whole diagnostic.
+_DEFAULT_BREAKER_ACTION = "Inspect the tool arguments and retry, or use another tool."
+
 
 def _harm_gate_policy() -> tuple:
     """(mode, trust_private_hosts) from security.harm_gate; fail-closed to "full".
@@ -566,21 +572,40 @@ def _record_tool_circuit_breaker(agent, tool_name: str, result: Any, is_error: b
             status=_st,
             error_message=_err_msg,
         )
-        if _breaker_event and _breaker_event.get("circuit_breaker_tripped"):
-            if isinstance(result, str) and "[CIRCUIT_BREAKER]" not in result:
-                fails = _breaker_event['consecutive_failures']
-                bgt = _breaker_event['budget']
-                fcls = _breaker_event['failure_class']
-                act = _breaker_event['suggested_action']
-                _diag = (
-                    f"\n\n[CIRCUIT_BREAKER] Tool '{tool_name}' has failed "
-                    f"{fails} consecutive times (budget: {bgt}). "
-                    f"Class: {fcls}. Suggested action: {act}"
-                )
-                return result + _diag
     except Exception as _cb_err:
         logger.debug("Circuit breaker record_result failed: %s", _cb_err)
-    return result
+        return result
+
+    if not (_breaker_event and _breaker_event.get("circuit_breaker_tripped")):
+        return result
+    if not (isinstance(result, str) and "[CIRCUIT_BREAKER]" not in result):
+        return result
+
+    # #353 — the diagnostic builder is NOT inside the tracing `except` above.
+    # It used to be, so a bad key in the event dict was swallowed at debug level
+    # and looked exactly like a benign record_result failure: the tracker tripped,
+    # nothing was appended, and 0 of the 243 breaker diagnostics in the corpus
+    # came from this producer. A builder fault is a warning, never a silent drop.
+    try:
+        fails = _breaker_event.get("consecutive_failures")
+        bgt = _breaker_event.get("budget")
+        fcls = _breaker_event.get("failure_class", "unknown")
+        # The tracker publishes `strategy_recommendation` (tools/tool_circuit_breaker.py).
+        act = _breaker_event.get("strategy_recommendation") or _DEFAULT_BREAKER_ACTION
+        _diag = (
+            f"\n\n[CIRCUIT_BREAKER] Tool '{tool_name}' has failed "
+            f"{fails} consecutive times (budget: {bgt}). "
+            f"Class: {fcls}. Suggested action: {act}"
+        )
+        return result + _diag
+    except Exception:
+        logger.warning(
+            "Circuit breaker diagnostic could not be built for %s (event keys: %s)",
+            tool_name,
+            sorted(_breaker_event)[:12],
+            exc_info=True,
+        )
+        return result
 
 
 def _run_tool(*args, **kwargs):
