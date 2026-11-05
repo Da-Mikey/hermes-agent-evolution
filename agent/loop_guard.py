@@ -69,7 +69,26 @@ _FAILURE_MARKERS = (
     "no results found",
 )
 
+# #350 — tools whose result IS their payload: a file body, a match list, a page
+# extraction. Never marker-scan these; a quoted "error:" inside a document is not
+# a verdict on the call. Every name below was verified against the repo's tool
+# registry in the same session that added this set.
+_CONTENT_PAYLOAD_TOOLS = frozenset({
+    "read_file",
+    "search_files",
+    "repo_map",
+    "skill_view",
+    "web_search",
+    "web_extract",
+})
+
 _EXIT_CODE_RE = re.compile(r"exit code[:\s]+([1-9]\d*)", re.IGNORECASE)
+# #350 — the gate's own wording, kept in step with agent/tool_diagnostics.py.
+_SAFETY_GATE_RE = re.compile(r"tool execution blocked by safety gate:", re.IGNORECASE)
+# How much of a content-tool result may be classified when it is prose rather
+# than an envelope: enough for a tool's own one-line error, far too little for a
+# payload to be mistaken for a verdict.
+_CONTENT_FAILURE_HEAD_CHARS = 200
 
 # Failure classes (from tool_diagnostics) that are DETERMINISTIC — a near-identical
 # retry reproduces them, so they must not be looped on (#231). Distinct from
@@ -747,15 +766,97 @@ def should_interactive_hard_stop(
     return warning_count >= INTERACTIVE_LOOP_GUARD_HARD_STOP_THRESHOLD
 
 
-def _failure_category(content: Any) -> Optional[str]:
+def _envelope_error_text(content: Any) -> Optional[str]:
+    """The tool's own error fields from a JSON envelope, or None (#350).
+
+    A content-returning tool's envelope carries the *payload* in a ``content``
+    key; the file body is not evidence about the tool call. Only the fields the
+    tool layer writes itself — ``error``, ``status``, ``error_class``,
+    ``message`` — may be read as a verdict on the call.
+    """
+    if not isinstance(content, str) or not content.lstrip().startswith("{"):
+        return None
+    try:
+        data = json.loads(content.strip())
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    evidence = [
+        str(data[key])
+        for key in ("error", "status", "error_class", "message")
+        if data.get(key)
+    ]
+    return " ".join(evidence) if evidence else ""
+
+
+def _content_prose_is_failure(content: str) -> bool:
+    """Does this prose result *open* with failure wording? (#350)
+
+    A tool's own error message begins with the failure ("error: …", "permission
+    denied", "no results found"). A file body or a hit list begins with its own
+    content, however many markers appear later in it. Position, not size, is what
+    separates the two — verified live: a real ``read_file`` failure renders a JSON
+    envelope (handled by ``_structural_failure``) and a real ``search_files``
+    miss renders ``{"total_count": 0, "_no_match_hint": …}``.
+    """
+    stripped = content.lstrip()
+    head = stripped[:_CONTENT_FAILURE_HEAD_CHARS].lower()
+    if any(head.startswith(m) for m in _FAILURE_MARKERS):
+        return True
+    return bool(_EXIT_CODE_RE.match(head))
+
+
+def _safety_refusal_is_positive(content: Any) -> bool:
+    """True only when the content itself *is* a safety-gate refusal (#350).
+
+    The gate is unambiguous evidence, so it must be read from a place the tool
+    layer controls: an envelope ``error``/``status`` field, or the refusal
+    message itself at the head of the result. A document that merely quotes the
+    phrase — anywhere, however often — is not a refusal, and treating it as one
+    injected a user-role "do not retry" directive and stopped the run.
+    """
+    if not isinstance(content, str):
+        return False
+    evidence = _envelope_error_text(content)
+    if evidence is not None:
+        return bool(_SAFETY_GATE_RE.search(evidence))
+    return bool(_SAFETY_GATE_RE.match(content.lstrip()[:400]))
+
+
+def _failure_category(content: Any, tool_name: Optional[str] = None) -> Optional[str]:
     """The tool_diagnostics failure class of a result, or None if not a failure.
-    Imported lazily with a no-op fallback so loop_guard stays standalone."""
+    Imported lazily with a no-op fallback so loop_guard stays standalone.
+
+    For a content-returning tool only the envelope's own error fields are
+    classified, never the payload (#350): a file body that quotes the gate
+    phrase made ``read_file`` read as ``safety_gate_blocked``.
+    """
+    original = content
+    if tool_name in _CONTENT_PAYLOAD_TOOLS:
+        evidence = _envelope_error_text(content)
+        if evidence is None:
+            # Not an envelope: only the narrow short-error-message shape counts.
+            if not _content_prose_is_failure(content):
+                return None
+            evidence = content.lstrip()[:_CONTENT_FAILURE_HEAD_CHARS]
+        if not evidence:
+            return None
+        content = evidence
     try:
         from agent.tool_diagnostics import classify
     except Exception:  # pragma: no cover - keep standalone if import path differs
         return None
     hit = classify(content)
-    return hit[0] if hit else None
+    if not hit:
+        return None
+    category = hit[0]
+    # #350 — a safety verdict outranks every threshold and injects a user-role
+    # "do not retry" directive, so it may never be *inferred* from a body. If the
+    # content is not a refusal in its own right, the category is not safety.
+    if category == "safety_gate_blocked" and not _safety_refusal_is_positive(original):
+        return None
+    return category
 
 
 def _structural_failure(content: str) -> Optional[bool]:
@@ -802,7 +903,7 @@ def _structural_failure(content: str) -> Optional[bool]:
     return None
 
 
-def _looks_like_failure(content: Any) -> bool:
+def _looks_like_failure(content: Any, tool_name: Optional[str] = None) -> bool:
     if not isinstance(content, str) or not content:
         return False
     # Structured status first — it is authoritative where present, and the
@@ -810,6 +911,15 @@ def _looks_like_failure(content: Any) -> bool:
     structural = _structural_failure(content)
     if structural is not None:
         return structural
+    # A content-returning tool's result IS its payload (#350): a file body or a
+    # search hit list that happens to quote "error:" or "timeout" says nothing
+    # about whether the call worked. Those tools report failure in their
+    # envelope, which ``_structural_failure`` has just ruled out; only a short
+    # prose result that opens with the failure wording is still read as one.
+    # Verified live: a failing ``read_file`` renders a JSON envelope carrying
+    # ``error``/``error_class``, never bare prose.
+    if tool_name in _CONTENT_PAYLOAD_TOOLS:
+        return _content_prose_is_failure(content)
     low = content.lower()
     if any(m in low for m in _FAILURE_MARKERS):
         return True
@@ -913,9 +1023,9 @@ def _recent_tool_runs(
                 if tm.get("role") != "tool":
                     break
                 content = tm.get("content")
-                if _looks_like_failure(content):
+                if _looks_like_failure(content, tool):
                     failed = True
-                    category = _failure_category(content) or category
+                    category = _failure_category(content, tool) or category
             runs.append((tool, failed, category, arg_hash))
             i -= 1
         elif msg.get("role") == "tool":
