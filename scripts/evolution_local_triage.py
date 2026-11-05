@@ -77,6 +77,59 @@ def _read_sidecar(path: Path) -> dict:
     return {"path": str(path), "char_count": len(text)}
 
 
+_UNKNOWN_EFFORT_MAX_SELECTION = 4
+"""Cap for selections whose effort the sidecar does not record.
+
+``filed`` items in an issues sidecar carry a ``priority_score`` but no effort
+figure (the sidecar's ``budget`` is a count of issues, not effort), so an
+unknown-effort candidate enters the effort loop with ``effort_score = 0.0`` and
+would never trip the budget cap. The implementation stage documents a maximum of
+four issues per run; that is policy, not a guess, so it is the cap used here.
+"""
+
+
+def _proposals_from_filed_list(issues_document: dict) -> list[dict]:
+    """Map the top-level ``filed[]`` list that issues passes actually write.
+
+    ``issues_document`` is the parsed sidecar (``_read_sidecar`` wraps it under
+    ``data``). Every issues sidecar under ``evolution/issues/`` stores its
+    output as a top-level ``filed`` array of ``{letter, number, url, title,
+    labels, source, hook, priority_score, why_it_survived}``; none of them
+    carries the ``proposals`` container this module was originally written
+    against (verified against 2026-10-21, 2026-10-25 and 2026-10-26-b). Reading
+    only that container made every fallback cycle select zero issues while still
+    emitting a schema-valid report — the exact silent-empty failure the local
+    pass exists to prevent (#308).
+
+    The mapping is lossless about what the sidecar records: effort is reported
+    as unknown rather than invented, and the caller caps unknown-effort
+    selections accordingly.
+    """
+    out = []
+    for item in issues_document.get("filed") or []:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number") or item.get("issue")
+        if not number:
+            continue
+        out.append({
+            "issue_number": number,
+            "title": item.get("title", ""),
+            "priority_score": item.get("priority_score", 0.0),
+            "impact_score": item.get("impact", 0.0),
+            "effort_score": 0.0,
+            "effort_unknown": True,
+            "category": item.get("category", ""),
+            "selected_reason": "local-triage-filed-sidecar",
+            "already_implemented": False,
+            "status": "open",
+            "reason": item.get("source", ""),
+            "notes": item.get("why_it_survived", ""),
+            "claimed_artifact": item.get("hook", ""),
+        })
+    return out
+
+
 def _extract_proposals(
     issues_sidecar: dict, repo_root: Optional[Path] = None
 ) -> list[dict]:
@@ -107,6 +160,12 @@ def _extract_proposals(
                 "notes": p.get("notes", ""),
                 "claimed_artifact": p.get("claimed_artifact", ""),
             })
+
+    # #308: the `data.proposals` container is not the shape issues passes write.
+    # Fall back to the top-level `filed[]` list rather than returning an empty
+    # selection and calling it a quiet day.
+    if not proposals:
+        raw_candidates = _proposals_from_filed_list(data)
 
     # Wire verification into candidate selection pipeline (#2494)
     if repo_root is not None:
@@ -205,9 +264,17 @@ def run_local_triage(evolution_dir: Path, repo_root: Optional[Path] = None) -> d
     max_effort = cal["effort_budget"]
     selected = []
     total_effort = 0.0
+    unknown_effort_selected = 0
     for p in proposals:
         if total_effort + p["effort_score"] > max_effort:
             continue
+        # #308: a candidate whose effort the sidecar never recorded costs 0.0
+        # against the budget, so the effort cap alone cannot bound the list.
+        # Bound it by the documented per-run maximum instead.
+        if p.get("effort_unknown"):
+            if unknown_effort_selected >= _UNKNOWN_EFFORT_MAX_SELECTION:
+                continue
+            unknown_effort_selected += 1
         selected.append(p)
         total_effort += p["effort_score"]
 
@@ -221,6 +288,19 @@ def run_local_triage(evolution_dir: Path, repo_root: Optional[Path] = None) -> d
         "rejected": [],
         "selected_for_implementation": selected,
     }
+
+    # #308: make a fallback cycle visible in the artifact. The stage gate cannot
+    # tell a lost cycle from a quiet one (confidence 50 / branch `refine` is
+    # emitted on every triage run), so a selection read from `filed[]` says so
+    # here instead of looking like a normal, empty day.
+    if any(p.get("selected_reason") == "local-triage-filed-sidecar" for p in selected):
+        output["degraded"] = True
+        output["degraded_reason"] = (
+            "issues sidecar carried no data.proposals — selection was read from "
+            "the top-level filed[] list; per-issue effort is not recorded there, "
+            f"so selections with unknown effort were capped at "
+            f"{_UNKNOWN_EFFORT_MAX_SELECTION} (#308)"
+        )
 
     # Run claim audit on output (#2494)
     if resolved_repo is not None:
