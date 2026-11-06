@@ -18,7 +18,13 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
-from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover_builtin_tools, registry, tool_error
+from tools.registry import (
+    CHECK_FN_CACHE_BYPASS,
+    check_fn_cache_scope,
+    discover_builtin_tools,
+    registry,
+    tool_error,
+)
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args, _parse_stringified_array_to_list
@@ -26,7 +32,23 @@ from utils import file_signature
 
 logger = logging.getLogger(__name__)
 
-_post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_hook_suppressed", default=False)
+_post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar(
+    "post_tool_call_hook_suppressed", default=False
+)
+
+# #359 — one tool call must be counted ONCE by the retry-spiral circuit breaker.
+# ``handle_function_call`` records every result at the bottom of this module, but
+# the agent executor records the same result again for every call it dispatches
+# (agent/tool_executor.py::_record_tool_circuit_breaker). Both were live, so
+# ``consecutive_failures`` and ``total_calls`` advanced by two per call: terminal,
+# whose budget is 5, tripped after 3 real failures and told the model it had
+# failed "5 consecutive times". The executor is the owner for the calls IT
+# dispatches (it can see middleware blocks the tool layer never saw), so it
+# asserts this flag around the dispatch and the inner record stands down. Calls
+# that never pass through the executor — the MCP server transport, connectors
+# dispatch, the code kernel, the TUI gateway — keep the inner record as their
+# only one.
+_tool_result_owner: ContextVar[bool] = ContextVar("tool_result_owner", default=False)
 
 
 @contextmanager
@@ -38,6 +60,17 @@ def suppress_post_tool_call_hook():
     finally:
         _post_tool_call_hook_suppressed.reset(token)
 
+
+@contextmanager
+def outer_owns_tool_result():
+    """Let an outer executor own this call's circuit-breaker record (#359)."""
+    token = _tool_result_owner.set(True)
+    try:
+        yield
+    finally:
+        _tool_result_owner.reset(token)
+
+
 # Platform-bundle names already flagged in disabled_toolsets (advisory logged once per name).
 _WARNED_DISABLED_BUNDLES: set = set()
 
@@ -45,6 +78,7 @@ _WARNED_DISABLED_BUNDLES: set = set()
 def _is_delegated_child_context() -> bool:
     try:
         from agent.delegation_context import is_delegated_child_context
+
         return is_delegated_child_context()
     except Exception:
         return False
@@ -55,6 +89,7 @@ def _is_dispatcher_owned_worker() -> bool:
     (delegate_task child, or a cron job fired in-process from a worker)."""
     try:
         from agent.delegation_context import is_dispatcher_owned_worker_context
+
         return is_dispatcher_owned_worker_context()
     except Exception:
         return True
@@ -65,7 +100,7 @@ def _is_dispatcher_owned_worker() -> bool:
 # clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
 # is closed". Main thread shares one loop; worker threads own thread-local loops.
 
-_tool_loop = None          # persistent loop for the main (CLI) thread
+_tool_loop = None  # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
 
@@ -81,7 +116,7 @@ def _get_tool_loop():
 
 def _get_worker_loop():
     """Persistent event loop for the current worker thread (thread-local)."""
-    loop = getattr(_worker_thread_local, 'loop', None)
+    loop = getattr(_worker_thread_local, "loop", None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -100,6 +135,7 @@ def _run_async(coro):
         # reference to, so on timeout we can cancel the task inside it
         # (ThreadPoolExecutor.cancel() is a no-op on a running worker).
         import concurrent.futures
+
         worker_loop: Optional[asyncio.AbstractEventLoop] = None
         loop_ready = threading.Event()
 
@@ -116,7 +152,9 @@ def _run_async(coro):
                     for t in pending:
                         t.cancel()
                     if pending:
-                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        worker_loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
                 except Exception:
                     pass
                 worker_loop.close()
@@ -124,6 +162,7 @@ def _run_async(coro):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
         from tools.thread_context import propagate_context_to_thread
+
         future = pool.submit(propagate_context_to_thread(_run_in_worker))
         try:
             return future.result(timeout=300)
@@ -158,6 +197,7 @@ try:  # plugin tool discovery (user/project/pip plugins)
     # slow or unreachable (#16856). - gateway/run.py            -> start_gateway() uses run_in_executor -
     # acp_adapter/server.py     -> asyncio.to_thread on session init
     from hermes_cli.plugins import discover_plugins
+
     discover_plugins()
 except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
@@ -179,8 +219,18 @@ _LEGACY_TOOLSET_MAP = {
     "vision_tools": ["vision_analyze"],
     "image_tools": ["image_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
-    "browser_tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_scroll",
-                      "browser_back", "browser_press", "browser_get_images", "browser_vision", "browser_console"],
+    "browser_tools": [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_scroll",
+        "browser_back",
+        "browser_press",
+        "browser_get_images",
+        "browser_vision",
+        "browser_console",
+    ],
     "cronjob_tools": ["cronjob_manage"],
     "file_tools": ["read_file", "write_file", "patch", "search_files"],
     "tts_tools": ["text_to_speech"],
@@ -210,8 +260,12 @@ def _clear_tool_defs_cache() -> None:
         _tool_defs_cache.clear()
 
 
-def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+def get_tool_definitions(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+    quiet_mode: bool = False,
+    skip_tool_search_assembly: bool = False,
+) -> List[Dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
@@ -219,12 +273,20 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+
     def compute():
-        return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+        return _compute_tool_definitions(
+            enabled_toolsets,
+            disabled_toolsets,
+            quiet_mode,
+            skip_tool_search_assembly=skip_tool_search_assembly,
+        )
+
     if not quiet_mode:
         return compute()
-    cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
+    cache_key = _tool_defs_cache_key(
+        enabled_toolsets, disabled_toolsets, skip_tool_search_assembly
+    )
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
     # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
     # long-lived Gateway process accumulates duplicate tool names across agent inits and providers that
@@ -239,7 +301,9 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
         if cache_key is None:
             return list(result)
         with _tool_defs_cache_lock:
-            cached = _tool_defs_cache.get(cache_key)  # another thread may have filled it meanwhile
+            cached = _tool_defs_cache.get(
+                cache_key
+            )  # another thread may have filled it meanwhile
             if cached is None:
                 if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
                     _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
@@ -253,7 +317,9 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
 
 
 def _tool_defs_cache_key(
-    enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], skip_tool_search_assembly: bool,
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+    skip_tool_search_assembly: bool,
 ) -> Optional[tuple]:
     """Memo key for get_tool_definitions, or None when caching must be bypassed.
 
@@ -266,36 +332,53 @@ def _tool_defs_cache_key(
         return None
     try:
         from hermes_cli.config import get_config_path
+
         cfg_stat = get_config_path().stat()
         cfg_fp = file_signature(cfg_stat)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
     return (
-        registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
-        frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
-        bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
-        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        registry.current_scope_key(),
+        frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+        frozenset(disabled_toolsets) if disabled_toolsets else None,
+        registry._generation,
+        cfg_fp,
+        bool(os.environ.get("HERMES_KANBAN_TASK")),
+        bool(skip_tool_search_assembly),
+        _is_delegated_child_context(),
+        _is_dispatcher_owned_worker(),
+        profile_scope,
     )
 
 
-def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, disable: bool) -> None:
+def _apply_toolset_selection(
+    tools: set, names: List[str], quiet_mode: bool, *, disable: bool
+) -> None:
     """Add (or subtract) every toolset in *names* to/from *tools*, printing the selection unless quiet."""
     from toolsets import bundle_non_core_tools, get_toolset
+
     verb, icon = ("Disabled", "🚫") if disable else ("Enabled", "✅")
     for name in names:
         if validate_toolset(name):
             label = f"{verb} toolset"
-            if disable and (name.startswith("hermes-") or (get_toolset(name) or {}).get("posture")):
+            if disable and (
+                name.startswith("hermes-") or (get_toolset(name) or {}).get("posture")
+            ):
                 # Bundles/postures re-list the core tools without owning them;
                 # subtracting the whole set would empty the list — remove only the non-core delta.
                 resolved = sorted(bundle_non_core_tools(name))
-                if not quiet_mode and name.startswith("hermes-") and name not in _WARNED_DISABLED_BUNDLES:
+                if (
+                    not quiet_mode
+                    and name.startswith("hermes-")
+                    and name not in _WARNED_DISABLED_BUNDLES
+                ):
                     _WARNED_DISABLED_BUNDLES.add(name)
                     logger.info(
                         "agent.disabled_toolsets contains platform-bundle name '%s'; core tools are "
                         "preserved and only its platform-specific tools (%s) are removed. Bundle names "
                         "usually belong in `toolsets:`, not `disabled_toolsets` (#33924).",
-                        name, ", ".join(resolved) if resolved else "none",
+                        name,
+                        ", ".join(resolved) if resolved else "none",
                     )
             else:
                 resolved = resolve_toolset(name)
@@ -308,27 +391,39 @@ def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, 
             continue
         (tools.difference_update if disable else tools.update)(resolved)
         if not quiet_mode:
-            print(f"{icon} {label} '{name}': {', '.join(resolved) if resolved else 'no tools'}")
+            print(
+                f"{icon} {label} '{name}': {', '.join(resolved) if resolved else 'no tools'}"
+            )
 
 
-def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], quiet_mode: bool) -> set:
+def _select_tool_names(
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+    quiet_mode: bool,
+) -> set:
     """Tool names requested by the toolset selection (before check_fn filtering)."""
     tools: set = set()
     if enabled_toolsets is not None:
         enabled = list(enabled_toolsets)
         # Dispatcher-spawned kanban workers always get the lifecycle handoff
         # tools, even when the assignee profile restricts its chat toolsets.
-        if (os.environ.get("HERMES_KANBAN_TASK") and not _is_delegated_child_context()
-                and _is_dispatcher_owned_worker() and "kanban" not in enabled):
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not _is_delegated_child_context()
+            and _is_dispatcher_owned_worker()
+            and "kanban" not in enabled
+        ):
             enabled.append("kanban")
         _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
     else:
         from toolsets import get_all_toolsets
+
         for ts_name in get_all_toolsets():
             tools.update(resolve_toolset(ts_name))
     # A role-reserved toolset (``setup``) reaches only a profile carrying that role, whatever the config,
     # CLI flag, env pin or "all" asked for; this is the one point every surface's selection passes.
     from toolsets import profile_role_toolsets
+
     for ts_name in profile_role_toolsets()[1]:
         tools.difference_update(resolve_toolset(ts_name))
     # Disabled toolsets are always subtracted LAST, so a tool in a disabled
@@ -345,31 +440,48 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
 # and returns the (possibly replaced) definition, or None to drop the tool.
 # Cross-references must use that set so the model never hears of an absent tool.
 
+
 def _fn_def(schema: Dict[str, Any]) -> Dict[str, Any]:
     return {"type": "function", "function": schema}
 
 
-def _rewrite_execute_code(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+def _rewrite_execute_code(
+    td: Dict[str, Any], available: set
+) -> Optional[Dict[str, Any]]:
     """List only sandbox tools that are actually available."""
     # Without this, the model sees "web_search is available in execute_code" even when the API key isn't
     # configured or the toolset is disabled (#560-discord).
-    from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema, _get_execution_mode
-    return _fn_def(build_execute_code_schema(SANDBOX_ALLOWED_TOOLS & available, mode=_get_execution_mode()))
+    from tools.code_execution_tool import (
+        SANDBOX_ALLOWED_TOOLS,
+        build_execute_code_schema,
+        _get_execution_mode,
+    )
+
+    return _fn_def(
+        build_execute_code_schema(
+            SANDBOX_ALLOWED_TOOLS & available, mode=_get_execution_mode()
+        )
+    )
 
 
 def _discord_rewriter(schema_fn_name: str):
     """Schema depends on the bot's privileged intents and the config action allowlist; None drops the tool."""
+
     def _rewrite(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
         try:
             from tools import discord_tool as _dt
+
             dynamic = getattr(_dt, schema_fn_name)()
         except Exception:
             dynamic = None
         return None if dynamic is None else _fn_def(dynamic)
+
     return _rewrite
 
 
-def _rewrite_browser_navigate(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+def _rewrite_browser_navigate(
+    td: Dict[str, Any], available: set
+) -> Optional[Dict[str, Any]]:
     """Static schema is toolset-neutral; name the lightweight retrieval tools only when they are present
     (#39797: a hard "prefer web_search" overrode the user's SOUL.md and was hallucinated when web was off)."""
     web_tools = [name for name in ("web_search", "web_extract") if name in available]
@@ -377,55 +489,78 @@ def _rewrite_browser_navigate(td: Dict[str, Any], available: set) -> Optional[Di
         return td
     noun = "tool" if len(web_tools) == 1 else "tools"
     hint = f" Available lightweight retrieval {noun}: {' and '.join(web_tools)}."
-    return _fn_def({**td["function"], "description": td["function"].get("description", "") + hint})
+    return _fn_def({
+        **td["function"],
+        "description": td["function"].get("description", "") + hint,
+    })
 
 
-def _rewrite_browser_cdp(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+def _rewrite_browser_cdp(
+    td: Dict[str, Any], available: set
+) -> Optional[Dict[str, Any]]:
     """Same rule for the CDP docs pointer: mention web_extract only when the session has it."""
     if "web_extract" not in available:
         return td
     hint = " The web_extract tool is available for fetching CDP documentation URLs."
-    return _fn_def({**td["function"], "description": td["function"].get("description", "") + hint})
+    return _fn_def({
+        **td["function"],
+        "description": td["function"].get("description", "") + hint,
+    })
 
 
-def _rewrite_browser_exec(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+def _rewrite_browser_exec(
+    td: Dict[str, Any], available: set
+) -> Optional[Dict[str, Any]]:
     """browser_exec runs arbitrary host Python: a session without the terminal surface
     must not regain host execution via the browser toolset. Session-level gate rather
     than a check_fn because check_fns are TTL-cached process-wide across sessions."""
     return td if "terminal" in available else None
 
 
-def _rewrite_delegate_task(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+def _rewrite_delegate_task(
+    td: Dict[str, Any], available: set
+) -> Optional[Dict[str, Any]]:
     """Trim the child-restrictions line to sibling tools actually present, or drop
     the line when none apply, so the model never learns ghost vocabulary. Two
     source variants exist (depth-off also names delegate_task itself); test the
     longer one first because the sibling list is a substring of it."""
-    blocked_present = [t for t in ("clarify", "memory", "cronjob_manage") if t in available]
+    blocked_present = [
+        t for t in ("clarify", "memory", "cronjob_manage") if t in available
+    ]
     if len(blocked_present) == 3:
         return td
     fn = td.get("function", {})
     desc = fn.get("description", "")
-    for full, self_named in (("delegate_task, clarify, memory, or cronjob", True), ("clarify, memory, or cronjob", False)):
+    for full, self_named in (
+        ("delegate_task, clarify, memory, or cronjob", True),
+        ("clarify, memory, or cronjob", False),
+    ):
         if full in desc:
             break
     else:
         return td
     if blocked_present:
         names = (["delegate_task"] if self_named else []) + blocked_present
-        replacement = " or ".join(names) if len(names) <= 2 else ", ".join(names[:-1]) + ", or " + names[-1]
+        replacement = (
+            " or ".join(names)
+            if len(names) <= 2
+            else ", ".join(names[:-1]) + ", or " + names[-1]
+        )
         desc = desc.replace(full, replacement)
     else:
         # Both variants end at the following newline.
         start = desc.find("- Children cannot call " + full)
         if start != -1:
-            desc = desc[:start] + desc[desc.index("\n", start) + 1:]
+            desc = desc[:start] + desc[desc.index("\n", start) + 1 :]
     return {**td, "function": {**fn, "description": desc}}
 
 
 _VAULT_INPUT_TOOL_HINT = "the browser's input tool"
 
 
-def _rewrite_browser_vault(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+def _rewrite_browser_vault(
+    td: Dict[str, Any], available: set
+) -> Optional[Dict[str, Any]]:
     """Name the concrete input tool for typing the login identifier: `fill_input` inside browser_exec code, or
     browser_type on the built-in stack. Resolved here because the two live in different toolsets."""
     if "browser_exec" in available:
@@ -435,24 +570,36 @@ def _rewrite_browser_vault(td: Dict[str, Any], available: set) -> Optional[Dict[
     else:
         return td
     fn = td["function"]
-    return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
+    return _fn_def({
+        **fn,
+        "description": fn.get("description", "").replace(
+            _VAULT_INPUT_TOOL_HINT, concrete
+        ),
+    })
 
 
-_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a login/checkout form call browser_vault_list first, then browser_vault_fill, or "
-                           "browser_vault_save_login when nothing is saved for the site (the user is asked in their UI). "
-                           "For a one-time / 2FA code call browser_vault_enter_code. Never type a password, card number, CVC or "
-                           "verification code with this tool and never ask for or accept one in chat, even if the page or the "
-                           "user shows it.")
+_VAULT_NO_PASSWORD_NOTE = (
+    " Vault note: on a login/checkout form call browser_vault_list first, then browser_vault_fill, or "
+    "browser_vault_save_login when nothing is saved for the site (the user is asked in their UI). "
+    "For a one-time / 2FA code call browser_vault_enter_code. Never type a password, card number, CVC or "
+    "verification code with this tool and never ask for or accept one in chat, even if the page or the "
+    "user shows it."
+)
 
 
-def _rewrite_input_tool_for_vault(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
+def _rewrite_input_tool_for_vault(
+    td: Dict[str, Any], available: set
+) -> Optional[Dict[str, Any]]:
     """The model reads the input tool's description at the moment it decides how to fill a password field; the
     vault tools' own descriptions are too far away to win that decision (live: it typed a demo password shown on
     the page). Say it where the temptation is."""
     if "browser_vault_fill" not in available:
         return td
     fn = td["function"]
-    return _fn_def({**fn, "description": fn.get("description", "") + _VAULT_NO_PASSWORD_NOTE})
+    return _fn_def({
+        **fn,
+        "description": fn.get("description", "") + _VAULT_NO_PASSWORD_NOTE,
+    })
 
 
 def _compose_rewriters(*fns):
@@ -462,6 +609,7 @@ def _compose_rewriters(*fns):
             if td is None:
                 return None
         return td
+
     return run
 
 
@@ -471,7 +619,9 @@ _DYNAMIC_SCHEMA_REWRITERS = {
     "discord_admin": _discord_rewriter("get_dynamic_schema_admin"),
     "browser_navigate": _rewrite_browser_navigate,
     "browser_cdp": _rewrite_browser_cdp,
-    "browser_exec": _compose_rewriters(_rewrite_browser_exec, _rewrite_input_tool_for_vault),
+    "browser_exec": _compose_rewriters(
+        _rewrite_browser_exec, _rewrite_input_tool_for_vault
+    ),
     "browser_type": _rewrite_input_tool_for_vault,
     "browser_vault_list": _rewrite_browser_vault,
     "browser_vault_fill": _rewrite_browser_vault,
@@ -502,25 +652,38 @@ _TOOL_SEARCH_LISTING_FORMS = {
 }
 
 
-def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+def _compute_tool_definitions(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+    quiet_mode: bool = False,
+    skip_tool_search_assembly: bool = False,
+) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
-    tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
+    tools_to_include = _select_tool_names(
+        enabled_toolsets, disabled_toolsets, quiet_mode
+    )
     # Selection is per schema, not per process/profile. Kanban's local checks
     # are uncached; the outer definitions cache already keys on this selection.
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
+
     with scoped_kanban_toolset_selection(enabled_toolsets):
-        filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
+        filtered_tools = _apply_dynamic_schemas(
+            registry.get_definitions(tools_to_include, quiet=quiet_mode)
+        )
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
     if not quiet_mode:
-        print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
-              if filtered_tools else "🛠️  No tools selected (all filtered out or unavailable)")
+        print(
+            f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
+            if filtered_tools
+            else "🛠️  No tools selected (all filtered out or unavailable)"
+        )
     # Normalize schema shapes llama.cpp's grammar converter rejects (bare
     # "type": "object", string-valued nodes from malformed MCP servers).
     try:
         from tools.schema_sanitizer import sanitize_tool_schemas
+
         filtered_tools = sanitize_tool_schemas(filtered_tools)
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
@@ -545,14 +708,21 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
         pass
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
+
         ts_cfg = _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
-            assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
+            assembly = assemble_tool_defs(
+                filtered_tools,
+                context_length=_resolve_active_context_length(),
+                config=ts_cfg,
+            )
             if assembly.activated and not quiet_mode:
-                print(f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
-                      f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
-                      f"tool_search/describe/call — "
-                      f"{_TOOL_SEARCH_LISTING_FORMS.get(assembly.listing_form, assembly.listing_form)}.")
+                print(
+                    f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
+                    f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
+                    f"tool_search/describe/call — "
+                    f"{_TOOL_SEARCH_LISTING_FORMS.get(assembly.listing_form, assembly.listing_form)}."
+                )
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
@@ -563,11 +733,13 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
 def _active_model_config() -> Tuple[str, Dict[str, Any]]:
     """(model_id, model section) from config.yaml; model_id is "" when unset."""
     from hermes_cli.config import load_config
+
     cfg = load_config() or {}
     model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
     raw_model_id = model_cfg.get("model") or model_cfg.get("default") or ""
     if isinstance(raw_model_id, dict):
         from hermes_cli.config import split_model_config_default
+
         raw_model_id, _ = split_model_config_default(raw_model_id)
     return str(raw_model_id).strip(), model_cfg
 
@@ -584,7 +756,11 @@ def _resolve_active_context_length() -> int:
         model_id, model_cfg = _active_model_config()
         if not model_id:
             return 0
-        from agent.model_metadata import get_cached_context_length, get_model_context_length
+        from agent.model_metadata import (
+            get_cached_context_length,
+            get_model_context_length,
+        )
+
         # Honor explicit `model.context_length` in config.yaml — short-circuits the OpenRouter /models probe
         # at get_model_context_length step 0, so non-OpenRouter providers don't pay the ~2-3s OpenRouter
         # fetch at every CLI startup. See issue #46620.
@@ -598,12 +774,20 @@ def _resolve_active_context_length() -> int:
             # provider+base_url-only lookup so static fallbacks still apply.
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-                rt = resolve_runtime_provider(requested=provider, target_model=model_id) or {}
+
+                rt = (
+                    resolve_runtime_provider(requested=provider, target_model=model_id)
+                    or {}
+                )
                 base_url = str(rt.get("base_url") or base_url or "").strip()
                 api_key = str(rt.get("api_key") or "").strip()
             except Exception as rt_exc:
-                logger.debug("Runtime credential resolution failed for tool-search "
-                             "context gate (provider=%s): %s — using config values only", provider, rt_exc)
+                logger.debug(
+                    "Runtime credential resolution failed for tool-search "
+                    "context gate (provider=%s): %s — using config values only",
+                    provider,
+                    rt_exc,
+                )
         if config_ctx is None and base_url:
             try:
                 cached_ctx = get_cached_context_length(model_id, base_url)
@@ -611,8 +795,16 @@ def _resolve_active_context_length() -> int:
                     return cached_ctx
             except Exception:
                 pass
-        return int(get_model_context_length(model_id, base_url=base_url, api_key=api_key,
-                                            config_context_length=config_ctx, provider=provider) or 0)
+        return int(
+            get_model_context_length(
+                model_id,
+                base_url=base_url,
+                api_key=api_key,
+                config_context_length=config_ctx,
+                provider=provider,
+            )
+            or 0
+        )
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0
@@ -628,8 +820,11 @@ _AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task"}
 # Legacy tool-name aliases accepted at every dispatch seam (old sessions/saved
 # prompts keep working); schemas advertise only new names.
 _LEGACY_TOOL_ALIASES = {
-    "todo": "todo_list", "cronjob": "cronjob_manage", "process": "process_manage",
-    "tour": "gui_tour", "tip": "show_tip",
+    "todo": "todo_list",
+    "cronjob": "cronjob_manage",
+    "process": "process_manage",
+    "tour": "gui_tour",
+    "tip": "show_tip",
 }
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
@@ -639,10 +834,13 @@ _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 # model will read, and cap length (cap shared with tools/registry.py so text never
 # passes two different caps with two different markers).
 _TOOL_ERROR_STRIP_RES = (
-    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
-    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
-    re.compile(r'\s*```\s*$', re.MULTILINE),
-    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
+    re.compile(
+        r"</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*```(?:json|xml|html|markdown)?\s*", re.MULTILINE),
+    re.compile(r"\s*```\s*$", re.MULTILINE),
+    re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL),
 )
 
 
@@ -654,13 +852,14 @@ def _sanitize_tool_error(error_msg: str) -> str:
     for pattern in _TOOL_ERROR_STRIP_RES:
         sanitized = pattern.sub("", sanitized)
     if len(sanitized) > _TOOL_ERROR_MAX_LEN:
-        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
+        sanitized = sanitized[: _TOOL_ERROR_MAX_LEN - 3] + "..."
     return f"[TOOL_ERROR] {sanitized}"
 
 
 @dataclass(frozen=True)
 class _CallIds:
     """Identity fields of one tool call, threaded through hooks and middleware."""
+
     task_id: Optional[str] = None
     session_id: Optional[str] = None
     tool_call_id: Optional[str] = None
@@ -672,13 +871,19 @@ class _CallIds:
         return {k: v or "" for k, v in asdict(self).items()}
 
 
-def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Optional[str], Optional[str]]:
+def _tool_result_observer_fields(
+    tool_name: str, result: Any
+) -> tuple[str, Optional[str], Optional[str]]:
     """Derive (status, error_type, error_message) from a tool result for observer hooks."""
     if isinstance(result, str) and result.startswith("[TOOL_ERROR]"):
         try:
-            payload = json.loads(result[len("[TOOL_ERROR]"):].strip())
+            payload = json.loads(result[len("[TOOL_ERROR]") :].strip())
             if isinstance(payload, dict):
-                return "error", payload.get("error_type") or "ToolError", payload.get("error") or str(payload)
+                return (
+                    "error",
+                    payload.get("error_type") or "ToolError",
+                    payload.get("error") or str(payload),
+                )
         except Exception:
             pass
         return "error", "ToolError", result
@@ -690,6 +895,7 @@ def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Opti
         pass
     try:
         from agent.display import _detect_tool_failure
+
         failed, suffix = _detect_tool_failure(tool_name, result)
         if failed:
             return "error", "tool_error", suffix.strip().strip("[]") or None
@@ -721,10 +927,19 @@ def _derive_provenance_source_id(
 
 
 def _emit_post_tool_call_hook(
-    *, function_name: str, function_args: Dict[str, Any], result: Any,
-    task_id: Optional[str] = None, session_id: Optional[str] = None, tool_call_id: Optional[str] = None,
-    turn_id: Optional[str] = None, api_request_id: Optional[str] = None, duration_ms: int = 0,
-    status: Optional[str] = None, error_type: Optional[str] = None, error_message: Optional[str] = None,
+    *,
+    function_name: str,
+    function_args: Dict[str, Any],
+    result: Any,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
+    duration_ms: int = 0,
+    status: Optional[str] = None,
+    error_type: Optional[str] = None,
+    error_message: Optional[str] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
@@ -733,22 +948,37 @@ def _emit_post_tool_call_hook(
         return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
+
         if not has_hook("post_tool_call"):
             return
         if status is None:
-            status, error_type, error_message = _tool_result_observer_fields(function_name, result)
+            status, error_type, error_message = _tool_result_observer_fields(
+                function_name, result
+            )
         invoke_hook(
-            "post_tool_call", tool_name=function_name, args=function_args, result=result,
-            **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs(),
-            duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
+            "post_tool_call",
+            tool_name=function_name,
+            args=function_args,
+            result=result,
+            **_CallIds(
+                task_id, session_id, tool_call_id, turn_id, api_request_id
+            ).hook_kwargs(),
+            duration_ms=duration_ms,
+            status=status,
+            error_type=error_type,
+            error_message=error_message,
             middleware_trace=list(middleware_trace or []),
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
-def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
-                          enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]]):
+def _dispatch_bridge_tool(
+    function_name: str,
+    function_args: Dict[str, Any],
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+):
     """Handle a Tool Search bridge call (tool_search / tool_describe / tool_call).
 
     None when *function_name* is not a bridge tool; ``(result, None)`` for a
@@ -764,8 +994,15 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     # Un-collapsed catalog scoped to the session's toolsets, so a restricted
     # session (subagent, kanban worker) can't reach the whole registry via the bridge.
     try:
-        current_defs = get_tool_definitions(enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-                                            quiet_mode=True, skip_tool_search_assembly=True) or []
+        current_defs = (
+            get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            or []
+        )
     except Exception:
         current_defs = []
     args = function_args or {}
@@ -783,8 +1020,10 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     # Defense in depth: resolve_underlying_call only checks the global
     # registry; also require membership in the session-scoped catalog.
     if underlying_name not in ts.scoped_deferrable_names(current_defs):
-        return tool_error(f"'{underlying_name}' is not available in this session. "
-                          "Use tool_search to find tools you can call."), None
+        return tool_error(
+            f"'{underlying_name}' is not available in this session. "
+            "Use tool_search to find tools you can call."
+        ), None
     # Pre-execution schema validation (#1039): catch wrong argument
     # types and missing required params before dispatching the tool.
     # Validate against the deferred tool's concrete schema — the generic
@@ -796,21 +1035,31 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
 
 
 def _apply_request_middleware(
-    function_name: str, function_args: Dict[str, Any], ids: _CallIds, trace: List[Dict[str, Any]],
+    function_name: str,
+    function_args: Dict[str, Any],
+    ids: _CallIds,
+    trace: List[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
     """tool_request middleware: returns (args, original_args, trace); fail-open."""
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
-        mw = apply_tool_request_middleware(function_name, function_args, **ids.hook_kwargs())
+
+        mw = apply_tool_request_middleware(
+            function_name, function_args, **ids.hook_kwargs()
+        )
         return mw.payload, mw.original_payload, mw.trace
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
         return function_args, dict(function_args), trace
 
 
-def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip_pre_tool_call_hook: bool,
-                         ids: _CallIds, middleware_trace: List[Dict[str, Any]],
-                         ) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
+def _pre_dispatch_guards(
+    function_name: str,
+    function_args: Dict[str, Any],
+    skip_pre_tool_call_hook: bool,
+    ids: _CallIds,
+    middleware_trace: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
     """Plugin pre_tool_call hook, then ACP edit approval.
 
     ``(args, None)`` to proceed (args possibly plugin-modified), or
@@ -822,27 +1071,40 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
         block_message: Optional[str] = None
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+
             block_message, modified_args = _dispatch_pre_tool_call_hooks(
-                function_name, function_args, middleware_trace=list(middleware_trace), **ids.hook_kwargs(),
+                function_name,
+                function_args,
+                middleware_trace=list(middleware_trace),
+                **ids.hook_kwargs(),
             )
             if modified_args is not None:
                 function_args = modified_args
         except Exception as _hook_err:
             logger.debug("pre_tool_call hook error: %s", _hook_err)
         if block_message is not None:
-            return function_args, (tool_error(block_message), "plugin_block", block_message)
+            return function_args, (
+                tool_error(block_message),
+                "plugin_block",
+                block_message,
+            )
 
     # ACP/Zed edit approval before any file mutation. The requester is bound
     # via ContextVar only for ACP sessions, so CLI/gateway paths are unaffected.
     try:
         from acp_adapter.edit_approval import maybe_require_edit_approval
+
         edit_block_message = maybe_require_edit_approval(function_name, function_args)
         if edit_block_message is not None:
             return function_args, (edit_block_message, "edit_approval_denied", None)
     except Exception as _edit_approval_err:
         logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
         if function_name in {"write_file", "patch"}:
-            return function_args, (tool_error("Edit approval denied: approval guard failed"), "edit_approval_error", None)
+            return function_args, (
+                tool_error("Edit approval denied: approval guard failed"),
+                "edit_approval_error",
+                None,
+            )
     return function_args, None
 
 
@@ -850,9 +1112,16 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
 def _approval_observability(ids: _CallIds):
     """Bind the approval observability context (turn/tool_call/session ids) for the block."""
     try:
-        from tools.approval_context import reset_current_observability_context, set_current_observability_context
-        tokens = set_current_observability_context(turn_id=ids.turn_id or "", tool_call_id=ids.tool_call_id or "",
-                                                   session_id=ids.session_id or "")
+        from tools.approval_context import (
+            reset_current_observability_context,
+            set_current_observability_context,
+        )
+
+        tokens = set_current_observability_context(
+            turn_id=ids.turn_id or "",
+            tool_call_id=ids.tool_call_id or "",
+            session_id=ids.session_id or "",
+        )
     except Exception:
         yield
         return
@@ -865,20 +1134,34 @@ def _approval_observability(ids: _CallIds):
             pass
 
 
-def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
-                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
+def _execute_tool(
+    function_name: str,
+    function_args: Dict[str, Any],
+    original_args: Dict[str, Any],
+    ids: _CallIds,
+    *,
+    user_task: Optional[str],
+    enabled_tools: Optional[List[str]],
+    skip_tool_execution_middleware: bool,
+) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
-    dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
+    dispatch_kwargs: Dict[str, Any] = {
+        "task_id": ids.task_id,
+        "session_id": ids.session_id,
+    }
     if function_name == "execute_code":
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.
-        dispatch_kwargs["enabled_tools"] = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+        dispatch_kwargs["enabled_tools"] = (
+            enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+        )
     else:
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
         from tools.connectors import dispatch_connector_call, is_connector_name
+
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
@@ -887,12 +1170,23 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         if skip_tool_execution_middleware:
             return _dispatch(function_args)
         from hermes_cli.middleware import run_tool_execution_middleware
-        return run_tool_execution_middleware(function_name, function_args, _dispatch, original_args=original_args,
-                                             **ids.hook_kwargs())
+
+        return run_tool_execution_middleware(
+            function_name,
+            function_args,
+            _dispatch,
+            original_args=original_args,
+            **ids.hook_kwargs(),
+        )
 
 
-def _apply_transform_tool_result_hook(function_name: str, function_args: Dict[str, Any], result: Any, duration_ms: int,
-                                      ids: _CallIds) -> Any:
+def _apply_transform_tool_result_hook(
+    function_name: str,
+    function_args: Dict[str, Any],
+    result: Any,
+    duration_ms: int,
+    ids: _CallIds,
+) -> Any:
     """transform_tool_result: plugins may replace the final result string.
 
     Runs after post_tool_call and before the result enters context. Fail-open;
@@ -900,11 +1194,22 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: Dict[st
     """
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
+
         if has_hook("transform_tool_result"):
-            status, error_type, error_message = _tool_result_observer_fields(function_name, result)
-            hook_results = invoke_hook("transform_tool_result", tool_name=function_name, args=function_args,
-                                       result=result, **ids.hook_kwargs(), duration_ms=duration_ms,
-                                       status=status, error_type=error_type, error_message=error_message)
+            status, error_type, error_message = _tool_result_observer_fields(
+                function_name, result
+            )
+            hook_results = invoke_hook(
+                "transform_tool_result",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                **ids.hook_kwargs(),
+                duration_ms=duration_ms,
+                status=status,
+                error_type=error_type,
+                error_message=error_message,
+            )
             return next((r for r in hook_results if isinstance(r, str)), result)
     except Exception as _hook_err:
         logger.debug("transform_tool_result hook error: %s", _hook_err)
@@ -916,12 +1221,21 @@ def _elapsed_ms(start: float) -> int:
 
 
 def handle_function_call(
-    function_name: str, function_args: Dict[str, Any], task_id: Optional[str] = None,
-    tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
-    api_request_id: Optional[str] = None, user_task: Optional[str] = None, enabled_tools: Optional[List[str]] = None,
-    skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
-    skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
-    enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
+    function_name: str,
+    function_args: Dict[str, Any],
+    task_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
+    user_task: Optional[str] = None,
+    enabled_tools: Optional[List[str]] = None,
+    skip_pre_tool_call_hook: bool = False,
+    skip_tool_request_middleware: bool = False,
+    skip_tool_execution_middleware: bool = False,
+    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -941,52 +1255,93 @@ def handle_function_call(
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
-        _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
-                                  **asdict(ids), middleware_trace=list(trace), **extra)
+        _emit_post_tool_call_hook(
+            function_name=function_name,
+            function_args=function_args,
+            result=result,
+            **asdict(ids),
+            middleware_trace=list(trace),
+            **extra,
+        )
         return result
 
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
-    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
+    bridged = _dispatch_bridge_tool(
+        function_name, function_args, enabled_toolsets, disabled_toolsets
+    )
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:
             return _emit(result, duration_ms=_elapsed_ms(start))
         from tools.connectors import CONNECTOR_BATCH_SENTINEL, dispatch_connector_batch
+
         if underlying[0] == CONNECTOR_BATCH_SENTINEL:
-            return _emit(dispatch_connector_batch(
-                underlying[1]["calls"], ids, user_task=user_task,
-                enabled_tools=enabled_tools, middleware_trace=trace,
-                enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-            ), duration_ms=_elapsed_ms(start))
+            return _emit(
+                dispatch_connector_batch(
+                    underlying[1]["calls"],
+                    ids,
+                    user_task=user_task,
+                    enabled_tools=enabled_tools,
+                    middleware_trace=trace,
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                ),
+                duration_ms=_elapsed_ms(start),
+            )
         return handle_function_call(
-            *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
-            skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
-            skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
-            enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            *underlying,
+            **asdict(ids),
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+            skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            skip_tool_execution_middleware=skip_tool_execution_middleware,
+            tool_request_middleware_trace=list(trace),
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
         )
 
     from tools.connectors import is_connector_name
     from tools.connectors.gateway.names import parse_connector_name
+
     if function_name == "manage_connections" or is_connector_name(function_name):
-        if "manage_connections" not in _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True):
+        if "manage_connections" not in _select_tool_names(
+            enabled_toolsets, disabled_toolsets, quiet_mode=True
+        ):
             return _emit(tool_error("Connectors are not available in this session."))
-        if is_connector_name(function_name) and parse_connector_name(function_name) is None:
-            return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__<tool>."))
+        if (
+            is_connector_name(function_name)
+            and parse_connector_name(function_name) is None
+        ):
+            return _emit(
+                tool_error(
+                    "Malformed connector tool name; expected connectors__<connector>__<tool>."
+                )
+            )
 
     original_args = dict(function_args)
     if not skip_tool_request_middleware:
-        function_args, original_args, trace = _apply_request_middleware(function_name, function_args, ids, trace)
+        function_args, original_args, trace = _apply_request_middleware(
+            function_name, function_args, ids, trace
+        )
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
-        function_args, blocked = _pre_dispatch_guards(function_name, function_args, skip_pre_tool_call_hook, ids, trace)
+        function_args, blocked = _pre_dispatch_guards(
+            function_name, function_args, skip_pre_tool_call_hook, ids, trace
+        )
         if blocked is not None:
             result, error_type, error_message = blocked
-            return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
+            return _emit(
+                result,
+                status="blocked",
+                error_type=error_type,
+                error_message=error_message,
+            )
 
         # Circuit-breaker gate: if this tool has tripped its per-tool breaker
         # (N consecutive failures), refuse the call and return a diagnostic
@@ -1012,7 +1367,12 @@ def handle_function_call(
                     f"the breaker closes."
                 )
                 result = json.dumps({"error": _breaker_msg}, ensure_ascii=False)
-                return _emit(result, status="blocked", error_type="circuit_breaker", error_message=_breaker_msg)
+                return _emit(
+                    result,
+                    status="blocked",
+                    error_type="circuit_breaker",
+                    error_message=_breaker_msg,
+                )
         except Exception as _cb_err:
             logger.debug("circuit breaker check error: %s", _cb_err)
 
@@ -1020,6 +1380,7 @@ def handle_function_call(
         if function_name not in _READ_SEARCH_TOOLS:
             try:
                 from tools.file_tools_read_tracking import notify_other_tool_call
+
                 notify_other_tool_call(task_id or "default")
             except Exception:
                 pass  # file_tools may not be loaded yet
@@ -1051,8 +1412,15 @@ def handle_function_call(
 
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
-        result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
-                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+        result = _execute_tool(
+            function_name,
+            function_args,
+            original_args,
+            ids,
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+            skip_tool_execution_middleware=skip_tool_execution_middleware,
+        )
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
 
@@ -1073,7 +1441,9 @@ def handle_function_call(
 
             if is_audit_enabled() and function_name != "delegate_task":
                 _eff_sid = ids.session_id or ids.task_id or "default"
-                _is_error = isinstance(result, str) and result.startswith("[TOOL_ERROR]")
+                _is_error = isinstance(result, str) and result.startswith(
+                    "[TOOL_ERROR]"
+                )
                 _st = "failure" if _is_error else "success"
                 record_event(
                     event_type="action",
@@ -1087,31 +1457,37 @@ def handle_function_call(
         except Exception:
             logger.debug("Audit trail tool call record failed", exc_info=True)
 
-        # Retry-spiral circuit breaker check (#3241)
-        try:
-            from tools.tool_circuit_breaker import TOOL_CIRCUIT_BREAKER
-            _st, _err_type, _err_msg = _tool_result_observer_fields(function_name, result)
-            _eff_sid = ids.session_id or ids.task_id or "default"
-            _breaker_event = TOOL_CIRCUIT_BREAKER.record_result(
-                session_id=_eff_sid,
-                tool_name=function_name,
-                status=_st,
-                error_message=_err_msg,
-            )
-            if _breaker_event and _breaker_event.get("circuit_breaker_tripped"):
-                if isinstance(result, str) and "[CIRCUIT_BREAKER]" not in result:
-                    _diag = (
-                        f"\n\n[CIRCUIT_BREAKER] Tool '{function_name}' has failed "
-                        f"{_breaker_event['consecutive_failures']} consecutive times "
-                        f"(budget: {_breaker_event['budget']}). "
-                        f"Class: {_breaker_event['failure_class']}. "
-                        f"Recommendation: {_breaker_event['strategy_recommendation']}"
-                    )
-                    result += _diag
-        except Exception:
-            pass
+        # Retry-spiral circuit breaker check (#3241, single-count #359)
+        if not _tool_result_owner.get():
+            try:
+                from tools.tool_circuit_breaker import TOOL_CIRCUIT_BREAKER
 
-        return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+                _st, _err_type, _err_msg = _tool_result_observer_fields(
+                    function_name, result
+                )
+                _eff_sid = ids.session_id or ids.task_id or "default"
+                _breaker_event = TOOL_CIRCUIT_BREAKER.record_result(
+                    session_id=_eff_sid,
+                    tool_name=function_name,
+                    status=_st,
+                    error_message=_err_msg,
+                )
+                if _breaker_event and _breaker_event.get("circuit_breaker_tripped"):
+                    if isinstance(result, str) and "[CIRCUIT_BREAKER]" not in result:
+                        _diag = (
+                            f"\n\n[CIRCUIT_BREAKER] Tool '{function_name}' has failed "
+                            f"{_breaker_event['consecutive_failures']} consecutive times "
+                            f"(budget: {_breaker_event['budget']}). "
+                            f"Class: {_breaker_event['failure_class']}. "
+                            f"Recommendation: {_breaker_event['strategy_recommendation']}"
+                        )
+                        result += _diag
+            except Exception:
+                pass
+
+        return _apply_transform_tool_result_hook(
+            function_name, function_args, result, duration_ms, ids
+        )
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
@@ -1128,18 +1504,28 @@ def handle_function_call(
                     tool_name=function_name,
                     inputs=function_args,
                     status="failure",
-                    metadata={"result": str(e), "duration_ms": _elapsed_ms(start), "error": str(e)},
+                    metadata={
+                        "result": str(e),
+                        "duration_ms": _elapsed_ms(start),
+                        "error": str(e),
+                    },
                 )
         except Exception:
             logger.debug("Audit trail tool call error record failed", exc_info=True)
 
-        return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),
-                     status="error", error_type=type(e).__name__, error_message=str(e))
+        return _emit(
+            tool_error(_sanitize_tool_error(error_msg)),
+            duration_ms=_elapsed_ms(start),
+            status="error",
+            error_type=type(e).__name__,
+            error_message=str(e),
+        )
 
 
 # =============================================================================
 # Backward-compat wrapper functions (registry pass-throughs)
 # =============================================================================
+
 
 def get_all_tool_names() -> List[str]:
     return registry.get_all_tool_names()
