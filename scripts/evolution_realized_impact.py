@@ -194,6 +194,31 @@ def signal_verified(records: List[Dict[str, Any]], issue: int) -> bool:
     return False
 
 
+def is_merge_record(rec: Dict[str, Any]) -> bool:
+    """Whether a ledger record describes a MERGE, not merely a verdict.
+
+    ``record_verdict`` writes a line carrying ``issue`` but no ``merged_at``;
+    keying "is this issue tracked?" on issue-presence alone therefore treats a
+    verdict-only line as proof that a merge happened (#320 defect 1). A merge
+    record is one that carries when it merged.
+    """
+    return bool(rec.get("merged_at"))
+
+
+def merge_record_for(
+    records: List[Dict[str, Any]], issue: int
+) -> Optional[Dict[str, Any]]:
+    """The newest MERGE record for ``issue``, or None if it was never merged.
+
+    Verdict-only records are skipped: they say what was observed, never that
+    something was merged to observe.
+    """
+    for rec in reversed(records):
+        if rec.get("issue") == issue and is_merge_record(rec):
+            return rec
+    return None
+
+
 def should_close_issue(
     records: List[Dict[str, Any]],
     issue: int,
@@ -210,6 +235,14 @@ def should_close_issue(
     - the merge is older than ``maturity_days`` AND no verdict exists (the
       verification step didn't run — close with a note that it was never
       verified, rather than leaving it open indefinitely).
+
+    FAIL-CLOSED (#320): when the ledger holds no MERGE record for the issue —
+    no line at all, or only a verdict-only line — the gate refuses to close.
+    "No record of a merge" is not evidence the fix worked; treating it as a
+    pass let ``check-close`` return CLOSE for every issue on a host whose
+    ledger contained one integration-stage change record with no ``issue`` key
+    at all (0 of 1 records carry one). Absent evidence reads as HOLD, never as
+    a pass.
 
     If the verdict is "no-signal" or "regressed", returns ``(False, reason)``
     so the issue stays open for a focused regression — this is the core fix
@@ -230,14 +263,13 @@ def should_close_issue(
     comparison sees the real drop. Verdicts are ANDed — every targeted reason
     must improve to clear the gate; any flat/regressed reason keeps it open.
     """
-    rec = None
-    for r in reversed(records):
-        if r.get("issue") == issue:
-            rec = r
-            break
-
+    rec = merge_record_for(records, issue)
     if rec is None:
-        return True, "not tracked in ledger — no signal to verify"
+        return False, (
+            f"no merge record for #{issue} in the realized-impact ledger — "
+            "cannot verify a post-merge signal, so the gate fails CLOSED. "
+            "Record the merge with `record-merge` first"
+        )
 
     verdict = rec.get("verdict")
     if verdict in VERDICTS_GOOD:
@@ -357,6 +389,7 @@ def compute_realized(
     that made the rate crater from ~55% to 20% in five merges' time on real
     data. Filtering first gives a stable, apples-to-apples sample.
     """
+
     def _is_mature(r: Dict[str, Any]) -> bool:
         days = _days_between(r.get("merged_at"), today)
         return days is not None and days >= maturity_days
@@ -377,9 +410,7 @@ def compute_realized(
 
     # Every window entry is mature by construction, so any without ANY verdict
     # is matured-but-unverified — the verification step never recorded one.
-    matured_unverified = [
-        r for r in window if r.get("verdict") not in VERDICTS_ANY
-    ]
+    matured_unverified = [r for r in window if r.get("verdict") not in VERDICTS_ANY]
 
     realized_rate = (len(confirmed) / len(verdicted)) if verdicted else None
 
@@ -506,31 +537,79 @@ def main(argv: List[str]) -> int:
     # issue to be marked resolved. Prints ``CLOSE`` or ``HOLD`` + the reason
     # and exits 0 when the issue may close, 1 when it must stay open.
     if args and args[0] == "check-close":
+        usage = (
+            "usage: evolution_realized_impact.py check-close "
+            "<issue> [<YYYY-MM-DD>] [--current-rate <failures/session>]"
+        )
         try:
             issue = int(args[1])
-            today = args[2] if len(args) > 2 else None
         except (IndexError, ValueError):
-            print(
-                "usage: evolution_realized_impact.py check-close <issue> [<YYYY-MM-DD>]",
-                file=sys.stderr,
-            )
+            print(usage, file=sys.stderr)
             return 2
+        # The date is POSITIONAL but optional, so a flag may arrive where a date
+        # would. --current-rate used to be captured as ``today``, which then
+        # parsed as 0 days since merge and reported a fictional maturity (#320).
+        # Walk the tail explicitly: a flag consumes its own value, so neither the
+        # flag nor its value can be mistaken for the date.
+        current_rate = None
+        today = None
+        i = 2
+        while i < len(args):
+            tok = args[i]
+            if tok == "--current-rate":
+                if i + 1 >= len(args):
+                    print("check-close: --current-rate needs a value", file=sys.stderr)
+                    return 2
+                try:
+                    current_rate = float(args[i + 1])
+                except ValueError:
+                    print(
+                        f"check-close: --current-rate {args[i + 1]!r} is not a number",
+                        file=sys.stderr,
+                    )
+                    return 2
+                i += 2
+                continue
+            if tok.startswith("-"):
+                print(f"check-close: unknown option {tok!r}\n{usage}", file=sys.stderr)
+                return 2
+            if today is not None:
+                print(
+                    f"check-close: unexpected argument {tok!r}\n{usage}",
+                    file=sys.stderr,
+                )
+                return 2
+            today = tok
+            i += 1
+        if today is not None:
+            try:
+                from datetime import date as _date
+
+                _date.fromisoformat(today)
+            except ValueError:
+                print(
+                    f"check-close: {today!r} is not an ISO date (YYYY-MM-DD)",
+                    file=sys.stderr,
+                )
+                return 2
         if not today:
             from datetime import datetime, timezone
 
             today = datetime.now(timezone.utc).date().isoformat()
-        # Optional --current-rate <rate>: current per-session failure rate for the
-        # rate-normalization override (#1324). Enables re-checking a "regressed"
-        # verdict against the stored baseline rate instead of raw counts.
-        current_rate = None
-        if "--current-rate" in args:
-            i = args.index("--current-rate")
-            if i + 1 < len(args):
-                try:
-                    current_rate = float(args[i + 1])
-                except ValueError:
-                    current_rate = None
         records = load_ledger(ledger_file)
+        # Exit codes are a contract the introspection skill branches on:
+        #   0 CLOSE         — signal verified (or matured unverified)
+        #   1 HOLD          — a merge exists and the signal did NOT verify
+        #   3 UNVERIFIABLE  — no merge record: never a pass, and never a
+        #                     "regression" verdict either — the ledger simply
+        #                     has nothing to judge, so do not re-open on it.
+        if merge_record_for(records, issue) is None:
+            print(
+                f"[realized-impact] #{issue} UNVERIFIABLE: no merge record in the "
+                "ledger — refusing to close (fail-closed). Record the merge with "
+                "`record-merge` before gating.",
+            )
+            return 3
         should, reason = should_close_issue(
             records, issue, today, current_failure_rate=current_rate
         )
