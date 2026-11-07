@@ -916,7 +916,14 @@ class SearchMixin:
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))
                 for f in all_files]
         bounded_sigpipe = result.exit_code == 141 and len(all_files) >= fetch_limit
-        if result.exit_code not in {0, 1, 124} and not bounded_sigpipe:
+        partial_failure = result.exit_code not in {0, 1, 124} and not bounded_sigpipe
+        # #364: ripgrep exits 2 on a PARTIAL error — one unreadable path among
+        # readable ones — yet still writes every filename it could read to stdout.
+        # Discarding that listing turned ten real paths into "permission_denied"
+        # and a dead end. Mirror the content path (_parse_search_output, :232):
+        # surface the error only when nothing usable survived; otherwise keep the
+        # listing and carry a bounded warning naming what rg could not read.
+        if partial_failure and not all_files:
             if order == "modified":
                 return SearchResult(error=(
                     "Exact modification-time order failed; ripgrep 14+ is "
@@ -940,9 +947,19 @@ class SearchMixin:
                     "this transport — check that the path exists and is searchable, then "
                     "retry with a narrower path or glob.")
             return SearchResult(error=message)
+        listing_warning = None
+        if partial_failure:
+            detail = (result.stderr or "").strip()
+            detail = "\n".join(detail.splitlines()[:6])[:800]
+            listing_warning = (
+                f"File search partially failed (ripgrep exit code {result.exit_code}); "
+                f"returning the {len(all_files)} path(s) it could read.")
+            if detail:
+                listing_warning += f" ripgrep reported:\n{detail}"
         return SearchResult(
             files=all_files[offset:offset + limit], total_count=len(all_files),
-            truncated=len(all_files) > offset + limit or bool(limit_reason), limit_reason=limit_reason)
+            truncated=len(all_files) > offset + limit or bool(limit_reason),
+            limit_reason=limit_reason, warning=listing_warning)
 
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
