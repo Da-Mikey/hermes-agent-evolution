@@ -29,9 +29,23 @@ NVAPI_PATTERN = r"nvapi-[A-Za-z0-9_-]{20,}"
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
+    # Isolate only what THIS module registers: snapshot every other source first and
+    # put it back afterwards. ``_reset_plugin_redaction_patterns()`` drops ALL sources,
+    # and a plugin registers its patterns as an import side effect (honcho registers
+    # ``hch-at-``/``hch-rt-`` at import), so an all-or-nothing clear here permanently
+    # un-registered them for the rest of the process and made any later test that
+    # relies on those patterns (tests/honcho_plugin/test_auth_recovery.py) fail purely
+    # because this file ran first — a test-order dependence, not a redaction bug.
+    saved = {
+        source: list(patterns)
+        for source, patterns in redact_mod._PLUGIN_PREFIX_PATTERNS.items()
+    }
     _reset_plugin_redaction_patterns()
     yield
-    _reset_plugin_redaction_patterns()
+    with redact_mod._registry_lock:
+        redact_mod._PLUGIN_PREFIX_PATTERNS.clear()
+        redact_mod._PLUGIN_PREFIX_PATTERNS.update(saved)
+        redact_mod._rebuild_prefix_matcher()
 
 
 # ── Baseline ────────────────────────────────────────────────────────────
