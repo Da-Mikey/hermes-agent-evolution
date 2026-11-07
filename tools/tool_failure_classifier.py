@@ -52,6 +52,12 @@ class ToolFailureCategory(str, Enum):
     not_found = "not_found"
     permission_denied = "permission_denied"
     safety_gate_blocked = "safety_gate_blocked"
+    # #365 — a gate that refuses a call ON PURPOSE and hands the model the exact
+    # recovery in its own payload (stale-read-before-write, and the families
+    # tracked by #352). Not a defect: it is a decision, it is retryable by
+    # following the instruction, and publishing it as a failure corrupts both
+    # agent behaviour and the failure census that reads these categories.
+    designed_refusal = "designed_refusal"
     rate_limited = "rate_limited"
     # Quota/billing exhaustion on a sub-tool's paid backend (vision model,
     # search API, etc.). Unlike ``rate_limited`` (which clears over time),
@@ -148,6 +154,7 @@ _CATEGORY_RETRYABLE: dict[ToolFailureCategory, bool] = {
     ToolFailureCategory.not_found: False,
     ToolFailureCategory.permission_denied: False,
     ToolFailureCategory.safety_gate_blocked: False,
+    ToolFailureCategory.designed_refusal: True,
     ToolFailureCategory.rate_limited: True,
     ToolFailureCategory.quota_exhausted: False,
     ToolFailureCategory.transient_network: True,
@@ -178,6 +185,13 @@ SAFETY_GATE_RECOVERY_HINT = (
 
 _CATEGORY_HINTS: dict[ToolFailureCategory, str] = {
     ToolFailureCategory.safety_gate_blocked: SAFETY_GATE_RECOVERY_HINT,
+    ToolFailureCategory.designed_refusal: (
+        "The tool refused this call by design and its own payload carries the "
+        "recovery (see next_action / recovery_hint). This is not a malfunction "
+        "and not a dead end: follow that instruction and call the tool again. "
+        "Do not repeat the identical call unchanged — the gate will refuse it "
+        "again for the same reason."
+    ),
     ToolFailureCategory.tool_unavailable: (
         "The tool or one of its dependencies is unavailable (not installed, not "
         "connected, or disabled). Do not retry — switch to an alternative tool "
@@ -261,6 +275,17 @@ def _rule(
 _BUILTIN_RULES: list[_Rule] = [
     # Pre-execution refusal, never a tool/dependency failure or retry prompt.
     _rule(r"tool execution blocked by safety gate:", ToolFailureCategory.safety_gate_blocked),
+    # #365 — write_file's stale-read guard is a DESIGNED refusal, and its own
+    # payload carries the recovery ("read it through to its last line, then call
+    # write_file again"). Classified as a failure it used to be stamped
+    # `Non-retryable: persistent_error` while the next_action in the same
+    # envelope told the model to retry — 40 of 45 sessions resolved the
+    # contradiction by ignoring the stamp, the rest stalled. It must be
+    # retryable-by-instruction: a designed refusal is not a tool defect.
+    _rule(
+        r"Refusing to overwrite[^\n]*The file was NOT modified",
+        ToolFailureCategory.designed_refusal,
+    ),
     # Argument-shaped "X not found" (missing required field / edit's old_string)
     # before the generic not_found rule.
     _rule(
