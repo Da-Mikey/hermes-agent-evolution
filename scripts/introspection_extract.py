@@ -217,7 +217,7 @@ _LOOP_GUARD_BLOCK_RE = re.compile(
     r"|end your turn|without resolving the task|blocked operation)",
     re.IGNORECASE,
 )
-_EXPECTED_REFUSAL_CLASSES = ("question_gate", "security_scan", "loop_guard")
+_EXPECTED_REFUSAL_CLASSES = ("question_gate", "security_scan", "loop_guard", "stale_write")
 
 # --- refusal-recovery detection (issue #1366, Child B of #1327) --------------
 # #1356 told the agent to propose an alternative path before refusing for a
@@ -534,6 +534,11 @@ def _expected_refusal_class(content: Any) -> Optional[str]:
     # The harm/safety gate stamps a machine-readable reason; trust it first.
     if data.get("reason") == "safety-gate-blocked":
         return "security_scan"
+    # #365 — the stale-read-before-write guard stamps a boolean and carries its
+    # own recovery. A designed refusal, not a failure: read the flag, never the
+    # prose (the same no-raw-text contract as everything else in here).
+    if data.get("stale_write_blocked") is True:
+        return "stale_write"
     if _QUESTION_GATE_RE.search(haystack):
         return "question_gate"
     if _SECURITY_SCAN_RE.search(haystack):
