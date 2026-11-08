@@ -16,5 +16,48 @@
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
     "checked_at": "2026-10-01",
     "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin)."
+  },
+  "release_assessment_20261108": {
+    "latest_release_checked": "v0.23.0",
+    "release_name": "Hermes Agent v0.23.0 - The Hearth Release",
+    "published_at": "2026-11-05T21:32:33Z",
+    "run_date": "2026-11-08",
+    "marker_guard": "git merge-base --is-ancestor v0.23.0 origin/main -> FALSE (not integrated; proceed)",
+    "divergence": {
+      "behind_upstream_main": 22342,
+      "ahead_of_upstream_main": 1634,
+      "commits_v2026.9.24_to_v0.23.0": 21110,
+      "commits_v0.22.7_to_v0.23.0": 808
+    },
+    "merge_trial": {
+      "method": "git worktree add --detach <tmp> v0.23.0; git merge --no-commit --no-ff origin/main; counted; aborted clean (0 dirty entries)",
+      "conflicting_files": 259,
+      "changed_entries": 1462,
+      "conflict_areas": "tests 58, tools 47, .github 36, agent 32, hermes_cli 22, root 15, gateway 14, cron 10, plugins 7",
+      "trend_across_releases": "v0.22.5=246, v0.22.6=258, v0.22.7=259, v0.23.0=259 (flat, not accelerating)"
+    },
+    "decision": "defer-full-merge",
+    "decision_reason": "259 conflicting files at 22,342 commits behind is a cost judgement past the skill's 'code conflicts + 400+ behind -> skip' threshold. Structural divergence, not a broken fork. Owner's call whether to rebase.",
+    "merge_base_with_main": "f97608f (the v0.21.5 release commit) - a future full merge remains possible",
+    "measurement_trap": "git merge-tree --write-tree is NOT a conflict count; only a real git merge --no-commit in a throwaway worktree gives a comparable number.",
+    "security_in_window": {
+      "published_advisories": 0,
+      "cve_tagged_commits": 0,
+      "approval_and_consent_commits": [
+        "267bf8faf9 fix(approval): walk carrier scripts for wmic, not just their first word - DEFERRED: patches _WmicShadowDeleteMatcher, which does not exist in this fork (our approval_detection.py has zero wmic rules); rides with the full merge",
+        "b7628b4abf fix(approval): pipe-to-shell keeps every case main caught - DEFERRED: patches _PipeRemoteToShellMatcher, absent from this fork",
+        "ef1dbcfcbb fix(approval): keep the bare mode-off result in check_dangerous_command - DEFERRED: 1-line, but our check_dangerous_command has a different shape; low value alone",
+        "14f74b3f89 fix(mcp): consent line never masks a flag after a secret flag - DEFERRED: tools/connectors/mcp_launch.py does not exist in this fork"
+      ],
+      "dependency_bumps": "body-parser 1.20.9, setuptools 84.1.0, qs 6.16.1, zod 4.6.7 (node/packaging, not in our runtime path)",
+      "measured_fork_gaps_vs_v0.23.0": "pipe-to-shell behind a launcher (sudo/env/doas/nohup/exec/command): ours MISSED, upstream FLAGGED -> FIXED this run in PR #368. Shared gaps (both miss): bare interpreter name, su -c, ssh host."
+    },
+    "backports_carried": [
+      "PR #368 (this run): pipe-to-shell sees through launchers - 34 tests, 970-test regression sweep, ruff clean",
+      "PR #362: secret-redaction hardening (44 commits, 35 proven leaks closed)",
+      "PR #346, #324, #294, #264, #276, #191: earlier approval-gate, CDP, dependency-CVE and plugin-gate backports"
+    ],
+    "stale_pr_warning": "PR #295 (chore/upstream-sync-state-20261026) is NOT a safe place to append: its branch would revert ~7,768 lines across 55 files (cron/drift_guard.py, tools/file_write_merge.py deleted). Superseded by this branch; recommend closing.",
+    "_note": "v0.23.0 is NOT merged. integrated_tag deliberately stays v2026.9.24 and synced_through_commit is untouched: release-track assessments are recorded here, not in the incremental cursor."
   }
 }
