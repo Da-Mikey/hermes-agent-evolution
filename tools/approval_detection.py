@@ -205,6 +205,48 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
+# ---- Pipe-to-shell launchers --------------------------------------------------------------
+# A launcher word between the pipe and the shell (`curl … | sudo bash`) is the same attack: the
+# fetched script runs, now with whatever privilege the launcher grants. The sink is therefore
+# matched through an optional chain of wrappers, each wrapper's flags skipped — values only for
+# options that actually take one, so `sudo -u bob bash` keeps `bash` as the sink while
+# `sudo -pl bash` (where `l` is the value of -p) is not mistaken for a privileged lookup.
+_PIPE_LAUNCHER_VALUE_FLAGS = {
+    "sudo": ("ugUCDhpRrtT", ("user", "group", "other-user", "close-from", "chdir", "host", "prompt",
+                             "role", "type", "command-timeout", "chroot")),
+    "doas": ("uC", ()),
+    # `-S STRING` is the command itself (split into words), never a swallowed value.
+    "env": ("uCa", ("unset", "chdir", "argv0")),
+    "exec": ("a", ()),
+    "command": ("", ()),
+    "nohup": ("", ()),
+    "setsid": ("", ()),
+    "builtin": ("", ()),
+}
+
+
+def _pipe_launcher_re(name: str, short: str, long_opts: tuple) -> str:
+    """One launcher: its name, then any run of the flags and assignments it may carry."""
+    valued = [rf"(?-i:-[^\W{short}\d-]*+[{short}])\s++[^\s|;&<>]++"] if short else []
+    valued += [rf"--(?:{'|'.join(long_opts)})\s++[^\s|;&<>]++"] if long_opts else []
+    duration = r"(?:infinity|\d++(?:\.\d++)?(?:e\d++)?|\.\d++)[smhd]?(?=\s)"
+    args = "|".join([*valued, r"-[^\s|;&<>]++", r"\w++=[^\s|;&<>]*+", duration])
+    return rf"{name}(?:\s++(?>{args}))*+"
+
+
+_PIPE_LAUNCHERS_RE = (
+    r"(?:\s*+(?:" + "|".join(_pipe_launcher_re(n, s, o)
+                             for n, (s, o) in _PIPE_LAUNCHER_VALUE_FLAGS.items()) + r")\s++)*+"
+)
+# Lookup/list modes name a shell without running it (`curl … | command -v bash`, `sudo -l bash`).
+# In `sudo -pl bash` the `l` is the VALUE of -p and bash does run, so only flags outside sudo's
+# value-taking set may precede the `l`.
+_PIPE_LOOKUP_RE = (
+    r"(?!\s*(?:command\s+-[a-zA-Z]*[vV]"
+    r"|sudo\s+(?:-(?-i:[^\WugUCDhpRrtT\d])*(?-i:l)|--list))\b)"
+)
+
+
 # ---- Dangerous command patterns -----------------------------------------------------------
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
@@ -291,7 +333,8 @@ DANGEROUS_PATTERNS = [
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
     # Shell -c is parsed structurally by _execution_flag_findings(); a regex searching a dash-token
     # for "c" also matched --norc/--rcfile/--restricted.
-    (rf'\b(curl|wget)\b.*\|\s*(?:[/\w]*/)?(?:{_SHELL_NAMES_RE})(?:\s|$|-c)', "pipe remote content to shell"),
+    (rf"\b(curl|wget)\b.*\|{_PIPE_LOOKUP_RE}\s*{_PIPE_LAUNCHERS_RE}['\"]?(?:[/\w]*/)?(?:{_SHELL_NAMES_RE})(?:\s|$|-c)",
+     "pipe remote content to shell"),
     (rf'\b(?:{_SHELL_NAMES_RE})\s+<\s*<?\s*\(\s*(curl|wget)\b', "execute remote script via process substitution"),
     # eval/source/. $(curl ...) — equivalent to piping remote content to a shell.
     (r'(?:\beval\b|\bsource\b|\.)\s*(?:\$\(\s*|`\s*)(?:curl|wget)\b', "execute remote content via command substitution"),
