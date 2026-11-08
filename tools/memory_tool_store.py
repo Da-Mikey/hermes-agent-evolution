@@ -37,12 +37,15 @@ except ImportError:
 
 logger = logging.getLogger("tools.memory_tool")
 
+
 def get_memory_dir() -> Path:
     try:
         from tools import memory_tool
+
         return memory_tool.get_memory_dir()
     except Exception:
         return get_hermes_home() / "memories"
+
 
 MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (your personal notes)",
@@ -172,7 +175,12 @@ def _entry_grounding(stored: str) -> tuple[str, str, str, str]:
     """
     entry, superseded_at = parse_supersession(stored)
     text, source, trust = parse_provenance(entry)
-    return text, source, trust, "revised" if superseded_at is not None else "unacknowledged"
+    return (
+        text,
+        source,
+        trust,
+        "revised" if superseded_at is not None else "unacknowledged",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +207,75 @@ from tools.memory_governance import (
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
     return _first_threat_message(content, scope="strict")
+
+
+# Flag set for the memory-write redactor (issue #370). Memory is unlike a tool
+# result: it is persisted, cloned by ``profiles.py``, and re-injected into the
+# system prompt on *every* turn of *every* later session, so a secret written
+# once is egress forever. The flags are therefore tuned for maximum coverage:
+#
+#   force=True               — memory is a hard egress boundary; never inherit
+#                              ``security.redact_secrets: false``.
+#   file_read=True           — yields the NON-REUSABLE sentinel
+#                              (``«redacted:sk-…»``) rather than a head/tail mask.
+#                              A mask still looks like a usable credential, so the
+#                              model could write it back as a dead key (#35519).
+#   secret_file=True         — REQUIRED alongside file_read: ``file_read`` implies
+#                              ``code_file``, which skips the ENV/JSON assignment
+#                              pass, so ``api_key="…"`` would pass through
+#                              untouched. ``secret_file`` is authoritative and
+#                              re-enables it (verified 2026-11-08: file_read
+#                              alone leaked an assignment value).
+#   redact_url_credentials=True
+#                            — catches the ``user:pass@`` userinfo form. Left off
+#                              globally because magic-link/OAuth URLs must survive
+#                              tool flows (#34029); a memory entry is never a
+#                              round-trip workflow, so masking here cannot break one.
+_MEMORY_REDACT_FLAGS: Dict[str, Any] = {
+    "force": True,
+    "file_read": True,
+    "secret_file": True,
+    "redact_url_credentials": True,
+}
+
+
+def _redact_memory_content(content: str) -> Tuple[str, bool]:
+    """Redact credentials from memory content before it is persisted (#370).
+
+    Returns ``(content, redacted)`` where ``redacted`` says whether anything was
+    masked. The caller must surface that flag to the model: a silent redaction
+    leaves the model believing the literal value is stored, and it will "fix"
+    the entry by retrying with the same secret.
+
+    Total function — on any failure the content is returned unchanged rather
+    than raising, matching ``tools.credential_masking.mask_credentials``. A
+    redactor bug must not make memory unwritable; the injection screen and the
+    provenance validator stay the hard gates.
+    """
+    if not isinstance(content, str) or not content:
+        return content, False
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(content, **_MEMORY_REDACT_FLAGS)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("memory credential redaction failed: %s", exc)
+        return content, False
+    if not isinstance(redacted, str):
+        return content, False
+    return redacted, redacted != content
+
+
+def _redaction_notice() -> str:
+    """Model-facing explanation attached when a memory write was redacted."""
+    return (
+        "NOTE: credential-shaped text in this entry was redacted before storage "
+        "(replaced by a non-reusable «redacted:…» sentinel). The raw value was "
+        "deliberately NOT stored, because memory is re-injected into the system "
+        "prompt on every future turn. Do not retry with the literal secret: it "
+        "will be redacted again. Keep credentials in the environment or a secrets "
+        "file and record only a reference here."
+    )
 
 
 def _make_provenance(source_class: str, trust_tier: str):
@@ -302,6 +379,7 @@ def _read_failed_error(path: "Path") -> Dict[str, Any]:
 DEFAULT_MEMORY_CHAR_LIMIT = 2200
 DEFAULT_USER_CHAR_LIMIT = 1375
 
+
 def _find_unique_match(entries: List[str], old_text: str) -> Tuple[Optional[int], bool]:
     """``(index, ambiguous)`` for entries matching *old_text*.
 
@@ -319,39 +397,44 @@ def _find_unique_match(entries: List[str], old_text: str) -> Tuple[Optional[int]
     return (matches[0] if matches else None), False
 
 
-
-
 def _pinned_index(entries: List[str], matched_entry: str) -> Optional[int]:
     """Index of the exact entry a staged write was reviewed against; None once it is gone (stale)."""
     return entries.index(matched_entry) if matched_entry in entries else None
 
 
 def _stale_entry_message(entry: str) -> str:
-    return (f"Entry changed since it was staged, so this write was not applied: '{entry}' is no longer "
-            f"in memory as reviewed. Recreate the change against the current entry or reject it; the "
-            f"pending record has been preserved.")
+    return (
+        f"Entry changed since it was staged, so this write was not applied: '{entry}' is no longer "
+        f"in memory as reviewed. Recreate the change against the current entry or reject it; the "
+        f"pending record has been preserved."
+    )
 
 
-def _locate_stored(entries: List[str], old_text: str, matched_entry: Optional[str] = None):
+def _locate_stored(
+    entries: List[str], old_text: str, matched_entry: Optional[str] = None
+):
     """``(index, error_dict)``. Error is set for a stale pin or an ambiguous match.
     Index is None with no error when nothing matched (the caller phrases the miss)."""
     if matched_entry is not None:
         idx = _pinned_index(entries, matched_entry)
         if idx is None:
-            return None, {"success": False, "error": _stale_entry_message(matched_entry)}
+            return None, {
+                "success": False,
+                "error": _stale_entry_message(matched_entry),
+            }
         return idx, None
     idx, ambiguous = _find_unique_match(entries, old_text)
     if ambiguous:
         displays = [parse_provenance(e)[0] for e in entries]
-        previews = [d[:80] + ("..." if len(d) > 80 else "") for d in displays if old_text in d]
+        previews = [
+            d[:80] + ("..." if len(d) > 80 else "") for d in displays if old_text in d
+        ]
         return None, {
             "success": False,
             "error": f"Multiple entries matched '{old_text}'. Be more specific.",
             "matches": previews,
         }
     return idx, None
-
-
 
 
 # Optional third value of an _apply closure: a dict merged into the success payload —
@@ -674,10 +757,16 @@ class MemoryStore:
         # add/replace, so the oversized block would silently ride in the prompt while every later
         # add is refused with no visible cause (#10877). Warn; never truncate a user's memories.
         for target in ("memory", "user"):
-            if (count := self._char_count(target)) > (limit := self._char_limit(target)):
-                logger.warning("%s exceeds its char limit on load: %d/%d chars. Entries stay loaded; "
-                               "further additions are blocked until it is back under the limit.",
-                               self._path_for(target).name, count, limit)
+            if (count := self._char_count(target)) > (
+                limit := self._char_limit(target)
+            ):
+                logger.warning(
+                    "%s exceeds its char limit on load: %d/%d chars. Entries stay loaded; "
+                    "further additions are blocked until it is back under the limit.",
+                    self._path_for(target).name,
+                    count,
+                    limit,
+                )
 
     @staticmethod
     def _sanitize_entries_for_snapshot(
@@ -794,7 +883,10 @@ class MemoryStore:
         TimeoutError with a diagnostic message.
         """
         lock_path = path.with_suffix(path.suffix + ".lock")
-        from tools import memory_tool as _mt  # fcntl/msvcrt live (and are patched) there
+        from tools import (
+            memory_tool as _mt,
+        )  # fcntl/msvcrt live (and are patched) there
+
         fcntl, msvcrt = _mt.fcntl, _mt.msvcrt
         from hermes_constants import mkdir_under_hermes_home
 
@@ -842,6 +934,7 @@ class MemoryStore:
         if the lock isn't acquired within *timeout* seconds.
         """
         from tools import memory_tool as _mt  # tests patch fcntl here
+
         fcntl = _mt.fcntl
         timeout = timeout if timeout is not None else MemoryStore._LOCK_TIMEOUT_SECONDS
         deadline = time.monotonic() + timeout
@@ -1025,7 +1118,9 @@ class MemoryStore:
             "usage": self._usage(target),
         })
 
-    def _mutate(self, target: str, mutate, *, skip_drift: bool = False) -> Dict[str, Any]:
+    def _mutate(
+        self, target: str, mutate, *, skip_drift: bool = False
+    ) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -1185,6 +1280,13 @@ class MemoryStore:
         if guard_event is not None:
             _log_guard_event("add", target, guard_event)
 
+        # Credential redaction (issue #370): the injection screen above blocks a
+        # narrow assignment-syntax secret shape and lets everything else through,
+        # and what it lets through is persisted and re-injected into the system
+        # prompt on every future turn. Redact the value here — the write still
+        # succeeds, the secret does not survive.
+        content, redacted = _redact_memory_content(content)
+
         # The string actually stored on disk carries the optional trailer.
         stored = encode_provenance(content, source_class, trust_tier)
 
@@ -1248,6 +1350,11 @@ class MemoryStore:
                     )
                     # Surface exactly what was dropped — never silent.
                     resp["evicted"] = evicted
+                    if redacted:
+                        resp["redacted"] = True
+                        # Separate key: "_success_response" owns "note" and sets
+                        # the anti-thrash "do not repeat it" instruction there.
+                        resp["redaction_note"] = _redaction_notice()
                     return resp
 
                 current = self._char_count(target)
@@ -1271,7 +1378,13 @@ class MemoryStore:
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        resp = self._success_response(target, "Entry added.")
+        if redacted:
+            # Never a silent redaction: the model must know the literal was not
+            # stored, or it will "fix" the entry by retrying with the secret.
+            resp["redacted"] = True
+            resp["redaction_note"] = _redaction_notice()
+        return resp
 
     def replace(
         self,
@@ -1312,6 +1425,10 @@ class MemoryStore:
             return {"success": False, "error": scan_error}
         if guard_event is not None:
             _log_guard_event("replace", target, guard_event)
+
+        # Credential redaction (issue #370) — same boundary as add(): a
+        # replacement can smuggle a secret in just as easily as a fresh entry.
+        new_content, redacted = _redact_memory_content(new_content)
 
         stored_new = encode_provenance(new_content, source_class, trust_tier)
 
@@ -1361,12 +1478,16 @@ class MemoryStore:
                         len(evicted),
                         "y" if len(evicted) == 1 else "ies",
                     )
-                    return self._success_response(
+                    resp = self._success_response(
                         target,
                         "Entry replaced (evicted %d oldest entr%s to make room)."
                         % (len(evicted), "y" if len(evicted) == 1 else "ies"),
                         replaced_entry=overwritten,
                     )
+                    if redacted:
+                        resp["redacted"] = True
+                        resp["redaction_note"] = _redaction_notice()
+                    return resp
                 current = self._char_count(target)
                 return self._consolidation_failure({
                     "success": False,
@@ -1387,11 +1508,17 @@ class MemoryStore:
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(
+        resp = self._success_response(
             target, "Entry replaced.", replaced_entry=overwritten
         )
+        if redacted:
+            resp["redacted"] = True
+            resp["redaction_note"] = _redaction_notice()
+        return resp
 
-    def remove(self, target: str, old_text: str, matched_entry: Optional[str] = None) -> Dict[str, Any]:
+    def remove(
+        self, target: str, old_text: str, matched_entry: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         old_text = old_text.strip()
         if not old_text:
@@ -1620,8 +1747,13 @@ class MemoryStore:
                 continue
             if min_rank is not None and _trust_rank(tier) < min_rank:
                 continue
-            row = {"text": text, "source_class": src, "trust_tier": tier,
-                   "grounding": _entry_grounding(entry)[3], "authorizes_actions": False}
+            row = {
+                "text": text,
+                "source_class": src,
+                "trust_tier": tier,
+                "grounding": _entry_grounding(entry)[3],
+                "authorizes_actions": False,
+            }
             if sup_ts is not None:
                 row["superseded_at"] = sup_ts
             rows.append(row)
@@ -1714,6 +1846,7 @@ class MemoryStore:
             replaced_entries: Dict[int, str] = {}
             removed_entries: Dict[int, str] = {}
             limit = self._char_limit(target, dynamic_limit=memory_char_limit)
+            redacted = False
 
             for i, op in enumerate(operations):
                 op = op or {}
@@ -1721,6 +1854,16 @@ class MemoryStore:
                 content = (op.get("content") or op.get("new_text") or "").strip()
                 old_text = (op.get("old_text") or "").strip()
                 pos = f"Operation {i + 1} ({act or 'unknown'})"
+
+                # Credential redaction (#370). This batch path writes into
+                # ``working`` directly and never calls add()/replace(), so it needs
+                # its own call site — and it is the one that carries the real
+                # exposure (every credential-shaped payload measured on the live
+                # store was an ``operations[].content``). Redact per-op so the
+                # dedupe/locate logic below matches on the stored form.
+                if act in {"add", "replace"} and content:
+                    content, op_redacted = _redact_memory_content(content)
+                    redacted = redacted or op_redacted
 
                 if act == "add":
                     if not content:
@@ -1742,9 +1885,13 @@ class MemoryStore:
                             f"{pos}: content is required (use action='remove' to delete).",
                             limit=limit,
                         )
-                    idx, loc_err = _locate_stored(working, old_text, op.get("matched_entry"))
+                    idx, loc_err = _locate_stored(
+                        working, old_text, op.get("matched_entry")
+                    )
                     if loc_err:
-                        return self._batch_error(target, f"{pos}: {loc_err['error']}", limit=limit)
+                        return self._batch_error(
+                            target, f"{pos}: {loc_err['error']}", limit=limit
+                        )
                     if idx is None:
                         return self._batch_error(
                             target,
@@ -1759,9 +1906,13 @@ class MemoryStore:
                         return self._batch_error(
                             target, f"{pos}: old_text is required.", limit=limit
                         )
-                    idx, loc_err = _locate_stored(working, old_text, op.get("matched_entry"))
+                    idx, loc_err = _locate_stored(
+                        working, old_text, op.get("matched_entry")
+                    )
                     if loc_err:
-                        return self._batch_error(target, f"{pos}: {loc_err['error']}", limit=limit)
+                        return self._batch_error(
+                            target, f"{pos}: {loc_err['error']}", limit=limit
+                        )
                     if idx is None:
                         return self._batch_error(
                             target,
@@ -1785,11 +1936,15 @@ class MemoryStore:
                 # commit an empty file as a normal successful write. Refuse; single
                 # remove() is the deliberate-wipe path.
                 label = self._path_for(target).name
-                return self._batch_failure(target, (
-                    f"Refusing to empty {label}: this batch would remove every entry from a "
-                    f"previously non-empty store. Keep at least one entry — merge overlapping "
-                    f"entries into a shorter one instead of removing the last one. To delete the "
-                    f"final entry deliberately, use single remove() calls."))
+                return self._batch_failure(
+                    target,
+                    (
+                        f"Refusing to empty {label}: this batch would remove every entry from a "
+                        f"previously non-empty store. Keep at least one entry — merge overlapping "
+                        f"entries into a shorter one instead of removing the last one. To delete the "
+                        f"final entry deliberately, use single remove() calls."
+                    ),
+                )
             new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
             if new_total > limit:
                 current = self._char_count(target)
@@ -1816,6 +1971,11 @@ class MemoryStore:
             extra["replaced_entries"] = replaced_entries
         if removed_entries:
             extra["removed_entries"] = removed_entries
+        if redacted:
+            # #370: never a silent redaction — say so, or the model re-sends the
+            # same secret believing the write failed to store it literally.
+            extra["redacted"] = True
+            extra["redaction_note"] = _redaction_notice()
         return self._success_response(
             target, f"Applied {len(operations)} operation(s).", limit=limit, **extra
         )
@@ -1841,7 +2001,6 @@ class MemoryStore:
             "usage": f"{current:,}/{effective_limit:,}",
         })
 
-
     def resolve_entry(self, target: str, old_text: str, verb: str) -> Dict[str, Any]:
         """Full entry *old_text* selects now, under the lock, or the error a direct edit would return."""
         old_text = (old_text or "").strip()
@@ -1864,7 +2023,9 @@ class MemoryStore:
                 })
             return {"success": True, "matched_entry": entries[idx]}
 
-    def resolve_batch_entries(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def resolve_batch_entries(
+        self, target: str, operations: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """Dry-run match of a batch under the lock. Success carries ``matched_entries`` (None for add)."""
         if not operations:
             return {"success": False, "error": "operations list is empty."}
@@ -1874,7 +2035,10 @@ class MemoryStore:
             if act in {"add", "replace"} and new_content:
                 scan_error = _scan_memory_content(new_content)
                 if scan_error:
-                    return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
+                    return {
+                        "success": False,
+                        "error": f"Operation {i + 1}: {scan_error}",
+                    }
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target, skip_drift=True)
             if bak is _READ_FAILED:
@@ -1889,22 +2053,34 @@ class MemoryStore:
                 pos = f"Operation {i + 1} ({act or 'unknown'})"
                 if act == "add":
                     if not content:
-                        return {"success": False, "error": f"{pos}: content is required."}
+                        return {
+                            "success": False,
+                            "error": f"{pos}: content is required.",
+                        }
                     matched.append(None)
                     if content not in working:
                         working.append(content)
                     continue
                 if act not in ("replace", "remove"):
-                    return {"success": False, "error": f"{pos}: unknown action. Use add, replace, or remove."}
+                    return {
+                        "success": False,
+                        "error": f"{pos}: unknown action. Use add, replace, or remove.",
+                    }
                 if not old_text:
                     return {"success": False, "error": f"{pos}: old_text is required."}
                 if act == "replace" and not content:
-                    return {"success": False, "error": f"{pos}: content is required (use action='remove' to delete)."}
+                    return {
+                        "success": False,
+                        "error": f"{pos}: content is required (use action='remove' to delete).",
+                    }
                 idx, loc_err = _locate_stored(working, old_text, None)
                 if loc_err:
                     return {"success": False, "error": f"{pos}: {loc_err['error']}"}
                 if idx is None:
-                    return {"success": False, "error": f"{pos}: no entry matched '{old_text}'."}
+                    return {
+                        "success": False,
+                        "error": f"{pos}: no entry matched '{old_text}'.",
+                    }
                 matched.append(working[idx])
                 if act == "replace":
                     working[idx] = content
@@ -2178,5 +2354,3 @@ def load_on_disk_store() -> "MemoryStore":
     )
     store.load_from_disk()
     return store
-
-
