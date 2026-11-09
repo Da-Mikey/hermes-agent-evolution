@@ -651,6 +651,13 @@ def enable_profile_log_routing(profile_homes: Sequence[str | Path]) -> bool:
     if len(homes) < 2:
         return False
 
+    # v0.23.0's redact engine reads only in-memory policy on the formatter thread: the
+    # profile's own redact_secrets policy must be recorded when routing is set up, or its
+    # records fall back to the secure default and an opted-out profile is redacted anyway.
+    from agent.redact import resolve_profile_policy
+    for home in homes:
+        resolve_profile_policy(home)
+
     with _queue_state_lock:
         if not _queued_file_handlers:
             return False
