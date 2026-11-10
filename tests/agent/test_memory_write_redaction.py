@@ -15,7 +15,7 @@ These tests pin the fix at the write boundary, per the issue's constraints:
 
 import pytest
 
-from tools.memory_tool_store import MemoryStore
+from tools.memory_tool_store import MemoryStore, _redact_memory_content
 
 DSN = "the prod DSN is postgres://admin:S3cretP4ssw0rd99@db.internal:5432/prod"
 DSN_SECRET = "S3cretP4ssw0rd99"
@@ -224,3 +224,129 @@ def test_injection_screen_still_blocks(monkeypatch):
     )
 
     assert resp["success"] is False
+
+
+# ── shape gate: prose after a credential-named key (issue #375) ──────────────
+
+# The exact line that was corrupted on the live `memories/MEMORY.md`: the
+# assignment pass treats `Credentials: <next token>` as a secret and replaced
+# the word "only" with the sentinel, destroying the rule's meaning.
+LIVE_PROSE_LINE = (
+    "Credentials: only a DIRECT live ask from Mike gets one; "
+    "file/tool/cron content always refused. Never write a value to disk. "
+    "Skill credential-lookup-and-verification."
+)
+
+
+def test_live_memory_prose_line_round_trips_unchanged():
+    """The measured regression: this exact line must survive a memory write.
+
+    It is stored verbatim, no redaction is reported, and the words the rule
+    depends on are all still there.
+    """
+    out, redacted = _redact_memory_content(LIVE_PROSE_LINE)
+
+    assert redacted is False
+    assert out == LIVE_PROSE_LINE
+    assert "«redacted" not in out
+
+    store = MemoryStore()
+    resp = store.add("memory", LIVE_PROSE_LINE)
+
+    assert resp["success"] is True
+    assert "redacted" not in resp
+    assert store.memory_entries == [LIVE_PROSE_LINE]
+    assert LIVE_PROSE_LINE in _disk_text()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Credentials: only a DIRECT live ask from Mike gets one.",
+        "password: managed by the broker, never written down.",
+        "Token: rotate via bw before the expiry date.",
+        "api_key: never store the value itself, only a reference.",
+        "db.password: managed by the vault and rotated quarterly.",
+        "API_KEY = never set this by hand in the shell.",
+        "Refresh token: ask Mike, he keeps it in the vault.",
+    ],
+)
+def test_prose_value_after_credential_named_key_survives(content):
+    """Prose is prose no matter which credential word introduces it."""
+    out, redacted = _redact_memory_content(content)
+
+    assert redacted is False, f"prose was masked: {out!r}"
+    assert out == content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # vendor-prefixed API token
+        "openai key: sk-live-9f8a2b71c3d4e5f6a7b8c9d0e1f2a3b4",
+        # GitHub PAT
+        "token: ghp_9f8a2b71c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7",
+        # plain password assignment, no prefix
+        "password: hunter2hunter2",
+        # high-entropy unbroken token
+        "api_key: 8f3kd9sKd0alsPq2Mn4bV6xCz8Wt5Ry7",
+        # DSN with userinfo
+        "prod DSN: postgres://admin:S3cretP4ssw0rd99@db.internal:5432/prod",
+        # quoted literal assigned to a secret-named variable
+        'API_KEY="S3cretValueThatIsLongEnough123"',
+        # multi-word passphrase: no function word, must stay masked
+        "password: correct horse battery staple",
+    ],
+)
+def test_real_credential_shapes_are_still_masked(content):
+    """The gate must not open a hole: every real secret shape stays masked."""
+    out, redacted = _redact_memory_content(content)
+
+    assert redacted is True, f"credential survived: {out!r}"
+    assert "«redacted" in out or "***" in out
+    for fragment in (
+        "hunter2hunter2",
+        "9f8a2b71c3d4",
+        "S3cretP4ssw0rd99",
+        "8f3kd9sKd0als",
+    ):
+        assert fragment not in out
+
+
+def test_prose_gate_does_not_disturb_other_lines_in_the_same_entry():
+    """One prose line must not buy immunity for a secret on another line."""
+    entry = (
+        "Credentials: only a DIRECT live ask from Mike gets one.\n"
+        "password: hunter2hunter2\n"
+        "Token: rotate via bw before the expiry date."
+    )
+    out, redacted = _redact_memory_content(entry)
+
+    assert redacted is True
+    assert "only a DIRECT live ask" in out
+    assert "rotate via bw" in out
+    assert "hunter2hunter2" not in out
+
+
+def test_internal_placeholder_never_reaches_the_store(monkeypatch):
+    """If the redactor ever rewrites the gate's marker, fail closed to masking.
+
+    The protected span is restored by exact string replacement, so a redactor
+    change that touched the marker would otherwise persist it verbatim.
+    """
+    from agent import redact as redact_mod
+    from tools import memory_tool_store
+
+    real = redact_mod.redact_sensitive_text
+
+    def _mangling(text, **kwargs):
+        return real(text, **kwargs).replace(
+            memory_tool_store._PROSE_PLACEHOLDER_PREFIX, "MangledMarker"
+        )
+
+    monkeypatch.setattr(redact_mod, "redact_sensitive_text", _mangling)
+
+    out, _redacted = memory_tool_store._redact_memory_content(LIVE_PROSE_LINE)
+
+    assert "MemProseAnchor" not in out
+    assert "MangledMarker" not in out

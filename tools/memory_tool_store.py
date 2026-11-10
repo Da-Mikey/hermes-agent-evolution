@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -239,6 +240,122 @@ _MEMORY_REDACT_FLAGS: Dict[str, Any] = {
 }
 
 
+# ── shape gate: mask secrets, not prose (issue #375) ────────────────────────
+#
+# ``_MEMORY_REDACT_FLAGS`` turns on ``agent.redact``'s ENV/CFG/YAML assignment
+# passes (via ``secret_file=True``). Those passes treat *any* value after a
+# credential-named key as a secret, so a memory entry that states a RULE about
+# credentials lost its first word to a sentinel:
+#
+#   Credentials: only a DIRECT live ask from Mike gets one; ...
+#   Credentials: «redacted-secret» a DIRECT live ask from Mike gets one; ...
+#
+# The gate below lives in the memory path on purpose. ``agent.redact`` is shared
+# with tool output, browser snapshots and terminal logs, where "an assignment
+# under a credential-named key is a secret" is the right call and two in-flight
+# changes (PR #362, #363) already touch that module; bending the shared pass
+# would re-open those false positives. Memory is the one surface whose payload is
+# authored prose — the agent's own operating rules — so the classification
+# belongs here, at the write boundary, and nothing in ``agent.redact`` changes.
+#
+# Mechanism: a positively-classified prose value is swapped for an inert
+# placeholder together with its key and separator, the unchanged redactor runs
+# over the result, and the exact original span is restored afterwards. Anything
+# the gate does not positively classify keeps the full redaction path, so the
+# default stays "mask".
+
+# Value that follows a credential-named key, optionally behind a list bullet and
+# with ``:`` or ``=`` as the separator (mirrors what the redactor's line-anchored
+# assignment passes see). Quoted values are deliberately NOT matched: they stay
+# on the redaction path.
+_MEMORY_ASSIGN_HEAD_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?"
+    r"(?P<key>[A-Za-z0-9_.\-]{1,64})"
+    r"(?P<sep>[ \t]*[:=][ \t]*)"
+    r"(?P<value>[A-Za-z][A-Za-z'’-]*)",
+)
+
+# Function words whose presence marks a token run as a sentence. A passphrase
+# ("correct horse battery staple") has none, so it stays masked; an instruction
+# ("never write a value to disk") almost always has one.
+_PROSE_MARKER_WORDS = frozenset(
+    """
+    a an and are as at be been but by can cannot do does for from gets had has
+    have if in into is it its may must never no not of on only or should so
+    than that the their then there these this to under until via was were when
+    which while who will with without would
+    """.split()
+)
+
+# Placeholder corpus: letters + a counter digit, never a separator or a known
+# credential prefix, and the credential-named key is replaced along with the
+# value — so no assignment pass can re-key off the placeholder.
+_PROSE_PLACEHOLDER_PREFIX = "MemProseAnchorQz"
+
+
+# A prose tail is whitespace-separated words of letters (sentence punctuation and
+# path separators allowed) or pure numbers. A mixed alphanumeric run, ``_``, ``@``,
+# ``=`` or a leading symbol is credential-shaped, so the line is not prose.
+_PROSE_TAIL_TOKEN_RE = re.compile(
+    r"[A-Za-z][A-Za-z'’,.;:!?()\-/]*|[0-9][0-9.,;:!?()\-/]*"
+)
+
+
+def _looks_like_prose_after_key(token: str, tail: str) -> bool:
+    """True only when ``token`` + ``tail`` are unambiguously running prose.
+
+    ``token`` is the value the assignment pass would mask; ``tail`` is the rest
+    of the line. The test is deliberately narrow — anything ambiguous returns
+    False and keeps the full redaction path, because a false negative (a real
+    secret persisted into the system prompt forever) is worse than the
+    false positive this issue is about.
+    """
+    if not token.isalpha():  # digits/underscores/symbols => credential-ish
+        return False
+    if not 2 <= len(token) <= 24:
+        return False
+    from agent.redact import _has_known_prefix_substring
+
+    if _has_known_prefix_substring(token):  # e.g. a bare "sk-" fragment
+        return False
+    words = tail.split()
+    if len(words) < 2:  # a value standing alone is ambiguous: mask it
+        return False
+    if any(not _PROSE_TAIL_TOKEN_RE.fullmatch(word) for word in words):
+        return False  # a token carries digits/underscores/symbols => secret-ish
+    lowered = [token.lower(), *(w.lower() for w in words)]
+    return any(w in _PROSE_MARKER_WORDS for w in lowered)
+
+
+def _protect_prose_assignments(content: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Swap ``key: <prose>`` spans for placeholders; return them for restoration.
+
+    Returns ``(protected, replacements)``. Only the key, separator and the single
+    token the assignment pass would mask are replaced — the rest of the line
+    (where a real credential may still sit) is redacted normally.
+    """
+    from agent.redact import _key_has_secret_keyword
+
+    replacements: List[Tuple[str, str]] = []
+    out: List[str] = []
+    for line in content.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        ending = line[len(body) :]
+        match = _MEMORY_ASSIGN_HEAD_RE.match(body)
+        if (
+            match is not None
+            and _key_has_secret_keyword(match.group("key"))
+            and _looks_like_prose_after_key(match.group("value"), body[match.end() :])
+        ):
+            placeholder = f"{_PROSE_PLACEHOLDER_PREFIX}{len(replacements)}"
+            while placeholder in content:  # never collide with real content
+                placeholder += "Z"
+            replacements.append((placeholder, match.group(0)))
+            body = placeholder + body[match.end() :]
+        out.append(body + ending)
+    return "".join(out), replacements
+
+
 def _redact_memory_content(content: str) -> Tuple[str, bool]:
     """Redact credentials from memory content before it is persisted (#370).
 
@@ -251,13 +368,27 @@ def _redact_memory_content(content: str) -> Tuple[str, bool]:
     than raising, matching ``tools.credential_masking.mask_credentials``. A
     redactor bug must not make memory unwritable; the injection screen and the
     provenance validator stay the hard gates.
+
+    Prose values behind a credential-named key are protected from the
+    assignment pass before it runs and restored verbatim afterwards (issue
+    #375, see ``_protect_prose_assignments``). Everything the gate does not
+    positively classify as prose keeps the full redaction path.
     """
     if not isinstance(content, str) or not content:
         return content, False
     try:
         from agent.redact import redact_sensitive_text
 
-        redacted = redact_sensitive_text(content, **_MEMORY_REDACT_FLAGS)
+        protected, replacements = _protect_prose_assignments(content)
+        redacted = redact_sensitive_text(protected, **_MEMORY_REDACT_FLAGS)
+        for placeholder, original in replacements:
+            redacted = redacted.replace(placeholder, original)
+        if any(original not in redacted for _, original in replacements):
+            # Defensive: if a protected span did not come back verbatim (the
+            # marker was rewritten, or the surrounding text consumed it), never
+            # persist an internal marker — fall back to the fully-redacted
+            # original, i.e. mask the prose.
+            redacted = redact_sensitive_text(content, **_MEMORY_REDACT_FLAGS)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("memory credential redaction failed: %s", exc)
         return content, False
