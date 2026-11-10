@@ -68,7 +68,7 @@ def _interpret_signal_exit(exit_code: int) -> str | None:
 # Informational non-zero exit codes per base command.
 _EXIT_CODE_SEMANTICS: dict[str, dict[int, str]] = {
     **dict.fromkeys(("grep", "egrep", "fgrep", "rg", "ag", "ack"), {1: "No matches found (not an error)"}),
-    **dict.fromkeys(("diff", "colordiff"), {1: "Files differ (expected, not an error)"}),
+    **dict.fromkeys(("diff", "colordiff", "cmp"), {1: "Files differ (expected, not an error)"}),
     **dict.fromkeys(("test", "["), {1: "Condition evaluated to false (expected, not an error)"}),
     "find": {1: "Some directories were inaccessible (partial results may still be valid)"},
     "curl": {6: "Could not resolve host", 7: "Failed to connect to host",
@@ -110,9 +110,23 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     last_segment = (segments[-1] if segments else command).strip()
     base_cmd = next((w.split("/")[-1] for w in last_segment.split()
                      if "=" not in w or w.startswith("-")), "")
+    # `git <sub>` benign codes first: the generic `git` row below would
+    # otherwise swallow `git grep` rc=1 with its vague "often normal" note and
+    # the payload would lose the "(not an error)" marker the runtime keys on.
+    from tools.terminal_failure_classifier import is_benign_exit_code
+    if base_cmd == "git" and is_benign_exit_code(command, exit_code):
+        return "No matches found (not an error)"
     semantic_note = _EXIT_CODE_SEMANTICS.get(base_cmd, {}).get(exit_code)
     if semantic_note is not None:
         return semantic_note
+
+    # Same predicate the failure classifier uses, so the note and the failure
+    # verdict can never disagree about the same command (#358).
+    if is_benign_exit_code(command, exit_code):
+        return (
+            f"{base_cmd or command} exited {exit_code}: "
+            "nothing to report — no matches or differences (not an error)"
+        )
 
     # Shell-level exit codes, which are about the INVOCATION rather than the
     # program (#1452). These are command-agnostic — 127 means the shell never

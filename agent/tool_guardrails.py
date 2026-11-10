@@ -15,7 +15,11 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    is_benign_terminal_result,
+    is_guardrail_refusal,
+)
 
 if TYPE_CHECKING:  # avoid a circular import; policy_interceptors imports this module
     from agent.policy_interceptors import PolicyInterceptorRegistry
@@ -549,6 +553,11 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
         if isinstance(data, dict):
             exit_code = data.get("exit_code")
             if exit_code is not None and exit_code != 0:
+                # Mirror of ``agent.display._detect_tool_failure``: the terminal
+                # tool's own benign verdict (grep rc=1 "no matches") is a
+                # successful empty answer, never a failure (#358).
+                if tool_name == "terminal" and is_benign_terminal_result(data):
+                    return False, ""
                 return True, f" [exit {exit_code}]"
             # #2241 — process-specific failure patterns that don't carry an
             # exit_code.  process_registry returns {"status": "not_found",

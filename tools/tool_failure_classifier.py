@@ -79,6 +79,11 @@ class ToolFailureCategory(str, Enum):
     # tells the model the tool malfunctioned; this category lets the failure
     # classifier and recovery dispatcher act on it too.
     broken_payload = "broken_payload"
+    # #358 — the command ran and its documented benign exit code means "nothing
+    # to report" (grep/rg rc=1 "no matches", diff/cmp rc=1 "differences found").
+    # Not a failure: it must not reach the non-retryable stamp, which told the
+    # model to abandon a search that had just worked.
+    benign_exit_code = "benign_exit_code"
     persistent_error = "persistent_error"
     unknown = "unknown"
 
@@ -161,6 +166,9 @@ _CATEGORY_RETRYABLE: dict[ToolFailureCategory, bool] = {
     ToolFailureCategory.timeout: True,
     ToolFailureCategory.unexpected_output: True,
     ToolFailureCategory.broken_payload: True,
+    # Not a failure at all — a plain retry of the search that returned nothing
+    # is pointless, but nothing is broken (#358).
+    ToolFailureCategory.benign_exit_code: False,
     ToolFailureCategory.persistent_error: False,
     ToolFailureCategory.unknown: False,
 }
@@ -237,6 +245,12 @@ _CATEGORY_HINTS: dict[ToolFailureCategory, str] = {
         "it likely malfunctioned, not a safety/permission issue. Retry the call, "
         "try a fallback tool, or report the malfunction. Do NOT fabricate a "
         "safety rationale (Unfaithful Safety Refusal, #1495)."
+    ),
+    ToolFailureCategory.benign_exit_code: (
+        "The command ran and its non-zero exit code is this command's benign "
+        "'nothing to report' status (no matches for grep/rg, differences found "
+        "for diff/cmp) — not an error. Do not abandon the tool: widen or change "
+        "the query, or continue with the empty result (#358)."
     ),
     ToolFailureCategory.persistent_error: (
         "The tool failed with a persistent error. Review the output and fix the "
@@ -468,6 +482,10 @@ _TERMINAL_CATEGORY_MAP: dict[_TerminalCategory, ToolFailureCategory] = {
     _TerminalCategory.output_encoding: ToolFailureCategory.persistent_error,
     _TerminalCategory.resource_limit: ToolFailureCategory.persistent_error,
     _TerminalCategory.env_not_found: ToolFailureCategory.persistent_error,
+    # #358 — a documented benign exit code (grep/rg rc=1 "no matches",
+    # diff/cmp rc=1 "differences found") is not a failure, so it gets its own
+    # shared label instead of degrading into ``persistent_error``.
+    _TerminalCategory.benign_exit_code: ToolFailureCategory.benign_exit_code,
 }
 
 
@@ -571,6 +589,7 @@ def classify_tool_failure(
     error: str = "",
     *,
     exit_code: int | None = None,
+    command: str = "",
     consecutive_count: int = 0,
     stdout: str = "",
     stderr: str = "",
@@ -583,6 +602,10 @@ def classify_tool_failure(
             ``stderr`` is not given).
         exit_code: Process exit code, when the tool has one. Terminal tools use
             this for their richer exit-code/signal logic.
+        command: The terminal command line, when the caller has it. Terminal
+            classification is command-aware: without it, a benign exit code
+            (grep rc=1 "no matches") cannot be told apart from a real failure
+            (#358).
         consecutive_count: Consecutive failures without progress; high values
             downgrade retryable terminal cases to persistent.
         stdout: Standard output, when available.
@@ -595,8 +618,22 @@ def classify_tool_failure(
     tool_type = tool_family(tool_name)
 
     if tool_type is ToolType.terminal and exit_code is not None:
+        # #358 — when the caller cannot supply the command line, fall back to
+        # the terminal tool's own verdict in the payload: an ``exit_code_meaning``
+        # saying "not an error" (grep rc=1 "no matches") means nothing failed.
+        # A command, when given, is authoritative and wins below.
+        if not command:
+            from agent.tool_result_classification import is_benign_terminal_result
+
+            if is_benign_terminal_result(error):
+                return ToolFailureClassification(
+                    category=ToolFailureCategory.benign_exit_code,
+                    tool_type=ToolType.terminal,
+                    hint=_CATEGORY_HINTS[ToolFailureCategory.benign_exit_code],
+                    should_retry=False,
+                )
         terminal = classify_terminal_failure(
-            command="",
+            command=command,
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr or error,

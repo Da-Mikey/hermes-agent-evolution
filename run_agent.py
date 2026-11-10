@@ -1649,6 +1649,7 @@ class AIAgent(
             )
 
             _exit_code = None
+            _command = ""
             if tool_name == "terminal":
                 try:
                     _parsed = json.loads(function_result)
@@ -1656,22 +1657,34 @@ class AIAgent(
                         _exit_code = _parsed["exit_code"]
                 except (ValueError, TypeError):
                     _exit_code = None
+                # #358 — terminal classification is command-aware: without the
+                # command a benign grep rc=1 ("no matches") is indistinguishable
+                # from a real failure.
+                if isinstance(function_args, dict):
+                    _command = str(function_args.get("command") or "")
             _nr = classify_tool_failure(
-                tool_name, function_result, exit_code=_exit_code
+                tool_name, function_result, exit_code=_exit_code, command=_command
             )
-            if _nr.category in {
-                ToolFailureCategory.persistent_error,
-                ToolFailureCategory.unknown,
-            }:
-                _dd = getattr(self, "_unhandled_drilldown", None)
-                if _dd is not None:
-                    try:
-                        _dd.record(tool_name, function_result or "")
-                    except Exception:
-                        pass
-            if not _nr.should_retry:
-                _nr_line = f"\n\n⚠️ Non-retryable: {_nr.category.value}. {_nr.hint}"
-                function_result = append_non_retryable_notice(function_result, _nr_line)
+            if _nr.category is ToolFailureCategory.benign_exit_code:
+                # Not a failure: the command ran and its documented exit code
+                # means "nothing to report" (grep rc=1 no matches, diff rc=1
+                # files differ). No stamp, no drilldown — the payload already
+                # tells the model what the code meant (#358).
+                pass
+            else:
+                if _nr.category in {
+                    ToolFailureCategory.persistent_error,
+                    ToolFailureCategory.unknown,
+                }:
+                    _dd = getattr(self, "_unhandled_drilldown", None)
+                    if _dd is not None:
+                        try:
+                            _dd.record(tool_name, function_result or "")
+                        except Exception:
+                            pass
+                if not _nr.should_retry:
+                    _nr_line = f"\n\n⚠️ Non-retryable: {_nr.category.value}. {_nr.hint}"
+                    function_result = append_non_retryable_notice(function_result, _nr_line)
 
         if failed and getattr(self, "_failure_recovery_enabled", False):
             from tools.recovery_strategy_dispatcher import (

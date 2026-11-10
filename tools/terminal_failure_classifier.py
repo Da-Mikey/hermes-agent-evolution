@@ -40,6 +40,11 @@ class FailureCategory(str, Enum):
     # interpreter environment, or undefined name.  Deterministic until fixed
     # (#2717).
     env_not_found = "env_not_found"
+    # Benign non-zero exit — the command ran to completion and the code is part
+    # of its success vocabulary (grep/rg rc=1 "no matches", diff/cmp rc=1
+    # "differences found").  Not a failure at all: stamping it non-retryable told
+    # the model to abandon the tool that had just worked (#358).
+    benign_exit_code = "benign_exit_code"
     unknown = "unknown"
 
 
@@ -156,6 +161,35 @@ _EXPECTED_NONZERO_COMMANDS = frozenset({
 })
 
 
+# Narrower than ``_EXPECTED_NONZERO_COMMANDS`` above, which only downgrades a
+# command to ``unknown`` (still non-retryable, still stamped on the model's
+# result).  This table is the set of *documented benign* codes: the command ran
+# to completion and the code is part of its success vocabulary (#358).
+#
+# Deliberately excluded, because their rc=1 carries real failure meaning:
+#   * ``find`` — rc=1 usually means "some directories were inaccessible", i.e.
+#     partial results, not a clean "nothing to report";
+#   * ``test`` / ``[`` — a legitimate "condition false" answer, but not an
+#     *empty search*, and the runtime has no evidence the caller expected it;
+#   * ``git`` (whole command) — rc=1 covers merge conflicts, failed pushes,
+#     missing refs.  Only the enumerated subcommands below are benign.
+_BENIGN_EXIT_CODES: dict[str, frozenset[int]] = {
+    # No matches found — the query succeeded, the answer is "nothing".
+    **dict.fromkeys(("grep", "egrep", "fgrep", "rg", "ag", "ack"), frozenset({1})),
+    # Differences found — the comparison succeeded, the answer is "they differ".
+    **dict.fromkeys(("diff", "colordiff", "cmp"), frozenset({1})),
+}
+
+# ``git <sub>`` subcommands whose rc=1 is the benign "no matches".
+_BENIGN_GIT_SUBCOMMANDS = frozenset({"grep"})
+
+# git global flags that consume the next token, so ``git -C dir grep x`` still
+# resolves ``grep`` as the subcommand.
+_GIT_VALUE_FLAGS = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+})
+
+
 def _base_command(command: str) -> str:
     """Extract the base command name from a shell pipeline/chain."""
     # Split on shell operators and take the last segment because the exit code
@@ -177,6 +211,48 @@ def _output_text(stdout: str, stderr: str) -> str:
         if part:
             parts.append(part)
     return "\n".join(parts)
+
+
+def _git_subcommand(command: str) -> str:
+    """The git subcommand of the last segment of ``command`` ("" when none)."""
+    segments = re.split(r"\s*(?:\|\||&&|[|;])\s*", command)
+    words = (segments[-1] if segments else command).split()
+    for index, word in enumerate(words):
+        if word.split("/")[-1] != "git":
+            continue
+        skip_next = False
+        for token in words[index + 1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if "=" in token and not token.startswith("-"):
+                continue  # VAR=val
+            if token.startswith("-"):
+                skip_next = token in _GIT_VALUE_FLAGS
+                continue
+            return token
+        return ""
+    return ""
+
+
+def is_benign_exit_code(command: str, exit_code: int) -> bool:
+    """Whether ``exit_code`` is ``command``'s documented "nothing to report".
+
+    A grep-family rc=1 ("no matches"), a diff/cmp rc=1 ("differences found") and
+    a ``git grep`` rc=1 are successes with an empty answer, not failures (#358).
+
+    Only the command's *documented* benign code qualifies, so the invocation-
+    level codes (126/127), signal deaths (>=128) and every other non-zero code
+    keep their existing failure verdict.
+    """
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return False
+    if exit_code in (0, 126, 127) or exit_code >= 128 or exit_code < 0:
+        return False
+    base_cmd = _base_command(command)
+    if base_cmd == "git":
+        return exit_code == 1 and _git_subcommand(command) in _BENIGN_GIT_SUBCOMMANDS
+    return exit_code in _BENIGN_EXIT_CODES.get(base_cmd, frozenset())
 
 
 def classify_terminal_failure(
@@ -342,6 +418,25 @@ def classify_terminal_failure(
                 "This is not a retryable error — investigate the cause "
                 "(memory limits, missing dependencies, user interrupt) "
                 "or switch to a different approach."
+            ),
+            should_retry=False,
+        )
+
+    # Benign non-zero exit: the command ran to completion and its *documented*
+    # code means "nothing to report" — grep/rg rc=1 (no matches), diff/cmp rc=1
+    # (files differ), `git grep` rc=1 (no matches).  Deliberately placed after
+    # the invocation-level (126/127), syntax and signal checks above so those
+    # keep their verdicts, and only the documented benign code of a known
+    # "absence is normal" command lands here (#358).
+    if is_benign_exit_code(command, exit_code):
+        return TerminalFailureClassification(
+            category=FailureCategory.benign_exit_code,
+            hint=(
+                f"{base_cmd or command} exited {exit_code}, which is this "
+                "command's documented 'nothing to report' status (no matches, "
+                "or differences found) — not an error. Do not treat it as a "
+                "failure or abandon the tool: widen or change the search, or "
+                "carry on with the empty result."
             ),
             should_retry=False,
         )

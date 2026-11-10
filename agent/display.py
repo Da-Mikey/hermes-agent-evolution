@@ -17,7 +17,11 @@ from urllib.parse import urlsplit
 
 from utils import safe_json_loads
 from agent.redact import redact_sensitive_text
-from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    is_benign_terminal_result,
+    is_guardrail_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1004,6 +1008,11 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
             if exit_code is not None and exit_code != 0:
                 if tool_name == "terminal" and data.get("status") == "degraded":
                     return True, _degraded_suffix(data)
+                # A documented benign exit code (grep rc=1 "no matches") is a
+                # successful empty answer, not a failure: the terminal tool
+                # already said so in ``exit_code_meaning`` (#358).
+                if tool_name == "terminal" and is_benign_terminal_result(data):
+                    return False, ""
                 err_msg = data.get("error")
                 if err_msg:
                     return True, f" [{_trim_error(str(err_msg))}]"

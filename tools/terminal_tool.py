@@ -1567,6 +1567,10 @@ def _run_foreground(
 
             if classification.category not in {
                 FailureCategory.unknown,
+                # #358 — a benign exit (grep rc=1 "no matches") is a success
+                # with an empty answer: it must not be published as an error
+                # payload with a failure_class and a streak note.
+                FailureCategory.benign_exit_code,
             }:
                 result_dict = {
                     "output": output,

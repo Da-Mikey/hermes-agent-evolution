@@ -171,14 +171,27 @@ class TestClassifyInformationalCommands:
         [
             ("grep foo bar", 1),
             ("diff a b", 1),
-            ("git diff", 1),
-            ("test -f missing", 1),
         ],
     )
-    def test_informational_exits_are_unknown(self, command, exit_code):
+    def test_documented_benign_exits_are_benign(self, command, exit_code):
+        """#358 — grep/diff rc=1 is a success with an empty answer."""
+        result = classifier.classify_terminal_failure(command, exit_code, "", "")
+        assert result.category == classifier.FailureCategory.benign_exit_code
+        assert result.should_retry is False
+
+    @pytest.mark.parametrize(
+        "command, exit_code",
+        [
+            ("git diff", 1),
+            ("test -f missing", 1),
+            ("find . -name x", 1),
+        ],
+    )
+    def test_unlisted_informational_exits_stay_unknown(self, command, exit_code):
         result = classifier.classify_terminal_failure(command, exit_code, "", "")
         assert result.category == classifier.FailureCategory.unknown
         assert result.should_retry is False
+
 
 
 class TestStreakRecommendation:
