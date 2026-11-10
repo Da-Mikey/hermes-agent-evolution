@@ -206,8 +206,35 @@ def test_modified_capability_failure_is_actionable_and_not_downgraded():
 
 
 @pytest.mark.parametrize("order", ["discovery", "modified"])
-def test_rg_partial_output_with_error_exit_fails_closed(order):
+def test_rg_partial_output_with_error_exit_keeps_the_listing(order):
+    """#364: rg exit 2 plus a parseable listing is a PARTIAL SUCCESS.
+
+    ripgrep exits 2 when one path in the walk is unreadable (permission denied)
+    but still writes every filename it could read to stdout. This test used to
+    assert the old fail-closed contract (``error is not None``, ``files == []``),
+    which discarded ten real paths per call and stamped the tool result
+    non-retryable. Keep the listing; report the unreadable path as a warning —
+    the same "payload wins over exit code" contract the content path documents
+    at ``_parse_search_output``. It still guards the behaviour because the
+    error/empty pair below fails closed when nothing usable survived.
+    """
     env = RecordingEnvironment(rg_output="/repo/partial.py\n", rg_code=2)
+
+    result = ShellFileOperations(env).search(
+        "*.py", path="/repo", target="files", order=order
+    )
+
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
+    assert result.total_count == 1
+    assert "exit code 2" in result.warning
+    assert len(env.rg_commands) == 1
+
+
+@pytest.mark.parametrize("order", ["discovery", "modified"])
+def test_rg_error_exit_with_empty_output_still_fails_closed(order):
+    """#364's other half: no usable payload must still surface the failure."""
+    env = RecordingEnvironment(rg_output="", rg_code=2)
 
     result = ShellFileOperations(env).search(
         "*.py", path="/repo", target="files", order=order
@@ -215,7 +242,28 @@ def test_rg_partial_output_with_error_exit_fails_closed(order):
 
     assert result.error is not None
     assert result.files == []
-    assert len(env.rg_commands) == 1
+    assert result.total_count == 0
+    assert result.warning is None
+
+
+@pytest.mark.parametrize("order", ["discovery", "modified"])
+def test_rg_interrupted_exit_fails_closed_even_with_parseable_output(order):
+    """Only exit 2 and a short-listing 141 are partial successes.
+
+    An interrupted rg (130) appends its own "[Command interrupted]" marker to
+    stdout, so its output must never be parsed as a filename list.
+    """
+    env = RecordingEnvironment(
+        rg_output="/repo/partial.py\n[Command interrupted]\n", rg_code=130
+    )
+
+    result = ShellFileOperations(env).search(
+        "*.py", path="/repo", target="files", order=order
+    )
+
+    assert result.error is not None
+    assert result.files == []
+    assert result.total_count == 0
 
 
 @pytest.mark.parametrize("order", ["discovery", "modified"])
@@ -233,16 +281,28 @@ def test_rg_sigpipe_is_benign_only_after_fetch_limit_paths(order):
 
 
 @pytest.mark.parametrize("order", ["discovery", "modified"])
-def test_rg_sigpipe_with_fewer_than_fetch_limit_paths_fails_closed(order):
+def test_rg_sigpipe_with_fewer_than_fetch_limit_paths_is_marked_incomplete(order):
+    """DECISION 1: a SIGPIPE mid-walk TRUNCATES the listing, so say so.
+
+    Exit 141 with fewer than ``fetch_limit`` paths cannot be the benign
+    "head closed after the bound" case (that path is pinned by the test above);
+    the walk was cut short. The paths are returned — throwing them away is the
+    #364 defect — but ``truncated`` is forced True (serialized as
+    ``total_count_is_lower_bound``) and the warning names SIGPIPE, so the caller
+    can never mistake the short list for the complete answer.
+    """
     env = RecordingEnvironment(rg_output="/repo/partial.py\n", rg_code=141)
 
     result = ShellFileOperations(env).search(
-        "*.py", path="/repo", target="files", limit=2, offset=1, order=order
+        "*.py", path="/repo", target="files", limit=2, offset=0, order=order
     )
 
-    assert result.error is not None
-    assert result.files == []
-    assert result.total_count == 0
+    assert result.error is None
+    assert result.files == ["/repo/partial.py"]
+    assert result.total_count == 1
+    assert result.truncated is True
+    assert "SIGPIPE" in result.warning
+    assert result.to_dict()["total_count_is_lower_bound"] is True
 
 
 def test_invalid_direct_file_order_returns_structured_error():

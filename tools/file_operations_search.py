@@ -916,7 +916,21 @@ class SearchMixin:
                 f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))
                 for f in all_files]
         bounded_sigpipe = result.exit_code == 141 and len(all_files) >= fetch_limit
-        if result.exit_code not in {0, 1, 124} and not bounded_sigpipe:
+        # #364: a non-zero exit does NOT always mean the listing is unusable.
+        # ripgrep exits 2 on a PARTIAL error — one unreadable path among readable
+        # ones — yet still writes every filename it could read to stdout. Under
+        # pipefail a mid-walk SIGPIPE (141) truncates the listing before ``head``
+        # hits its bound. Discarding either payload turned ten real paths into
+        # "permission_denied" + total_count 0 and told the model not to retry.
+        # Mirror the content path's contract (_parse_search_output, :232): an
+        # error is surfaced only when no usable payload remains. Everything else
+        # (127 exec failure, 130 interrupted, ...) keeps failing closed: its
+        # stdout is not a trustworthy filename list — the interrupted path even
+        # appends a "[Command interrupted]" marker that must never become a file.
+        partial_listing = (result.exit_code in {2, 141} and bool(all_files)
+                           and not bounded_sigpipe)
+        if (result.exit_code not in {0, 1, 124} and not bounded_sigpipe
+                and not partial_listing):
             if order == "modified":
                 return SearchResult(error=(
                     "Exact modification-time order failed; ripgrep 14+ is "
@@ -940,9 +954,34 @@ class SearchMixin:
                     "this transport — check that the path exists and is searchable, then "
                     "retry with a narrower path or glob.")
             return SearchResult(error=message)
+        warning = None
+        truncated = len(all_files) > offset + limit or bool(limit_reason)
+        if partial_listing:
+            detail = (result.stderr or "").strip()
+            detail = "\n".join(detail.splitlines()[:6])[:800]
+            if result.exit_code == 141:
+                # DECISION 1: fewer paths than the bound cannot be the benign
+                # "head closed after fetch_limit rows" SIGPIPE, so the walk was
+                # cut short. Keep the paths but mark the answer incomplete in the
+                # same field the caller already reads for a bounded listing
+                # (truncated -> total_count_is_lower_bound), plus say why.
+                warning = (
+                    "File search was TRUNCATED: ripgrep was killed by SIGPIPE (exit "
+                    f"code 141) after {len(all_files)} path(s), fewer than the "
+                    f"{fetch_limit} requested. This listing is incomplete — re-run the "
+                    "search (a narrower path or glob is cheaper) before concluding "
+                    "that a file is missing.")
+                truncated = True
+            else:
+                warning = (
+                    "File search partially failed (ripgrep exit code 2); returning the "
+                    f"{len(all_files)} path(s) it could read. Some paths were unreadable, "
+                    "so a narrow enough root or glob may surface entries missing here.")
+            if detail:
+                warning += f" ripgrep reported:\n{detail}"
         return SearchResult(
             files=all_files[offset:offset + limit], total_count=len(all_files),
-            truncated=len(all_files) > offset + limit or bool(limit_reason), limit_reason=limit_reason)
+            truncated=truncated, limit_reason=limit_reason, warning=warning)
 
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
