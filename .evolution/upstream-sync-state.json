@@ -65,7 +65,7 @@
     "published_at": "2026-11-10T01:42:15Z",
     "run_date": "2026-11-11",
     "marker_guard": "git merge-base --is-ancestor v0.23.1 origin/main -> FALSE (not integrated); git rev-list --count main..v0.23.1 = 23714",
-    "tag_namespace_change": "UPSTREAM RENAMED ITS RELEASE TAGS. Dated tags (v2026.9.24 was the last) were replaced by semver v0.2x.y: v0.22.2 ... v0.22.7, v0.23.0, v0.23.1. `git tag -l 'v20*'` - the filter in the release-track step - now matches ONLY the old dated tags, so a run trusting it alone reports 'no new release' while eight have shipped. Discovery must use `gh release list --repo nousresearch/hermes-agent` or `git tag -l 'v0.*' 'v20*'`. Fix belongs to an interactive session: cron cannot write the skills tree.",
+    "tag_namespace_change": "UPSTREAM RENAMED ITS RELEASE TAGS. Dated tags (v2026.9.24 was the last) were replaced by semver at v0.21.6 (2026-10-08). Twelve releases have published since our base: v0.21.6, v0.21.7, v0.22.0-v0.22.7, v0.23.0, v0.23.1. `git tag -l 'v20*'` - the filter in the release-track step - now matches ONLY the old dated tags, so a run trusting it alone reports 'no new release' while twelve have shipped. Discovery must use `gh release list --repo nousresearch/hermes-agent` or `git tag -l 'v0.*' 'v20*'`. Verified 2026-11-11 against gh release list --limit 25. Fix belongs to an interactive session: cron cannot write the skills tree.",
     "divergence": {
       "behind_v0_23_1": 23714,
       "ahead_of_v0_23_1": 1636,
