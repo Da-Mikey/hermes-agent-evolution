@@ -285,13 +285,66 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
+# Exception classes whose ``str()`` carries nothing useful — the whole asyncio
+# timeout family (``str(asyncio.TimeoutError()) == ""``), aiohttp's
+# ``ServerTimeoutError``, and any bare re-raise. Matched on the class name so a
+# lazily-imported aiohttp subclass is recognised without importing aiohttp here.
+_TIMEOUT_EXC_MARKERS = ("timeout", "timedout")
+
+
+def _is_timeout_exception(exc: BaseException) -> bool:
+    """True for the timeout family, including classes with an empty ``str()``."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    name = type(exc).__name__.lower()
+    return any(marker in name for marker in _TIMEOUT_EXC_MARKERS)
+
+
+def _describe_exception(exc: BaseException) -> str:
+    """A cause that is never empty, and that keeps the timeout family legible.
+
+    ``_dispatch`` used to publish ``f"{fail_msg}: {e}"``, which for a timed-out
+    request is literally ``"Failed to call automation.trigger: "`` — nothing
+    after the colon. With nothing to match, the failure classifier fell through
+    every rule to ``persistent_error`` (non-retryable), so a transient timeout
+    was reported as a permanent defect and the model stopped retrying a call
+    that would have worked a second later (#384).
+
+    The class name is always carried, and a timeout is always spelled
+    "timed out" — the token the classifier buckets as retryable ``timeout``.
+    """
+    name = type(exc).__name__
+    text = str(exc).strip()
+    if _is_timeout_exception(exc):
+        return f"{name}: timed out" + (f" ({text})" if text else "")
+    if text:
+        return f"{name}: {text}"
+    return f"{name} raised with no message"
+
+
+def _failure_reason(exc: BaseException) -> Optional[str]:
+    """Structured failure-reason tag for the error envelope, or None.
+
+    Only the timeout family is tagged today: it is the one category the text
+    classifier used to lose, and a machine-readable tag lets a consumer pin the
+    disposition without re-parsing the message.
+    """
+    if _is_timeout_exception(exc):
+        return "timeout"
+    return None
+
+
 def _dispatch(coro, log_name: str, fail_msg: str) -> str:
     """Run ``coro`` and wrap as ``{"result": ...}``; on error log and return tool_error."""
     try:
         return json.dumps({"result": _run_async(coro)})
     except Exception as e:
-        logger.error("%s error: %s", log_name, e)
-        return tool_error(f"{fail_msg}: {e}")
+        cause = _describe_exception(e)
+        logger.error("%s error: %s", log_name, cause)
+        reason = _failure_reason(e)
+        if reason:
+            return tool_error(f"{fail_msg}: {cause}", failure_reason=reason)
+        return tool_error(f"{fail_msg}: {cause}")
 
 
 def _handle_get_state(args: dict, **kw) -> str:
@@ -334,8 +387,12 @@ def _handle_get_state(args: dict, **kw) -> str:
             payload["listing_failed"] = True
         return tool_error(message, **payload)
     except Exception as e:
-        logger.error("ha_get_state error: %s", e)
-        return tool_error(f"Failed to get state for {entity_id}: {e}")
+        cause = _describe_exception(e)
+        logger.error("ha_get_state error: %s", cause)
+        reason = _failure_reason(e)
+        if reason:
+            return tool_error(f"Failed to get state for {entity_id}: {cause}", failure_reason=reason)
+        return tool_error(f"Failed to get state for {entity_id}: {cause}")
 
 
 def _handle_call_service(args: dict, **kw) -> str:
