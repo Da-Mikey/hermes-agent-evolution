@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -239,6 +240,111 @@ _MEMORY_REDACT_FLAGS: Dict[str, Any] = {
 }
 
 
+# --- Prose-assignment shield (#375) -----------------------------------------
+# With ``secret_file=True`` the ENV/JSON assignment pass is live, and it masks the
+# token after ANY credential-named key without looking at the value. An operating
+# rule written as "Credentials: only a DIRECT live ask ..." therefore has the word
+# "only" replaced by «redacted-secret» on every write — memory is re-injected into
+# the system prompt every turn, so the agent's own rules rot silently.
+#
+# The shield below is deliberately narrow: it exempts an assignment ONLY when the
+# first token of its value is a word from a small curated list of function words
+# that can never BE a credential. Prose *shape* alone is never enough — the first
+# attempt at this (#375 r1) exempted anything with two function words in the tail,
+# which persisted "password: Swordfish is stored in the vault" in the clear.
+# Possessive determiners ("my") and leading verbs ("is", "was") are also left out
+# on purpose: "password: my dog ate the homework" is the shape a real secret hides
+# behind, so it must keep being masked.
+_PROSE_VALUE_WORDS = frozenset({
+    "a",
+    "an",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "all",
+    "any",
+    "some",
+    "none",
+    "no",
+    "not",
+    "never",
+    "always",
+    "every",
+    "each",
+    "both",
+    "either",
+    "neither",
+    "one",
+    "two",
+    "first",
+    "last",
+    "same",
+    "other",
+    "another",
+    "only",
+    "just",
+    "also",
+    "still",
+    "yet",
+    "yes",
+    "unknown",
+    "unset",
+    "unused",
+    "none",
+    "direct",
+    "directly",
+    "manual",
+    "manual-only",
+    "here",
+    "there",
+    "now",
+    "later",
+    "anytime",
+    "ask",
+    "asked",
+    "asks",
+    "refused",
+    "enabled",
+    "disabled",
+    "required",
+})
+
+# ``key: value`` / ``key = value`` with the value being ONE token whose end is
+# whitespace, punctuation or end-of-string. The trailing boundary is load-bearing:
+# without it "Hunter2" could be split into a shielded "Hunter" plus an unmaskable
+# "2" left in the clear.
+_PROSE_ASSIGNMENT_RE = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,39})[ \t]*[:=][ \t]*"
+    r"(?P<value>[A-Za-z][A-Za-z'\-]*)(?=[\s,;.)\]]|$)"
+)
+
+# Private-use placeholders: inert to every redaction pattern and impossible to
+# collide with real memory text.
+_PROSE_PLACEHOLDER_RE = re.compile("\ue000(\\d+)\ue001")
+_PROSE_PLACEHOLDER = "\ue000{}\ue001"
+
+
+def _shield_prose_assignments(content: str) -> Tuple[str, List[str]]:
+    """Swap non-secret prose assignments out of *content* before redaction.
+
+    Returns ``(shielded, spans)``. ``spans[i]`` is the literal text that
+    placeholder ``i`` stands for. Only assignments whose value is a listed
+    non-secret function word are shielded, so a real credential value can never
+    reach this path.
+    """
+    spans: List[str] = []
+
+    def _swap(match: "re.Match[str]") -> str:
+        if match.group("value").lower() not in _PROSE_VALUE_WORDS:
+            return match.group(0)
+        spans.append(match.group(0))
+        return _PROSE_PLACEHOLDER.format(len(spans) - 1)
+
+    return _PROSE_ASSIGNMENT_RE.sub(_swap, content), spans
+
+
 def _redact_memory_content(content: str) -> Tuple[str, bool]:
     """Redact credentials from memory content before it is persisted (#370).
 
@@ -257,7 +363,22 @@ def _redact_memory_content(content: str) -> Tuple[str, bool]:
     try:
         from agent.redact import redact_sensitive_text
 
-        redacted = redact_sensitive_text(content, **_MEMORY_REDACT_FLAGS)
+        shielded, spans = _shield_prose_assignments(content)
+        redacted = redact_sensitive_text(shielded, **_MEMORY_REDACT_FLAGS)
+        if isinstance(redacted, str) and spans:
+            redacted = _PROSE_PLACEHOLDER_RE.sub(
+                lambda m: (
+                    spans[int(m.group(1))]
+                    if int(m.group(1)) < len(spans)
+                    else m.group(0)
+                ),
+                redacted,
+            )
+            if _PROSE_PLACEHOLDER_RE.search(redacted):
+                # Restore failed: never persist a placeholder, and never persist
+                # the shield-bypassed text either. Re-redact the ORIGINAL so the
+                # failure direction is over-masking, not a leak.
+                redacted = redact_sensitive_text(content, **_MEMORY_REDACT_FLAGS)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("memory credential redaction failed: %s", exc)
         return content, False
