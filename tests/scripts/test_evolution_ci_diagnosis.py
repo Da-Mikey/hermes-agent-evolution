@@ -50,7 +50,7 @@ def _pr_payload(
     return {
         "number": number,
         "title": title,
-        "html_url": f"https://github.com/Lexus2016/hermes-agent-evolution/pull/{number}",
+        "html_url": f"https://github.com/Da-Mikey/hermes-agent-evolution/pull/{number}",
         "head": {"sha": head_sha, "ref": head_branch},
     }
 
@@ -183,7 +183,7 @@ def test_diagnose_prs_detects_failure_and_creates_child_issue(hermes_home, monke
     ]
     issue_response = {
         "number": 777,
-        "html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/777",
+        "html_url": "https://github.com/Da-Mikey/hermes-agent-evolution/issues/777",
     }
 
     client = FakeClient([
@@ -213,7 +213,7 @@ def test_diagnose_prs_detects_failure_and_creates_child_issue(hermes_home, monke
     assert state_path.is_file()
     recorded = json.loads(state_path.read_text(encoding="utf-8"))
     assert (
-        recorded["Lexus2016/hermes-agent-evolution#42:key-error"]
+        recorded["Da-Mikey/hermes-agent-evolution#42:key-error"]
         == issue_response["html_url"]
     )
 
@@ -386,7 +386,7 @@ def test_create_child_issue_surfaces_unclassified_raw_excerpt(hermes_home):
         title="feat: opaque failure",
         head_sha="sha60",
         head_branch="evolution/x",
-        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/60",
+        html_url="https://github.com/Da-Mikey/hermes-agent-evolution/pull/60",
     )
     check = diag.FailedCheck(
         check_run_id=7,
@@ -408,14 +408,14 @@ def test_create_child_issue_surfaces_unclassified_raw_excerpt(hermes_home):
         (
             201,
             {
-                "html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/999"
+                "html_url": "https://github.com/Da-Mikey/hermes-agent-evolution/issues/999"
             },
         ),
     ])
     url = diag.create_child_issue(
         client, pr, [(check, failure)], "unknown", dry_run=False
     )
-    assert url == "https://github.com/Lexus2016/hermes-agent-evolution/issues/999"
+    assert url == "https://github.com/Da-Mikey/hermes-agent-evolution/issues/999"
     post_body = json.loads(client.calls[-1][2] or "{}")
     assert "opaque detail" in post_body["body"]
     assert "Raw log/annotation excerpt" in post_body["body"]
@@ -481,14 +481,14 @@ def test_extract_failure_tags_mast_mode():
 
 def test_issue_key_includes_error_class():
     assert diag._issue_key(42, "key-error") == (
-        "Lexus2016/hermes-agent-evolution#42:key-error"
+        "Da-Mikey/hermes-agent-evolution#42:key-error"
     )
     assert diag._issue_key(42, "test-failure") != diag._issue_key(42, "key-error")
 
 
 def test_find_existing_issue_searches_error_class_in_query():
     item = {
-        "html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/777"
+        "html_url": "https://github.com/Da-Mikey/hermes-agent-evolution/issues/777"
     }
     client = FakeClient([(200, {"total_count": 1, "items": [item]})])
     url = diag._find_existing_issue(client, 42, "key-error")
@@ -513,8 +513,8 @@ def test_create_child_issue_separate_issues_per_error_class(hermes_home, monkeyp
                 "message": "KeyError: 'missing'", "title": "t"}]
     ann_timeout = [{"path": "tests/y.py", "start_line": 1, "annotation_level": "failure",
                     "message": "Operation timed out after 120s", "title": "t"}]
-    issue1 = {"html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/500"}
-    issue2 = {"html_url": "https://github.com/Lexus2016/hermes-agent-evolution/issues/501"}
+    issue1 = {"html_url": "https://github.com/Da-Mikey/hermes-agent-evolution/issues/500"}
+    issue2 = {"html_url": "https://github.com/Da-Mikey/hermes-agent-evolution/issues/501"}
     # fmt: on
 
     client = FakeClient([
@@ -568,7 +568,7 @@ def test_comment_on_existing_skips_when_issue_is_closed():
     pr = diag.PRInfo(
         number=42,
         title="fix: example",
-        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        html_url="https://github.com/Da-Mikey/hermes-agent-evolution/pull/42",
         head_sha="sha123",
         head_branch="fix",
     )
@@ -593,7 +593,7 @@ def test_comment_on_existing_skips_when_issue_is_closed():
     ])
     diag._comment_on_existing(
         client,
-        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        "https://github.com/Da-Mikey/hermes-agent-evolution/issues/100",
         pr,
         [(check, failure)],
         "exit-code",
@@ -606,7 +606,7 @@ def test_comment_on_existing_skips_when_body_has_same_sha():
     pr = diag.PRInfo(
         number=42,
         title="fix: example",
-        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        html_url="https://github.com/Da-Mikey/hermes-agent-evolution/pull/42",
         head_sha="sha123",
         head_branch="fix",
     )
@@ -631,7 +631,7 @@ def test_comment_on_existing_skips_when_body_has_same_sha():
     ])
     diag._comment_on_existing(
         client,
-        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        "https://github.com/Da-Mikey/hermes-agent-evolution/issues/100",
         pr,
         [(check, failure)],
         "exit-code",
@@ -644,7 +644,7 @@ def test_comment_on_existing_skips_when_comment_has_same_sha_or_url():
     pr = diag.PRInfo(
         number=42,
         title="fix: example",
-        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        html_url="https://github.com/Da-Mikey/hermes-agent-evolution/pull/42",
         head_sha="sha123",
         head_branch="fix",
     )
@@ -670,7 +670,7 @@ def test_comment_on_existing_skips_when_comment_has_same_sha_or_url():
     ])
     diag._comment_on_existing(
         client,
-        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        "https://github.com/Da-Mikey/hermes-agent-evolution/issues/100",
         pr,
         [(check, failure)],
         "exit-code",
@@ -683,7 +683,7 @@ def test_comment_on_existing_posts_when_new_sha_on_open_issue():
     pr = diag.PRInfo(
         number=42,
         title="fix: example",
-        html_url="https://github.com/Lexus2016/hermes-agent-evolution/pull/42",
+        html_url="https://github.com/Da-Mikey/hermes-agent-evolution/pull/42",
         head_sha="new_sha_456",
         head_branch="fix",
     )
@@ -710,7 +710,7 @@ def test_comment_on_existing_posts_when_new_sha_on_open_issue():
     ])
     diag._comment_on_existing(
         client,
-        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        "https://github.com/Da-Mikey/hermes-agent-evolution/issues/100",
         pr,
         [(check, failure)],
         "exit-code",
@@ -795,7 +795,7 @@ def test_comment_on_closed_issue_reports_not_covered():
     client = FakeClient([(200, {"state": "closed", "body": ""})])
     reported = diag._comment_on_existing(
         client,
-        "https://github.com/Lexus2016/hermes-agent-evolution/issues/100",
+        "https://github.com/Da-Mikey/hermes-agent-evolution/issues/100",
         pr,
         _stub_failure(),
         "lint-error",
@@ -825,3 +825,39 @@ def test_total_checks_counts_checks_not_clean_prs(tmp_path):
     assert summary["total_prs"] == 3  # PR level: 1..3, never 5 rows
     assert summary["prs_failed"] == 1
     assert summary["prs_success"] == 2
+
+
+class TestRepoUnderDiagnosis:
+    """#390: the loop must poll the repo the pipeline files PRs into.
+
+    It polled ``Lexus2016/hermes-agent-evolution`` — the read-only upstream — for
+    seven consecutive runs, reporting ``total_prs=0`` in 298-byte reports while
+    15 PRs were open in the fork. A monitor measuring the wrong repo does not
+    fail; it reports calm, which is worse.
+    """
+
+    def test_polls_the_pipeline_repo_not_the_upstream_fork(self):
+        assert diag._REPO == "Da-Mikey/hermes-agent-evolution"
+
+    def test_issue_fingerprint_carries_the_polled_repo(self):
+        """The dedup key embeds the repo, so a wrong repo also mis-keys issues."""
+        assert diag._issue_key(42, "lint-error").startswith(diag._REPO + "#42:")
+
+    def test_repo_is_env_overridable(self):
+        """The repo has moved once; a bare constant rots silently when it moves again.
+
+        Checked in a subprocess so the reload cannot rebind module-level
+        dataclasses under the rest of this suite.
+        """
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[2]
+        env = {**os.environ, "GITHUB_EVOLUTION_REPO": "someone/elsewhere"}
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import scripts.evolution_ci_diagnosis as d; print(d._REPO)"],
+            cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr[-500:]
+        assert proc.stdout.strip() == "someone/elsewhere"

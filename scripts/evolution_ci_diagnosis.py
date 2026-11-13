@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CI failure auto-diagnosis for evolution PRs — issue #577 (rework).
 
-Polls open PRs in ``Lexus2016/hermes-agent-evolution`` via the GitHub REST
+Polls open PRs in ``Da-Mikey/hermes-agent-evolution`` via the GitHub REST
 API, detects failed check runs using the supported check-runs endpoint, fetches
 failure messages from the annotations API (with a ``gh run view --log-failed``
 fallback), classifies failures as trivial vs complex, and creates focused
@@ -38,7 +38,12 @@ from hermes_constants import get_hermes_home
 # Constants
 # -----------------------------------------------------------------------------
 
-_REPO = "Lexus2016/hermes-agent-evolution"
+# The repo the evolution pipeline actually opens its PRs against. Polling the
+# upstream Lexus2016 fork instead returned total_prs=0 on seven consecutive runs
+# while 15 PRs were open here, so the whole diagnosis loop was blind (#390).
+# Overridable for the same reason every other evolution script is: the repo has
+# already moved once, and a hardcoded constant silently rots when it moves again.
+_REPO = os.environ.get("GITHUB_EVOLUTION_REPO", "Da-Mikey/hermes-agent-evolution")
 _GITHUB_API = "https://api.github.com"
 _DEFAULT_LIMIT = 100
 
