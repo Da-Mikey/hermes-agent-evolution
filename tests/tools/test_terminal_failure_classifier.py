@@ -181,6 +181,47 @@ class TestClassifyInformationalCommands:
         assert result.should_retry is False
 
 
+class TestChainExitAttribution:
+    """#358: a benign-by-convention final command must not excuse a chain that
+    short-circuited before it ever ran."""
+
+    @pytest.mark.parametrize("command", [
+        "grep foo bar",
+        "grep foo bar | head",     # pipeline: the last command owns the status
+        "ls; grep foo bar",        # sequence: the last command owns it
+        "ls nosuch || grep foo bar",
+        'grep "a && b" file',      # quoted && is not a chain operator
+    ])
+    def test_attribution_is_sound(self, command):
+        assert classifier.exit_code_attributable_to_last_segment(command) is True
+
+    @pytest.mark.parametrize("command", [
+        "cd /nonexistent && grep foo f",
+        "false && diff a b",
+        "cd /x && ls && grep foo f",
+    ])
+    def test_ampersand_chain_is_not_attributable(self, command):
+        assert classifier.exit_code_attributable_to_last_segment(command) is False
+
+    def test_real_failure_is_not_excused(self):
+        """The regression #358 named: exit 1 came from `cd`, not grep's no-match."""
+        result = classifier.classify_terminal_failure(
+            "cd /nonexistent && grep foo f", 1, "", "")
+        assert result.category == classifier.FailureCategory.persistent_error
+        assert result.should_retry is False
+        assert "&&" in result.hint
+
+    def test_real_stderr_version_is_never_informational(self):
+        result = classifier.classify_terminal_failure(
+            "cd /nonexistent && grep foo f", 1, "", "cd: /nonexistent: No such file or directory")
+        assert result.category != classifier.FailureCategory.unknown
+
+    def test_plain_benign_exit_stays_informational(self):
+        result = classifier.classify_terminal_failure("grep foo bar", 1, "", "")
+        assert result.category == classifier.FailureCategory.unknown
+        assert result.should_retry is False
+
+
 class TestStreakRecommendation:
     def test_low_streak_no_recommendation(self):
         assert classifier.streak_recommendation(1) is None
