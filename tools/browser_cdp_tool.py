@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error
@@ -116,6 +117,32 @@ def _blocked(message: str, method: str) -> str:
     return tool_error(message, method=method, cdp_docs=CDP_DOCS_URL)
 
 
+# ``Input.*`` only types text or dispatches key/mouse events — a URL in its text is never
+# fetched by the call, so screening it would refuse innocent typing (upstream 9a0bbf03af).
+_TEXT_INPUT_METHOD_PREFIX = "Input."
+_URL_LITERAL_RE = re.compile(r"""https?://[^\s'"`)\]<>]+""", re.IGNORECASE)
+
+
+def _param_url_literals(value: Any, method: str = "", key: str = "") -> list[str]:
+    """Every URL a CDP call's params name: each ``url`` value whole, plus every ``http(s)://``
+    literal in any string at any depth (function bodies, injected scripts, HTML).
+
+    This is what makes the metadata floor cover ``Runtime.evaluate("fetch('http://169.254.169.254/…')")``,
+    ``Network.loadNetworkResource`` and ``Fetch.continueRequest`` — not just a ``url`` param.
+    """
+    if method.startswith(_TEXT_INPUT_METHOD_PREFIX):
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        found = [text] if key == "url" and text else []
+        return found + [m.rstrip(".,;") for m in _URL_LITERAL_RE.findall(value)]
+    if isinstance(value, dict):
+        return [u for k, v in value.items() for u in _param_url_literals(v, method, str(k))]
+    if isinstance(value, (list, tuple)):
+        return [u for v in value for u in _param_url_literals(v, method, key)]
+    return []
+
+
 def _expression_private_target(expression: str) -> Optional[str]:
     from tools.browser_tool_eval_policy import _expression_targets_private_url
     return _expression_targets_private_url(expression)
@@ -148,6 +175,17 @@ def _browser_cdp_private_guard(*, task_id: str, method: str, params: Dict[str, A
         from tools import browser_tool as bt  # type: ignore[import-not-found]
         from tools import browser_tool_eval_policy as policy
         if not policy._eval_ssrf_guard_active(task_id):
+            # The cloud-metadata floor stays UNCONDITIONAL, exactly as in browser_exec's own
+            # policy check: a local backend, ``allow_private_urls`` or ``trust_private_hosts``
+            # must never unblock 169.254.169.254. Without this, raw CDP was the one remaining
+            # way to open the metadata endpoint while browser_exec refused it everywhere.
+            # Ported from upstream 09660feb36 + 1fdfdecbcf + f4aa77a467 + 9a0bbf03af.
+            from tools.url_safety import is_always_blocked_url
+            metadata = next((u for u in _param_url_literals(params or {}, method)
+                             if is_always_blocked_url(u)), None)
+            if metadata:
+                return _blocked(
+                    f"Blocked: CDP {method} targets a cloud metadata endpoint ({metadata}).", method)
             return None
         guard = _METHOD_PARAM_GUARDS.get(method)
         if guard is not None:
@@ -155,6 +193,14 @@ def _browser_cdp_private_guard(*, task_id: str, method: str, params: Dict[str, A
             literal = probe(bt, params or {})
             if literal:
                 return _blocked(template.format(literal), method)
+        # The metadata floor is unconditional in THIS branch too: an unlisted method
+        # (``Network.loadNetworkResource``, ``Fetch.continueRequest``) must not reach the
+        # metadata endpoint from an otherwise-public page (upstream f4aa77a467).
+        from tools.url_safety import is_always_blocked_url
+        metadata = next((u for u in _param_url_literals(params or {}, method)
+                         if is_always_blocked_url(u)), None)
+        if metadata:
+            return _blocked(f"Blocked: CDP {method} targets a cloud metadata endpoint ({metadata}).", method)
         if method not in _CDP_PRIVATE_PAGE_ALLOWED_METHODS:
             blocked_url = policy._current_page_private_url(task_id)
             if blocked_url:
