@@ -16,5 +16,85 @@
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
     "checked_at": "2026-10-01",
     "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin)."
+  },
+  "release_assessment_20261108": {
+    "latest_release_checked": "v0.23.0",
+    "release_name": "Hermes Agent v0.23.0 - The Hearth Release",
+    "published_at": "2026-11-05T21:32:33Z",
+    "run_date": "2026-11-08",
+    "marker_guard": "git merge-base --is-ancestor v0.23.0 origin/main -> FALSE (not integrated; proceed)",
+    "divergence": {
+      "behind_upstream_main": 22342,
+      "ahead_of_upstream_main": 1634,
+      "commits_v2026.9.24_to_v0.23.0": 21110,
+      "commits_v0.22.7_to_v0.23.0": 808
+    },
+    "merge_trial": {
+      "method": "git worktree add --detach <tmp> v0.23.0; git merge --no-commit --no-ff origin/main; counted; aborted clean (0 dirty entries)",
+      "conflicting_files": 259,
+      "changed_entries": 1462,
+      "conflict_areas": "tests 58, tools 47, .github 36, agent 32, hermes_cli 22, root 15, gateway 14, cron 10, plugins 7",
+      "trend_across_releases": "v0.22.5=246, v0.22.6=258, v0.22.7=259, v0.23.0=259 (flat, not accelerating)"
+    },
+    "decision": "defer-full-merge",
+    "decision_reason": "259 conflicting files at 22,342 commits behind is a cost judgement past the skill's 'code conflicts + 400+ behind -> skip' threshold. Structural divergence, not a broken fork. Owner's call whether to rebase.",
+    "merge_base_with_main": "f97608f (the v0.21.5 release commit) - a future full merge remains possible",
+    "measurement_trap": "git merge-tree --write-tree is NOT a conflict count; only a real git merge --no-commit in a throwaway worktree gives a comparable number.",
+    "security_in_window": {
+      "published_advisories": 0,
+      "cve_tagged_commits": 0,
+      "approval_and_consent_commits": [
+        "267bf8faf9 fix(approval): walk carrier scripts for wmic, not just their first word - DEFERRED: patches _WmicShadowDeleteMatcher, which does not exist in this fork (our approval_detection.py has zero wmic rules); rides with the full merge",
+        "b7628b4abf fix(approval): pipe-to-shell keeps every case main caught - DEFERRED: patches _PipeRemoteToShellMatcher, absent from this fork",
+        "ef1dbcfcbb fix(approval): keep the bare mode-off result in check_dangerous_command - DEFERRED: 1-line, but our check_dangerous_command has a different shape; low value alone",
+        "14f74b3f89 fix(mcp): consent line never masks a flag after a secret flag - DEFERRED: tools/connectors/mcp_launch.py does not exist in this fork"
+      ],
+      "dependency_bumps": "body-parser 1.20.9, setuptools 84.1.0, qs 6.16.1, zod 4.6.7 (node/packaging, not in our runtime path)",
+      "measured_fork_gaps_vs_v0.23.0": "pipe-to-shell behind a launcher (sudo/env/doas/nohup/exec/command): ours MISSED, upstream FLAGGED -> FIXED this run in PR #368. Shared gaps (both miss): bare interpreter name, su -c, ssh host."
+    },
+    "backports_carried": [
+      "PR #368 (this run): pipe-to-shell sees through launchers - 34 tests, 970-test regression sweep, ruff clean",
+      "PR #362: secret-redaction hardening (44 commits, 35 proven leaks closed)",
+      "PR #346, #324, #294, #264, #276, #191: earlier approval-gate, CDP, dependency-CVE and plugin-gate backports"
+    ],
+    "stale_pr_warning": "PR #295 (chore/upstream-sync-state-20261026) is NOT a safe place to append: its branch would revert ~7,768 lines across 55 files (cron/drift_guard.py, tools/file_write_merge.py deleted). Superseded by this branch; recommend closing.",
+    "_note": "v0.23.0 is NOT merged. integrated_tag deliberately stays v2026.9.24 and synced_through_commit is untouched: release-track assessments are recorded here, not in the incremental cursor."
+  },
+  "release_assessment_20261111": {
+    "latest_release_checked": "v0.23.1",
+    "published_at": "2026-11-10T01:42:15Z",
+    "run_date": "2026-11-11",
+    "marker_guard": "git merge-base --is-ancestor v0.23.1 origin/main -> FALSE (not integrated); git rev-list --count main..v0.23.1 = 23714",
+    "tag_namespace_change": "UPSTREAM RENAMED ITS RELEASE TAGS. Dated tags (v2026.9.24 was the last) were replaced by semver at v0.21.6 (2026-10-08). Twelve releases have published since our base: v0.21.6, v0.21.7, v0.22.0-v0.22.7, v0.23.0, v0.23.1. `git tag -l 'v20*'` - the filter in the release-track step - now matches ONLY the old dated tags, so a run trusting it alone reports 'no new release' while twelve have shipped. Discovery must use `gh release list --repo nousresearch/hermes-agent` or `git tag -l 'v0.*' 'v20*'`. Verified 2026-11-11 against gh release list --limit 25. Fix belongs to an interactive session: cron cannot write the skills tree.",
+    "divergence": {
+      "behind_v0_23_1": 23714,
+      "ahead_of_v0_23_1": 1636,
+      "commits_v0_23_0_to_v0_23_1": 2604,
+      "window_files_changed": 2781,
+      "window_diff": "+151690 / -62595",
+      "note": "Window figures corroborated twice: upstream's release notes and our own `git diff --shortstat v0.23.0..v0.23.1` agree exactly."
+    },
+    "merge_trial": {
+      "method": "git worktree add --detach <scratch>/wt-sync-rel-v0.23.1 v0.23.1; git merge --no-commit --no-ff origin/main; counted; aborted clean; worktree removed. Live install tree never checked out or reset.",
+      "conflicting_files": 263,
+      "conflict_classes": "236 content + 27 modify/delete (upstream modified files we deleted: tools/tirith_security.py, tools/homeassistant_tool.py, plugins/memory/mem0/__init__.py, scripts/check_compat_pointers.py and their tests)",
+      "conflict_areas": "tools 47, .github 37, agent 33, tests/tools 19, gateway 14, cron 10, tests/agent 9, plugins 8, tests/hermes_cli 7, scripts 6",
+      "trend_across_releases": "v0.22.5=246, v0.22.6=258, v0.22.7=259, v0.23.0=259, v0.23.1=263 (flat, not accelerating)"
+    },
+    "decision": "defer-full-merge",
+    "decision_reason": "263 conflicting files at 23,714 commits behind: past the skill's 'code conflicts + 400+ behind -> skip' threshold. v0.23.1 is a roll-up patch (2,604 commits of churn since v0.23.0, curated notes deferred to v0.24.0) whose one headlined fix is a plugin-catalog size cap (2 MiB -> 16 MiB) for `hermes plugins install`. This fork does not consume upstream's plugin catalog, so the merge buys 263 manual resolutions for near-zero delivered value.",
+    "security_in_window": {
+      "published_advisories": 0,
+      "cve_or_ghsa_tagged_commits": 0,
+      "keyword_sweep": "104 commits matched (security|redact|secret|credential|SSRF|inject|bypass|harden|...); triaged: almost all are plugin-catalog pins (secretshield, secret-guard, injection-guard, cortive, tensorfold) or gateway/Telegram topic-and-approval behaviour fixes bound to an architecture this fork never adopted",
+      "would_matter_if_merged": [
+        "d0fd66ed1e fix(telegram): the moved standalone sender keeps proxy credentials out of logs",
+        "8336bb8d1d fix(url_safety): every SSRF-safe client sends an identifying User-Agent - hygiene, not a vulnerability"
+      ],
+      "coverage_instrument_failed": "Subtracting shas already carried by open backport PRs via `cherry picked from commit` trailers returned 0 covered shas, because those branches carry hand-resolved verbatim-from-tag commits without -x trailers (exactly as the skill's step 3 prescribes). The '104 uncovered' figure is an upper bound from a broken instrument, NOT a leak list, and is deliberately not reported as exposure. A real coverage check is a backport run's job."
+    },
+    "open_pr_state_at_run": "8 PRs open, all mergeable=MERGEABLE with SUCCESS/SKIPPED checks, none merged: #369 (state), #368 (pipe-to-shell launchers), #362 (redaction hardening, 44 commits), #324 (CDP metadata floor), #294 (dependency CVEs), #276 (plugin gate on websockets), #264 (revoked allowlist), #191 (v0.21.6 security). Four are security work with no path to main except an owner merge click - that is the outstanding exposure, not v0.23.1.",
+    "report": "~/.hermes/evolution/upstream/2026-11-11.md",
+    "_note": "v0.23.1 is NOT merged. integrated_tag deliberately stays v2026.9.24 and synced_through_commit is untouched: release-track assessments are recorded here, not in the incremental cursor."
   }
 }
