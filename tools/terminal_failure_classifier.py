@@ -156,11 +156,30 @@ _EXPECTED_NONZERO_COMMANDS = frozenset({
 })
 
 
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"")
+_CHAIN_OPERATORS = re.compile(r"\s*(?:\|\||&&|[|;])\s*")
+
+
+def chain_segments(command: str) -> list:
+    """Split a shell command into chain segments, ignoring quoted operators.
+
+    Quote-aware on purpose: ``grep "a && b" file`` is one command, not a chain.
+    Splitting it blindly made the base command ``b'`` and lost grep's no-match
+    meaning entirely.
+    """
+    return [s for s in _CHAIN_OPERATORS.split(_QUOTED_SPAN.sub(" ", command)) if s.strip()]
+
+
 def _base_command(command: str) -> str:
-    """Extract the base command name from a shell pipeline/chain."""
-    # Split on shell operators and take the last segment because the exit code
-    # in a chain is determined by the final command.
-    segments = re.split(r"\s*(?:\|\||&&|[|;])\s*", command)
+    """Extract the base command name from a shell pipeline/chain.
+
+    The *last* segment is probed because in a pipeline or a ``;`` sequence the
+    chain's status is the final command's.  That assumption does NOT hold for
+    ``&&`` chains — see :func:`exit_code_attributable_to_last_segment`, which
+    callers must consult before excusing a non-zero code on the strength of this
+    name alone.
+    """
+    segments = chain_segments(command)
     last_segment = (segments[-1] if segments else command).strip()
     words = last_segment.split()
     for w in words:
@@ -168,6 +187,21 @@ def _base_command(command: str) -> str:
             continue  # skip VAR=val
         return w.split("/")[-1]
     return ""
+
+
+def exit_code_attributable_to_last_segment(command: str) -> bool:
+    """Whether a non-zero exit code must have come from the chain's final segment.
+
+    ``a && b`` short-circuits: when *a* fails, *b* never runs and the chain
+    exits with *a*'s status.  Attributing that code to *b* is how
+    ``cd /nonexistent && grep foo f`` came back as "no matches (not an error)" —
+    a real failure reported as success.  Pipelines (``|``), sequences (``;``)
+    and alternatives (``||``) all leave the final command owning the status, so
+    attribution is sound there.
+
+    Quoted spans are removed first: ``grep "a && b" file`` contains no chain.
+    """
+    return "&&" not in _QUOTED_SPAN.sub(" ", command)
 
 
 def _output_text(stdout: str, stderr: str) -> str:
@@ -347,7 +381,11 @@ def classify_terminal_failure(
         )
 
     # Some commands use non-zero exit codes for normal informational purposes.
-    if base_cmd in _EXPECTED_NONZERO_COMMANDS:
+    # Only trust that table when the code provably belongs to the last segment:
+    # in ``a && b`` a failure in *a* exits with *a*'s status before *b* runs.
+    if base_cmd in _EXPECTED_NONZERO_COMMANDS and exit_code_attributable_to_last_segment(
+        command
+    ):
         return TerminalFailureClassification(
             category=FailureCategory.unknown,
             hint=(
@@ -417,6 +455,21 @@ def classify_terminal_failure(
                 "unset (env var, interpreter, or environment). Export/set it "
                 "explicitly or activate the right environment before retrying; "
                 "the same command unchanged will fail identically."
+            ),
+            should_retry=False,
+        )
+
+    # A conventionally-benign command ended the chain, but an ``&&`` may have
+    # short-circuited before it ran, so the code is not its to excuse.  Say so
+    # instead of falling through to a generic "persistent error" with no cause.
+    if base_cmd in _EXPECTED_NONZERO_COMMANDS:
+        return TerminalFailureClassification(
+            category=FailureCategory.persistent_error,
+            hint=(
+                f"The command chain exited {exit_code}. '{base_cmd}' normally uses "
+                "non-zero codes informationally, but this chain contains '&&', so an "
+                "earlier segment most likely failed before it ran. Run the failing "
+                "segment on its own to see the real error."
             ),
             should_retry=False,
         )
