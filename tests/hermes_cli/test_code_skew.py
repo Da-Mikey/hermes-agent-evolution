@@ -40,6 +40,64 @@ class TestDetectCodeSkew:
         skew = code_skew.detect_code_skew()
         assert skew == ("abc1234567", "def4567890")
 
+    def test_same_commit_on_a_new_branch_is_not_skew(self, monkeypatch):
+        # #393: `git checkout -b evolution/issue-N` keeps the commit, reloads
+        # nothing, and must not request a gateway restart.
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:dbbdd9727621")
+        code_skew.record_boot_fingerprint()
+
+        monkeypatch.setattr(
+            code_skew,
+            "_fingerprint",
+            lambda: "git:refs/heads/evolution/issue-393-code-skew:dbbdd9727621",
+        )
+        assert code_skew.detect_code_skew() is None
+
+    def test_new_commit_on_a_new_branch_is_skew(self, monkeypatch):
+        # The ref changed AND the commit changed: a restart is genuinely wanted.
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:dbbdd9727621")
+        code_skew.record_boot_fingerprint()
+
+        monkeypatch.setattr(
+            code_skew,
+            "_fingerprint",
+            lambda: "git:refs/heads/evolution/issue-393:abc1234567890",
+        )
+        skew = code_skew.detect_code_skew()
+        assert skew == ("dbbdd97276", "abc1234567")
+
+    def test_unresolved_sha_still_compares_the_whole_fingerprint(self, monkeypatch):
+        # No commit identity to compare -> stay conservative, keep the old
+        # full-fingerprint behaviour rather than swallowing a real drift.
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:unresolved")
+        code_skew.record_boot_fingerprint()
+
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/other:unresolved")
+        assert code_skew.detect_code_skew() == ("unresolved", "unresolved")
+
+
+class TestCommitIdentity:
+
+    def test_git_fingerprint_yields_its_sha(self):
+        assert code_skew._commit_identity("git:refs/heads/main:abc123") == "abc123"
+
+    def test_non_git_fingerprint_falls_back_to_the_whole_string(self):
+        fp = "skills:0.23.0:20261014:1750000000000:4096"
+        assert code_skew._commit_identity(fp) == fp
+
+    def test_non_git_drift_with_an_unchanged_size_still_trips(self, monkeypatch):
+        # A non-git install's identity is the whole string: the size field alone
+        # would hide an edit that kept the byte count identical.
+        monkeypatch.setattr(
+            code_skew, "_fingerprint", lambda: "skills:0.23.0:20261014:1750000000000:4096"
+        )
+        code_skew.record_boot_fingerprint()
+
+        monkeypatch.setattr(
+            code_skew, "_fingerprint", lambda: "skills:0.23.0:20261014:1750000999999:4096"
+        )
+        assert code_skew.detect_code_skew() is not None
+
 
 
 
