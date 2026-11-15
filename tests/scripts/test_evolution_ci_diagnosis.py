@@ -827,6 +827,120 @@ def test_total_checks_counts_checks_not_clean_prs(tmp_path):
     assert summary["prs_success"] == 2
 
 
+class TestPerLevelCounters:
+    """#397: PR-level rows must never be counted as check-level results.
+
+    The 05:12 run of 2026-11-15 published ``{"success": 13, "failed": 0,
+    "total_checks": 0}`` — 13 success and 0 failed from a run that measured no
+    checks at all. Both numbers came from summing ``results`` wholesale, where
+    the 13 rows were PR-level (``check_run_id: null``). The reader sees
+    "nothing failing"; the only field showing the fault is the one that reads
+    zero.
+    """
+
+    def _blank_0512_body(self) -> List[Dict[str, Any]]:
+        """The exact shape of diagnosis-2026-11-15T051218Z.json: 13 PR rows, 0 check rows."""
+        return [
+            {
+                "pr_number": n,
+                "pr_title": f"PR {n}",
+                "pr_url": f"https://example/pr/{n}",
+                "head_sha": "deadbeef",
+                "conclusion": "success",
+                "classification": None,
+                "error_class": None,
+                "message": None,
+                "child_issue_url": None,
+                "check_run_id": None,
+            }
+            for n in range(1, 14)
+        ]
+
+    def test_unmeasured_run_cannot_publish_a_clean_check_rate(self, tmp_path):
+        """The defect itself: 13 PR rows + 0 checks must not read as 13 successes."""
+        path = diag.save_diagnosis_report(self._blank_0512_body(), report_dir=tmp_path)
+        summary = json.loads(path.read_text(encoding="utf-8"))["summary"]
+
+        assert summary["total_checks"] == 0
+        assert summary["checks_success"] == 0, "PR rows are not check successes"
+        assert summary["checks_failed"] == 0
+        # The alias readers already trust must carry the check-level number.
+        assert summary["success"] == 0, "`success` must alias checks_success, not rows"
+        assert summary["failed"] == 0
+        # The run is visible as unmeasured rather than as calm.
+        assert summary["checks_measured"] is False
+        assert summary["status"] == "unmeasured"
+
+    def test_measured_run_counts_each_level_from_its_own_rows(self, tmp_path):
+        results = [
+            {"pr_number": 1, "conclusion": "success", "check_run_id": None},
+            {"pr_number": 2, "pr_title": "failing", "conclusion": "success", "check_run_id": None},
+            {"pr_number": 2, "check_run_id": 11, "conclusion": "failure", "classification": "trivial"},
+            {"pr_number": 2, "check_run_id": 12, "conclusion": "failure", "classification": "complex"},
+            {"pr_number": 3, "check_run_id": 13, "conclusion": "success"},
+            {"pr_number": 3, "check_run_id": 14, "conclusion": None},
+        ]
+        path = diag.save_diagnosis_report(results, report_dir=tmp_path)
+        summary = json.loads(path.read_text(encoding="utf-8"))["summary"]
+
+        # Check level: 4 check rows -> 1 success, 2 failed, 1 pending.
+        assert summary["total_checks"] == 4
+        assert summary["checks_success"] == 1
+        assert summary["checks_failed"] == 2
+        assert summary["checks_in_progress"] == 1
+        assert summary["success"] == 1
+        assert summary["failed"] == 2
+        # Classification lives on check rows only (PR rows carry none).
+        assert summary["trivial"] == 1
+        assert summary["complex"] == 1
+        # PR level: 3 PRs — 2 failed (a failing check), 3 has a pending check row so it
+        # is in progress, never counted as a success (pre-fix it was counted as FAILED,
+        # because `failed_pr_numbers` collected every check row of a PR).
+        assert summary["total_prs"] == 3
+        assert summary["prs_failed"] == 1
+        assert summary["prs_in_progress"] == 1
+        assert summary["prs_success"] == 1
+        assert summary["checks_measured"] is True
+        assert summary["status"] == "ok"
+
+    def test_green_check_row_does_not_make_a_pr_failed(self, tmp_path):
+        """#397 second defect: `prs_failed` collected every check row, not failing ones."""
+        results = [
+            {"pr_number": 1, "check_run_id": 31, "conclusion": "success"},
+            {"pr_number": 2, "check_run_id": 32, "conclusion": "success"},
+            {"pr_number": 2, "check_run_id": 33, "conclusion": "failure"},
+        ]
+        path = diag.save_diagnosis_report(results, report_dir=tmp_path)
+        summary = json.loads(path.read_text(encoding="utf-8"))["summary"]
+
+        assert summary["prs_failed"] == 1, "only PR 2 had a failing check"
+        assert summary["prs_success"] == 1, "PR 1 is clean and must be counted clean"
+        assert summary["checks_success"] == 2
+        assert summary["checks_failed"] == 1
+
+    def test_zero_denominator_rate_is_null_never_zero(self, tmp_path):
+        """A published rate with a zero denominator must not serialize as 0.0 (#249)."""
+        path = diag.save_diagnosis_report([], report_dir=tmp_path)
+        summary = json.loads(path.read_text(encoding="utf-8"))["summary"]
+
+        assert summary["total_checks"] == 0
+        assert summary["check_pass_rate"] is None
+        assert summary["pr_pass_rate"] is None
+        assert summary["status"] == "unmeasured"
+
+    def test_pass_rates_are_check_and_pr_scoped(self, tmp_path):
+        results = [
+            {"pr_number": 1, "conclusion": "success", "check_run_id": None},
+            {"pr_number": 2, "check_run_id": 21, "conclusion": "success"},
+            {"pr_number": 2, "check_run_id": 22, "conclusion": "failure"},
+        ]
+        path = diag.save_diagnosis_report(results, report_dir=tmp_path)
+        summary = json.loads(path.read_text(encoding="utf-8"))["summary"]
+
+        assert summary["check_pass_rate"] == 0.5  # 1 of 2 measured checks
+        assert summary["pr_pass_rate"] == 0.5  # 1 of 2 PRs clean
+
+
 class TestRepoUnderDiagnosis:
     """#390: the loop must poll the repo the pipeline files PRs into.
 
