@@ -1097,6 +1097,10 @@ def handle_function_call(
                 tool_name=function_name,
                 status=_st,
                 error_message=_err_msg,
+                # #359 — identity, so the outer producer's second view of this same
+                # call is deduped instead of counting as another failure.
+                call_id=ids.tool_call_id,
+                producer="model_tools",
             )
             if _breaker_event and _breaker_event.get("circuit_breaker_tripped"):
                 if isinstance(result, str) and "[CIRCUIT_BREAKER]" not in result:

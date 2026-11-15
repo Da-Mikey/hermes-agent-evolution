@@ -95,8 +95,25 @@ class _ToolCircuitBreakerTracker:
         status: str,
         error_message: Optional[str] = None,
         budget: Optional[int] = None,
+        call_id: Optional[str] = None,
+        producer: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Record a tool result and return a diagnostic event if the circuit breaker trips."""
+        """Record a tool result and return a diagnostic event if the circuit breaker trips.
+
+        ``call_id`` is the runtime's ``tool_call_id`` for this invocation and
+        ``producer`` names the layer recording it. Together they make one tool
+        call count once (#359): two producers legitimately see the same call —
+        ``model_tools.execute_tool`` records the raw result, and
+        ``agent.tool_executor._record_tool_circuit_breaker`` records the wrapped
+        result immediately afterwards — and without an identity every call was
+        recorded twice, so ``terminal``'s budget of 5 tripped after three real
+        failures and announced "5 consecutive times".
+
+        The dedupe is deliberately scoped to the producer pair: if the SAME
+        producer records the SAME call id again, that is a genuine re-execution
+        and it spends the budget (the breaker must never be disarmed); and when
+        either argument is absent the record is made exactly as before.
+        """
         with self._lock:
             sid = str(session_id or "default").strip()
             tname = str(tool_name or "").strip()
@@ -112,8 +129,25 @@ class _ToolCircuitBreakerTracker:
                     "total_failures": 0,
                     "last_error": None,
                     "last_failure_class": None,
+                    "last_call_id": None,
+                    "last_call_producers": set(),
                 },
             )
+
+            cid = str(call_id).strip() if call_id else None
+            prod = str(producer).strip() if producer else None
+            if cid is not None and prod is not None:
+                if tool_rec.get("last_call_id") == cid:
+                    if prod in tool_rec.get("last_call_producers", set()):
+                        # Same call id, same producer: a real second attempt.
+                        tool_rec["last_call_producers"] = {prod}
+                    else:
+                        # A second layer's view of a call already recorded.
+                        tool_rec["last_call_producers"].add(prod)
+                        return None
+                else:
+                    tool_rec["last_call_id"] = cid
+                    tool_rec["last_call_producers"] = {prod}
 
             tool_rec["total_calls"] += 1
 
