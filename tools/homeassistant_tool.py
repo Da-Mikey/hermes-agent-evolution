@@ -227,6 +227,45 @@ async def _async_get_state(entity_id: str) -> Dict[str, Any]:
         "last_changed": data.get("last_changed"), "last_updated": data.get("last_updated")}
 
 
+# #385 — a household instruction names several devices at once ("all the lamps",
+# "the garage and the passage"). The single-entity regex turned that into a format
+# error with no batch path, so a scheduled evening-lights job failed on the
+# identical call every run and the lights never changed.
+_MAX_BATCH_ENTITIES = 25
+
+
+def _split_entity_ids(raw: Any) -> Optional[List[str]]:
+    """Normalise an ``entity_id`` argument into a list of ids (#385).
+
+    Accepts the three shapes a caller actually sends — a plain string, a
+    comma-separated string, a JSON array string, or a real list — and returns
+    ``None`` for anything else so the handler can return an actionable error
+    instead of a confusing format failure. An absent value stays ``[]``: some
+    services (``scene.turn_on``, ``script.turn_on``) take no entity at all.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        items = [str(x).strip() for x in raw]
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        parsed: Any = None
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+        if isinstance(parsed, list):
+            items = [str(x).strip() for x in parsed]
+        else:
+            items = [part.strip() for part in text.split(",")]
+    else:
+        return None
+    return [item for item in items if item]
+
+
 def _build_service_payload(entity_id: Optional[str] = None, data: Optional[Dict[str, Any]] = None) -> Dict:
     """JSON payload for a HA service call; ``entity_id`` overrides data["entity_id"]."""
     payload: Dict[str, Any] = dict(data or {})
@@ -248,6 +287,46 @@ async def _async_call_service(
     result = await _api_json(
         "POST", f"/api/services/{domain}/{service}", 15, _build_service_payload(entity_id, data))
     return _parse_service_response(domain, service, result)
+
+
+async def _async_call_service_many(
+    domain: str, service: str, entity_ids: List[str], data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fan one service call out over several entities, naming every failure (#385).
+
+    "Turn off all the lamps" is the ordinary shape of a home-automation request,
+    but the handler accepted exactly one entity, so a comma-joined list was
+    rejected as a *format* error: nothing retried, the evening lights stayed on
+    (or off) and the run still recorded as completed.
+
+    One entity failing must not hide the others, so each call is collected
+    separately rather than wrapped in a single try. The aggregate carries
+    ``success: False`` plus a ``failures`` list naming the exact entity and
+    cause, which is what lets the caller correct itself in one step.
+    """
+    affected: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    for eid in entity_ids:
+        try:
+            res = await _async_call_service(domain, service, eid, data)
+        except Exception as exc:
+            failures.append({"entity_id": eid, "error": _describe_exception(exc)})
+            continue
+        listed = res.get("affected_entities") or []
+        # A service that returns no state list (e.g. turn_off) still acted on this
+        # entity; report it so the caller can see every id was attempted.
+        affected.extend(listed or [{"entity_id": eid, "state": ""}])
+    out: Dict[str, Any] = {
+        "success": not failures,
+        "service": f"{domain}.{service}",
+        "requested_entities": entity_ids,
+        "affected_entities": affected,
+    }
+    if failures:
+        out["failures"] = failures
+        out["failed"] = len(failures)
+        out["succeeded"] = len(entity_ids) - len(failures)
+    return out
 
 
 async def _async_list_services(domain: Optional[str] = None) -> Dict[str, Any]:
@@ -409,15 +488,37 @@ def _handle_call_service(args: dict, **kw) -> str:
         return tool_error(
             f"Service domain '{domain}' is blocked for security. "
             f"Blocked domains: {', '.join(sorted(_BLOCKED_DOMAINS))}")
-    entity_id = args.get("entity_id")
-    if entity_id and not _ENTITY_ID_RE.match(entity_id):
-        return tool_error(f"Invalid entity_id format: {entity_id}")
+    raw_entity = args.get("entity_id")
+    entity_ids = _split_entity_ids(raw_entity)
+    if entity_ids is None:
+        return tool_error(
+            f"entity_id must be a string or a list, got {type(raw_entity).__name__}. "
+            "Pass one id ('light.hall'), several comma-separated "
+            "('light.hall,light.study'), or a JSON array.")
+    if len(entity_ids) > _MAX_BATCH_ENTITIES:
+        return tool_error(
+            f"entity_id names {len(entity_ids)} entities; the batch limit is "
+            f"{_MAX_BATCH_ENTITIES}. Use a Home Assistant group, script or scene for a "
+            "whole-house action, or split the call.")
+    invalid = [e for e in entity_ids if not _ENTITY_ID_RE.match(e)]
+    if invalid:
+        return tool_error(
+            f"Invalid entity_id format: {', '.join(invalid)}. Expected "
+            "'<domain>.<object_id>' (e.g. light.living_room).")
     data = args.get("data")
     if isinstance(data, str):  # XML tool-calling mode delivers data as a JSON string
         try:
             data = json.loads(data) if data.strip() else None
         except json.JSONDecodeError as e:
             return tool_error(f"Invalid JSON string in 'data' parameter: {e}")
+    if len(entity_ids) > 1:
+        # #385 — a household instruction names several devices at once; fan out
+        # instead of rejecting the batch as a format error.
+        return _dispatch(
+            _async_call_service_many(domain, service, entity_ids, data),
+            "ha_call_service",
+            f"Failed to call {domain}.{service} on {len(entity_ids)} entities")
+    entity_id = entity_ids[0] if entity_ids else None
     return _dispatch(
         _async_call_service(domain, service, entity_id, data),
         "ha_call_service", f"Failed to call {domain}.{service}")
@@ -530,8 +631,12 @@ HA_CALL_SERVICE_SCHEMA = {
             "entity_id": {
                 "type": "string",
                 "description": (
-                    "Target entity ID (e.g. 'light.living_room'). "
-                    "Some services (like scene.turn_on) may not need this."
+                    "Target entity ID (e.g. 'light.living_room'). Several targets may "
+                    "be given at once as a comma-separated list "
+                    "('light.living_room,light.hall,switch.passage') or a JSON array "
+                    "string ('[\"light.a\",\"light.b\"]'); each is called in turn and "
+                    "the result names any entity that failed. Some services (like "
+                    "scene.turn_on) may not need this."
                 ),
             },
             "data": {
