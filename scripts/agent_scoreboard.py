@@ -354,6 +354,79 @@ def is_refusal(answer):
     return bool(answer) and _REFUSAL_RE.search(answer) is not None
 
 
+#: A governance / housekeeping aside appended after the answer proper.  The
+#: ``max_words`` cap is a VERBOSITY measure -- "the answer comes first and is not
+#: buried" -- so it must not count the note the agent adds when a gate refused one
+#: of its calls (issue #401).  Measured 2026-11-15 on one unchanged install: an
+#: answer whose body was 14 words and whose trailing aside explained that the turn
+#: gate had refused its ``terminal`` call for the sum came to 86 words, passed every
+#: substantive check, and failed ``<= 60 words`` on the aside alone.
+#:
+#: The marker is a note introduced by a dash or a blank line after a sentence end,
+#: or a paragraph opening with ``Note:``-style wording.  A bare dash is NOT enough:
+#: arithmetic prose is full of them.
+_ASIDE_MARKER_RE = re.compile(
+    r"(?:"
+    r"(?<=[.!?])[ \t]+"  # a sentence end and a space, or
+    r"|\n[ \t]*\n[ \t]*"  # a blank line -- which is how the recorded answer
+    r")"  # separated its note
+    r"(?:(?:—+|–+|-{1,2})\s*)?"  # an optional dash run, alone on its own line or inline
+    r"(?:one note|a note|note:|nb:|aside:|housekeeping:|governance note|"
+    r"one caveat|caveat:|one flag|flag:)",
+    re.I,
+)
+
+
+#: What makes a trailing passage a GOVERNANCE aside rather than more answer: it
+#: talks about the machinery that decided whether the agent could act -- a gate, a
+#: refusal, an approval, an instruction.  Without this token the passage is not
+#: stripped, so a long answer that merely happens to contain "Note:" in its middle
+#: still pays the full cap.
+_GOVERNANCE_TAIL_RE = re.compile(
+    r"(?:"
+    r"safety gate|turn gate|approval gate|gate\b|"
+    r"refus\w*|denied|not allowed|blocked|permission|approv\w*|"
+    r"polic(?:y|ies)|instruction|directive|system prompt|guardrail|"
+    r"dry[- ]run|housekeeping|"
+    r"couldn'?t|wouldn'?t|won'?t"
+    r")",
+    re.I,
+)
+
+
+def strip_governance_aside(answer):
+    """Split a trailing governance aside off *answer*.
+
+    Returns ``(body, aside)``.  ``aside`` is ``None`` when the answer carries no
+    trailing note, and the answer is returned unchanged when stripping it would
+    leave no body at all (an answer that is *only* a note is still measured in
+    full) or when the trailing passage says nothing about the machinery that ran
+    the agent (see ``_GOVERNANCE_TAIL_RE``) -- an essay is an essay.
+
+    The cut is made at the LAST marker, not the first, so a note about the agent's
+    own arithmetic cannot delete the working that follows it from the count.  The
+    checks that matter -- the numeral, the no-preamble exclusion -- still run
+    against the WHOLE answer, so nothing is hidden by this: only the length cap
+    looks at the body.
+    """
+    if not answer:
+        return answer, None
+    last = None
+    for m in _ASIDE_MARKER_RE.finditer(answer):
+        last = m
+    if last is None:
+        return answer, None
+    body = answer[: last.start()].rstrip()
+    tail = answer[last.start() :]
+    if len(body.split()) < 2:
+        return answer, None
+    if not _GOVERNANCE_TAIL_RE.search(tail):
+        return answer, None
+    if len(tail.split()) > 300:
+        return answer, None
+    return body, tail
+
+
 def _check(label, ok, why="", matched_pattern=None, matched_text=None, **extra):
     """One check outcome, shaped for the run record.
 
@@ -455,19 +528,35 @@ def check_case(case, answer, gt_tokens):
                 )
             )
         elif kind == "max_words":
-            n = len(answer.split())
+            # The cap measures verbosity, so a trailing governance aside is not
+            # part of the answer being measured (issue #401).  The raw count is
+            # still recorded next to the measured one: a verdict that hides how
+            # much text was set aside cannot be audited.
+            body, aside = strip_governance_aside(answer)
+            n = len(body.split())
+            raw_n = len(answer.split())
             ok = n <= chk["n"]
+            label = f"<= {chk['n']} words (got {n})"
+            if aside is not None:
+                label = (
+                    f"<= {chk['n']} words (got {n} of the answer body; "
+                    f"{raw_n} raw, {raw_n - n}-word governance aside not counted)"
+                )
             results.append(
                 _check(
-                    f"<= {chk['n']} words (got {n})",
+                    label,
                     ok,
                     chk.get("why", ""),
                     None,
                     None,
                     measured=n,
                     limit=int(chk["n"]),
+                    raw_measured=raw_n,
+                    aside_stripped=aside is not None,
+                    aside_text=(aside or "")[:400],
                 )
             )
+
         elif kind == "min_words":
             n = len(answer.split())
             ok = n >= chk["n"]
