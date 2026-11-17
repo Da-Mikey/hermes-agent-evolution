@@ -365,14 +365,27 @@ def is_refusal(answer):
 #: The marker is a note introduced by a dash or a blank line after a sentence end,
 #: or a paragraph opening with ``Note:``-style wording.  A bare dash is NOT enough:
 #: arithmetic prose is full of them.
+#:
+#: The OPENER is deliberately not an enumerated vocabulary (rework brief, #401):
+#: the live model writes ``(Small note, since …`` and ``(Odd wrinkle: …``, and a
+#: fixed list of openers only ever matches the phrasings it was written for.  So a
+#: boundary followed by an opening parenthesis, or by a short ``<qualifier> note,``
+#: / ``<qualifier> wrinkle:`` shape, is a candidate -- what decides whether the
+#: passage IS an aside is the governance test on its own text, below.
 _ASIDE_MARKER_RE = re.compile(
     r"(?:"
     r"(?<=[.!?])[ \t]+"  # a sentence end and a space, or
     r"|\n[ \t]*\n[ \t]*"  # a blank line -- which is how the recorded answer
     r")"  # separated its note
     r"(?:(?:—+|–+|-{1,2})\s*)?"  # an optional dash run, alone on its own line or inline
-    r"(?:one note|a note|note:|nb:|aside:|housekeeping:|governance note|"
-    r"one caveat|caveat:|one flag|flag:)",
+    r"(?:"
+    r"[(\[]"  # a parenthetical aside: "(Small note, since …"
+    r"|(?:one note|a note|note:|nb:|aside:|housekeeping:|governance note|"
+    r"one caveat|caveat:|one flag|flag:)"
+    r"|(?:[A-Za-z][\w'-]*[ \t]+){0,2}"  # a short qualifier: "Small note", "Odd wrinkle"
+    r"(?:note|notes|caveat|flag|aside|wrinkle|remark|observation|"
+    r"disclaimer|footnote)\b[ \t]*[,:]"
+    r")",
     re.I,
 )
 
