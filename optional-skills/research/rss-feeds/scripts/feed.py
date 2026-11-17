@@ -33,6 +33,10 @@ NS = {
 }
 FEED_TYPES = ("application/rss+xml", "application/atom+xml", "application/feed+json", "application/json")
 COMMON_FEED_PATHS = ("/feed", "/feed.xml", "/rss", "/rss.xml", "/atom.xml", "/index.xml", "/feed.json", "/blog/feed", "/blog/rss.xml")
+# Feeds that hand back a fixed number of entries and no pagination link. When
+# one of these is full it reads exactly like a quiet feed, so the caller has to
+# be told which it is: absence inside the window is not evidence of absence.
+KNOWN_FEED_CAPS = {"releases.atom": 10, "commits.atom": 10, "tags.atom": 10}
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 
@@ -95,9 +99,14 @@ def parse_xml(data: bytes) -> dict:
         entries = []
         for e in root.findall("atom:entry", NS):
             entries.append({
+                "id": _text(e, "atom:id"),
                 "title": strip_html(_text(e, "atom:title")),
                 "link": _atom_link(e),
-                "published": parse_date(_text(e, "atom:published", "atom:updated")),
+                # GitHub atom feeds emit no <published> at all: only <updated>,
+                # which moves whenever an entry body is edited. Keeping the two
+                # apart means an edit time can never be read as a publish time.
+                "published": parse_date(_text(e, "atom:published")),
+                "updated": parse_date(_text(e, "atom:updated")),
                 "author": strip_html(_text(e, "atom:author/atom:name", "dc:creator")),
                 "summary": strip_html(_text(e, "atom:summary", "atom:content"))[:2000],
             })
@@ -108,9 +117,11 @@ def parse_xml(data: bytes) -> dict:
     entries = []
     for item in channel.iter("item") if tag == "rss" else root.iter("{http://purl.org/rss/1.0/}item"):
         entries.append({
+            "id": (_text(item, "guid", "{http://purl.org/rss/1.0/}identifier") or "").strip() or None,
             "title": strip_html(_text(item, "title", "{http://purl.org/rss/1.0/}title")),
             "link": (_text(item, "link", "{http://purl.org/rss/1.0/}link") or "").strip() or None,
             "published": parse_date(_text(item, "pubDate", "dc:date")),
+            "updated": parse_date(_text(item, "atom:updated")),
             "author": strip_html(_text(item, "dc:creator", "author")),
             "summary": strip_html(_text(item, "content:encoded", "description", "{http://purl.org/rss/1.0/}description"))[:2000],
         })
@@ -123,9 +134,11 @@ def parse_json_feed(data: bytes) -> dict:
     for item in doc.get("items", []):
         authors = item.get("authors") or ([item["author"]] if item.get("author") else [])
         entries.append({
+            "id": item.get("id"),
             "title": strip_html(item.get("title")),
             "link": item.get("url") or item.get("external_url"),
-            "published": parse_date(item.get("date_published") or item.get("date_modified")),
+            "published": parse_date(item.get("date_published")),
+            "updated": parse_date(item.get("date_modified")),
             "author": ", ".join(a.get("name", "") for a in authors if isinstance(a, dict)) or None,
             "summary": strip_html(item.get("summary") or item.get("content_text") or item.get("content_html"))[:2000],
         })
@@ -191,20 +204,105 @@ def read(url: str) -> dict:
     raise SystemExit(f"no feed found at {url}; tried {len(candidates)} candidates\n" + "\n".join(errors))
 
 
-def filter_entries(entries: list[dict], limit: int, since: str | None) -> list[dict]:
+def feed_cap(url: str, override: int | None = None) -> int | None:
+    """Entry cap this URL is known to impose, or None when it is not capped."""
+    if override:
+        return override
+    path = urllib.parse.urlsplit(url).path
+    for suffix, cap in KNOWN_FEED_CAPS.items():
+        if path.endswith(suffix):
+            return cap
+    # GitHub's commits feed is /OWNER/REPO/commits/<BRANCH>.atom — no fixed suffix.
+    if "/commits/" in path and path.endswith(".atom"):
+        return KNOWN_FEED_CAPS["commits.atom"]
+    return None
+
+
+def entry_date(entry: dict, age_by: str = "published") -> str | None:
+    """The timestamp an entry is aged by, or None when the feed gave none."""
+    if age_by == "updated":
+        return entry.get("updated") or entry.get("published")
+    return entry.get("published")
+
+
+def _cutoff(since: str) -> datetime:
+    cutoff = (
+        datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+        if "T" not in since
+        else datetime.fromisoformat(since.replace("Z", "+00:00"))
+    )
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    return cutoff
+
+
+def select_entries(
+    entries: list[dict], limit: int, since: str | None, age_by: str = "published"
+) -> tuple[list[dict], dict]:
+    """Window, sort and slice, and report what was left out and why.
+
+    A feed that just returned a full ten-entry atom window and one that is
+    genuinely quiet both print as ten lines. Only the counts let a reader tell
+    them apart, so they travel with the entries. Entries carrying no timestamp
+    for ``age_by`` are reported as ``undated_excluded`` rather than dropped
+    silently.
+    """
+    seen = len(entries)
+    undated = 0
     if since:
-        cutoff = datetime.fromisoformat(since).replace(tzinfo=timezone.utc) if "T" not in since else datetime.fromisoformat(since.replace("Z", "+00:00"))
-        if cutoff.tzinfo is None:
-            cutoff = cutoff.replace(tzinfo=timezone.utc)
-        entries = [e for e in entries if e["published"] and datetime.fromisoformat(e["published"]) >= cutoff]
-    entries.sort(key=lambda e: e["published"] or "", reverse=True)
-    return entries[:limit]
+        cutoff = _cutoff(since)
+        windowed = []
+        for entry in entries:
+            stamp = entry_date(entry, age_by)
+            if not stamp:
+                undated += 1
+                continue
+            if datetime.fromisoformat(stamp) >= cutoff:
+                windowed.append(entry)
+    else:
+        windowed = list(entries)
+    windowed.sort(key=lambda e: entry_date(e, age_by) or "", reverse=True)
+    selected = windowed[:limit]
+    stats = {
+        "age_by": age_by,
+        "entries_seen": seen,
+        "entries_shown": len(selected),
+        "dropped_by_limit": len(windowed) - len(selected),
+        "dropped_by_since": seen - len(windowed) - undated,
+        "undated_excluded": undated,
+    }
+    return selected, stats
+
+
+def filter_entries(entries: list[dict], limit: int, since: str | None) -> list[dict]:
+    """The selection alone, without the counts (kept for existing callers)."""
+    selected, _ = select_entries(entries, limit, since)
+    return selected
 
 
 def render_text(feed: dict) -> str:
+    age_by = feed.get("age_by", "published")
+    seen = feed.get("entries_seen")
+    shown = feed.get("entries_shown", len(feed["entries"]))
     lines = [f"{feed.get('title') or '(untitled feed)'}  [{feed['format']}]  {feed['url']}"]
+    if seen is not None:
+        counts = f"showing {shown} of {seen} entries (aged by {age_by})"
+        if feed.get("dropped_by_limit"):
+            counts += f"; {feed['dropped_by_limit']} dropped by --limit"
+        if feed.get("dropped_by_since"):
+            counts += f"; {feed['dropped_by_since']} older than --since"
+        if feed.get("undated_excluded"):
+            counts += f"; {feed['undated_excluded']} undated, excluded by --since"
+        lines.append(counts)
+    if feed.get("truncated"):
+        lines.append(
+            f"warning: this feed returned {seen} entries, its documented cap — the window is"
+            " full, so anything older is not visible here and absence is not evidence of none"
+        )
     for e in feed["entries"]:
-        when = (e["published"] or "")[:10]
+        when = (entry_date(e, age_by) or "")[:10]
+        if not when:
+            when = f"undated (edited {e['updated'][:10]})" if e.get("updated") else "undated"
         by = f"  — {e['author']}" if e.get("author") else ""
         lines.append(f"- {when}  {e['title'] or '(no title)'}{by}\n  {e['link'] or ''}")
         if e.get("summary"):
@@ -219,6 +317,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("url")
     r.add_argument("--limit", type=int, default=20)
     r.add_argument("--since", help="ISO date/datetime; drop older entries")
+    r.add_argument(
+        "--age-by",
+        choices=("published", "updated"),
+        default="published",
+        help="timestamp used for --since and ordering (default: published)",
+    )
+    r.add_argument("--cap", type=int, help="override the feed's known entry cap")
     r.add_argument("--json", action="store_true")
     d = sub.add_parser("discover", help="list feed URLs advertised by a page")
     d.add_argument("url")
@@ -231,7 +336,13 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(urls, indent=2) if args.json else "\n".join(urls))
             return 0
         feed = read(args.url)
-        feed["entries"] = filter_entries(feed["entries"], args.limit, args.since)
+        cap = feed_cap(feed["url"], args.cap)
+        feed["entries"], stats = select_entries(
+            feed["entries"], args.limit, args.since, args.age_by
+        )
+        feed.update(stats)
+        feed["cap"] = cap
+        feed["truncated"] = cap is not None and stats["entries_seen"] >= cap
         print(json.dumps(feed, indent=2, ensure_ascii=False) if args.json else render_text(feed))
         return 0
     except urllib.error.HTTPError as exc:
