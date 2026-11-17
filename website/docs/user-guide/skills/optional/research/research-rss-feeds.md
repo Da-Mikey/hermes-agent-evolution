@@ -74,8 +74,30 @@ python3 scripts/feed.py discover https://example.com/               # list candi
 | Substack / Medium / WordPress / Ghost | `SITE/feed`, `medium.com/feed/@user`, `SITE/rss/` |
 | Podcasts | the show's RSS URL from its hosting page (`discover` finds it) |
 
-Output fields per entry: `title`, `link`, `published` (UTC ISO 8601), `author`, `summary`
-(HTML stripped, ≤ 2000 chars). Entries are sorted newest-first.
+Output fields per entry: `id`, `title`, `link`, `published`, `updated`, `author`, `summary`
+(HTML stripped, ≤ 2000 chars). Timestamps are UTC ISO 8601, or `null` when the feed does
+not supply one. Entries are sorted newest-first by the `--age-by` field (`published` by
+default; pass `--age-by updated` to order by edit time).
+
+### A full feed is not a quiet feed
+
+GitHub's `releases.atom`, `commits.atom` and `tags.atom` return exactly **ten** entries
+with no pagination link and HTTP 200. A repository with ten new builds therefore reads
+exactly like a repository where nothing happened. The reader now says which one it is:
+
+- the header prints `showing N of M entries`, and `--json` carries `entries_seen`,
+  `entries_shown`, `dropped_by_limit`, `dropped_by_since`, `undated_excluded`, `cap`
+  and `truncated`;
+- `truncated: true` (or the warning line in text mode) means the window is **full**, so
+  the honest reading is "no release visible in the last 10 entries", never "no release";
+- pass `--cap N` for a feed with an undocumented cap.
+
+**Before concluding a specific tag or release does not exist, cross-check the API:**
+`gh api repos/OWNER/REPO/releases/tags/<tag>` (or `releases?per_page=30`) — it returns
+the true `published_at`, while the atom feed carries only an edit time. GitHub atom
+entries have no `<published>` at all, so `published` is `null` for them and `updated`
+holds the time the body was last edited. Use `--age-by updated` only when you want
+edit-time ordering, and remember an edited old release will look new under it.
 
 ## Procedure
 
