@@ -34,7 +34,7 @@ def test_all_three_formats_normalise_to_the_same_entry_shape_and_utc_dates():
     """RSS (RFC 822), Atom (ISO), JSON Feed (ISO) parse to identical keys with UTC-normalised dates,
     and Atom picks the rel=alternate link over rel=self."""
     rss, atom, jf = feed.parse_feed(RSS), feed.parse_feed(ATOM), feed.parse_feed(JSONFEED, "application/feed+json")
-    keys = {"title", "link", "published", "author", "summary"}
+    keys = {"id", "title", "link", "published", "updated", "author", "summary"}
     for f in (rss, atom, jf):
         assert f["entries"] and all(set(e) == keys for e in f["entries"])
     assert rss["title"] == "Blog & Notes"
