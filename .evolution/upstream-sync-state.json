@@ -15,6 +15,13 @@
     "merged_at": "2026-09-29T17:47:15Z",
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
     "checked_at": "2026-10-01",
+    "last_assessed_tag": "v0.23.2",
+    "last_assessed_at": "2026-11-17",
+    "last_assessed_decision": "defer-full-merge",
+    "last_assessed_conflicting_files": 274,
+    "last_assessed_report": "~/.hermes/evolution/upstream/2026-11-17.md",
+    "open_security_backports": [191, 264, 276, 294, 324, 362, 368, 408],
+    "_assessed_note": "v0.23.2 assessed 2026-11-17: merge trial 274 conflicting files / 1470 changed entries, divergence 31882 behind / 1647 ahead, 0 published advisories. Full merge deferred (trend 246->258->259->259->274). Not integrated: marker guard v0.23.2 ancestor of origin/main = false. Backport 03593a3538 shipped as PR #408 (credential-file redaction: .netrc/.pgpass/.npmrc/.pypirc/.git-credentials/.aws/credentials were read in cleartext). synced_through_commit is NOT advanced by release-track assessment or backports.",
     "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin)."
   }
 }
