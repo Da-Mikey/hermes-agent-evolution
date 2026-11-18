@@ -5,7 +5,7 @@
   "our_version": "0.16.0",
   "synced_at": "2026-06-13",
   "deferred": [],
-  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it — so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review.",
+  "_note": "synced_through_commit is the LOGICAL cursor: the upstream commit through which evolution-upstream-sync has ACCOUNTED for every commit (applied OR deferred). Each run processes the next <=25 commits AFTER it (oldest-first) and advances it \u2014 so nothing in the window is ever silently skipped. Seeded to the merge-base of our main and upstream/main (the honest contiguous synced point). synced_through_tag/date = newest upstream release tag that is an ancestor of the cursor (mirrored into __release_date__ for the banner); they advance ONLY when the cursor crosses a new tag. deferred[] records commits evaluated but not applied (conflict/irrelevant) with reasons, for owner review.",
   "release_sync": {
     "mode": "release-track",
     "integrated_tag": "v2026.9.24",
@@ -34,7 +34,35 @@
       425
     ],
     "_assessed_note": "v0.23.3 released 2026-11-20T00:34Z (1,657 non-merge commits / 3,948 files since v0.23.2). Merge trial measured 283 conflicting paths (up from 274 at v0.23.2); divergence 33,649 behind / 1,652 ahead -> full merge deferred, escalate to owner. Marker guard: v0.23.3 ancestor of fork/main = false. Advisory GHSA-p22p-9ph6-gmrh (high, Bot Desktop sandbox env) = NOT AFFECTED: our version 0.21.5 is below the affected floor 0.21.6 and tools/bot_desktop/sandbox_host.py does not exist in our tree. PR #425 shipped the profiles-aware _HERMES_HOME_DIR backport (profile config.yaml edits were ungated). OPEN GAP: five rounds of approval home-fold hardening (tools/approval_home_fold.py) are absent; 9/15 spec cases bypass, needs a spaced home to bite -- separate PR. synced_through_commit NOT advanced (release-track).",
-    "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin)."
+    "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin).",
+    "dependency_backports": {
+      "_note": "Targeted dependency security backports from UNRELEASED upstream main (a release-track merge cannot carry them). Each advisory is measured against our lockfiles, never inferred from upstream's diff.",
+      "last_run": "2026-11-18",
+      "upstream_source": {
+        "pr": 157133,
+        "title": "fix(deps): clear release-age-eligible security alerts",
+        "merged": "2026-11-17T22:18:19Z",
+        "note": "Landed AFTER v0.23.2, so the release track does not deliver it."
+      },
+      "shipped": {
+        "pr": 413,
+        "branch": "fix/security-deps-20261118",
+        "commit": "b7f423eabc",
+        "packages": {
+          "follow-redirects": "1.16.0 -> 1.16.2 (GHSA-mrwp-f3q8-3g9p, high)",
+          "joi": "17.13.4 -> 17.13.9 (GHSA-4528-x5fx-h6hg, high)",
+          "serialize-javascript": "7.0.7 -> 7.1.4 (GHSA-m5mm-p8h7-m29v, low)",
+          "oauthlib": "3.3.1 -> 4.0.1 (GHSA-3jp2-3mrg-2vxc, high)",
+          "tornado": "6.5.8 -> 6.6.1 (GHSA-5cjw-f85j-cv6r, low)"
+        },
+        "verified": "control-first advisory verifier: FAIL on all 6 pre-change, PASS after; uv lock --check 0; guard suite 115 passed / 2 skipped; ruff clean; oauthlib 3.3.1 vs 4.0.1 differential byte-identical on six signing paths",
+        "residual_risk": "no live Google consent round-trip performed; we pin google-auth-oauthlib 1.3.1 while upstream runs 1.5.0 with oauthlib 4.x, so upstream CI does not prove our pairing"
+      },
+      "deferred": {
+        "opentelemetry-api": "GHSA-mf5v-w3w3-f6cg (medium, affects <= 1.45.1); ours pinned 1.39.1 alongside opentelemetry-instrumentation 0.60b1 \u2014 needs a coordinated instrumentation-family move, not a patch bump"
+      },
+      "fixed_drift": "uv.lock absorbed pre-existing lock/pyproject drift: the hindsight-client exclude-newer exclusion was never locked, so uv lock --check FAILED on main before this change and passes after it"
+    }
   },
   "release_assessment_20261108": {
     "latest_release_checked": "v0.23.0",
