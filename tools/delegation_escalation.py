@@ -51,10 +51,69 @@ def load_values(path):
     return values
 
 
+class _NullTraceEntry:
+    """The one attribute EscalationRun writes on an entry: ``args_summary``."""
+
+    __slots__ = ("tool", "args_summary", "result_status")
+
+    def __init__(self, tool, args_summary, result_status):
+        self.tool = tool
+        self.args_summary = args_summary
+        self.result_status = result_status
+
+    def to_dict(self):
+        return {"tool": self.tool, "args_summary": self.args_summary,
+                "result_status": self.result_status}
+
+
+class _NullTrajectoryLog:
+    """Interface-compatible stand-in for the optional ``TrajectoryLog`` (#414).
+
+    EscalationRun only needs ``entries``, ``add_tool_call`` and ``save``. A
+    missing trajectory logger must degrade *observability*, not delegation, so
+    every method here is a no-op that cannot raise and the entries stay in
+    memory for the lifetime of the run.
+    """
+
+    def __init__(self, session_id="", date="", completed=None, task_key=""):
+        self.session_id = session_id
+        self.date = date
+        self.completed = completed
+        self.task_key = task_key
+        self.entries = []
+
+    def add(self, entry):
+        self.entries.append(entry)
+
+    def add_tool_call(self, tool, args, result=None, status="success",
+                      duration_ms=None, reasoning_summary=""):
+        self.entries.append(
+            _NullTraceEntry(tool, args if isinstance(args, dict) else {}, status)
+        )
+
+    def to_dict(self):
+        return {"date": self.date, "session_id": self.session_id,
+                "entries": [e.to_dict() for e in self.entries]}
+
+    def save(self, trajectory_dir=None):
+        return None
+
+
 class EscalationRun:
     def __init__(self, child, goal, config):
         from hermes_constants import get_hermes_home
-        from scripts.evolution_trajectory_logger import TrajectoryLog
+        try:
+            from scripts.evolution_trajectory_logger import TrajectoryLog
+        except Exception:
+            # The trajectory logger is optional observability, not a
+            # prerequisite for delegation. Imported bare, a missing module (or
+            # any ImportError inside it) raised here and killed *every*
+            # delegated subagent; fall back to a null trace instead (#414).
+            log.warning(
+                "Evolution trajectory logger unavailable; delegation "
+                "trajectories will not be persisted", exc_info=True,
+            )
+            TrajectoryLog = _NullTrajectoryLog
         self.child = child
         self.goal = goal
         self.config = config if isinstance(config, dict) else {}
