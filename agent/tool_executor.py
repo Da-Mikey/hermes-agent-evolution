@@ -559,7 +559,10 @@ def _harm_gated_invoke(agent, ref, next_args, messages):
     )
 
 
-def _record_tool_circuit_breaker(agent, tool_name: str, result: Any, is_error: bool, effective_task_id: str) -> Any:
+def _record_tool_circuit_breaker(
+    agent, tool_name: str, result: Any, is_error: bool, effective_task_id: str,
+    call_id: Optional[str] = None,
+) -> Any:
     # Retry-spiral circuit breaker check (#3391)
     try:
         from tools.tool_circuit_breaker import TOOL_CIRCUIT_BREAKER
@@ -571,6 +574,10 @@ def _record_tool_circuit_breaker(agent, tool_name: str, result: Any, is_error: b
             tool_name=tool_name,
             status=_st,
             error_message=_err_msg,
+            # #359 — model_tools already recorded this call; the tracker dedupes
+            # by (call_id, producer) so one call costs one unit of budget.
+            call_id=call_id,
+            producer="tool_executor",
         )
     except Exception as _cb_err:
         logger.debug("Circuit breaker record_result failed: %s", _cb_err)
@@ -1642,7 +1649,9 @@ class _ConcurrentBatch:
         if not blocked and not dispatched:
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
         is_error, _ = _detect_tool_failure(ref.name, result)
-        result = _record_tool_circuit_breaker(agent, ref.name, result, is_error, ref.task_id)
+        result = _record_tool_circuit_breaker(
+            agent, ref.name, result, is_error, ref.task_id, call_id=ref.call_id
+        )
         if is_error:
             logger.info("tool %s failed (%.2fs): %s", ref.name, duration, str(result)[:200])
         else:
@@ -2095,7 +2104,9 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     # Multimodal dict results (_multimodal=True) are not sliceable as strings.
     _result_len = len(function_result) if isinstance(function_result, str) else len(str(function_result))
     _is_error_result, _ = _detect_tool_failure(ref.name, function_result)
-    function_result = _record_tool_circuit_breaker(agent, ref.name, function_result, _is_error_result, ref.task_id)
+    function_result = _record_tool_circuit_breaker(
+        agent, ref.name, function_result, _is_error_result, ref.task_id, call_id=ref.call_id
+    )
     committed = _commit_tool_result(
         agent, messages, ref, function_result,
         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,

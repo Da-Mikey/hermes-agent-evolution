@@ -16,10 +16,10 @@
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
     "checked_at": "2026-10-01",
     "last_assessed_tag": "v0.23.2",
-    "last_assessed_at": "2026-11-18",
+    "last_assessed_at": "2026-11-19",
     "last_assessed_decision": "defer-full-merge",
     "last_assessed_conflicting_files": 274,
-    "last_assessed_report": "~/.hermes/evolution/upstream/2026-11-18.md",
+    "last_assessed_report": "~/.hermes/evolution/upstream/2026-11-19.md",
     "open_security_backports": [
       191,
       264,
@@ -35,7 +35,8 @@
     "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin).",
     "dependency_backports": {
       "_note": "Targeted dependency security backports from UNRELEASED upstream main (a release-track merge cannot carry them). Each advisory is measured against our lockfiles, never inferred from upstream's diff.",
-      "last_run": "2026-11-18",
+      "last_run": "2026-11-19",
+      "rebase_20261119": "PR #413 rebased onto main e08617f3dd (was CONFLICTING after #420/#421 landed). Sole conflict was this file; dep hunks applied clean. Re-verified control-first: verifier FAILS on pre-change locks, PASSES here; uv lock --check rc=0; ruff rc=0; 8-file covering suite matches unmodified main exactly (1 pre-existing env failure + 3 pre-existing cross-file isolation errors, identical on fork/main).",
       "upstream_source": {
         "pr": 157133,
         "title": "fix(deps): clear release-age-eligible security alerts",

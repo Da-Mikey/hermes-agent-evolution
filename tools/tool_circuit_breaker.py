@@ -30,6 +30,14 @@ FAILURE_CLASS_NOT_FOUND = "not_found"
 FAILURE_CLASS_PERMISSION = "permission_denied"
 FAILURE_CLASS_INVALID_ARG = "invalid_argument"
 FAILURE_CLASS_TIMEOUT = "timeout"
+
+# #359 — how many recent tool-call ids the producer dedupe remembers per
+# (session, tool). A single ``last_call_id`` is not enough: the sequential and
+# concurrent dispatch paths record the SAME call from two threads, so the two
+# recordings can interleave with a second call's inner recording. A small window
+# of ids, each with the set of producers already seen for it, dedupes a call
+# however the interleaving falls out.
+RECORD_DEDUPE_WINDOW = 8
 FAILURE_CLASS_PROVIDER = "provider_error"
 FAILURE_CLASS_TRANSIENT = "transient"
 
@@ -87,6 +95,46 @@ class _ToolCircuitBreakerTracker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._state: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # #359 — per (session, tool): recent call_id order + which producers have
+        # already recorded each id. Kept out of ``_state`` so ``get_session_stats``
+        # stays a pure view of the counters.
+        self._seen_calls: Dict[Any, Dict[str, Any]] = {}
+
+    def _already_recorded(
+        self, sid: str, tname: str, call_id: Optional[str], producer: Optional[str]
+    ) -> bool:
+        """True when this call was already recorded by a DIFFERENT producer.
+
+        A repeat from the same producer is not deduped — it spends the budget,
+        because the same producer recording twice is a real second observation.
+        Callers must hold ``self._lock``.
+        """
+        if not call_id:
+            return False
+        cid = str(call_id)
+        entry = self._seen_calls.get((sid, tname))
+        if entry is None:
+            entry = {"order": [], "producers": {}}
+            self._seen_calls[(sid, tname)] = entry
+        order: list = entry["order"]
+        producers: Dict[str, set] = entry["producers"]
+
+        seen = producers.get(cid)
+        if seen is not None:
+            if producer and producer not in seen:
+                # Same call, second producer -> one observation, dedupe it.
+                producers[cid] = seen | {producer}
+                return True
+            # Same producer again (or an unattributed repeat): spend the budget.
+            if producer:
+                producers[cid] = seen | {producer}
+            return False
+
+        producers[cid] = {producer} if producer else set()
+        order.append(cid)
+        while len(order) > RECORD_DEDUPE_WINDOW:
+            producers.pop(order.pop(0), None)
+        return False
 
     def record_result(
         self,
@@ -95,12 +143,19 @@ class _ToolCircuitBreakerTracker:
         status: str,
         error_message: Optional[str] = None,
         budget: Optional[int] = None,
+        call_id: Optional[str] = None,
+        producer: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Record a tool result and return a diagnostic event if the circuit breaker trips."""
         with self._lock:
             sid = str(session_id or "default").strip()
             tname = str(tool_name or "").strip()
             if not sid or not tname:
+                return None
+
+            # #359 — one tool call is recorded by both the dispatcher
+            # (model_tools) and the executor. Count it once.
+            if self._already_recorded(sid, tname, call_id, producer):
                 return None
 
             sess_map = self._state.setdefault(sid, {})
@@ -160,9 +215,13 @@ class _ToolCircuitBreakerTracker:
     def reset(self, session_id: Optional[str] = None) -> None:
         with self._lock:
             if session_id:
-                self._state.pop(str(session_id).strip(), None)
+                sid = str(session_id).strip()
+                self._state.pop(sid, None)
+                for key in [k for k in self._seen_calls if isinstance(k, tuple) and k[0] == sid]:
+                    self._seen_calls.pop(key, None)
             else:
                 self._state.clear()
+                self._seen_calls.clear()
 
 
 TOOL_CIRCUIT_BREAKER = _ToolCircuitBreakerTracker()
