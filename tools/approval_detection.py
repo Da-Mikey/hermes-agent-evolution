@@ -40,6 +40,10 @@ _SENSITIVE_WRITE_TARGET = (
 )
 _USER_SENSITIVE_WRITE_TARGET = rf'(?:{_SSH_SENSITIVE_PATH}|{_SHELL_RC_FILES}|{_CREDENTIAL_FILES})'
 _PROJECT_SENSITIVE_WRITE_TARGET = rf'(?:{_PROJECT_ENV_PATH}|{_PROJECT_CONFIG_PATH})'
+# Write-door targets: anything a mutating binary must not be pointed at. Used by the unpaired
+# write-door rules (sort -o, truncate, ln, uniq) where the binary names its output file itself,
+# so the same credential/SSH/shell-rc/system-config/project-env target set applies.
+_WRITE_DOOR_TARGET = rf'(?:{_SENSITIVE_WRITE_TARGET}|{_PROJECT_SENSITIVE_WRITE_TARGET})'
 # cp/mv/install: the sensitive path is a write target only as the LAST argument (destination), so
 # `cp config.yaml backup.yaml` (config.yaml as SOURCE) stays out.
 _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
@@ -405,6 +409,34 @@ DANGEROUS_PATTERNS = [
     # script-execution pattern above (which targets code evaluation, not file mutation). Pairs the sed -i
     # coverage from #14639.
     (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (perl/ruby)"),
+    # ── Unpaired write doors (#409) ────────────────────────────────────────────────────────
+    # Four binaries WRITE the file they name, and none was covered by the redirection / tee /
+    # cp / mv / sed -i rules above. Measured on HEAD before this fix, all of these returned
+    # (False, None, None) — no reason, no denial event, nothing for the transcript or audit
+    # trail: `sort -o ~/.ssh/authorized_keys`, `sort --output=$HOME/.ssh/authorized_keys`,
+    # `truncate -s 0 ~/.ssh/authorized_keys`, `ln -sf /tmp/x ~/.ssh/authorized_keys`,
+    # `uniq /tmp/x ~/.ssh/authorized_keys`. Same rationale as the sed -i rule above: the tool
+    # mutates the file directly, so gate the same credential/startup targets.
+    # The gate is the TARGET, never the option — neutral destinations stay clean
+    # (`sort -o /tmp/out.txt`, `truncate -s 0 /tmp/out.txt`, `ln -sf /tmp/x /tmp/y`,
+    # `uniq /tmp/in.txt /tmp/out.txt`), so ordinary use of these tools does not prompt.
+    # sort: -o / --output owns the filename that follows it. The read-tool option tables
+    # (:630-:656) already teach the parser that -o takes an argument; this is the rule that
+    # treats that argument as a write DESTINATION, which is the gap the tables left open.
+    (rf'\bsort\b[^;|&\n]*?(?:(?<!\S)-[a-z]*o|--output(?![-\w]))\s*=?\s*[\s"\']*{_WRITE_DOOR_TARGET}',
+     "overwrite sensitive credential/SSH path via sort -o"),
+    # truncate shrinks or extends every operand it names.
+    (rf'\btruncate\b[^;|&\n]*[\s"\']*{_WRITE_DOOR_TARGET}',
+     "truncate of sensitive credential/SSH path"),
+    # ln replaces its destination: `ln -sf /tmp/x ~/.ssh/authorized_keys` is a key implant, and
+    # `ln -s ~/.ssh/id_rsa /tmp/x` turns a sensitive file into a readable name by another route.
+    # Both directions are gated, since either needs a human to look at it.
+    (rf'\bln\b[^;|&\n]*[\s"\']*{_WRITE_DOOR_TARGET}',
+     "create link to/over sensitive credential/SSH path via ln"),
+    # uniq writes its SECOND operand (the INPUT OUTPUT form). Requiring an input operand before
+    # the target keeps a plain `uniq ~/.ssh/authorized_keys` (a read) out.
+    (rf'\buniq\b[^;|&\n]*?\s+[^\s-]\S*\s+["\']?{_WRITE_DOOR_TARGET}',
+     "overwrite sensitive credential/SSH path via uniq OUTPUT"),
     # Interpreter heredocs are handled by _execution_flag_findings(); only shell heredocs stay
     # regex-based. `bash <<'EOF'` runs arbitrary commands without triggering the `bash -c` path.
     (rf'\b(?:{_SHELL_NAMES_RE})\s+<<', "shell execution via heredoc"),
@@ -654,6 +686,16 @@ _READ_TOOL_SHORT_OPTIONS_WITH_ARG = {
     "rg": frozenset("efEmjgdtTABCMr"), "sort": frozenset("koStT"), "man": frozenset("CRLmMSserEPp"),
     "ag": frozenset("gGmpW"),
 }
+# Binaries modelled as read tools that ALSO write a file they name: every one of these must be
+# covered by a write-door rule in DANGEROUS_PATTERNS. `sort` is the case that produced #409 — the
+# option tables above taught the parser that `-o`/`--output` takes an argument and nothing ever
+# asked what that argument IS. tests/tools/test_write_door_coverage.py asserts the coverage, so a
+# binary added to the tables above without a write-door verdict fails CI instead of shipping.
+_WRITE_DOOR_BINARIES = frozenset({"sort", "truncate", "ln", "uniq"})
+# Read tools signed off as genuinely NOT writers: none of their argument-taking options names a
+# write destination. Program-bearing options (--pre, --hostname-bin, --pager, --compress-program)
+# are separately covered by _READ_TOOL_EXEC_FLAGS and the execution-flag findings.
+_READ_TOOL_NOT_A_WRITER = frozenset({"rg", "ag", "man"})
 _GREP_OPTIONS_WITH_ARG = {
     "--after-context", "--before-context", "--binary-files", "--context", "--directories", "--devices", "--exclude",
     "--exclude-dir", "--exclude-from", "--include", "--label", "--max-count", "--regexp", "--file",
