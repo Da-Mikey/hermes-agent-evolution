@@ -29,7 +29,8 @@ from tools.approval_context import (
     _tirith_fail_open, get_current_session_key,
 )
 from tools.approval_detection import (
-    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
+    _approval_key_aliases, _check_sudo_stdin_guard, detect_content_rule_keys, detect_dangerous_command,
+    detect_hardline_command,
 )
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
@@ -695,6 +696,22 @@ def _unattended_contexts() -> list[_Unattended]:
     return contexts
 
 
+def _unapproved_findings(command: str, approved) -> tuple[list[str], str] | None:
+    """``(pattern_keys, description)`` still needing consent, or None. The first match plus every
+    content-level rule (credential upload, invisible Unicode) each need their own approval, so an
+    approved pipe-to-shell cannot wave through the credential upload in the same command; overlapping
+    verb rules keep the first key only. ``approved(key)`` is the session or permanent check."""
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if not is_dangerous:
+        return None
+    findings = [(pattern_key, description)]
+    findings += [(key, key) for key in detect_content_rule_keys(command) if key != pattern_key]
+    pending = [(key, text) for key, text in findings if not approved(key)]
+    if not pending:
+        return None
+    return [key for key, _ in pending], "; ".join(text for _, text in pending)
+
+
 def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
     """Deny-mode handling for one unattended context (cron / -q / webhook); None = allow.
 
@@ -711,11 +728,12 @@ def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
             subject, noun="dangerous commands",
             advice="Find an alternative approach that avoids this command.")}
 
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    if is_dangerous and not _is_permanently_approved(pattern_key):
+    pending = _unapproved_findings(command, _is_permanently_approved)
+    if pending is not None:
+        keys, description = pending
         result = block(f"Command flagged as dangerous ({description})")
         if ctx.name == "single_query":
-            result.update(pattern_key=pattern_key, description=description)
+            result.update(pattern_key=keys[0], description=description)
         return result
     tirith = _tirith_scan(command)
     if tirith.get("configuration_error"):
@@ -1009,6 +1027,7 @@ def _run_approval_gate(
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
+    pattern_keys: list[str] | None = None,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -1019,7 +1038,8 @@ def _run_approval_gate(
     context without an ask bridge BLOCKS instead of auto-approving, so a plugin-flagged action
     never runs ungated.
     Unattended deny text is ``ctx.block_message(subject, noun, advice)`` unless the caller passes
-    an explicit ``*_deny_message`` (the file-tool write gates word their own).
+    an explicit ``*_deny_message`` (the file-tool write gates word their own). ``pattern_keys``
+    (default ``[pattern_key]``) are what a session/always answer persists.
     """
     # Hardline blocks are the caller's job BEFORE this gate, so yolo here only skips the recoverable approval layer.
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
@@ -1074,7 +1094,7 @@ def _run_approval_gate(
 
     return _human_decision(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
-        pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
+        pattern_keys=pattern_keys or [pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
     )
 
@@ -1139,11 +1159,14 @@ def check_dangerous_command(command: str, env_type: str,
         return _approved()
     if _command_matches_permanent_allowlist(command):
         return _approved()
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    if not is_dangerous:
+    session_key = get_current_session_key()
+    pending = _unapproved_findings(command, lambda key: is_approved(session_key, key))
+    if pending is None:
         return _approved()
+    keys, description = pending
     return _run_approval_gate(
-        pattern_key=pattern_key, description=description, display_target=command, approval_callback=approval_callback,
+        pattern_key=keys[0], pattern_keys=keys, description=description, display_target=command,
+        approval_callback=approval_callback,
         subject=f"Command flagged as dangerous ({description})", noun="dangerous commands",
         advice="Find an alternative approach that avoids this command.",
         autoapprove_log_prefix="AUTO-APPROVED dangerous command in non-interactive non-gateway context",
@@ -1254,24 +1277,29 @@ def check_all_command_guards(command: str, env_type: str,
                 return result
         return _approved()
 
-    # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
-    # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
+    session_key = get_current_session_key()
+    # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through
+    # the approval flow (block used to be a hard stop) so users can inspect the findings and approve.
+    warnings = []
     tirith_result = _tirith_scan(command)
     # A missing policy cannot be approved or cached as an ordinary scan finding.
     if tirith_result.get("configuration_error"):
         return {"approved": False, "message": tirith_result["summary"],
                 "failure_class": "configuration_error"}
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    warnings = []
-    session_key = get_current_session_key()
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
         tirith_key = f"tirith:{rule_id}"
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
-    if is_dangerous and not is_approved(session_key, pattern_key):
-        warnings.append((pattern_key, description, False))
+    # Every content-level rule still needing consent, not just the first match: an approved
+    # pipe-to-shell key must not wave through the credential upload in the same command
+    # (upstream 8f6bb36594). Overlapping verb rules keep the first key only.
+    pending = _unapproved_findings(command, lambda key: is_approved(session_key, key))
+    if pending is not None:
+        keys, pending_desc = pending
+        warnings.append((keys[0], pending_desc, False))
+        warnings.extend((key, key, False) for key in keys[1:])
     if not warnings:
         return _approved()
 
@@ -1279,9 +1307,10 @@ def check_all_command_guards(command: str, env_type: str,
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
 
-    # "Always" is offered when at least one warning is a dangerous-pattern key the persistence layer would actually
-    # allowlist permanently. Pure-tirith findings are session-max by design, so a tirith-only prompt hides Always;
-    # mixed prompts offer it (the pattern key persists, tirith downgrades to session — see _persist_choice).
+    # "Always" is offered when at least one warning is a dangerous-pattern key the persistence layer would
+    # actually allowlist permanently. Pure-tirith findings are session-max by design, so a tirith-only prompt
+    # hides Always; mixed prompts offer it (the pattern key persists, tirith downgrades to session — see
+    # _persist_choice).
     return _human_decision(
         _COMMAND_GATE, command=command, description=combined_desc,
         pattern_key=primary_key, pattern_keys=all_keys, warnings=warnings,
