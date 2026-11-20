@@ -17,7 +17,16 @@ logger = logging.getLogger("tools.approval")
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
 # home is folded into these forms at detection time by _normalize_command_for_detection(), so no
 # import-time path snapshot (stale once HERMES_HOME is set after import) lives in the patterns.
-_SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+_HOME_SSH_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+# ANOTHER user's home, written literally. _rewrite_resolved_user_home() folds only the INVOKING
+# user's home to `~/`, so `/root/...` and `/home/<other>/...` survive normalization as absolute
+# paths and matched no rule at all: `cp /tmp/x /root/.ssh/authorized_keys` returned
+# (False, None, None) — a credential write door with no reason string and no denial event (#424).
+# `/root` is the case that matters (Prometheus runs as `mike` with a `sudo -n` helper, so a
+# sudo-prefixed command naming /root is reachable); `/home/<user>` is the same class next door.
+# The lookbehind keeps a longer path ending in a `/root` component (…/project/root/.ssh) out.
+_OTHER_USER_HOME = r'(?:(?<![\w./-])/root|(?<![\w./-])/home/[^/\s"\'`]+)'
+_SSH_SENSITIVE_PATH = rf'(?:{_HOME_SSH_PATH}|{_OTHER_USER_HOME}/\.ssh(?:/|$))'
 _HERMES_ENV_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'\.env\b'
 )
@@ -28,8 +37,18 @@ _HERMES_CONFIG_PATH = (
 )
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
-_SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
-_CREDENTIAL_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:netrc|pgpass|npmrc|pypirc)\b'
+_HOME_SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
+_HOME_CREDENTIAL_FILES = (
+    r'(?:(?:~|\$home|\$\{home\})/\.(?:netrc|pgpass|npmrc|pypirc)\b'
+    r'|(?:~|\$home|\$\{home\})/\.aws/credentials\b)'
+)
+# Same two families for another user's literal home (#424) — `/root/.bashrc` is a persistence
+# write door even when the command cannot touch the invoking user's rc file.
+_SHELL_RC_FILES = rf'(?:{_HOME_SHELL_RC_FILES}|{_OTHER_USER_HOME}/\.(?:bashrc|zshrc|profile|bash_profile|zprofile)\b)'
+_CREDENTIAL_FILES = (
+    rf'(?:{_HOME_CREDENTIAL_FILES}'
+    rf'|{_OTHER_USER_HOME}/\.(?:netrc|pgpass|npmrc|pypirc)\b|{_OTHER_USER_HOME}/\.aws/credentials\b)'
+)
 # macOS: /etc, /var, /tmp, /home are symlinks to /private/*, so /private/etc/sudoers would bypass a plain
 # "/etc/" check. Match both forms.
 _MACOS_PRIVATE_SYSTEM_PATH = r'/private/(?:etc|var|tmp|home)/'
