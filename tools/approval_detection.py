@@ -27,13 +27,19 @@ _HOME_SSH_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
 # The lookbehind keeps a longer path ending in a `/root` component (…/project/root/.ssh) out.
 _OTHER_USER_HOME = r'(?:(?<![\w./-])/root|(?<![\w./-])/home/[^/\s"\'`]+)'
 _SSH_SENSITIVE_PATH = rf'(?:{_HOME_SSH_PATH}|{_OTHER_USER_HOME}/\.ssh(?:/|$))'
+# A Hermes home: the default root or a named profile under it
+# (profiles/<name>/ has its own config.yaml/.env).
+_HERMES_HOME_DIR = (
+    r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)'
+    r'(?:profiles/[^/\s"\'`]+/)?'
+)
 _HERMES_ENV_PATH = (
-    r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'\.env\b'
+    _HERMES_HOME_DIR + r'\.env\b'
 )
 # ~/.hermes/config.yaml IS the security policy (approvals.mode, yolo, allowlist) and the config cache is mtime-keyed,
 # so a write takes effect mid-session. Terminal-side coverage (sed -i, tee, >, cp) pairs the file_tools deny.
 _HERMES_CONFIG_PATH = (
-    r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
+    _HERMES_HOME_DIR + r'config\.yaml\b'
 )
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
