@@ -52,17 +52,17 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Monitoring ─────────────────────────────────────────────────────────
     # OTLP export; tracks the `otlp` extra.
     "export.otlp": (
-        "opentelemetry-sdk==1.39.1",
-        "opentelemetry-exporter-otlp-proto-http==1.39.1",
+        "opentelemetry-sdk==1.45.2",
+        "opentelemetry-exporter-otlp-proto-http==1.45.2",
     ),
     # ─── TTS providers ─────────────────────────────────────────────────────
     # mistralai: 2.4.6 was a malicious quarantined release — never pin below 2.4.7.
     # Voxtral STT + TTS share the SDK.
-    "tts.mistral": ("mistralai==2.4.8",),
+    "tts.mistral": ("mistralai==2.10.1",),
     "tts.edge": ("edge-tts==7.2.7",),
     "tts.elevenlabs": ("elevenlabs==1.59.0",),
     # ─── Speech-to-text providers ──────────────────────────────────────────
-    "stt.mistral": ("mistralai==2.4.8",),
+    "stt.mistral": ("mistralai==2.10.1",),
     "stt.faster_whisper": (
         "faster-whisper==1.2.1",
         "sounddevice==0.5.5",
@@ -199,9 +199,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # install is unavailable. Keep these pins in lockstep with the 
     # extra in pyproject.toml.
     "telemetry.otel": (
-        "opentelemetry-api==1.39.1",
-        "opentelemetry-sdk==1.39.1",
-        "opentelemetry-exporter-otlp-proto-http==1.39.1",
+        "opentelemetry-api==1.45.2",
+        "opentelemetry-sdk==1.45.2",
+        "opentelemetry-exporter-otlp-proto-http==1.45.2",
     ),
 
     "tool.doc_extract": ("firecrawl-anydoc==0.2.4",),  # imports as `anydoc`; lockstep with pyproject
