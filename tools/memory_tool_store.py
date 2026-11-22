@@ -167,6 +167,85 @@ def parse_provenance(stored: str):
     return display, src, tier
 
 
+# ---------------------------------------------------------------------------
+# Entry-boundary safety (issue #436)
+#
+# The on-disk format is entries joined by ``ENTRY_DELIMITER`` plus an optional
+# provenance trailer appended by ``encode_provenance()``.  Both are metadata the
+# *parser* trusts to have been written by this module.  Entry content is free
+# text from the caller, so unless it is neutralised at the write boundary one
+# ``add`` can:
+#
+#   * mint two entries where the caller asked for one — an embedded delimiter is
+#     indistinguishable from a real boundary at read time, and
+#   * carry a ``⟦src:…|trust:…⟧`` trailer that ``parse_provenance()`` then reads
+#     as an assertion the writer never made, which satisfies
+#     ``search(min_trust=…)`` / ``source_filter=`` on a tier nothing validated.
+#
+# Two remedies, because the two inputs differ in kind:
+#
+#   delimiter → ESCAPE.  Visible and reversible.  Rejecting would silently drop
+#               the rest of the caller's text, which is the same class of bug
+#               as accepting it (the caller cannot tell which half survived).
+#   trailer   → REJECT.  A provenance sentinel in content is never legitimate —
+#               there is no faithful re-encoding of "pretend to be trusted".
+#               The error is recoverable: pass source_class/trust_tier instead.
+#
+# Entries containing neither are stored byte-identically to before (the
+# backward-compatibility constraint in the module docstring still holds), and
+# legacy files keep parsing exactly as they do today.
+# ---------------------------------------------------------------------------
+
+_SECTION_SIGN = "§"
+
+# Visible escape for a section sign in content.  NOT the empty string and not a
+# silent strip: the stored entry must still say what the caller wrote, and the
+# escape must be legible in MEMORY.md without a decoder.  ``\u00a7`` is ASCII, so
+# it cannot itself re-form a delimiter.
+_SECTION_SIGN_ESCAPE = "\\u00a7"
+
+
+def _embedded_provenance_error(content: str) -> Optional[str]:
+    """Return an error string when ``content`` embeds a provenance sentinel."""
+    open_at = content.find(_PROV_OPEN)
+    if open_at == -1:
+        return None
+    if content.find(_PROV_CLOSE, open_at + len(_PROV_OPEN)) == -1:
+        return None
+    return (
+        f"Content contains a provenance sentinel ({_PROV_OPEN}...{_PROV_CLOSE}). "
+        "Provenance is recorded by the store, not by entry content — pass "
+        "source_class/trust_tier instead."
+    )
+
+
+def neutralise_entry_delimiter(content: str) -> str:
+    """Return ``content`` that cannot split one entry into two (#436).
+
+    Every section sign is escaped to a visible inert form, so no arrangement of
+    the caller's text — including one that only becomes a delimiter once the
+    writer joins entries — can form ``ENTRY_DELIMITER`` on disk.  Content with
+    no section sign in it is returned unchanged, keeping the on-disk bytes of
+    ordinary entries identical to the pre-fix format.
+    """
+    if _SECTION_SIGN not in content:
+        return content
+    return content.replace(_SECTION_SIGN, _SECTION_SIGN_ESCAPE)
+
+
+def sanitise_entry_content(content: str) -> Tuple[str, Optional[str]]:
+    """Return ``(safe_content, error)`` for store entry content (#436).
+
+    ``error`` is set (and ``safe_content`` returned unchanged) when the content
+    forges provenance; callers must surface it as a write failure rather than
+    storing the entry.
+    """
+    error = _embedded_provenance_error(content)
+    if error:
+        return content, error
+    return neutralise_entry_delimiter(content), None
+
+
 def _entry_grounding(stored: str) -> tuple[str, str, str, str]:
     """Resolve context metadata; neither model tags nor storage approval grant authority.
 
@@ -1385,6 +1464,14 @@ class MemoryStore:
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
+        # Boundary guard (#436): one add must mint exactly ONE entry, and any
+        # provenance trailer on disk must be one this module wrote — not one the
+        # caller smuggled in as text. Applied before the threat scan so the
+        # scanner and the parser see the same string.
+        content, boundary_error = sanitise_entry_content(content)
+        if boundary_error:
+            return {"success": False, "error": boundary_error}
+
         prov_error = _validate_provenance(source_class, trust_tier)
         if prov_error:
             return {"success": False, "error": prov_error}
@@ -1532,6 +1619,12 @@ class MemoryStore:
                 "success": False,
                 "error": "new_content cannot be empty. Use 'remove' to delete entries.",
             }
+
+        # Boundary guard (#436) — same invariant as add(): a replacement is one
+        # entry, and it cannot carry a trailer the caller forged.
+        new_content, boundary_error = sanitise_entry_content(new_content)
+        if boundary_error:
+            return {"success": False, "error": boundary_error}
 
         prov_error = _validate_provenance(source_class, trust_tier)
         if prov_error:

@@ -629,7 +629,7 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace'. For 'replace' it is the COMPLETE new entry text: the whole matched entry is overwritten, so include everything you want to keep. Alias: 'new_text' is also accepted (same full-entry meaning)."
+                "description": "The entry content. Required for 'add' and 'replace'. For 'replace' it is the COMPLETE new entry text: the whole matched entry is overwritten, so include everything you want to keep. Alias: 'new_text' is also accepted (same full-entry meaning). ONE entry only: a section sign '§' in the text is stored escaped as '\\u00a7' so it cannot split the entry, and a '⟦src:…|trust:…⟧' provenance sentinel in the text is refused — tag provenance with source_class/trust_tier instead."
             },
             "old_text": {
                 "type": "string",
