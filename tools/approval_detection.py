@@ -12,6 +12,8 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.approval_ansi_c import _is_shell_comment_start, expand_ansi_c_quotes
+
 logger = logging.getLogger("tools.approval")
 
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
@@ -541,6 +543,9 @@ def _normalize_command_for_detection(command: str) -> str:
     """Normalize a command before pattern matching so ANSI escapes, null bytes, Unicode fullwidth
     forms, and shell splicing tricks cannot bypass detection."""
     from tools.ansi_strip import strip_ansi
+    # Decode $'...' first: the escape strip below would turn $'\x72\x6d' into $'x72x6d', and the
+    # home fold must see the decoded absolute path.
+    command = expand_ansi_c_quotes(command)
     command = unicodedata.normalize('NFKC', strip_ansi(command).replace('\x00', ''))
     # Collapse backslash-newline continuations (`rm -rf \<newline>/` runs as `rm -rf /`). MUST
     # precede the generic escape strip below, whose [^\n] class skips newlines and would leave the
@@ -1239,11 +1244,6 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
     return word
 
 
-def _is_shell_comment_start(command: str, index: int) -> bool:
-    return command[index] == "#" and (index == 0 or command[index - 1].isspace()
-                                      or command[index - 1] in ";&|()<>")
-
-
 def _iter_shell_command_starts(command: str):
     starts = [0]
 
@@ -1508,7 +1508,9 @@ def _deny_command_variants(command: str):
 def _command_detection_variants(command: str):
     # Mask quoted newlines BEFORE normalization: normalization strips escapes (\" -> ") and ""
     # pairs, corrupting quote tracking (`echo "a\""` becomes an unterminated quote) so masking
-    # afterwards could swallow a REAL unquoted newline separator. The raw command carries faithful quote state.
+    # afterwards could swallow a REAL unquoted newline separator. The raw command carries faithful quote state
+    # once $'...' is rewritten as plain single quotes (`$'\''` otherwise desyncs every quote-aware scanner).
+    command = expand_ansi_c_quotes(command)
     normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
     # Quote-aware grep parsing hides only structurally identified pattern operands; malformed or
     # ambiguous input stays byte-for-byte intact.
