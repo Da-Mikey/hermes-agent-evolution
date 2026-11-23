@@ -563,6 +563,36 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -
     )
 
 
+def _redact_projected_assistant_row(message: Dict[str, Any]) -> None:
+    """Storage-boundary scrub of one projected assistant row, as the chat path does (#43666).
+
+    ``CodexEventProjector`` builds its assistant rows itself and ``_persist_projected_messages``
+    flushes them straight to the session DB, so the masking the chat-completions path applies in
+    ``build_assistant_message`` has to run here or a credential the model quoted in its reply or
+    reasoning reaches ``state.db`` (and the FTS index) verbatim.
+
+    ``content`` and the unsigned ``reasoning`` copy are masked in place; both follow
+    ``security.redact_secrets`` through :func:`agent.redact.redact_sensitive_text`, so redaction off
+    keeps every row byte-identical. Tool-call arguments stay verbatim (#43083): the mask covers the
+    readable text only, never the replay material a provider has to check.
+
+    ``reasoning_details`` is not handled because this projector never emits it (it stashes joined
+    ``reasoning`` text only). If the projector learns to carry unsigned detail dicts, the
+    unsigned-detail scrub has to move here with it.
+    """
+    if message.get("role") != "assistant":
+        return
+    from agent.redact import redact_sensitive_text
+
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        message["content"] = redact_sensitive_text(content)
+    for key in ("reasoning", "reasoning_content"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            message[key] = redact_sensitive_text(value)
+
+
 def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> bool:
     """Splice the projected messages into ``messages`` and flush them to the session DB; True when the
     rows are durable in the session DB (the codex thread binding may then be published).
@@ -582,6 +612,7 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
             and first.get("content") == submitted_user_text):
         projected_messages = projected_messages[1:]
     for projected_message in projected_messages:
+        _redact_projected_assistant_row(projected_message)
         append_message(messages, projected_message)
     if getattr(agent, "_session_db", None) is None:
         return False
