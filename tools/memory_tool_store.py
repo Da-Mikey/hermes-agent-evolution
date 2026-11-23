@@ -167,6 +167,144 @@ def parse_provenance(stored: str):
     return display, src, tier
 
 
+# ---------------------------------------------------------------------------
+# Entry-boundary safety (issue #436)
+#
+# The on-disk format is entries joined by ``ENTRY_DELIMITER`` plus an optional
+# provenance trailer appended by ``encode_provenance()``.  Both are metadata the
+# *parser* trusts to have been written by this module.  Entry content is free
+# text from the caller, so unless it is neutralised at the write boundary one
+# ``add`` can:
+#
+#   * mint two entries where the caller asked for one — an embedded delimiter is
+#     indistinguishable from a real boundary at read time, and
+#   * carry a ``⟦src:…|trust:…⟧`` trailer that ``parse_provenance()`` then reads
+#     as an assertion the writer never made, which satisfies
+#     ``search(min_trust=…)`` / ``source_filter=`` on a tier nothing validated.
+#
+# Two remedies, because the two inputs differ in kind:
+#
+#   delimiter → ESCAPE.  Visible and reversible.  Rejecting would silently drop
+#               the rest of the caller's text, which is the same class of bug
+#               as accepting it (the caller cannot tell which half survived).
+#   trailer   → REJECT.  A provenance sentinel in content is never legitimate —
+#               there is no faithful re-encoding of "pretend to be trusted".
+#               The error is recoverable: pass source_class/trust_tier instead.
+#
+# Entries containing neither are stored byte-identically to before (the
+# backward-compatibility constraint in the module docstring still holds), and
+# legacy files keep parsing exactly as they do today.
+# ---------------------------------------------------------------------------
+
+_SECTION_SIGN = "§"
+
+# Visible escape for a section sign in content.  NOT the empty string and not a
+# silent strip: the stored entry must still say what the caller wrote, and the
+# escape must be legible in MEMORY.md without a decoder.  ``\u00a7`` is ASCII, so
+# it cannot itself re-form a delimiter.
+_SECTION_SIGN_ESCAPE = "\\u00a7"
+
+
+def _embedded_provenance_error(content: str) -> Optional[str]:
+    """Return an error string when ``content`` embeds a provenance sentinel."""
+    open_at = content.find(_PROV_OPEN)
+    if open_at == -1:
+        return None
+    if content.find(_PROV_CLOSE, open_at + len(_PROV_OPEN)) == -1:
+        return None
+    return (
+        f"Content contains a provenance sentinel ({_PROV_OPEN}...{_PROV_CLOSE}). "
+        "Provenance is recorded by the store, not by entry content — pass "
+        "source_class/trust_tier instead."
+    )
+
+
+def neutralise_entry_delimiter(content: str) -> str:
+    """Return ``content`` that cannot split one entry into two (#436).
+
+    Every section sign is escaped to a visible inert form, so no arrangement of
+    the caller's text — including one that only becomes a delimiter once the
+    writer joins entries — can form ``ENTRY_DELIMITER`` on disk.  Content with
+    no section sign in it is returned unchanged, keeping the on-disk bytes of
+    ordinary entries identical to the pre-fix format.
+    """
+    if _SECTION_SIGN not in content:
+        return content
+    return content.replace(_SECTION_SIGN, _SECTION_SIGN_ESCAPE)
+
+
+def sanitise_entry_content(content: str) -> Tuple[str, Optional[str]]:
+    """Return ``(safe_content, error)`` for store entry content (#436).
+
+    ``error`` is set (and ``safe_content`` returned unchanged) when the content
+    forges provenance; callers must surface it as a write failure rather than
+    storing the entry.
+    """
+    error = _embedded_provenance_error(content)
+    if error:
+        return content, error
+    return neutralise_entry_delimiter(content), None
+
+
+class MemoryBoundaryViolation(RuntimeError):
+    """A commit would persist an entry that forges a store boundary (#436).
+
+    Raised by :meth:`MemoryStore._write_file` — the single function that turns
+    entries into file bytes. It fires only when a caller reached that writer
+    WITHOUT passing the input-edge guard (``add``/``replace``/``apply_batch``
+    each run ``sanitise_entry_content`` first), i.e. from a sink added later.
+    Loud on purpose: a bypass is a bug, and a poisoned memory file outlives it.
+    """
+
+
+def _commit_boundary_violation(
+    entries: List[str], previous_entries: Optional[List[str]] = None
+) -> Optional[str]:
+    """Return an error when *entries* would write a forged boundary (#436).
+
+    Called from the ONE choke point behind every persist (``_write_file``), so a
+    content sink added later cannot bypass what the input edge already enforces.
+
+    Only entries the caller INTRODUCED are validated: *previous_entries* is the
+    on-disk set and an unchanged legacy entry is grandfathered. Without that, a
+    file poisoned before this guard existed could never be repaired — every
+    write, including the ``remove`` that fixes it, would refuse.
+
+    Two invariants, both decidable from the string alone and both kept by the
+    store's own writer:
+
+    * ``ENTRY_DELIMITER`` never appears inside an entry. Parsing splits on it,
+      so such an entry becomes two entries on the next read — the headline
+      symptom of this issue.
+    * At most ONE provenance opener per entry. A stored entry carries the single
+      trailer this module appended (``_make_provenance``); a supersession
+      marker is namespaced ``⟦sup:`` and cannot produce a second one.
+
+    Deliberately absent: any check that would have to decide whether a *single*
+    trailing trailer is authentic. ``add()`` writes ``content ⟦src:…|trust:…⟧``
+    and a forged payload is textually identical, so a commit-time verdict there
+    would be a guess — that forgery is refused at the input edge instead, where
+    it is still distinguishable from ``source_class``/``trust_tier``.
+    """
+    grandfathered = set(previous_entries or ())
+    for entry in entries:
+        if entry in grandfathered:
+            continue
+        if ENTRY_DELIMITER in entry:
+            return (
+                "Refusing to write: an entry contains the entry delimiter "
+                "(§-on-its-own-line), which would split into two entries on the "
+                "next read. Write one entry per operation."
+            )
+        if entry.count(_PROV_OPEN) > 1:
+            return (
+                f"Refusing to write: an entry carries {entry.count(_PROV_OPEN)} "
+                f"provenance sentinels ({_PROV_OPEN}...{_PROV_CLOSE}). An entry "
+                "may assert provenance once, and only the store may write it."
+            )
+    return None
+
+
 def _entry_grounding(stored: str) -> tuple[str, str, str, str]:
     """Resolve context metadata; neither model tags nor storage approval grant authority.
 
@@ -1385,6 +1523,14 @@ class MemoryStore:
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
+        # Boundary guard (#436): one add must mint exactly ONE entry, and any
+        # provenance trailer on disk must be one this module wrote — not one the
+        # caller smuggled in as text. Applied before the threat scan so the
+        # scanner and the parser see the same string.
+        content, boundary_error = sanitise_entry_content(content)
+        if boundary_error:
+            return {"success": False, "error": boundary_error}
+
         prov_error = _validate_provenance(source_class, trust_tier)
         if prov_error:
             return {"success": False, "error": prov_error}
@@ -1532,6 +1678,12 @@ class MemoryStore:
                 "success": False,
                 "error": "new_content cannot be empty. Use 'remove' to delete entries.",
             }
+
+        # Boundary guard (#436) — same invariant as add(): a replacement is one
+        # entry, and it cannot carry a trailer the caller forged.
+        new_content, boundary_error = sanitise_entry_content(new_content)
+        if boundary_error:
+            return {"success": False, "error": boundary_error}
 
         prov_error = _validate_provenance(source_class, trust_tier)
         if prov_error:
@@ -1986,6 +2138,21 @@ class MemoryStore:
                     content, op_redacted = _redact_memory_content(content)
                     redacted = redacted or op_redacted
 
+                # Boundary guard (#436). This path writes into ``working``
+                # directly and never calls add()/replace(), so it needs its own
+                # call site — and it is the RECOMMENDED path (the tool schema
+                # tells the model to send every change as one ``operations``
+                # call). Without this, one batch op could mint two entries, or a
+                # forged provenance trailer could satisfy ``min_trust``.
+                # Per-op so the abort names the offending index, and
+                # all-or-nothing: nothing is committed below.
+                if act in {"add", "replace"} and content:
+                    content, boundary_error = sanitise_entry_content(content)
+                    if boundary_error:
+                        return self._batch_error(
+                            target, f"{pos}: {boundary_error}", limit=limit
+                        )
+
                 if act == "add":
                     if not content:
                         return self._batch_error(
@@ -2426,7 +2593,20 @@ class MemoryStore:
         open("w") + flock truncates before the lock is acquired, racing
         concurrent readers. Callers hold ``_file_lock``: a bare write from an
         earlier snapshot drops concurrent entries (#119668).
+
+        This is the ONE choke point every persist goes through, so the #436
+        boundary invariant is enforced HERE as well as at the input edge: a sink
+        added later inherits the guard instead of silently bypassing it.
+        ``_commit_boundary_violation`` refuses (raises, nothing written) before
+        the temp file is even created, and grandfathers entries already on disk
+        so an old poisoned file stays repairable.
         """
+        previous_raw, read_ok = MemoryStore._read_raw_checked(path)
+        violation = _commit_boundary_violation(
+            entries, MemoryStore._parse_entries(previous_raw) if read_ok else []
+        )
+        if violation:
+            raise MemoryBoundaryViolation(violation)
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         try:
             atomic_write_text(path, content, tmp_prefix=".mem_")
