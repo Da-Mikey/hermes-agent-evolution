@@ -181,3 +181,45 @@ def test_tool_call_only_assistant_row_survives_the_scrub():
     assert row["content"] is None
     assert row["tool_calls"][0]["function"]["arguments"] == "{\"command\": \"ls\"}"
     assert _SECRET not in row["reasoning"]
+
+
+def test_a_real_session_db_holds_no_credential(tmp_path, monkeypatch):
+    """End to end against sqlite, not the writer boundary: build the real agent, run the real turn,
+    then read the ``messages`` table. This is the ground-truth form of the assertion above."""
+    import sqlite3
+
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True, raising=False)
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
+    try:
+        db.create_session(session_id="s1", source="cli", model="codex")
+        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        session_db=db, session_id="s1")
+        agent._session_db_created = True
+        agent._codex_session = MagicMock()
+        agent._codex_session.run_turn.return_value = _tool_then_reply_turn()
+        agent.tool_progress_callback = None
+        messages = [{"role": "user", "content": "check my token"}]
+        agent._flush_messages_to_session_db(messages)  # turn-start flush owns the user row
+        result = run_codex_app_server_turn(
+            agent, user_message="check my token", original_user_message="check my token",
+            messages=messages, effective_task_id="task-1")
+    finally:
+        db.close()
+
+    assert result["completed"] is True and result["agent_persisted"] is True
+    con = sqlite3.connect(db_path)
+    rows = con.execute("SELECT role, content, reasoning, tool_calls FROM messages ORDER BY id").fetchall()
+    con.close()
+    assert len(rows) == 4, "user, tool-call round, tool result, final reply"
+    assert not [r for r in rows if any(_SECRET in str(field) for field in r)], \
+        "a credential reached sqlite"
+    # Masked rather than dropped, and the tool round's arguments are untouched.
+    reply_row = rows[-1]
+    assert "ghp_" in reply_row[1] and "..." in reply_row[1]
+    assert "gh auth status" in rows[1][3]
+
