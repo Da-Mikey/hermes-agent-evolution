@@ -141,7 +141,10 @@ class TestSetupLogging:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
         monkeypatch.setattr(redact, "_REDACT_ENABLED", launch_redacts)
-        monkeypatch.setattr(redact, "_REDACT_ENABLED_BY_HOME", {})
+        # v0.23.0 replaced the single _REDACT_ENABLED_BY_HOME bool cache with two
+        # raw-policy caches (env + config), resolved per routed home.
+        monkeypatch.setattr(redact, "_ENV_POLICY_BY_HOME", {})
+        monkeypatch.setattr(redact, "_CONFIG_POLICY_BY_HOME", {})
         routed = tmp_path / "profile-b"
         routed.mkdir()
         if routed_opt_out == "config":

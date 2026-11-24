@@ -285,3 +285,75 @@ class TestExpressionScanHelper:
         monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda url: False)
         out = bt_eval_policy._expression_targets_private_url("location.href='http://10.0.0.1/';")
         assert out == "http://10.0.0.1/"
+
+
+# ---------------------------------------------------------------------------
+# Raw CDP: the cloud-metadata floor survives the private-URL guard being OFF
+# ---------------------------------------------------------------------------
+
+
+def test_raw_cdp_keeps_the_metadata_floor_when_the_private_guard_is_off(monkeypatch):
+    """``allow_private_urls`` / ``trust_private_hosts`` must never unblock 169.254.169.254.
+
+    ``_browser_cdp_private_guard`` short-circuits when eval-driven private-network access is
+    unguarded (local backend, local sidecar, ``allow_private_urls``) — which used to skip the
+    whole guard, leaving raw CDP the one path that could open the cloud-metadata endpoint
+    while ``browser_exec`` refuses it unconditionally. The metadata floor is now the
+    unconditional piece; ordinary private URLs stay allowed (that is the escape hatch).
+    """
+    from tools import browser_cdp_tool
+
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda _tid: False)
+    guard = browser_cdp_tool._browser_cdp_private_guard
+    for method in ("Page.navigate", "Target.createTarget"):
+        blocked = guard(task_id="t-1", method=method, params={"url": METADATA_URL})
+        assert blocked is not None, f"{method} opened the cloud-metadata endpoint"
+        assert "cloud metadata" in str(blocked)
+        assert guard(task_id="t-1", method=method, params={"url": PRIVATE_URL}) is None
+    # methods that carry no request target are untouched
+    assert guard(task_id="t-1", method="Page.captureScreenshot", params={}) is None
+
+
+def test_raw_cdp_metadata_floor_covers_url_parameters_and_string_bodies(monkeypatch):
+    """The floor is not just a ``url`` param: fetches in evaluated bodies and network
+    preloads reach the metadata endpoint too (upstream 1fdfdecbcf / f4aa77a467)."""
+    from tools import browser_cdp_tool
+
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda _tid: False)
+    guard = browser_cdp_tool._browser_cdp_private_guard
+
+    fetch = guard(task_id="t-1", method="Runtime.evaluate",
+                  params={"expression": "fetch('http://169.254.169.254/latest/meta-data/')"})
+    assert fetch is not None and "cloud metadata" in str(fetch)
+
+    preload = guard(task_id="t-1", method="Network.loadNetworkResource",
+                    params={"url": METADATA_URL, "frameId": "f-1"})
+    assert preload is not None and "cloud metadata" in str(preload)
+
+    continued = guard(task_id="t-1", method="Fetch.continueRequest",
+                      params={"requestId": "r-1", "url": METADATA_URL})
+    assert continued is not None and "cloud metadata" in str(continued)
+
+
+def test_raw_cdp_typing_a_metadata_url_is_not_refused(monkeypatch):
+    """``Input.*`` inserts text / dispatches events; it fetches nothing (upstream 9a0bbf03af)."""
+    from tools import browser_cdp_tool
+
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda _tid: False)
+    assert browser_cdp_tool._browser_cdp_private_guard(
+        task_id="t-1", method="Input.insertText", params={"text": METADATA_URL}) is None
+
+
+def test_raw_cdp_blocks_metadata_for_unlisted_methods_even_with_the_guard_on(monkeypatch):
+    """Guard ON used to check only the page URL, so an unlisted method could preload a
+    metadata host from a public page (upstream f4aa77a467). The floor is unconditional.
+
+    The floor fires before the page-URL probe, so no live browser is needed here.
+    """
+    from tools import browser_cdp_tool
+
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda _tid: True)
+    blocked = browser_cdp_tool._browser_cdp_private_guard(
+        task_id="t-1", method="Network.loadNetworkResource",
+        params={"url": METADATA_URL, "frameId": "f-1"})
+    assert blocked is not None and "cloud metadata" in str(blocked)
