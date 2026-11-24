@@ -185,3 +185,28 @@ class TestRedactPiiQuarantine:
             assert sample not in content
             # remove the file for the next sample to keep directory clean
             files[-1].unlink()
+
+
+class TestPhoneLookalikesStayClean:
+    """Digit runs that are NOT phone numbers must pass through untouched.
+
+    A log line range ("52702-52761") and a session id ("20260826_020532") both matched the
+    unanchored phone pattern and were mangled in issue/PR text. Anchored at both ends, they
+    read normally while real numbers still block.
+    """
+
+    @pytest.mark.parametrize(
+        "clean",
+        ["52702-52761", "20260826_020532", "see lines 52702-52761 in the log",
+         "build 20260826_020532 finished"],
+    )
+    def test_digit_runs_are_not_phones(self, clean: str):
+        rc, out, err = _run(clean)
+        assert rc == 0
+        assert out.strip() == clean
+
+    @pytest.mark.parametrize("dirty", ["082 555 1234", "+27 82 555 1234", "072-123-4567"])
+    def test_real_numbers_still_blocked(self, dirty: str):
+        rc, out, err = _run(dirty)
+        assert rc == 1
+        assert "[REDACTED]" in out

@@ -109,7 +109,13 @@ def _compile() -> None:
         (
             "Phone number",
             re.compile(
-                r"(?:\+?[1-9]\d{0,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}"
+                # \b anchored both ends (2026-08-26, Prometheus, owner-delegated):
+                # without anchors, digit-heavy text like log line ranges
+                # "52702-52761" and session ids "20260826_020532" false-flag as
+                # phone numbers, blocking legitimate issue/PR publishing.
+                # Real numbers (082 555 1234, +27 82 555 1234, 072-123-4567,
+                # 0115551234) still match — verified by test.
+                r"\b(?:\+?[1-9]\d{0,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b"
             ),
         ),
     ]
