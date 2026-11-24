@@ -39,14 +39,22 @@ def _disk_text(target: str = "memory") -> str:
 
 
 def test_add_redacts_dsn_password():
-    """The headline case: a DSN copied out of a .env must not reach disk."""
+    """The headline case: a DSN copied out of a .env must not reach disk.
+
+    Memory-write redaction is deliberately broader than a tool-result mask: it is a
+    hard egress boundary (``_MEMORY_REDACT_FLAGS`` sets ``redact_url_credentials``), so
+    the whole ``user:pass@`` userinfo goes, not only the password. What must survive is
+    the destination — proving the entry is masked, not nuked into uselessness.
+    """
     store = MemoryStore()
     resp = store.add("memory", DSN)
 
+    entries = " ".join(store.memory_entries)
     assert resp["success"] is True
-    assert DSN_SECRET not in " ".join(store.memory_entries)
+    assert DSN_SECRET not in entries
     assert DSN_SECRET not in _disk_text()
-    assert "postgres://admin:" in " ".join(store.memory_entries)
+    assert "postgres://admin:" not in entries          # userinfo is masked wholesale
+    assert "db.internal:5432/prod" in entries          # the useful part survives
 
 
 def test_add_redacts_prefixed_api_token():
