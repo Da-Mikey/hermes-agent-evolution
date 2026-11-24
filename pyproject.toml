@@ -601,6 +601,11 @@ sounddevice = false
 starlette = false
 supermemory = false
 tenacity = false
+# tornado: same shape as h2/aiohttp/cryptography — GHSA-5cjw-f85j-cv6r (6.6.1)
+# is newer than the 14-day window, so the resolver cannot see the fix and
+# settles on 6.6, which is inside the advisory's affected range (<= 6.6.0).
+# Remove once 6.6.1 ages past the cutoff.
+tornado = false
 ty = false
 tzdata = false
 unpaddedbase64 = false

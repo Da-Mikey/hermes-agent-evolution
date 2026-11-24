@@ -92,6 +92,7 @@ nemo-relay = false
 requests = false
 httplib2 = false
 httpx = false
+tornado = false
 pyasn1 = false
 snowballstemmer = false
 concurrent-log-handler = false
