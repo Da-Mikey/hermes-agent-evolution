@@ -20,13 +20,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from typing import Any, Deque, Dict
 from urllib.parse import quote, unquote, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from hermes_cli.dashboard_auth import (
@@ -215,18 +215,45 @@ async def auth_login(request: Request, provider: str, next: str = ""):
 
 # --- Public: RFC 8252 native-app authorization (system browser + loopback + PKCE)
 
+# RFC 8252 loopback IP literals -> their canonical URL authority spelling.
+_LOOPBACK_NETLOC_HOSTS = {"127.0.0.1": "127.0.0.1", "::1": "[::1]"}
+
+
 def _validate_loopback_redirect_uri(raw: str) -> str:
-    """Accept only ``http://127.0.0.1[:port]/…`` / ``http://[::1][:port]/…``. Security boundary:
-    the route is public, so a non-loopback host would make the callback an open redirect leaking
-    a live code. ``localhost`` is rejected (RFC 8252 §8.3)."""
+    """Return a canonical RFC 8252 loopback URI or reject it.
+
+    Both the server parser and the system browser must see the same authority: URL userinfo,
+    backslashes, fragments, controls, and non-canonical host/port spellings are rejected before
+    the URI is persisted. ``localhost`` is rejected in favour of IP literals (RFC 8252 §8.3).
+    """
     if not raw:
         raise _http(400, "redirect_uri required")
-    parsed = urlparse(raw)
+    if (
+        not raw.isascii()
+        or "\\" in raw
+        or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in raw)
+    ):
+        raise _http(400, "native redirect_uri must use a canonical loopback URL")
+    try:
+        parsed = urlparse(raw)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise _http(400, "native redirect_uri must use a canonical loopback URL")
     if parsed.scheme != "http":
         raise _http(400, "native redirect_uri must be http:// on the loopback interface")
-    if (parsed.hostname or "").lower() not in ("127.0.0.1", "::1"):
+    if "#" in raw:
+        raise _http(400, "native redirect_uri must not contain a fragment")
+    if parsed.username is not None or parsed.password is not None:
+        raise _http(400, "native redirect_uri must not contain userinfo")
+    canonical_host = _LOOPBACK_NETLOC_HOSTS.get(hostname)
+    if canonical_host is None:
         raise _http(400, "native redirect_uri host must be a loopback IP literal (127.0.0.1 / ::1)")
-    return raw
+    canonical_netloc = canonical_host + (f":{port}" if port is not None else "")
+    if parsed.netloc != canonical_netloc:
+        raise _http(400, "native redirect_uri must use a canonical loopback authority")
+    # scheme/netloc are already canonical and fragments rejected; only an empty path needs "/".
+    return urlunparse(parsed._replace(path=parsed.path or "/"))
 
 
 def _select_native_provider(provider: str):
@@ -251,7 +278,7 @@ async def auth_native_authorize(
         raise _http(400, "code_challenge_method must be S256")
     if not code_challenge:
         raise _http(400, "code_challenge required")
-    _validate_loopback_redirect_uri(redirect_uri)
+    redirect_uri = _validate_loopback_redirect_uri(redirect_uri)
     p = _select_native_provider(provider)
     if p is None and not provider:
         candidates = list_session_providers()
@@ -333,12 +360,26 @@ async def auth_callback(
 
 # --- Public: password (non-redirect) login ---------------------------------
 # Brute-force throttle: a process-local sliding window per client IP. Best-effort
-# defence-in-depth on top of the provider's constant-time verify (resets on restart; behind a
-# proxy the IP is the proxy's unless X-Forwarded-For).
+# defence-in-depth on top of the provider's constant-time verify (resets on restart).
+# Uses the ASGI peer; trusted proxy normalization must happen upstream.
 _PW_RATE_MAX_ATTEMPTS = 10
 _PW_RATE_WINDOW_SEC = 60.0
-_pw_attempts: Dict[str, Deque[float]] = defaultdict(deque)
+_PW_RATE_MAX_BUCKETS = 4096
+_pw_attempts: "OrderedDict[str, Deque[float]]" = OrderedDict()
 _pw_attempts_lock = threading.Lock()
+
+
+def _prune_password_rate_buckets_locked(cutoff: float) -> None:
+    """Drop expired/empty password-login limiter buckets.
+
+    Must be called with ``_pw_attempts_lock`` held.
+    """
+    for bucket_key in list(_pw_attempts.keys()):
+        bucket = _pw_attempts[bucket_key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if not bucket:
+            _pw_attempts.pop(bucket_key, None)
 
 
 def _password_rate_limited(ip: str) -> bool:
@@ -347,7 +388,19 @@ def _password_rate_limited(ip: str) -> bool:
     now = time.monotonic()
     cutoff = now - _PW_RATE_WINDOW_SEC
     with _pw_attempts_lock:
-        bucket = _pw_attempts[ip or "_unknown_"]
+        key = ip or "_unknown_"
+        max_buckets = max(1, int(_PW_RATE_MAX_BUCKETS))
+        if key not in _pw_attempts and len(_pw_attempts) >= max_buckets:
+            _prune_password_rate_buckets_locked(cutoff)
+        while key not in _pw_attempts and len(_pw_attempts) >= max_buckets:
+            _pw_attempts.popitem(last=False)
+
+        bucket = _pw_attempts.get(key)
+        if bucket is None:
+            bucket = deque()
+            _pw_attempts[key] = bucket
+        else:
+            _pw_attempts.move_to_end(key)
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
         if len(bucket) >= _PW_RATE_MAX_ATTEMPTS:
@@ -363,7 +416,8 @@ def _reset_password_rate_limit() -> None:
 
 
 class _PasswordLoginBody(BaseModel):
-    provider: str
+    # Providers use short stable IDs, not display names or URLs.
+    provider: str = Field(max_length=128)
     username: str
     password: str
     next: str = ""
