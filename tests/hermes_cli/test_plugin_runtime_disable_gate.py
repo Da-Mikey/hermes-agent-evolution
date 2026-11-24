@@ -14,6 +14,7 @@ Covers two residual bypasses addressed in the PR:
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 
 import pytest
@@ -103,8 +104,7 @@ class TestPluginApiRuntimeGate:
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
 
         with patch.object(web_server, "_get_dashboard_plugins", return_value=[fake_plugin]), \
-             patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"hot"}), \
-             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"hot"}):
+             patch("hermes_cli.web_server_dashboard._plugin_enable_sets_here", return_value=({"hot"}, {"hot"})):
             response = await web_server._plugin_api_runtime_gate(request, call_next)
 
         assert response.status_code == 404
@@ -155,13 +155,40 @@ class TestPluginApiRuntimeGate:
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
 
         with patch.object(web_server, "_get_dashboard_plugins", return_value=[]), \
-             patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
-             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()):
+             patch("hermes_cli.web_server_dashboard._plugin_enable_sets_here", return_value=(set(), set())):
             response = await web_server._plugin_api_runtime_gate(request, call_next)
 
         assert response.status_code == 404
         call_next.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_middleware_blocks_disabled_plugin_for_native_ticket_request(self):
+        """Desktop authenticates with a native ticket (``native_http_principal``), not a
+        session token; a plugin disabled while the daemon runs must 404 for it too."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/plugins/hot/probe",
+            "query_string": b"",
+            "headers": [],
+            "state": {"native_http_principal": {"profile_id": "default", "purpose": "native-http"}},
+            # Local Desktop: loopback mode, no gated auth.
+            "app": SimpleNamespace(state=SimpleNamespace(auth_required=False)),
+        }
+        request = Request(scope)
+
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        with patch.object(web_server, "_get_dashboard_plugins", return_value=[{"name": "hot", "source": "user"}]), \
+             patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"hot"}), \
+             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"hot"}):
+            response = await web_server._plugin_api_runtime_gate(request, call_next)
+
+        assert response.status_code == 404
+        call_next.assert_not_called()
 
 # ---------------------------------------------------------------------------
 # Test 2: Disabled bundled plugin assets return 404
@@ -186,25 +213,94 @@ class TestBundledPluginAssetGate:
 
         with patch.object(web_server, "_get_dashboard_plugins", return_value=[fake_plugin]):
             # Sanity: asset is served when not disabled.
-            with patch(
-                "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
-            ), patch(
-                "hermes_cli.plugins_cmd._get_disabled_set", return_value=set()
-            ):
+            with patch("hermes_cli.web_server_dashboard._plugin_enable_sets_here", return_value=(set(), set())):
                 resp = test_client.get("/dashboard-plugins/bundledx/dist/index.js")
                 assert resp.status_code == 200, (
                     "Sanity: bundled plugin asset should be served when not disabled"
                 )
 
             # Disable it.
-            with patch(
-                "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
-            ), patch(
-                "hermes_cli.plugins_cmd._get_disabled_set", return_value={"bundledx"}
-            ):
+            with patch("hermes_cli.web_server_dashboard._plugin_enable_sets_here", return_value=(set(), {"bundledx"})):
                 resp = test_client.get("/dashboard-plugins/bundledx/dist/index.js")
                 assert resp.status_code == 404, (
                     "Disabled bundled plugin asset must return 404"
                 )
 
 
+class TestPluginApiWebSocketGate:
+    """The runtime gate must hold on websockets too.
+
+    ``_plugin_api_runtime_gate`` is ``@app.middleware("http")``, so a plugin disabled
+    while the server runs kept accepting NEW connections on its websocket routes until
+    restart: the HTTP gate never sees an upgrade (#134889, PLG-8).
+    """
+
+    @staticmethod
+    def _scope(path: str) -> dict:
+        return {"type": "websocket", "path": path, "root_path": "", "query_string": b"",
+                "headers": [], "app": None}
+
+    @pytest.mark.asyncio
+    async def test_disabled_plugin_websocket_closed_before_accept(self):
+        from starlette import status
+        from hermes_cli.web_server_dashboard import PluginApiWebSocketGate
+
+        inner_called: list = []
+        sent: list = []
+
+        async def inner(scope, receive, send):
+            inner_called.append(True)
+
+        async def send(msg):
+            sent.append(msg)
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        with patch("hermes_cli.web_server_dashboard._plugin_api_request_refused", return_value=True):
+            await PluginApiWebSocketGate(inner)(self._scope("/api/plugins/hot/ws"), receive, send)
+
+        assert sent == [{"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION}]
+        assert inner_called == []
+
+    @pytest.mark.asyncio
+    async def test_enabled_plugin_websocket_reaches_the_app(self):
+        from hermes_cli.web_server_dashboard import PluginApiWebSocketGate
+
+        inner_called: list = []
+        sent: list = []
+
+        async def inner(scope, receive, send):
+            inner_called.append(True)
+
+        async def send(msg):
+            sent.append(msg)
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        with patch("hermes_cli.web_server_dashboard._plugin_api_request_refused", return_value=False):
+            await PluginApiWebSocketGate(inner)(self._scope("/api/plugins/hot/ws"), receive, send)
+
+        assert inner_called == [True]
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_non_plugin_websocket_is_untouched(self):
+        from hermes_cli.web_server_dashboard import PluginApiWebSocketGate
+
+        inner_called: list = []
+
+        async def inner(scope, receive, send):
+            inner_called.append(True)
+
+        async def send(msg):
+            pass
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        with patch("hermes_cli.web_server_dashboard._plugin_api_request_refused", return_value=True):
+            await PluginApiWebSocketGate(inner)(self._scope("/ws/chat"), receive, send)
+
+        assert inner_called == [True]
