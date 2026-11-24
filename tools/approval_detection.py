@@ -17,7 +17,16 @@ logger = logging.getLogger("tools.approval")
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
 # home is folded into these forms at detection time by _normalize_command_for_detection(), so no
 # import-time path snapshot (stale once HERMES_HOME is set after import) lives in the patterns.
-_SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+_HOME_SSH_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+# ANOTHER user's home, written literally. _rewrite_resolved_user_home() folds only the INVOKING
+# user's home to `~/`, so `/root/...` and `/home/<other>/...` survive normalization as absolute
+# paths and matched no rule at all: `cp /tmp/x /root/.ssh/authorized_keys` returned
+# (False, None, None) — a credential write door with no reason string and no denial event (#424).
+# `/root` is the case that matters (Prometheus runs as `mike` with a `sudo -n` helper, so a
+# sudo-prefixed command naming /root is reachable); `/home/<user>` is the same class next door.
+# The lookbehind keeps a longer path ending in a `/root` component (…/project/root/.ssh) out.
+_OTHER_USER_HOME = r'(?:(?<![\w./-])/root|(?<![\w./-])/home/[^/\s"\'`]+)'
+_SSH_SENSITIVE_PATH = rf'(?:{_HOME_SSH_PATH}|{_OTHER_USER_HOME}/\.ssh(?:/|$))'
 _HERMES_ENV_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'\.env\b'
 )
@@ -28,8 +37,18 @@ _HERMES_CONFIG_PATH = (
 )
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
-_SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
-_CREDENTIAL_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:netrc|pgpass|npmrc|pypirc)\b'
+_HOME_SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
+_HOME_CREDENTIAL_FILES = (
+    r'(?:(?:~|\$home|\$\{home\})/\.(?:netrc|pgpass|npmrc|pypirc)\b'
+    r'|(?:~|\$home|\$\{home\})/\.aws/credentials\b)'
+)
+# Same two families for another user's literal home (#424) — `/root/.bashrc` is a persistence
+# write door even when the command cannot touch the invoking user's rc file.
+_SHELL_RC_FILES = rf'(?:{_HOME_SHELL_RC_FILES}|{_OTHER_USER_HOME}/\.(?:bashrc|zshrc|profile|bash_profile|zprofile)\b)'
+_CREDENTIAL_FILES = (
+    rf'(?:{_HOME_CREDENTIAL_FILES}'
+    rf'|{_OTHER_USER_HOME}/\.(?:netrc|pgpass|npmrc|pypirc)\b|{_OTHER_USER_HOME}/\.aws/credentials\b)'
+)
 # macOS: /etc, /var, /tmp, /home are symlinks to /private/*, so /private/etc/sudoers would bypass a plain
 # "/etc/" check. Match both forms.
 _MACOS_PRIVATE_SYSTEM_PATH = r'/private/(?:etc|var|tmp|home)/'
@@ -40,6 +59,10 @@ _SENSITIVE_WRITE_TARGET = (
 )
 _USER_SENSITIVE_WRITE_TARGET = rf'(?:{_SSH_SENSITIVE_PATH}|{_SHELL_RC_FILES}|{_CREDENTIAL_FILES})'
 _PROJECT_SENSITIVE_WRITE_TARGET = rf'(?:{_PROJECT_ENV_PATH}|{_PROJECT_CONFIG_PATH})'
+# Write-door targets: anything a mutating binary must not be pointed at. Used by the unpaired
+# write-door rules (sort -o, truncate, ln, uniq) where the binary names its output file itself,
+# so the same credential/SSH/shell-rc/system-config/project-env target set applies.
+_WRITE_DOOR_TARGET = rf'(?:{_SENSITIVE_WRITE_TARGET}|{_PROJECT_SENSITIVE_WRITE_TARGET})'
 # cp/mv/install: the sensitive path is a write target only as the LAST argument (destination), so
 # `cp config.yaml backup.yaml` (config.yaml as SOURCE) stays out.
 _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
@@ -205,6 +228,48 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
+# ---- Pipe-to-shell launchers --------------------------------------------------------------
+# A launcher word between the pipe and the shell (`curl … | sudo bash`) is the same attack: the
+# fetched script runs, now with whatever privilege the launcher grants. The sink is therefore
+# matched through an optional chain of wrappers, each wrapper's flags skipped — values only for
+# options that actually take one, so `sudo -u bob bash` keeps `bash` as the sink while
+# `sudo -pl bash` (where `l` is the value of -p) is not mistaken for a privileged lookup.
+_PIPE_LAUNCHER_VALUE_FLAGS = {
+    "sudo": ("ugUCDhpRrtT", ("user", "group", "other-user", "close-from", "chdir", "host", "prompt",
+                             "role", "type", "command-timeout", "chroot")),
+    "doas": ("uC", ()),
+    # `-S STRING` is the command itself (split into words), never a swallowed value.
+    "env": ("uCa", ("unset", "chdir", "argv0")),
+    "exec": ("a", ()),
+    "command": ("", ()),
+    "nohup": ("", ()),
+    "setsid": ("", ()),
+    "builtin": ("", ()),
+}
+
+
+def _pipe_launcher_re(name: str, short: str, long_opts: tuple) -> str:
+    """One launcher: its name, then any run of the flags and assignments it may carry."""
+    valued = [rf"(?-i:-[^\W{short}\d-]*+[{short}])\s++[^\s|;&<>]++"] if short else []
+    valued += [rf"--(?:{'|'.join(long_opts)})\s++[^\s|;&<>]++"] if long_opts else []
+    duration = r"(?:infinity|\d++(?:\.\d++)?(?:e\d++)?|\.\d++)[smhd]?(?=\s)"
+    args = "|".join([*valued, r"-[^\s|;&<>]++", r"\w++=[^\s|;&<>]*+", duration])
+    return rf"{name}(?:\s++(?>{args}))*+"
+
+
+_PIPE_LAUNCHERS_RE = (
+    r"(?:\s*+(?:" + "|".join(_pipe_launcher_re(n, s, o)
+                             for n, (s, o) in _PIPE_LAUNCHER_VALUE_FLAGS.items()) + r")\s++)*+"
+)
+# Lookup/list modes name a shell without running it (`curl … | command -v bash`, `sudo -l bash`).
+# In `sudo -pl bash` the `l` is the VALUE of -p and bash does run, so only flags outside sudo's
+# value-taking set may precede the `l`.
+_PIPE_LOOKUP_RE = (
+    r"(?!\s*(?:command\s+-[a-zA-Z]*[vV]"
+    r"|sudo\s+(?:-(?-i:[^\WugUCDhpRrtT\d])*(?-i:l)|--list))\b)"
+)
+
+
 # ---- Dangerous command patterns -----------------------------------------------------------
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
@@ -291,7 +356,8 @@ DANGEROUS_PATTERNS = [
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
     # Shell -c is parsed structurally by _execution_flag_findings(); a regex searching a dash-token
     # for "c" also matched --norc/--rcfile/--restricted.
-    (rf'\b(curl|wget)\b.*\|\s*(?:[/\w]*/)?(?:{_SHELL_NAMES_RE})(?:\s|$|-c)', "pipe remote content to shell"),
+    (rf"\b(curl|wget)\b.*\|{_PIPE_LOOKUP_RE}\s*{_PIPE_LAUNCHERS_RE}['\"]?(?:[/\w]*/)?(?:{_SHELL_NAMES_RE})(?:\s|$|-c)",
+     "pipe remote content to shell"),
     (rf'\b(?:{_SHELL_NAMES_RE})\s+<\s*<?\s*\(\s*(curl|wget)\b', "execute remote script via process substitution"),
     # eval/source/. $(curl ...) — equivalent to piping remote content to a shell.
     (r'(?:\beval\b|\bsource\b|\.)\s*(?:\$\(\s*|`\s*)(?:curl|wget)\b', "execute remote content via command substitution"),
@@ -405,6 +471,34 @@ DANGEROUS_PATTERNS = [
     # script-execution pattern above (which targets code evaluation, not file mutation). Pairs the sed -i
     # coverage from #14639.
     (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (perl/ruby)"),
+    # ── Unpaired write doors (#409) ────────────────────────────────────────────────────────
+    # Four binaries WRITE the file they name, and none was covered by the redirection / tee /
+    # cp / mv / sed -i rules above. Measured on HEAD before this fix, all of these returned
+    # (False, None, None) — no reason, no denial event, nothing for the transcript or audit
+    # trail: `sort -o ~/.ssh/authorized_keys`, `sort --output=$HOME/.ssh/authorized_keys`,
+    # `truncate -s 0 ~/.ssh/authorized_keys`, `ln -sf /tmp/x ~/.ssh/authorized_keys`,
+    # `uniq /tmp/x ~/.ssh/authorized_keys`. Same rationale as the sed -i rule above: the tool
+    # mutates the file directly, so gate the same credential/startup targets.
+    # The gate is the TARGET, never the option — neutral destinations stay clean
+    # (`sort -o /tmp/out.txt`, `truncate -s 0 /tmp/out.txt`, `ln -sf /tmp/x /tmp/y`,
+    # `uniq /tmp/in.txt /tmp/out.txt`), so ordinary use of these tools does not prompt.
+    # sort: -o / --output owns the filename that follows it. The read-tool option tables
+    # (:630-:656) already teach the parser that -o takes an argument; this is the rule that
+    # treats that argument as a write DESTINATION, which is the gap the tables left open.
+    (rf'\bsort\b[^;|&\n]*?(?:(?<!\S)-[a-z]*o|--output(?![-\w]))\s*=?\s*[\s"\']*{_WRITE_DOOR_TARGET}',
+     "overwrite sensitive credential/SSH path via sort -o"),
+    # truncate shrinks or extends every operand it names.
+    (rf'\btruncate\b[^;|&\n]*[\s"\']*{_WRITE_DOOR_TARGET}',
+     "truncate of sensitive credential/SSH path"),
+    # ln replaces its destination: `ln -sf /tmp/x ~/.ssh/authorized_keys` is a key implant, and
+    # `ln -s ~/.ssh/id_rsa /tmp/x` turns a sensitive file into a readable name by another route.
+    # Both directions are gated, since either needs a human to look at it.
+    (rf'\bln\b[^;|&\n]*[\s"\']*{_WRITE_DOOR_TARGET}',
+     "create link to/over sensitive credential/SSH path via ln"),
+    # uniq writes its SECOND operand (the INPUT OUTPUT form). Requiring an input operand before
+    # the target keeps a plain `uniq ~/.ssh/authorized_keys` (a read) out.
+    (rf'\buniq\b[^;|&\n]*?\s+[^\s-]\S*\s+["\']?{_WRITE_DOOR_TARGET}',
+     "overwrite sensitive credential/SSH path via uniq OUTPUT"),
     # Interpreter heredocs are handled by _execution_flag_findings(); only shell heredocs stay
     # regex-based. `bash <<'EOF'` runs arbitrary commands without triggering the `bash -c` path.
     (rf'\b(?:{_SHELL_NAMES_RE})\s+<<', "shell execution via heredoc"),
@@ -654,6 +748,16 @@ _READ_TOOL_SHORT_OPTIONS_WITH_ARG = {
     "rg": frozenset("efEmjgdtTABCMr"), "sort": frozenset("koStT"), "man": frozenset("CRLmMSserEPp"),
     "ag": frozenset("gGmpW"),
 }
+# Binaries modelled as read tools that ALSO write a file they name: every one of these must be
+# covered by a write-door rule in DANGEROUS_PATTERNS. `sort` is the case that produced #409 — the
+# option tables above taught the parser that `-o`/`--output` takes an argument and nothing ever
+# asked what that argument IS. tests/tools/test_write_door_coverage.py asserts the coverage, so a
+# binary added to the tables above without a write-door verdict fails CI instead of shipping.
+_WRITE_DOOR_BINARIES = frozenset({"sort", "truncate", "ln", "uniq"})
+# Read tools signed off as genuinely NOT writers: none of their argument-taking options names a
+# write destination. Program-bearing options (--pre, --hostname-bin, --pager, --compress-program)
+# are separately covered by _READ_TOOL_EXEC_FLAGS and the execution-flag findings.
+_READ_TOOL_NOT_A_WRITER = frozenset({"rg", "ag", "man"})
 _GREP_OPTIONS_WITH_ARG = {
     "--after-context", "--before-context", "--binary-files", "--context", "--directories", "--devices", "--exclude",
     "--exclude-dir", "--exclude-from", "--include", "--label", "--max-count", "--regexp", "--file",

@@ -265,6 +265,46 @@ _CRON_HINT = (
 _HARD_STOP_DIVERSION_TURNS = 5
 
 
+# Dispatcher-resolvable template markers: date-shaped tokens a job author (or a job template)
+# leaves in a prompt. This is an explicit ALLOWLIST resolved with literal replacement — never
+# ``str.format()``, because prompts legitimately contain braces (JSON snippets, f-strings, glob
+# braces ``{a,b}``) and a format pass would either raise or silently eat them. Markers that carry
+# information the dispatcher does not have (``<feature_name>``, ``{{file path}}``) are deliberately
+# left alone: substituting a guess there would be worse than the refusal.
+_DATE_MARKERS = (
+    "{{current_date}}", "{{date}}",
+    "{current_date}", "{date}",
+    "<current_date>", "<date>",
+)
+
+
+def _expand_prompt_markers(text: str) -> str:
+    """Substitute dispatcher-resolvable template markers with real values.
+
+    Why this lives here (#418, third round after #95 and #139): a job prompt carrying ``{date}``
+    reached the agent verbatim, so a run that copied its goal into ``delegate_task`` tripped the
+    unexpanded-marker guard in ``tools/delegate_tool_tasks`` and the delegated work was refused —
+    silently, because a parent that does not inspect the child still finishes feeling successful.
+    Earlier rounds fixed the SILENT loss at the tool boundary; this fixes the EMISSION, at the one
+    place the prompt is composed, so the marker never reaches a tool call.
+
+    The clock is the household clock (``hermes_time.now``), so a job scheduled in SAST gets the
+    SAST date rather than UTC's. An unresolvable clock leaves the text untouched and logs: the
+    tool-boundary guard is still there to refuse the call loudly.
+    """
+    if not text:
+        return text
+    try:
+        today = _hermes_now().strftime("%Y-%m-%d")
+    except Exception as e:  # noqa: BLE001 — a broken clock must not kill the run
+        logger.warning("Failed to resolve date markers in cron prompt: %s", e)
+        return text
+    for marker in _DATE_MARKERS:
+        if marker in text:
+            text = text.replace(marker, today)
+    return text
+
+
 def _build_job_prompt(
     job: dict, prerun_script: Optional[tuple] = None, extra_prompt: Optional[str] = None,
     runtime_data_prompt: Optional[str] = None,
@@ -279,9 +319,9 @@ def _build_job_prompt(
     omitted, the script (if any) runs inline as before. extra_prompt: Optional per-run context (from
     ``cronjob(action='run')``, 57331 — salvaged from #57342 by @liuhao1024).
     """
-    user_prompt = str(job.get("prompt") or "")
+    user_prompt = _expand_prompt_markers(str(job.get("prompt") or ""))
     if extra_prompt:
-        user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+        user_prompt = f"{user_prompt}\n\n## Run Context\n{_expand_prompt_markers(extra_prompt)}"
     prompt = user_prompt
     # Runtime DATA (script stdout, upstream output) legitimately quotes command-shape strings, so it
     # must not be scanned with the strict user-prompt set — see _scan_assembled_cron_prompt.
