@@ -465,6 +465,41 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+_HARM_GATE_MODES = ("full", "destructive-only", "off")
+_DESTRUCTIVE_ONLY_ARMS = frozenset({"destructive-command"})
+
+# #353 — fallback for the [CIRCUIT_BREAKER] diagnostic when the tracker event
+# carries no strategy recommendation. The tracker does publish one
+# (`strategy_recommendation`), but reading a missing key used to raise KeyError
+# into a debug-level `except`, which silently suppressed the whole diagnostic.
+_DEFAULT_BREAKER_ACTION = "Inspect the tool arguments and retry, or use another tool."
+
+
+def _harm_gate_policy() -> tuple:
+    """(mode, trust_private_hosts) from security.harm_gate; fail-closed to "full".
+
+    "full" is the upstream posture. "destructive-only" keeps the one arm that
+    names irreversible harm and drops the lexical ones — a regex cannot tell a
+    household probe from a leak, and a gate that cries wolf teaches its operator
+    to ignore refusals instead of reading them. "off" leaves the independent
+    tirith scanner and the approval layer as the guards.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        section = cfg.get("security") if isinstance(cfg, dict) else None
+        gate = section.get("harm_gate") if isinstance(section, dict) else None
+        if not isinstance(gate, dict):
+            return "full", False
+        mode = str(gate.get("mode") or "full").strip().lower()
+        if mode not in _HARM_GATE_MODES:
+            mode = "full"
+        return mode, bool(gate.get("trust_private_hosts"))
+    except Exception:
+        return "full", False
+
+
 def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[str]:
     """Score a pre-execution call with the AgentProcessBench harm rules."""
     name = str(function_name or "").lower()
@@ -473,9 +508,18 @@ def _harm_gate_block_reason(function_name: str, function_args: Any) -> Optional[
         and any(k in function_args for k in ("path", "file_path", "filename", "command"))
     ):
         return None
+    mode, trust_private = _harm_gate_policy()
+    if mode == "off":
+        return None
+    arms = _DESTRUCTIVE_ONLY_ARMS if mode == "destructive-only" else None
     try:
         from evolution.lib.agent_process_bench import harm_verdict_for_tool_call
-        return harm_verdict_for_tool_call(name, function_args)
+        return harm_verdict_for_tool_call(
+            name,
+            function_args,
+            trust_private_hosts=trust_private,
+            arms=arms,
+        )
     except Exception:
         return None
 
@@ -515,7 +559,10 @@ def _harm_gated_invoke(agent, ref, next_args, messages):
     )
 
 
-def _record_tool_circuit_breaker(agent, tool_name: str, result: Any, is_error: bool, effective_task_id: str) -> Any:
+def _record_tool_circuit_breaker(
+    agent, tool_name: str, result: Any, is_error: bool, effective_task_id: str,
+    call_id: Optional[str] = None,
+) -> Any:
     # Retry-spiral circuit breaker check (#3391)
     try:
         from tools.tool_circuit_breaker import TOOL_CIRCUIT_BREAKER
@@ -527,22 +574,45 @@ def _record_tool_circuit_breaker(agent, tool_name: str, result: Any, is_error: b
             tool_name=tool_name,
             status=_st,
             error_message=_err_msg,
+            # #359 — model_tools already recorded this call; the tracker dedupes
+            # by (call_id, producer) so one call costs one unit of budget.
+            call_id=call_id,
+            producer="tool_executor",
         )
-        if _breaker_event and _breaker_event.get("circuit_breaker_tripped"):
-            if isinstance(result, str) and "[CIRCUIT_BREAKER]" not in result:
-                fails = _breaker_event['consecutive_failures']
-                bgt = _breaker_event['budget']
-                fcls = _breaker_event['failure_class']
-                act = _breaker_event['suggested_action']
-                _diag = (
-                    f"\n\n[CIRCUIT_BREAKER] Tool '{tool_name}' has failed "
-                    f"{fails} consecutive times (budget: {bgt}). "
-                    f"Class: {fcls}. Suggested action: {act}"
-                )
-                return result + _diag
     except Exception as _cb_err:
         logger.debug("Circuit breaker record_result failed: %s", _cb_err)
-    return result
+        return result
+
+    if not (_breaker_event and _breaker_event.get("circuit_breaker_tripped")):
+        return result
+    if not (isinstance(result, str) and "[CIRCUIT_BREAKER]" not in result):
+        return result
+
+    # #353 — the diagnostic builder is NOT inside the tracing `except` above.
+    # It used to be, so a bad key in the event dict was swallowed at debug level
+    # and looked exactly like a benign record_result failure: the tracker tripped,
+    # nothing was appended, and 0 of the 243 breaker diagnostics in the corpus
+    # came from this producer. A builder fault is a warning, never a silent drop.
+    try:
+        fails = _breaker_event.get("consecutive_failures")
+        bgt = _breaker_event.get("budget")
+        fcls = _breaker_event.get("failure_class", "unknown")
+        # The tracker publishes `strategy_recommendation` (tools/tool_circuit_breaker.py).
+        act = _breaker_event.get("strategy_recommendation") or _DEFAULT_BREAKER_ACTION
+        _diag = (
+            f"\n\n[CIRCUIT_BREAKER] Tool '{tool_name}' has failed "
+            f"{fails} consecutive times (budget: {bgt}). "
+            f"Class: {fcls}. Suggested action: {act}"
+        )
+        return result + _diag
+    except Exception:
+        logger.warning(
+            "Circuit breaker diagnostic could not be built for %s (event keys: %s)",
+            tool_name,
+            sorted(_breaker_event)[:12],
+            exc_info=True,
+        )
+        return result
 
 
 def _run_tool(*args, **kwargs):
@@ -1579,7 +1649,9 @@ class _ConcurrentBatch:
         if not blocked and not dispatched:
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
         is_error, _ = _detect_tool_failure(ref.name, result)
-        result = _record_tool_circuit_breaker(agent, ref.name, result, is_error, ref.task_id)
+        result = _record_tool_circuit_breaker(
+            agent, ref.name, result, is_error, ref.task_id, call_id=ref.call_id
+        )
         if is_error:
             logger.info("tool %s failed (%.2fs): %s", ref.name, duration, str(result)[:200])
         else:
@@ -2032,7 +2104,9 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     # Multimodal dict results (_multimodal=True) are not sliceable as strings.
     _result_len = len(function_result) if isinstance(function_result, str) else len(str(function_result))
     _is_error_result, _ = _detect_tool_failure(ref.name, function_result)
-    function_result = _record_tool_circuit_breaker(agent, ref.name, function_result, _is_error_result, ref.task_id)
+    function_result = _record_tool_circuit_breaker(
+        agent, ref.name, function_result, _is_error_result, ref.task_id, call_id=ref.call_id
+    )
     committed = _commit_tool_result(
         agent, messages, ref, function_result,
         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,

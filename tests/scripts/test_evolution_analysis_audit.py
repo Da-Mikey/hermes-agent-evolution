@@ -17,6 +17,9 @@ from evolution_analysis_audit import (  # noqa: E402
     reconcile_latest,
     reconcile_report,
     verify_implementation_claim,
+    VERIFIED,
+    REFUTED,
+    CANNOT_DETERMINE,
 )
 
 
@@ -250,23 +253,24 @@ class TestVerifyImplementationClaim:
             "already_implemented": True,
             "reason": "implemented in evolution/lib/real.py",
         }
-        assert verify_implementation_claim(item, tmp_path) is True
+        assert verify_implementation_claim(item, tmp_path) == VERIFIED
 
-    def test_nonexistent_file_claim_verifies_false(self, tmp_path):
+    def test_nonexistent_file_claim_is_refuted(self, tmp_path):
         item = {
             "issue_number": 102,
             "already_implemented": True,
             "reason": "claimed done in evolution/lib/nonexistent_file.py",
         }
-        assert verify_implementation_claim(item, tmp_path) is False
+        assert verify_implementation_claim(item, tmp_path) == REFUTED
 
-    def test_no_concrete_path_verifies_true(self, tmp_path):
+    def test_no_concrete_path_is_cannot_determine(self, tmp_path):
+        """#281 — this used to assert True ("cannot disprove" == "verified")."""
         item = {
             "issue_number": 103,
             "already_implemented": True,
             "reason": "already done in earlier refactor",
         }
-        assert verify_implementation_claim(item, tmp_path) is True
+        assert verify_implementation_claim(item, tmp_path) == CANNOT_DETERMINE
 
 
 class TestAuditImplementedClaims:

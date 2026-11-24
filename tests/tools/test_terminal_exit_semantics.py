@@ -122,3 +122,34 @@ class TestShellLevelExitCodes:
 
     def test_zero_still_returns_none(self):
         assert _interpret_exit_code("nosuchtool", 0) is None
+
+
+class TestChainAttribution:
+    """A non-zero code belongs to the segment that FAILED, not the last one (#358).
+
+    ``a && b`` short-circuits, so ``cd /nonexistent && grep foo f`` exits 1
+    because of ``cd``. Reading that as grep's "no matches" published a real
+    failure as success — worse, introspection treats a note carrying
+    ``exit_code_meaning`` as informational and drops it from the failure rate.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "cd /nonexistent && grep foo f",
+        "false && diff a b",
+        "cd /x && ls && grep foo f",
+    ])
+    def test_ampersand_chain_borrows_nothing(self, cmd):
+        assert _interpret_exit_code(cmd, 1) is None
+
+    @pytest.mark.parametrize("cmd", [
+        "ls; grep foo bar",            # sequence: the last command owns the status
+        "ls nosuch || grep foo bar",   # alternative: the last command owns it
+        "grep 'a && b' file.txt",      # && inside quotes is not a chain operator
+    ])
+    def test_single_status_chains_keep_their_meaning(self, cmd):
+        note = _interpret_exit_code(cmd, 1)
+        assert note is not None
+        assert "no matches" in note.lower()
+
+    def test_plain_grep_is_unchanged(self):
+        assert "no matches" in _interpret_exit_code("grep foo bar", 1).lower()

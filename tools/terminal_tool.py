@@ -683,8 +683,14 @@ def _nearby_missing_path_hint(command: str, output: str) -> Optional[str]:
         nf_path = m_nsf.group(1)
     elif command and (
         "No such file or directory" in (output or "")
-        or "not found" in (output or "").lower()
+        # #282 — only explicit *command-not-found* markers may stand in for a
+        # path report. A bare "not found" substring matched arbitrary output
+        # (a command merely quoting the phrase, a nested tool result naming a
+        # directory) and the first "/"-bearing token of the command was then
+        # reported as a missing file.
+        or "command not found" in (output or "").lower()
         or "command was not found" in (output or "").lower()
+        or "executable file not found" in (output or "").lower()
     ):
         for token in command.split():
             cleaned = token.strip("'\"")
@@ -694,7 +700,7 @@ def _nearby_missing_path_hint(command: str, output: str) -> Optional[str]:
     if not nf_path:
         return None
     nearby = suggest_nearby_paths(nf_path)
-    return format_nearby_hint(nf_path, nearby)
+    return format_nearby_hint(nf_path, nearby, tool_name="terminal")
 
 
 def _apply_classified_enrichments(

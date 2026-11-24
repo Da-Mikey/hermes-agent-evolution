@@ -186,9 +186,13 @@ index and the `SessionDB` message store). These are real agent↔user dialogues.
      the gate so the close loop acts on the verdict; on a HOLD (no-signal/regressed)
      re-open the issue and label it so a focused regression is filed:
      ```bash
-     # Exits 0 = may close; 1 = HOLD (re-open + label needs-regression).
+     # Exit codes: 0 = may close; 1 = HOLD (a merge exists and the signal did
+     # NOT verify → re-open + label needs-regression); 3 = UNVERIFIABLE (no
+     # merge record in the realized-impact ledger → the gate refuses to close,
+     # but this is NOT a regression: do not re-open, record the merge instead).
      python3 scripts/evolution_realized_impact.py check-close <#> "$(date +%Y-%m-%d)"
-     if [ $? -ne 0 ]; then
+     rc=$?
+     if [ "$rc" -eq 1 ]; then
        gh label create needs-regression --repo "$REPO" --color d93f0b \
          --description "Post-merge signal not verified — needs a focused regression" 2>/dev/null || true
        gh issue reopen <#> --repo "$REPO" 2>/dev/null || true

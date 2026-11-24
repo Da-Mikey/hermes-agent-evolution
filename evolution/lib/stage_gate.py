@@ -5,13 +5,19 @@ Slice B of the AREX loop (#1330).  Slice A (#1338) gave every stage a uniform
 :class:`~evolution.lib.stage_result.StageResult`; this module is the gate that
 *acts* on the confidence carried in it.
 
-Three branches, decided at a stage boundary:
+Four branches, decided at a stage boundary:
 
-* **Accept**  — ``confidence >= threshold``.  Proceed as normal.
+* **Accept**  — ``confidence >= threshold`` **and** at least one evidence
+  pointer.  Proceed as normal.
 * **Refine**  — below threshold but the trajectory is recoverable: keep the
   evidence already gathered and re-investigate only the gaps.
 * **Restart** — below threshold and the trajectory is too noisy to salvage:
   discard it and reinitialize from the original problem.
+* **Cannot determine** — the evidence a decision would have to rest on is
+  absent (#281): either no evidence pointer at all, or a ``required_facts``
+  entry no pointer names.  Confidence cannot substitute for evidence, so this
+  outcome holds even at confidence 100.  It is *not* a rejection — nothing has
+  been disproved; the stage must go and gather the missing fact.
 
 On recoverability
 -----------------
@@ -35,7 +41,7 @@ rest of ``evolution/lib``.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +51,7 @@ __all__ = [
     "ACCEPT",
     "REFINE",
     "RESTART",
+    "CANNOT_DETERMINE",
     "DEFAULT_CONFIDENCE_THRESHOLD",
     "RESTART_RATE_ALERT_THRESHOLD",
     "GateDecision",
@@ -60,6 +67,11 @@ __all__ = [
 ACCEPT = "accept"
 REFINE = "refine"
 RESTART = "restart"
+#: Fourth outcome (#281): the gate cannot honestly decide, because the evidence
+#: a decision would have to rest on is absent.  Distinct from RESTART — the
+#: trajectory may be perfectly sound; what is missing is proof.  A boolean is
+#: the wrong return type for an admission decision.
+CANNOT_DETERMINE = "cannot_determine"
 
 #: Conservative default τ.  See module docstring on the 50-confidence interaction.
 DEFAULT_CONFIDENCE_THRESHOLD = 70
@@ -99,6 +111,10 @@ class GateDecision:
     threshold: int
     reason: str
     retained_evidence: list[str]
+    #: Required facts (#281) that no evidence pointer named.  Non-empty only on
+    #: a CANNOT_DETERMINE decision, and recorded in the ledger so the outcome is
+    #: diagnosable without re-running the stage.
+    missing_facts: list[str] = field(default_factory=list)
 
     @property
     def proceeds(self) -> bool:
@@ -114,6 +130,7 @@ class GateDecision:
             "threshold": self.threshold,
             "reason": self.reason,
             "retained_evidence": list(self.retained_evidence),
+            "missing_facts": list(self.missing_facts),
         }
 
     def log_line(self) -> str:
@@ -122,6 +139,24 @@ class GateDecision:
             f"[stage-gate] {self.stage}: {self.branch.upper()} "
             f"(confidence={self.confidence}, threshold={self.threshold}) — {self.reason}"
         )
+
+
+def _missing_required_facts(required: list[str], evidence: list[str]) -> list[str]:
+    """Required facts (#281) that no evidence pointer names.
+
+    A fact counts as covered when some evidence pointer mentions it (case
+    -insensitive substring), so a stage can declare ``"pytest full suite"`` and
+    satisfy it by citing the run's log path.  Blank facts are ignored.
+    """
+    if not required:
+        return []
+    haystack = " ".join(str(e) for e in evidence).lower()
+    missing: list[str] = []
+    for fact in required:
+        name = fact.strip()
+        if name and name.lower() not in haystack:
+            missing.append(name)
+    return missing
 
 
 def decide(
@@ -154,8 +189,43 @@ def decide(
     confidence = max(0, min(100, int(stage_result.confidence)))
     evidence = list(stage_result.evidence_pointers)
     stage = stage_result.stage or "unknown"
+    required = [str(f) for f in (getattr(stage_result, "required_facts", None) or [])]
+
+    # #281 — a fact the result declares it rests on, with no evidence pointer
+    # naming it, is a hole no confidence number can paper over.  Checked first
+    # so it holds at confidence 100.
+    missing = _missing_required_facts(required, evidence)
+    if missing:
+        return GateDecision(
+            branch=CANNOT_DETERMINE,
+            stage=stage,
+            confidence=confidence,
+            threshold=threshold,
+            reason=(
+                f"required fact(s) not covered by any evidence pointer: "
+                f"{', '.join(missing)} — cannot determine from what was gathered"
+            ),
+            retained_evidence=evidence,
+            missing_facts=missing,
+        )
 
     if confidence >= threshold:
+        # #281 — confidence is a claim about the evidence, so it cannot stand in
+        # for the evidence.  Absent an evidence pointer the honest answer is
+        # "cannot determine", not "accept".
+        if not evidence:
+            return GateDecision(
+                branch=CANNOT_DETERMINE,
+                stage=stage,
+                confidence=confidence,
+                threshold=threshold,
+                reason=(
+                    "confidence at or above threshold but no evidence pointer — "
+                    "an accepted result must cite at least one"
+                ),
+                retained_evidence=[],
+                missing_facts=[],
+            )
         return GateDecision(
             branch=ACCEPT,
             stage=stage,
@@ -285,7 +355,12 @@ def load_decisions(ledger_file: Path) -> list[dict[str, Any]]:
             rec = json.loads(ln)
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(rec, dict) and rec.get("branch") in (ACCEPT, REFINE, RESTART):
+        if isinstance(rec, dict) and rec.get("branch") in (
+            ACCEPT,
+            REFINE,
+            RESTART,
+            CANNOT_DETERMINE,
+        ):
             out.append(rec)
     return out
 
@@ -311,7 +386,8 @@ def compute_gate_rates(records: list[dict[str, Any]]) -> dict[str, dict[str, Any
         # blind the feature permanently.
         stage = str(rec.get("stage") or "unknown")
         bucket = by_stage.setdefault(
-            stage, {"total": 0, ACCEPT: 0, REFINE: 0, RESTART: 0}
+            stage,
+            {"total": 0, ACCEPT: 0, REFINE: 0, RESTART: 0, CANNOT_DETERMINE: 0},
         )
         bucket["total"] += 1
         bucket[rec["branch"]] += 1
@@ -319,6 +395,11 @@ def compute_gate_rates(records: list[dict[str, Any]]) -> dict[str, dict[str, Any
         total = bucket["total"] or 1
         bucket["stage_refine_rate"] = round(bucket[REFINE] / total, 4)
         bucket["stage_restart_rate"] = round(bucket[RESTART] / total, 4)
+        # #281 — an undetermined boundary is neither healthy nor restarting; it
+        # is a gate whose evidence was absent, and that deserves its own rate.
+        bucket["stage_cannot_determine_rate"] = round(
+            bucket[CANNOT_DETERMINE] / total, 4
+        )
     return by_stage
 
 

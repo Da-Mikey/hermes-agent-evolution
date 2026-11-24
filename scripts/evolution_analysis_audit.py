@@ -183,26 +183,39 @@ def extract_cited_paths(text: str) -> List[str]:
     return _CITED_PATH_RE.findall(str(text))
 
 
+#: Three-valued outcome of :func:`verify_implementation_claim` (#281).  A
+#: boolean conflated "disproved" with "nothing to check", so a claim with no
+#: cited artifact read as verified.  Callers must branch explicitly.
+VERIFIED = "verified"
+REFUTED = "refuted"
+CANNOT_DETERMINE = "cannot_determine"
+
+
 def verify_implementation_claim(
     item: Dict[str, Any], repo_root: Optional[Path]
-) -> bool:
-    """Verify whether an already_implemented claim refers to real code artifacts in repo_root.
+) -> str:
+    """Verify whether an already_implemented claim refers to real code artifacts.
 
-    Returns True if:
-    - repo_root is None or unreadable (cannot disprove)
-    - At least one cited repo path exists on disk
-    - No concrete paths are cited (cannot disprove by file existence alone)
+    Returns a three-valued outcome (#281) — the claim is never treated as a
+    pass by default:
 
-    Returns False if concrete repo paths are cited and none exist on disk.
+    - :data:`VERIFIED` — at least one cited repo path exists on disk;
+    - :data:`REFUTED` — concrete repo paths are cited and none exist on disk;
+    - :data:`CANNOT_DETERMINE` — nothing concrete was cited, or ``repo_root`` is
+      absent/unreadable.  Absent evidence is *not* corroboration: the caller
+      must decide explicitly what to do with an unverified claim.
+
+    A boolean return type was the defect: it gave "I could not find contrary
+    evidence" the same value as "the claim holds".
     """
     if not isinstance(item, dict) or repo_root is None:
-        return True
+        return CANNOT_DETERMINE
     repo = Path(repo_root)
     try:
         if not repo.is_dir():
-            return True
+            return CANNOT_DETERMINE
     except OSError:
-        return True
+        return CANNOT_DETERMINE
 
     text_blobs = [
         str(item.get("reason") or ""),
@@ -217,9 +230,11 @@ def verify_implementation_claim(
             if p not in cited:
                 cited.append(p)
 
-    if cited and not any((repo / p).exists() for p in cited):
-        return False
-    return True
+    if not cited:
+        return CANNOT_DETERMINE
+    if any((repo / p).exists() for p in cited):
+        return VERIFIED
+    return REFUTED
 
 
 def audit_implemented_claims(
@@ -256,25 +271,36 @@ def audit_implemented_claims(
         )
         if not is_claimed:
             continue
-        if not verify_implementation_claim(item, repo):
-            issue = (
-                item.get("issue_number")
-                or item.get("issue")
-                or item.get("id")
-                or "unknown"
+        outcome = verify_implementation_claim(item, repo)
+        if outcome == VERIFIED:
+            continue
+        issue = (
+            item.get("issue_number")
+            or item.get("issue")
+            or item.get("id")
+            or "unknown"
+        )
+        cited = extract_cited_paths(
+            str(
+                item.get("reason")
+                or item.get("claimed_artifact")
+                or item.get("notes")
+                or ""
             )
-            cited = extract_cited_paths(
-                str(
-                    item.get("reason")
-                    or item.get("claimed_artifact")
-                    or item.get("notes")
-                    or ""
-                )
-            )
-            cited_str = f" citing {', '.join(cited[:3])}" if cited else ""
+        )
+        cited_str = f" citing {', '.join(cited[:3])}" if cited else ""
+        if outcome == REFUTED:
             out.append(
                 f"UNVERIFIED_IMPLEMENTED_CLAIM: issue #{issue} marked already_implemented{cited_str} "
                 f"— artifact does not exist in worktree"
+            )
+        else:
+            # #281 — cannot_determine is reported, not silently passed.  The
+            # claim cites nothing we can check, which is precisely the hole this
+            # audit exists to surface.
+            out.append(
+                f"UNVERIFIABLE_IMPLEMENTED_CLAIM: issue #{issue} marked already_implemented{cited_str} "
+                f"— no checkable artifact cited, so the claim is unverified"
             )
     return out
 
@@ -300,10 +326,15 @@ def reconcile_implemented_candidates(
             or str(item.get("status") or "").lower() == "already_implemented"
         )
         if is_claimed and repo_root is not None:
-            if not verify_implementation_claim(item, repo_root):
+            outcome = verify_implementation_claim(item, repo_root)
+            if outcome == REFUTED:
                 item["already_implemented"] = False
                 if str(item.get("status") or "").lower() == "already_implemented":
                     item["status"] = "open"
+                item["already_implemented_unverified"] = True
+            elif outcome == CANNOT_DETERMINE:
+                # #281 — no cited artifact does not disprove the claim, so it is
+                # NOT cleared here; but it must not read as verified either.
                 item["already_implemented_unverified"] = True
         reconciled.append(item)
     return reconciled

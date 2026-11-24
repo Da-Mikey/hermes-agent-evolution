@@ -270,6 +270,174 @@ class TestInformationalExitCodeMeaning:
         assert s["tool_failures_by_reason"] == {"terminal": {"timeout": 1}}
 
 
+_LOOP_WARNING = (
+    "\n\n[Tool loop warning: repeated_exact_failure_warning; count=3; "
+    "tool_call failed 3 consecutive times with identical arguments. "
+    "Change the arguments, switch tool, or stop and report the blocker.]"
+)
+_FALLBACK = (
+    "\n[Fallback directive: use search_files instead of read_file for a directory]"
+)
+_HARD_STOP = (
+    "\n\n[Tool loop hard stop: repeated_exact_failure_warning; count=5; "
+    "identical call repeated 5 times.]"
+)
+
+
+class TestRuntimeAppendedTrailer:
+    """#337 regression: runtime guidance is appended to the SAME string.
+
+    ``append_toolguard_guidance`` puts a ``[Tool loop warning: …]`` (and
+    optionally a ``[Fallback directive: …]``) on the tail of whatever the tool
+    returned. The old envelope test required the string to END in ``}``, so a
+    warned genuine ``{"error": …}`` envelope ended in ``]``, was taken for plain
+    text, and was scored healthy — 10 warned results, 0 counted as failures.
+    """
+
+    def test_warned_error_envelope_still_counts(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "warned_error",
+            [
+                _asst("tool_call", "c1"),
+                _tool("c1", _fail("tool_call requires 'calls'") + _LOOP_WARNING),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {"tool_call": 1}
+
+    def test_warning_plus_fallback_directive_still_counts(self, tmp_path):
+        """The two trailers stack; both must be stripped, not just the last."""
+        p = _session(
+            tmp_path,
+            "warned_fallback",
+            [
+                _asst("write_file", "c1"),
+                _tool(
+                    "c1",
+                    _fail("Refusing to overwrite without a fresh read")
+                    + _LOOP_WARNING
+                    + _FALLBACK,
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {"write_file": 1}
+
+    def test_hard_stop_trailer_still_counts(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "hard_stop",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", _term("boom", exit_code=2) + _HARD_STOP),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {"terminal": 1}
+
+    def test_successful_envelope_with_warning_is_not_a_failure(self, tmp_path):
+        """The suffix must not become a failure signal in the other direction."""
+        p = _session(
+            tmp_path,
+            "warned_ok",
+            [
+                _asst("read_file", "c1"),
+                _tool("c1", _ok(content="42 lines") + _LOOP_WARNING),
+                _asst("terminal", "c2"),
+                _tool("c2", _term("all good", exit_code=0) + _LOOP_WARNING),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {}
+
+    def test_plain_text_with_warning_is_not_guessed(self, tmp_path):
+        """Stripping the trailer must not turn a plain body into a guess: an
+        unenveloped result stays uncounted (the #331 invariant)."""
+        p = _session(
+            tmp_path,
+            "plain_warned",
+            [
+                _asst("read_file", "c1"),
+                _tool("c1", "Error: could not read that file" + _LOOP_WARNING),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {}
+
+    def test_trailer_inside_error_text_is_not_truncated(self):
+        """A bracket inside the envelope body must survive: the strip is
+        anchored to trailing guidance lines only."""
+        from introspection_extract import _strip_runtime_trailers
+
+        body = '{"error": "bad [value] in field"}'
+        assert _strip_runtime_trailers(body + _LOOP_WARNING) == body
+        assert _strip_runtime_trailers(body) == body
+
+
+class TestDomainNotFoundReasons:
+    """#250 — a miss in a tool's own namespace is not a filesystem miss.
+
+    Before this, the taxonomy was text-only with the generic filesystem rule
+    ordered first, so every failure of the home-automation state lookup was
+    recorded as ``file-not-found``: 148 failures in one window, 100% of that
+    tool's failures. The reliability signal that per-tool ranking and the
+    circuit breaker consume was therefore wrong, and the residual UX defect
+    became invisible after its own fix was closed.
+    """
+
+    @pytest.mark.parametrize(
+        "tool,message,reason",
+        [
+            ("ha_get_state", "Entity not found: sensor.gate_battery", "entity-not-found"),
+            ("ha_get_state", "Unknown entity: sensor.does_not_exist", "entity-not-found"),
+            ("ha_call_service", "Service not found: light.turn_on", "service-not-found"),
+            ("ha_get_state", "Authentication failed: invalid token", "domain-auth-denied"),
+            ("ha_get_state", "Node is unavailable: offline", "domain-unavailable"),
+        ],
+    )
+    def test_domain_failures_are_not_recorded_as_file_not_found(
+        self, tmp_path, tool, message, reason
+    ):
+        p = _session(
+            tmp_path,
+            "domain",
+            [
+                _asst(tool, "c1"),
+                _tool("c1", json.dumps({"error": message})),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures"] == {tool: 1}
+        assert s["tool_failures_by_reason"] == {tool: {reason: 1}}
+
+    def test_filesystem_tool_keeps_file_not_found(self, tmp_path):
+        """The regression that matters: a real path miss still reads as one."""
+        p = _session(
+            tmp_path,
+            "fs",
+            [
+                _asst("read_file", "c1"),
+                _tool(
+                    "c1",
+                    json.dumps({"error": "No such file or directory: /tmp/missing.txt"}),
+                ),
+            ],
+        )
+        s = scan_session(p)
+        assert s["tool_failures_by_reason"] == {"read_file": {"file-not-found": 1}}
+
+    def test_no_tool_name_preserves_previous_behaviour(self):
+        """Legacy callers pass content only and must not be re-classified."""
+        from introspection_extract import _classify_failure_reason
+
+        content = json.dumps({"error": "Entity not found: sensor.gate_battery"})
+        assert _classify_failure_reason(content) == "file-not-found"
+        assert (
+            _classify_failure_reason(content, "ha_get_state") == "entity-not-found"
+        )
+
+
 class TestFailureReasonClassification:
     """#1325 — failures are sub-classified by reason so the introspection loop
     attributes regressions to the actual mode, not just the tool name. Stops the
@@ -764,6 +932,215 @@ class TestFailureReasonClassification:
         assert d["signals"]["failure_rate_by_reason"] == {
             "read_file": {"file-not-found": 0.5, "permission-denied": 0.5}
         }
+
+
+class TestExpectedRefusals:
+    """#331 — a designed safety refusal is a decision, not a defect.
+
+    The question gate, the safety scan and the loop guard all refuse calls on
+    purpose, and each refusal arrives as an ``{"error": ...}`` envelope. Before
+    this change the taxonomy counted them as tool failures: 17.6% of all
+    recorded failures and 30.2% of terminal ones in the window ending
+    2026-10-31, plus 81% of the ``oneshot`` probe harness's 22% rate.
+    """
+
+    QUESTION_GATE = (
+        "QUESTION ASKED — the tool you just tried is WORK, not investigation. "
+        "The user asked a question; answer it before doing work."
+    )
+
+    @staticmethod
+    def _err(message, **extra):
+        return json.dumps({"error": message, **extra}, ensure_ascii=False)
+
+    def test_question_gate_refusal_is_netted_out_of_the_published_rate(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_gate",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", self._err(self.QUESTION_GATE)),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"question_gate": 1}
+        # The gross figure still proves the refusal happened …
+        assert d["signals"]["tool_failures_gross"] == {"terminal": 1}
+        assert d["signals"]["failure_rate_gross"] == {"terminal": 1.0}
+        # … while the published failure signal no longer blames the tool.
+        assert d["signals"]["tool_failures"] == {}
+        assert d["signals"]["failure_rate"] == {}
+        # The basis changed, so an old baseline is never compared against it.
+        assert d["failure_rate_basis"] == "per_tool_call_excluding_expected_refusals"
+        assert d["failure_rate_basis_gross"] == "per_tool_call"
+
+    def test_real_failure_still_counts_beside_a_refusal(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_mix",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", _fail("no such file or directory")),
+                _asst("terminal", "c2"),
+                _tool("c2", self._err(self.QUESTION_GATE)),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+        assert d["signals"]["tool_failures_gross"] == {"terminal": 2}
+        # The defect rate is halved, not zeroed: 1 genuine failure / 2 calls.
+        assert d["signals"]["failure_rate"] == {"terminal": 0.5}
+        assert d["signals"]["tool_failures_by_reason"] == {
+            "terminal": {"file-not-found": 1}
+        }
+        assert d["signals"]["tool_failures_by_reason_gross"]["terminal"][
+            "file-not-found"
+        ] == 1
+        assert d["signals"]["refusals_by_class"] == {"question_gate": 1}
+
+    def test_safety_scan_refusal_is_classed_security_scan(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_scan",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err(
+                        "tool execution blocked by safety gate: harm_score=1.0",
+                        reason="safety-gate-blocked",
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"security_scan": 1}
+        assert d["signals"]["tool_failures"] == {}
+
+    def test_blocked_prefix_envelope_is_classed_security_scan(self, tmp_path):
+        """#343 — the scan's OWN "BLOCKED: Security scan" envelope.
+
+        This is the literal the gate emits (verbatim from the live corpus:
+        ``errors.log`` → "Tool terminal returned error: BLOCKED: Security scan
+        — [MEDIUM] URL uses raw IP address 10.0.0.12 …"). Every regex branch
+        before #343 required the preposition "by", so all 92 structured
+        envelopes carrying it scored as tool defects.
+        """
+        _session(
+            tmp_path,
+            "s_scan_prefix",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err(
+                        "Tool terminal returned error: BLOCKED: Security scan — "
+                        "[MEDIUM] URL uses raw IP address 10.0.0.12; "
+                        "[HIGH] Schemeless URL in sink context"
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"security_scan": 1}
+        # Still recorded grossly — the refusal happened and must stay visible.
+        assert d["signals"]["tool_failures_gross"] == {"terminal": 1}
+        # …but it is a decision, not a defect, so it leaves the published rate.
+        assert d["signals"]["tool_failures"] == {}
+
+    def test_a_plain_security_scan_mention_is_not_a_refusal(self, tmp_path):
+        """#343 guard — the new branch must not swallow ordinary failures.
+
+        A failure that merely *talks about* a security scan is still a defect;
+        only the gate's own "BLOCKED:" prefix marks a decision.
+        """
+        _session(
+            tmp_path,
+            "s_scan_word",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", _fail("scheduled security scan failed: timeout")),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {}
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+
+    def test_loop_guard_block_is_a_refusal(self, tmp_path):
+        _session(
+            tmp_path,
+            "s_guard",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err(
+                        "[loop-guard] Do not retry or bypass this safety refusal "
+                        "with another tool."
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {"loop_guard": 1}
+        assert d["signals"]["tool_failures"] == {}
+
+    def test_loop_guard_diagnostic_is_still_a_failure(self, tmp_path):
+        """The guard also emits DIAGNOSTICS that accompany a real failure.
+        Only its blocking phrasing is a refusal — a marker-only rule would hide
+        the defect it was reporting."""
+        _session(
+            tmp_path,
+            "s_diag",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    self._err("[loop-guard] Re-issued `terminal` 4 times; try a different tool."),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {}
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+
+    def test_prose_mentioning_refusal_is_not_a_refusal(self, tmp_path):
+        """Structured fields only: a failing command whose output merely talks
+        about refusing must keep counting as a defect."""
+        _session(
+            tmp_path,
+            "s_prose",
+            [
+                _asst("terminal", "c1"),
+                _tool(
+                    "c1",
+                    _term(
+                        "grep: no refusal markers in this file",
+                        exit_code=2,
+                        error="grep failed",
+                    ),
+                ),
+            ],
+        )
+        d = build_digest(tmp_path)
+        assert d["signals"]["refusals_by_class"] == {}
+        assert d["signals"]["tool_failures"] == {"terminal": 1}
+
+    def test_scan_session_surfaces_the_class_breakdown(self, tmp_path):
+        p = _session(
+            tmp_path,
+            "s_scan_keys",
+            [
+                _asst("terminal", "c1"),
+                _tool("c1", self._err(self.QUESTION_GATE)),
+            ],
+        )
+        s = scan_session(p)
+        assert s["refusals_by_class"] == {"question_gate": 1}
+        assert s["tool_failures_expected_refusal"] == {"terminal": 1}
+        # Gross per-session failure count is unchanged — the split happens in
+        # build_digest, so existing consumers of scan_session see no surprise.
+        assert s["tool_failures"] == {"terminal": 1}
 
 
 class TestBuildDigest:

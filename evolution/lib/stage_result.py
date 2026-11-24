@@ -55,6 +55,11 @@ class StageResult:
     confidence: int = 0
     stage: str = ""
     timestamp: str = ""
+    #: Facts this result *rests on*, each satisfied only by an evidence pointer
+    #: that names it (#281).  Empty by default so every pre-existing emitter
+    #: keeps its behaviour; a stage that declares a required fact gains a
+    #: concrete, checkable precondition instead of "we re-checked it".
+    required_facts: list[str] = field(default_factory=list)
 
     # -- serialisation ----------------------------------------------------
 
@@ -66,17 +71,23 @@ class StageResult:
             "confidence": self.confidence,
             "stage": self.stage,
             "timestamp": self.timestamp,
+            "required_facts": list(self.required_facts),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> StageResult:
-        """Reconstruct from a :meth:`to_dict` payload."""
+        """Reconstruct from a :meth:`to_dict` payload.
+
+        ``required_facts`` is optional so historical records (written before
+        #281) round-trip unchanged with an empty list.
+        """
         return cls(
             result=data.get("result"),
             evidence_pointers=list(data.get("evidence_pointers", [])),
             confidence=int(data.get("confidence", 0)),
             stage=data.get("stage", ""),
             timestamp=data.get("timestamp", ""),
+            required_facts=list(data.get("required_facts", []) or []),
         )
 
     # -- helpers ----------------------------------------------------------
@@ -90,6 +101,7 @@ class StageResult:
         confidence: int = 0,
         stage: str = "",
         timestamp: str = "",
+        required_facts: list[str] | None = None,
     ) -> StageResult:
         """Convenience factory used at stage boundaries.
 
@@ -107,4 +119,5 @@ class StageResult:
             confidence=confidence,
             stage=stage,
             timestamp=timestamp,
+            required_facts=list(required_facts or []),
         )

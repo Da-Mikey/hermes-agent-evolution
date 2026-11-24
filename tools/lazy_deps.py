@@ -191,7 +191,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency (pyproject `dependencies`), so
     # this entry is a belt-and-suspenders fallback for stripped/source-build installs that somehow dropped
     # it. See #40490.
-    "tool.vision": ("Pillow==12.3.0",),
+    "tool.vision": ("Pillow==13.0.0",),
     # ─── Telemetry ─────────────────────────────────────────────────────────
     # Opt-in OpenTelemetry export (#167). Resolved at first use only when
     # telemetry.otel.enabled in config.yaml; the call site (hermes_telemetry

@@ -433,6 +433,66 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return default
 
 
+# ── introspection artifact normaliser ─────────────────────────────────
+# The introspection stage has shipped two JSON shapes. These two helpers
+# read either one so the rubric measures the analysis instead of the key
+# names. See StrictRubricJudgeGrader._score_introspection.
+
+def _introspection_sessions_examined(d: Dict[str, Any]) -> int:
+    """Session count from the 2026-11-09+ `sessions_examined` census."""
+    se = d.get("sessions_examined")
+    if isinstance(se, dict):
+        for key in (
+            "count_with_tool_results_7d",
+            "count_any_message_7d",
+            "count_with_tool_results_48h",
+            "count_with_tool_results_24h",
+            "count",
+        ):
+            v = _safe_int(se.get(key))
+            if v:
+                return v
+        return 0
+    return _safe_int(se)
+
+
+def _introspection_items(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Normalise `signals` (legacy) and `patterns` (current) into one list.
+
+    Each item: {observation, issue, proposal, headline, counts, legacy}.
+    """
+    items: List[Dict[str, Any]] = []
+    for s in _as_dict(d.get("signals")).values():
+        if not isinstance(s, dict):
+            continue
+        items.append({
+            "observation": str(s.get("observation") or ""),
+            "issue": _safe_int(s.get("tracked_in_issue")) or None,
+            "proposal": s if s.get("priority_score") is not None else None,
+            "headline": None,
+            "counts": None,
+            "legacy": True,
+        })
+    for p in (d.get("patterns") or []):
+        if not isinstance(p, dict):
+            continue
+        obs = " ".join(
+            str(p.get(k) or "") for k in ("mechanism", "class", "recurrence")
+        )
+        ref = f"{p.get('maps_to_known_issue') or ''} {p.get('status') or ''}"
+        m = re.search(r"#(\d+)", ref)
+        fix = p.get("fix") if isinstance(p.get("fix"), dict) else None
+        items.append({
+            "observation": obs,
+            "issue": int(m.group(1)) if m else None,
+            "proposal": fix,
+            "headline": p.get("headline_number"),
+            "counts": p.get("counts") if isinstance(p.get("counts"), dict) else None,
+            "legacy": False,
+        })
+    return items
+
+
 # ──────────────────────────────────────────────────────────────────────
 # StrictRubricJudgeGrader — deterministic, rule-based, no LLM
 # ──────────────────────────────────────────────────────────────────────
@@ -551,10 +611,30 @@ class StrictRubricJudgeGrader:
     # ── Introspection ─────────────────────────────────────────────────
 
     def _score_introspection(self, data: Any) -> Dict[str, float]:
+        """Score the introspection artifact across the four criteria.
+
+        The stage has shipped two artifact schemas. The 2026-06/08 shape
+        carried ``sessions_scanned`` / ``signals`` / ``new_issues_proposed``;
+        from 2026-11-09 the stage emits ``sessions_examined`` / ``patterns``
+        (each pattern carrying ``headline_number``, ``counts``, ``mechanism``,
+        ``maps_to_known_issue`` and ``fix``) / ``below_bar``. This scorer read
+        only the first shape, so every cycle from 2026-11-09 to 2026-11-15
+        scored 0.0/10.0 on a 61 KB artifact that had the analysis in it —
+        a broken instrument, not an absent stage. Both shapes are now read;
+        the legacy branches are unchanged so historical scores stay
+        comparable.
+
+        Measured 2026-11-16 against the live artifact set: 2026-11-08 (legacy)
+        still scores 2.0, 2026-11-13 scores 3.0, 2026-11-14 scores 6.0,
+        2026-11-15 scores 9.0.
+        """
         d = _as_dict(data) if data is not None else {}
+        items = _introspection_items(d)
 
         # session_coverage
         scanned = _safe_int(d.get("sessions_scanned"))
+        if not scanned:
+            scanned = _introspection_sessions_examined(d)
         window = _safe_int(d.get("window_days", 1))
         expected = window * 3  # rough proxy: ~3 sessions per day per profile
         if scanned >= expected:
@@ -564,37 +644,48 @@ class StrictRubricJudgeGrader:
         else:
             session_coverage = 0.0
 
-        # signal_quality: distinct signals with rich observations
-        signals = _as_dict(d.get("signals"))
-        good_signals = sum(
-            1
-            for s in signals.values()
-            if isinstance(s, dict) and len(str(s.get("observation", ""))) > 80
-        )
-        signal_quality = min(3.0, good_signals)
+        # signal_quality: distinct signals with rich observations. A modern
+        # pattern counts only when it explains itself (mechanism text) AND
+        # carries a measured headline (a number plus its counts).
+        good_signals = 0
+        for it in items:
+            if len(it["observation"]) <= 80:
+                continue
+            if it["counts"] is not None and it["headline"] is not None:
+                good_signals += 1
+            elif it["legacy"]:
+                good_signals += 1
+        signal_quality = min(3.0, float(good_signals))
 
-        # cross_referencing: signals refer to tracked issues
-        ref_count = sum(
-            1
-            for s in signals.values()
-            if isinstance(s, dict) and _safe_int(s.get("tracked_in_issue"))
-        )
-        total_signals = len(signals)
-        if total_signals > 0 and ref_count == total_signals:
+        # cross_referencing: findings refer to tracked issues
+        total = len(items)
+        ref_count = sum(1 for it in items if it["issue"])
+        if total > 0 and ref_count == total:
             cross_referencing = 2.0
         elif ref_count > 0:
             cross_referencing = 1.0
         else:
             cross_referencing = 0.0
 
-        # action_proposals: new_issues_proposed with impact/effort
-        proposals = d.get("new_issues_proposed") or []
-        scored_props = sum(
-            1
-            for p in proposals
-            if isinstance(p, dict) and p.get("priority_score") is not None
-        )
-        action_proposals = min(3.0, scored_props)
+        # action_proposals: an explicit proposal that names a target and a
+        # change (modern `fix{file,proposal}` or an `action_proposals` entry),
+        # or the legacy scored issue.
+        scored_props = 0
+        for p in (d.get("new_issues_proposed") or []):
+            if isinstance(p, dict) and p.get("priority_score") is not None:
+                scored_props += 1
+        for p in (d.get("action_proposals") or []):
+            if isinstance(p, dict) and p.get("priority_score") is not None:
+                scored_props += 1
+        for it in items:
+            fx = it["proposal"]
+            if not fx:
+                continue
+            if fx.get("priority_score") is not None:
+                scored_props += 1
+            elif fx.get("file") and (fx.get("proposal") or fx.get("change")):
+                scored_props += 1
+        action_proposals = min(3.0, float(scored_props))
 
         return {
             "session_coverage": float(session_coverage),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CI failure auto-diagnosis for evolution PRs — issue #577 (rework).
 
-Polls open PRs in ``Lexus2016/hermes-agent-evolution`` via the GitHub REST
+Polls open PRs in ``Da-Mikey/hermes-agent-evolution`` via the GitHub REST
 API, detects failed check runs using the supported check-runs endpoint, fetches
 failure messages from the annotations API (with a ``gh run view --log-failed``
 fallback), classifies failures as trivial vs complex, and creates focused
@@ -38,7 +38,12 @@ from hermes_constants import get_hermes_home
 # Constants
 # -----------------------------------------------------------------------------
 
-_REPO = "Lexus2016/hermes-agent-evolution"
+# The repo the evolution pipeline actually opens its PRs against. Polling the
+# upstream Lexus2016 fork instead returned total_prs=0 on seven consecutive runs
+# while 15 PRs were open here, so the whole diagnosis loop was blind (#390).
+# Overridable for the same reason every other evolution script is: the repo has
+# already moved once, and a hardcoded constant silently rots when it moves again.
+_REPO = os.environ.get("GITHUB_EVOLUTION_REPO", "Da-Mikey/hermes-agent-evolution")
 _GITHUB_API = "https://api.github.com"
 _DEFAULT_LIMIT = 100
 
@@ -975,6 +980,88 @@ def _cleanup_old_reports(max_days: int = 7) -> int:
     return deleted
 
 
+def summarize_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarise a diagnosis run, counting each level from its own rows (#397).
+
+    Two levels, never conflated (#231 defect 2): a clean PR contributes no check
+    rows, so counting ``len(results)`` reported 10 clean PRs + 13 failing checks
+    as 23 of one thing.
+
+    #397 extends that rule to *every* key. Until this fix ``success``,
+    ``failed``, ``in_progress``, ``trivial`` and ``complex`` were still summed
+    over ``results`` wholesale, so PR-level rows (which carry no
+    ``check_run_id``) counted as check results: the 05:12 run of 2026-11-15
+    published ``{"success": 13, "failed": 0, "total_checks": 0}`` — thirteen
+    successes from a run that measured no checks at all. ``failed: 0`` is the
+    field the morning reader trusts, and it could not tell a clean CI from an
+    empty measurement.
+
+    A ratio with a zero denominator serializes as ``None``, never as a zero
+    numerator (#249): 0/0 is not "nothing failing".
+    """
+    check_rows = [r for r in results if r.get("check_run_id") is not None]
+    pr_numbers = {r.get("pr_number") for r in results if r.get("pr_number") is not None}
+    # #397 (second defect, found while fixing the first): this set used to collect
+    # EVERY check row for a PR — green and pending included — while being called
+    # `failed_pr_numbers`, so `prs_failed` counted PRs that merely *have* checks and
+    # `prs_success` silently dropped them. Invisible while every check row was a
+    # failure; wrong the moment a PR had a green or pending check row.
+    failed_pr_numbers = {
+        r.get("pr_number")
+        for r in check_rows
+        if r.get("pr_number") is not None and r.get("conclusion") == "failure"
+    }
+    pending_pr_numbers = {
+        r.get("pr_number")
+        for r in check_rows
+        if r.get("pr_number") is not None
+        and r.get("conclusion") in {None, "in_progress"}
+    } - failed_pr_numbers
+
+    # Check level — measured only from rows that name a check run.
+    checks_success = sum(1 for r in check_rows if r.get("conclusion") == "success")
+    checks_failed = sum(1 for r in check_rows if r.get("conclusion") == "failure")
+    checks_in_progress = sum(
+        1 for r in check_rows if r.get("conclusion") in {None, "in_progress"}
+    )
+    total_checks = len(check_rows)
+
+    # PR level — a PR is failed when one of its checks failed, pending when one is
+    # still running (and none failed), clean otherwise. Never weighted by how many
+    # rows that PR contributed.
+    total_prs = len(pr_numbers)
+    prs_failed = len(failed_pr_numbers)
+    prs_in_progress = len(pending_pr_numbers)
+    prs_success = total_prs - prs_failed - prs_in_progress
+
+    checks_measured = total_checks > 0
+    return {
+        "total_prs": total_prs,
+        "prs_failed": prs_failed,
+        "prs_success": prs_success,
+        "prs_in_progress": prs_in_progress,
+        "total_checks": total_checks,
+        "checks_success": checks_success,
+        "checks_failed": checks_failed,
+        "checks_in_progress": checks_in_progress,
+        # Aliases kept for existing readers, now carrying the check-level number.
+        "success": checks_success,
+        "failed": checks_failed,
+        "in_progress": checks_in_progress,
+        "trivial": sum(1 for r in check_rows if r.get("classification") == "trivial"),
+        "complex": sum(1 for r in check_rows if r.get("classification") == "complex"),
+        # A count of issues created, not a rate: rows of either level may carry one.
+        "child_issues_created": sum(1 for r in results if r.get("child_issue_url")),
+        # #397 — so a consumer can tell "no checks measured" from "all checks green".
+        "checks_measured": checks_measured,
+        "status": "ok" if checks_measured else "unmeasured",
+        "check_pass_rate": (
+            round(checks_success / total_checks, 4) if total_checks else None
+        ),
+        "pr_pass_rate": round(prs_success / total_prs, 4) if total_prs else None,
+    }
+
+
 def save_diagnosis_report(
     results: List[Dict[str, Any]],
     report_dir: Optional[Path] = None,
@@ -983,27 +1070,7 @@ def save_diagnosis_report(
     target.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     report_path = target / f"diagnosis-{date_str}.json"
-    # Two levels, never conflated (#231 defect 2): a clean PR contributes no check rows, so
-    # counting len(results) reported 10 clean PRs + 13 failing checks as 23 of one thing.
-    check_rows = [r for r in results if r.get("check_run_id") is not None]
-    pr_numbers = {r.get("pr_number") for r in results if r.get("pr_number") is not None}
-    failed_pr_numbers = {
-        r.get("pr_number") for r in check_rows if r.get("pr_number") is not None
-    }
-    summary = {
-        "total_prs": len(pr_numbers),
-        "prs_failed": len(failed_pr_numbers),
-        "prs_success": len(pr_numbers) - len(failed_pr_numbers),
-        "total_checks": len(check_rows),
-        "success": sum(1 for r in results if r.get("conclusion") == "success"),
-        "failed": sum(1 for r in results if r.get("conclusion") == "failure"),
-        "in_progress": sum(
-            1 for r in results if r.get("conclusion") in {None, "in_progress"}
-        ),
-        "trivial": sum(1 for r in results if r.get("classification") == "trivial"),
-        "complex": sum(1 for r in results if r.get("classification") == "complex"),
-        "child_issues_created": sum(1 for r in results if r.get("child_issue_url")),
-    }
+    summary = summarize_results(results)
     data = {
         "run_time": datetime.now(timezone.utc).isoformat(),
         "summary": summary,
@@ -1011,6 +1078,17 @@ def save_diagnosis_report(
     }
     report_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     print(f"[ci-diagnosis] report saved: {report_path}")
+    # Loud on stderr, so a cron log carries the distinction the old summary hid.
+    # Deliberately NOT a non-zero exit: PR-level rows exist precisely when no check
+    # run was fetched, and a healthy all-green day produces the same zero check
+    # rows until the collector fetches them — exiting non-zero would alarm daily.
+    if not summary["checks_measured"]:
+        print(
+            "[ci-diagnosis] WARNING: no check-level measurements this run "
+            f"({summary['total_prs']} PR row(s)); published rates are unmeasured, "
+            "not clean",
+            file=sys.stderr,
+        )
     return report_path
 
 

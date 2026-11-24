@@ -2128,6 +2128,9 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
+    # True when config.yaml was actually read for this run (#310: a swallowed read failure used to
+    # substitute an env value into the drift comparison, silently changing the guard's verdict).
+    config_loaded: bool = False
 
 
 # Marker prefix for a #44585 drift-guard skip. Same alert-once contract as
@@ -2224,11 +2227,13 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     _cron_default_provider = ""
     _cfg: dict = {}
     _model_cfg: Any = {}
+    _config_loaded = False
     try:
         from hermes_cli.config_effective import load_user_config_effective
         _cfg_path = str(_get_hermes_home() / "config.yaml")
         if os.path.exists(_cfg_path):
             _cfg = load_user_config_effective(Path(_cfg_path))
+            _config_loaded = True
             # Coerce null to {} so a falsy default never clobbers a resolved env value.
             _model_cfg = _cfg.get("model") or {}
             _cron_cfg_for_model = _cfg.get("cron") or {}
@@ -2279,7 +2284,7 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         _net_cfg = _cfg.get("network", {})
         if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
+    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider, _config_loaded)
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -3139,44 +3144,40 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
 
-    from hermes_cli.config import cron_model_drift_guard_enabled, cron_model_drift_axes
+    from cron import drift_guard
+    from hermes_cli.config import cron_model_drift_guard_enabled
+
     if cron_model_drift_guard_enabled(_cfg):
-        configured_provider_for_drift = (
-            str((_cfg.get("model") or {}).get("provider") or "").strip().lower()
-            if isinstance(_cfg.get("model"), dict)
-            else ""
+        # #310: the comparison baseline is resolved ONCE for this run, from the persisted config
+        # (plus the snapshot stored on the job). Tick-volatile inputs — a mid-run fallback to a
+        # backup provider/model, a lazily resolved provider, the per-tick environment — are passed
+        # as empty on purpose: they describe provider health or process state, not a global config
+        # change, and letting them in made the same snapshot skip on 10 ticks and run on 43.
+        _fallback_walk = bool(setup.fallback_notice)
+        _baseline = drift_guard.resolve_baseline(
+            _cfg,
+            resolved_provider=(
+                "" if _fallback_walk else str((setup.runtime or {}).get("provider") or "")
+            ),
+            resolved_model=(
+                "" if _fallback_walk else str(jc.model or setup.model or "")
+            ),
         )
-        _current_provider = str(
-            (
-                ""
-                if agent_owns_routing
-                else str(job.get("provider") or "").strip().lower()
-            )
-            or configured_provider_for_drift
-            or (setup.runtime.get("provider") or "")
-        ).strip().lower()
-        _current_model = str(jc.model or setup.model or "").strip().lower()
-        _drift: list[str] = []
-        for _axis in cron_model_drift_axes(
-            job,
-            current_provider=_current_provider,
-            current_model=_current_model,
-            config=_cfg,
-        ):
-            _snapshot = str(job.get(f"{_axis}_snapshot") or "").strip().lower()
-            _current = _current_provider if _axis == "provider" else _current_model
-            _drift.append(f"{_axis} '{_snapshot}' -> '{_current}'")
-        if _drift:
-            _changes = "; ".join(_drift)
+        _verdict = drift_guard.evaluate(job, config=_cfg, baseline=_baseline)
+        # Record both compared values for EVERY tick the guard rules on (log + execution row), so
+        # a passing tick and a skipping tick can be diffed afterwards (they never could be before).
+        drift_guard.record_observation(job, _verdict, config_loaded=jc.config_loaded)
+        if _verdict.drifted:
+            _changes = _verdict.changes
             _auto_repin_done = False
             if _cron_drift_auto_repin_enabled(_cfg):
                 _auto_repin_done = _auto_repin_drifted_job(job_id, _changes)
             if _auto_repin_done:
                 job.pop("drift_alerted", None)
-                if "provider" in _drift and _current_provider:
-                    job["provider_snapshot"] = _current_provider
-                if "model" in _drift and _current_model:
-                    job["model_snapshot"] = _current_model
+                if "provider" in _verdict.drifted_axes and _baseline.provider:
+                    job["provider_snapshot"] = _baseline.provider
+                if "model" in _verdict.drifted_axes and _baseline.model:
+                    job["model_snapshot"] = _baseline.model
             else:
                 _repeat = job.get("repeat") if isinstance(job.get("repeat"), dict) else {}
                 _finite_oneshot = (
@@ -3208,23 +3209,18 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
                     _changes,
                     _remediation,
                 )
-                _drift_already_alerted = False
-                try:
-                    from cron.jobs import mark_drift_alerted
-
-                    _drift_already_alerted = mark_drift_alerted(job_id)
-                except Exception:
-                    pass  # fail open: better a duplicate alert than none
-                job["drift_alerted"] = True
+                # A skip is a failed run: open/refresh the incident row for it so it is never
+                # silent (#310). The first skip of a given change delivers; later ticks of the
+                # SAME change stay silent; a changed drift is a new signature and alerts again.
+                _already_alerted, _drift_incident_id = drift_guard.record_skip(
+                    job, _verdict, remediation=_remediation
+                )
                 _drift_marker = (
-                    DRIFT_SKIP_SILENT_MARKER if _drift_already_alerted
+                    DRIFT_SKIP_SILENT_MARKER if _already_alerted
                     else DRIFT_SKIP_MARKER
                 )
                 raise RuntimeError(
-                    f"{_drift_marker} Skipped to prevent unintended spend: global "
-                    f"inference config drifted since this job was created "
-                    f"({_changes}), and this job is unpinned. No inference call "
-                    f"was made. {_remediation} "
+                    f"{_drift_marker} {drift_guard.skip_body(_verdict, _remediation)} "
                     f"This alert is sent once; the job stays skipped until the "
                     f"config is pinned or restored. See #44585."
                 )

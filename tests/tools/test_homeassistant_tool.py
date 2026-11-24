@@ -169,6 +169,139 @@ class TestDomainBlocklist:
 
 
 # ---------------------------------------------------------------------------
+# Multi-entity service calls (#385)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiEntityBatch:
+    """#385 — "turn off all the lamps" must fan out, not fail as a format error.
+
+    The handler accepted exactly one ``entity_id``, so a comma-joined household
+    instruction was rejected as a *format* error: nothing retried, the evening
+    lights never changed, and the run still recorded as completed. A scheduled
+    job failed on the identical call on separate days.
+    """
+
+    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
+    def test_comma_separated_entities_fan_out(self, mock_call_service):
+        mock_call_service.return_value = {
+            "success": True, "service": "light.turn_off", "affected_entities": []
+        }
+        result = json.loads(_handle_call_service({
+            "domain": "light",
+            "service": "turn_off",
+            "entity_id": "light.hall, light.study ,light.passage",
+        }))
+
+        assert [c.args[2] for c in mock_call_service.await_args_list] == [
+            "light.hall", "light.study", "light.passage"
+        ]
+        assert result["result"]["success"] is True
+        assert result["result"]["requested_entities"] == [
+            "light.hall", "light.study", "light.passage"
+        ]
+        # HA returns no state list for turn_off; every attempted id is still named.
+        assert [a["entity_id"] for a in result["result"]["affected_entities"]] == [
+            "light.hall", "light.study", "light.passage"
+        ]
+
+    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
+    def test_json_array_string_fans_out(self, mock_call_service):
+        mock_call_service.return_value = {"success": True, "affected_entities": []}
+        json.loads(_handle_call_service({
+            "domain": "switch",
+            "service": "turn_off",
+            "entity_id": '["switch.garage", "switch.passage"]',
+        }))
+        assert [c.args[2] for c in mock_call_service.await_args_list] == [
+            "switch.garage", "switch.passage"
+        ]
+
+    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
+    def test_python_list_fans_out(self, mock_call_service):
+        mock_call_service.return_value = {"success": True, "affected_entities": []}
+        json.loads(_handle_call_service({
+            "domain": "switch",
+            "service": "turn_off",
+            "entity_id": ["switch.garage", "switch.passage"],
+        }))
+        assert mock_call_service.await_count == 2
+
+    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
+    def test_single_entity_keeps_the_single_call_shape(self, mock_call_service):
+        """One entity is unchanged: no aggregate keys appear."""
+        mock_call_service.return_value = {"success": True, "affected_entities": []}
+        result = json.loads(_handle_call_service({
+            "domain": "light", "service": "turn_on", "entity_id": "light.hall"
+        }))
+        mock_call_service.assert_awaited_once_with("light", "turn_on", "light.hall", None)
+        assert "requested_entities" not in result["result"]
+
+    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
+    def test_one_failing_entity_does_not_hide_the_others(self, mock_call_service):
+        """A dead entity is named in ``failures``; the rest still ran."""
+        mock_call_service.side_effect = [
+            RuntimeError("HTTP 500 from HA"),
+            {"success": True, "affected_entities": [{"entity_id": "light.study", "state": "off"}]},
+        ]
+        result = json.loads(_handle_call_service({
+            "domain": "light", "service": "turn_off",
+            "entity_id": "light.hall,light.study",
+        }))["result"]
+
+        assert result["success"] is False
+        assert result["failed"] == 1
+        assert result["succeeded"] == 1
+        assert [f["entity_id"] for f in result["failures"]] == ["light.hall"]
+        assert "500" in result["failures"][0]["error"]
+        assert [a["entity_id"] for a in result["affected_entities"]] == ["light.study"]
+        assert mock_call_service.await_count == 2
+
+    def test_invalid_entity_in_a_batch_is_named(self):
+        result = json.loads(_handle_call_service({
+            "domain": "light", "service": "turn_off",
+            "entity_id": "light.hall,Not An Id",
+        }))
+        assert "Invalid entity_id format" in result["error"]
+        assert "Not An Id" in result["error"]
+
+    def test_batch_limit_names_the_group_alternative(self):
+        ids = ",".join(f"light.zone_{i}" for i in range(homeassistant_tool._MAX_BATCH_ENTITIES + 1))
+        result = json.loads(_handle_call_service({
+            "domain": "light", "service": "turn_off", "entity_id": ids,
+        }))
+        assert "batch limit" in result["error"]
+        assert "group" in result["error"]
+
+    def test_entity_id_of_wrong_type_is_rejected_with_guidance(self):
+        result = json.loads(_handle_call_service({
+            "domain": "light", "service": "turn_off", "entity_id": 42,
+        }))
+        assert "must be a string or a list" in result["error"]
+
+
+class TestSplitEntityIds:
+    """The normaliser behind the batch path (#385)."""
+
+    def test_absent_and_blank_are_empty(self):
+        assert homeassistant_tool._split_entity_ids(None) == []
+        assert homeassistant_tool._split_entity_ids("") == []
+        assert homeassistant_tool._split_entity_ids("   ") == []
+
+    def test_commas_and_spaces_are_trimmed_and_empties_dropped(self):
+        assert homeassistant_tool._split_entity_ids(" light.a ,, light.b ,") == [
+            "light.a", "light.b"
+        ]
+
+    def test_malformed_json_falls_back_to_comma_split(self):
+        """A '[…' string that is not JSON must not crash the handler."""
+        assert homeassistant_tool._split_entity_ids("[light.a") == ["[light.a"]
+
+    def test_non_string_non_list_is_none(self):
+        assert homeassistant_tool._split_entity_ids(42) is None
+
+
+# ---------------------------------------------------------------------------
 # Security: entity_id validation
 # ---------------------------------------------------------------------------
 

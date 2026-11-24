@@ -308,6 +308,11 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
+from hermes_cli.dashboard_auth.body_limit import AuthBodyLimitMiddleware  # noqa: E402
+
+# Register first (innermost): auth gates run before this, JSON parsing after it.
+app.add_middleware(AuthBodyLimitMiddleware)
+
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
@@ -612,9 +617,10 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
     plugin_name = _plugin_api_name(request.scope)
     # Only gate authenticated requests. Unauthenticated ones fall through so
     # auth_middleware / the OAuth gate return 401 first and this route can't
-    # be used as a plugin-name oracle.
+    # be used as a plugin-name oracle. Desktop authenticates with a native ticket.
     if plugin_name and (
         getattr(request.state, "token_authenticated", False)
+        or getattr(request.state, "native_http_principal", None)
         or getattr(request.app.state, "auth_required", False)
         or _has_valid_session_token(request)
         or _has_valid_query_token(request, path)

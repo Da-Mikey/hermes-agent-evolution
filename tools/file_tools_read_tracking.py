@@ -44,6 +44,13 @@ _DEDUP_CAP = 1000
 _READ_TIMESTAMPS_CAP = 1000
 _FULL_WRITE_BASELINES_CAP = 1000
 _NOT_FOUND_CAP = 500
+
+# Merge bases (#252): the exact text this task last saw in full, kept so a
+# write whose precondition went stale is re-read and three-way merged instead
+# of refused. Bounded hard — a base only matters for the file about to be
+# written, and a big file is not worth holding in memory.
+_MERGE_BASES_CAP = 8
+_MERGE_BASE_MAX_BYTES = 131_072
 _NOT_FOUND_TTL_SECONDS = 60.0  # a path that didn't exist may be created soon
 
 
@@ -52,7 +59,8 @@ def _task_data(task_id: str) -> dict:
     (search_tool / tests create partial entries). Lock must be held."""
     task_data = _read_tracker.setdefault(task_id, {
         "last_key": None, "consecutive": 0, "read_history": set()})
-    for key in ("dedup", "dedup_hits", "read_timestamps", "read_coverage", "full_write_baselines"):
+    for key in ("dedup", "dedup_hits", "read_timestamps", "read_coverage",
+                "full_write_baselines", "merge_bases"):
         task_data.setdefault(key, {})
     task_data.setdefault("dedup_generation_reads", set())
     return task_data
@@ -99,6 +107,7 @@ def _cap_read_tracker_data(task_data: dict) -> None:
         ("read_timestamps", _READ_TIMESTAMPS_CAP),
         ("read_coverage", _READ_TIMESTAMPS_CAP),
         ("full_write_baselines", _FULL_WRITE_BASELINES_CAP),
+        ("merge_bases", _MERGE_BASES_CAP),
         ("not_found", _NOT_FOUND_CAP)):
         container = task_data.get(key)
         if container is not None and len(container) > cap:
@@ -300,6 +309,55 @@ def _has_full_write_baseline(resolved: str, task_id: str) -> bool:
     return baseline is not None and _file_version(resolved) == baseline
 
 
+def _store_merge_base(resolved: str, task_id: str, version: tuple) -> None:
+    """Keep the text this task just saw in full, as the merge base for #252.
+
+    Called after a COMPLETE unredacted read (one page, or contiguous pages
+    reaching the last line) at *version*. A stale ``write_file`` precondition
+    then has the "version the task last saw" needed to replay the intended
+    change onto whatever is on disk now, instead of refusing outright.
+
+    Bounded twice: files above ``_MERGE_BASE_MAX_BYTES`` are skipped (the write
+    keeps the old refusal), and the per-task map is capped at
+    ``_MERGE_BASES_CAP`` with oldest-first eviction.
+    """
+    try:
+        if os.stat(resolved).st_size > _MERGE_BASE_MAX_BYTES:
+            _drop_merge_base(resolved, task_id)
+            return
+        with open(resolved, "rb") as stream:
+            raw = stream.read(_MERGE_BASE_MAX_BYTES + 1)
+    except OSError:
+        return
+    if len(raw) > _MERGE_BASE_MAX_BYTES:
+        return
+    # write_file encodes with utf-8/surrogateescape, so this decodes to exactly
+    # the bytes it will write back (and never raises on a stray surrogate).
+    text = raw.decode("utf-8", "surrogateescape")
+    with _read_tracker_lock:
+        task_data = _task_data(task_id)
+        bases = task_data.setdefault("merge_bases", {})
+        bases.pop(str(resolved), None)
+        bases[str(resolved)] = (version, text)
+        _evict_oldest(bases, _MERGE_BASES_CAP)
+
+
+def _get_merge_base(resolved: str, task_id: str) -> tuple | None:
+    """``(version, text)`` this task last saw in full for *resolved*, if any."""
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id) or {}
+        return task_data.get("merge_bases", {}).get(str(resolved))
+
+
+def _drop_merge_base(resolved: str, task_id: str) -> None:
+    """Forget the merge base for *resolved* (its bytes are no longer the base)."""
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        bases = task_data.get("merge_bases") if task_data else None
+        if bases:
+            bases.pop(str(resolved), None)
+
+
 _READ_COVERAGE_RANGES_CAP = 256
 
 
@@ -374,3 +432,9 @@ def _mark_verification_stale(task_id: str, resolved_paths: list[str],
         mark_workspace_edited(session_id=session_id or task_id, cwd=cwd, paths=paths)
     except Exception:
         logger.debug("verification stale marker failed", exc_info=True)
+
+
+# Public names for the stale-write merge path (#252); the underscore forms stay
+# for the module-internal call sites above.
+get_merge_base = _get_merge_base
+forget_merge_base = _drop_merge_base

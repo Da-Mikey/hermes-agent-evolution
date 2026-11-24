@@ -224,6 +224,46 @@ def _record_dispatch(
     _write_ledger(evo_dir, pruned)
 
 
+def _report_ledger_tick(evo_dir: Path, edges: Tuple[str, ...]) -> None:
+    """Read back the tick just recorded through the schema-locked reader (#148).
+
+    The gate is now a *consumer* of ``scripts/orchbench_ledger.py``: after it
+    records the edges it dispatched, it re-reads the ledger it just wrote and
+    reports the validated tick on stderr. That closes the dead-code defect that
+    bounced the slice-A PR — a reader nothing read — without inventing slice B's
+    replay semantics, which is the next, separate, design-bearing step.
+
+    Deliberately fail-soft: this is observability, not a decision. A corrupt
+    ledger must never change the wake verdict (the gate's own ``_read_ledger``
+    fails open for the same reason), so a schema violation is reported and
+    swallowed rather than raised into the cron.
+    """
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        from orchbench_ledger import LedgerSchemaError, read_ledger, summarise
+    except ImportError:  # deploy without the reader — report nothing, decide as before
+        return
+
+    try:
+        records = read_ledger(evo_dir)
+    except LedgerSchemaError as exc:
+        print(f"[hydra-gate] ledger readback failed: {exc}", file=sys.stderr)
+        return
+
+    summary = summarise(records)
+    this_tick = ", ".join(
+        f"{edge}={records[edge].date}" for edge in edges if edge in records
+    )
+    print(
+        f"[hydra-gate] ledger readback: {summary['edge_count']} edge(s), "
+        f"latest {summary['latest_date'] or 'none'}"
+        + (f"; this tick: {this_tick}" if this_tick else ""),
+        file=sys.stderr,
+    )
+
+
 def _has_upstream_freshness(
     evo_dir: Path,
     upstream_stage: str,
@@ -417,6 +457,8 @@ def _has_work(evo_dir: Path) -> Tuple[bool, str]:
                 _latest_output(evo_dir, up_stage),
                 _stage_content_hash(evo_dir, up_stage),
             )
+        # Read the tick back through the schema-locked reader (#148 slice A+).
+        _report_ledger_tick(evo_dir, tuple(fresh_pairs))
         return True, f"fresh material: {', '.join(fresh_pairs)}"
 
     # Time-based triggers: root stages that should run periodically even when

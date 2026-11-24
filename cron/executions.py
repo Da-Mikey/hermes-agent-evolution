@@ -88,6 +88,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    # #310: the drift guard's compared values (snapshot vs resolved config) for every tick it
+    # ruled on, so a passing tick and a skipping tick can be diffed after the fact.
+    add_column_if_missing(conn, "executions", "drift_detail", "drift_detail TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -304,6 +307,25 @@ def finish_execution(
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record
+
+
+def record_drift_detail(execution_id: str, detail: str) -> bool:
+    """Attach the drift guard's compared values to a live execution row (#310).
+
+    Written for EVERY tick the guard rules on (pass and skip alike) so the
+    operator can diff a tick that ran against one that was skipped. Best effort:
+    the run never fails because an audit write did; only rows still in a live
+    status are touched.
+    """
+    text = str(detail or "")[:1000]
+    if not text:
+        return False
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET drift_detail=? WHERE id=? AND status IN ('claimed','running')",
+            (text, str(execution_id)),
+        )
+        return cur.rowcount == 1
 
 
 _OWNER_GONE_REASON = (

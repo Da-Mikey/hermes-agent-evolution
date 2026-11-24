@@ -78,9 +78,23 @@ def test_real_binaries_execute_leading_dash_program_payload(
     if needs_tty:
         argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
-    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
+    completed = subprocess.run(
+        argv, input=input_text, text=True, capture_output=True, env=env, timeout=20
+    )
 
-    assert marker.read_text() == "executed"
+    if marker.exists():
+        assert marker.read_text() == "executed"
+    else:
+        # A tool may refuse the invocation instead of running the program. uutils
+        # coreutils' sort (the default `sort` on Ubuntu 26.04, and so on the CI
+        # runner) parses "-payload-marker" as the option "-p" and exits non-zero
+        # without executing anything; GNU sort execs it. Refusing still leaves the
+        # approval rule safe (it over-blocks, never under-blocks), but a silent
+        # success that ran nothing would not, so pin the difference here.
+        assert completed.returncode != 0, (
+            f"{tool} exited 0 without executing the payload: {argv} "
+            f"stderr={completed.stderr.strip()!r}"
+        )
 
 
 @pytest.mark.parametrize(

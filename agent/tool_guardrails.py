@@ -230,6 +230,15 @@ class ToolCallGuardrailConfig:
     non_interactive_hard_stop_enabled: bool = True
     exact_failure_warn_after: int = 2
     exact_failure_block_after: int = 5
+    # #315 — a tool result can declare its OWN retry verdict (the
+    # ``Non-retryable: <category>`` line the agent loop appends from
+    # ``tools.tool_failure_classifier``), but the controller only ever counted
+    # failures, so the identical call was re-dispatched verbatim (268 observed
+    # dispatches). When the last failure for a signature carries a *named
+    # deterministic* verdict, the identical re-dispatch is refused through the
+    # existing ``repeated_exact_failure_block`` path. ``False`` restores the
+    # count-only behaviour.
+    non_retryable_exact_block: bool = True
     same_tool_failure_warn_after: int = 3
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
@@ -325,6 +334,10 @@ class ToolCallGuardrailConfig:
                     "exact_failure", data.get("exact_failure_block_after")
                 ),
                 defaults.exact_failure_block_after,
+            ),
+            non_retryable_exact_block=_as_bool(
+                data.get("non_retryable_exact_block"),
+                defaults.non_retryable_exact_block,
             ),
             same_tool_failure_halt_after=_positive_int(
                 hard_stop_after.get(
@@ -580,6 +593,53 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return False, ""
 
 
+# #315 — categories where the payload's own verdict is *deterministic*: the
+# same arguments cannot succeed on a verbatim replay. The catch-all buckets
+# (``persistent_error``, ``unknown``) are deliberately excluded — every
+# generic ``{"error": ...}`` payload lands there, so blocking on them would
+# refuse legitimate retries of heuristically-classified failures.
+_DETERMINISTIC_NON_RETRYABLE_CATEGORIES = frozenset(
+    {
+        "tool_unavailable",
+        "invalid_arguments",
+        "not_found",
+        "permission_denied",
+        "safety_gate_blocked",
+        "quota_exhausted",
+    }
+)
+
+
+def declared_non_retryable_verdict(tool_name: str, result: str | None) -> str | None:
+    """Return the payload's own non-retryable verdict for this result, if any.
+
+    #315 — ``run_agent`` already asks ``tools.tool_failure_classifier`` for a
+    retry verdict and appends a ``Non-retryable: <category>`` line to the
+    result, but that verdict is never consulted before the next dispatch. This
+    helper extracts the same verdict *inside* the guardrail so ``after_call``
+    can record it against the call signature.
+
+    Returns the category name (e.g. ``"not_found"``) when the payload declares
+    a deterministic non-retryable verdict, else ``None``.
+    """
+    if not result:
+        return None
+    try:
+        from tools.tool_failure_classifier import classify_tool_failure as _classify
+    except Exception:  # pragma: no cover - import kept lazy to avoid cycles
+        return None
+    try:
+        verdict = _classify(tool_name, result)
+    except Exception:  # pragma: no cover - classification must never break a turn
+        return None
+    if verdict.should_retry:
+        return None
+    category = getattr(verdict.category, "value", str(verdict.category))
+    if category not in _DETERMINISTIC_NON_RETRYABLE_CATEGORIES:
+        return None
+    return category
+
+
 # Guardrail verdict text injected into the conversation, keyed by decision code.
 # ``same_tool_failure_warning`` is built by _tool_failure_recovery_hint (tool-specific).
 _DECISION_MESSAGES: dict[str, str] = {
@@ -676,6 +736,13 @@ class ToolCallGuardrailController:
         # this, the fail→diagnostic-success→fail pattern (the production
         # spiral) nets 0 per cycle and the cap is unreachable.
         self._cross_turn_success_streaks: dict[str, int] = {}
+        # #315 — signature -> (declared verdict category, refusal count). Holds
+        # the retry verdict the payload declared for its OWN failure so the
+        # identical re-dispatch can be refused. Deliberately NOT cleared by
+        # ``reset_for_turn``: the observed replay was one identical call per
+        # API turn, which resets every per-turn counter and therefore never
+        # reached ``exact_failure_block_after`` (268 verbatim re-dispatches).
+        self._non_retryable_signatures: dict[ToolCallSignature, tuple[str, int]] = {}
         # #1826 — session-level permanent hard-stop set. Once a spiral-prone
         # tool's cross-turn streak reaches the cap, the tool is added here and
         # ALL subsequent calls are permanently blocked for the session. This is
@@ -756,6 +823,35 @@ class ToolCallGuardrailController:
         exact_count = self._exact_failure_counts.get(signature, 0)
         if self._progress_since_failure.get(signature):
             exact_count = 0
+        # #315 — consult the payload's own verdict before the count threshold.
+        # The per-turn exact counter is reset every API turn, so a replay that
+        # happens once per turn never reaches ``exact_failure_block_after``.
+        # A declared deterministic verdict needs no count: the identical call
+        # cannot succeed, so it is refused through the same block path.
+        declared = self._non_retryable_signatures.get(signature)
+        if (
+            declared is not None
+            and self.config.hard_stop_enabled
+            and self.config.non_retryable_exact_block
+        ):
+            verdict, refused = declared
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="repeated_exact_failure_block",
+                message=(
+                    f"Blocked {tool_name}: the previous identical call declared its "
+                    f"own verdict as non-retryable ({verdict}) and has been refused "
+                    f"{refused} time(s). Re-dispatching it unchanged cannot change "
+                    "the outcome — change the arguments, switch tools, or explain "
+                    "the blocker."
+                ),
+                tool_name=tool_name,
+                count=refused,
+                signature=signature,
+            )
+            self._non_retryable_signatures[signature] = (verdict, refused + 1)
+            self._halt_decision = decision
+            return decision
         if self.config.hard_stop_enabled and exact_count >= self.config.exact_failure_block_after:
             decision = ToolGuardrailDecision(
                 action="block",
@@ -949,6 +1045,17 @@ class ToolCallGuardrailController:
             self.policy_registry.record_observation(tool_name, args, failed=failed)
 
         if failed:
+            # #315 — record the payload's own retry verdict against the
+            # signature so ``before_call`` can refuse the identical replay.
+            # Only named deterministic categories are recorded; a retryable or
+            # heuristic verdict clears any stale entry.
+            verdict = declared_non_retryable_verdict(tool_name, result)
+            if verdict is None:
+                self._non_retryable_signatures.pop(signature, None)
+            else:
+                previous = self._non_retryable_signatures.get(signature)
+                refused = previous[1] if previous is not None else 0
+                self._non_retryable_signatures[signature] = (verdict, refused)
             # An identical failing call is only a REPLAY if nothing landed in
             # between. If any mutating call succeeded since the previous
             # identical failure (edit -> re-run pytest, click -> re-snapshot),
@@ -1107,6 +1214,8 @@ class ToolCallGuardrailController:
                 tool_name=tool_name, count=exact_count, signature=signature
             )
 
+        # The call succeeded: its signature carries no non-retryable verdict.
+        self._non_retryable_signatures.pop(signature, None)
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
         # #1188 — decay (decrement) the cross-turn streak instead of clearing
@@ -1159,22 +1268,26 @@ class ToolCallGuardrailController:
         # being counted this turn: the next identical retry runs against
         # changed state, so it is a fresh attempt rather than a replay. Pure
         # loops never mutate anything between attempts, so the replay detector
-        # keeps its teeth.
+        # keeps its teeth. #315 — recorded non-retryable verdicts are dropped
+        # for the same reason: the state the verdict was about may now differ.
         if tool_name in {"patch", "write_file"} or file_mutation_result_landed(tool_name, result):
             for sig in list(self._exact_failure_counts):
                 self._progress_since_failure[sig] = True
             self._same_tool_failure_counts.clear()
+            self._non_retryable_signatures.clear()
             self._cross_turn_tool_failure_counts.pop("terminal", None)
             self._cross_turn_tool_failure_counts.pop("execute_code", None)
         elif _is_browser_tool(tool_name) and tool_name != "browser_navigate":
             for sig in list(self._exact_failure_counts):
                 self._progress_since_failure[sig] = True
             self._same_tool_failure_counts.clear()
+            self._non_retryable_signatures.clear()
             self._cross_turn_tool_failure_counts.pop("browser_navigate", None)
         elif tool_name in PROGRESS_RESET_TOOL_NAMES:
             for sig in list(self._exact_failure_counts):
                 self._progress_since_failure[sig] = True
             self._same_tool_failure_counts.clear()
+            self._non_retryable_signatures.clear()
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)

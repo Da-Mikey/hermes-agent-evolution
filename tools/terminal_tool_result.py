@@ -13,6 +13,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+from tools.terminal_failure_classifier import (
+    chain_segments,
+    exit_code_attributable_to_last_segment,
+)
+
 logger = logging.getLogger("tools.terminal_tool")
 
 
@@ -104,15 +109,19 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
         # re-running or mis-diagnosing (137 = OOM kill is the big one). 130/SIGINT is deliberately absent:
         # the executor has bespoke interrupt-marker handling for rc=130.
         return signal_note
-    # The last command of a pipeline/chain determines the exit code; base
-    # command = its first word that isn't a VAR=val assignment, basename'd.
-    segments = re.split(r'\s*(?:\|\||&&|[|;])\s*', command)
-    last_segment = (segments[-1] if segments else command).strip()
-    base_cmd = next((w.split("/")[-1] for w in last_segment.split()
-                     if "=" not in w or w.startswith("-")), "")
-    semantic_note = _EXIT_CODE_SEMANTICS.get(base_cmd, {}).get(exit_code)
-    if semantic_note is not None:
-        return semantic_note
+    # The last command of a pipeline or `;` sequence owns the chain's exit code,
+    # so base command = its first word that isn't a VAR=val assignment, basename'd.
+    # In an `&&` chain that inference is unsound: a failure short-circuits before
+    # the final command ever runs, so the per-command table is skipped entirely —
+    # `cd /nonexistent && grep foo f` must not read as "no matches found".
+    if exit_code_attributable_to_last_segment(command):
+        segments = chain_segments(command)
+        last_segment = (segments[-1] if segments else command).strip()
+        base_cmd = next((w.split("/")[-1] for w in last_segment.split()
+                         if "=" not in w or w.startswith("-")), "")
+        semantic_note = _EXIT_CODE_SEMANTICS.get(base_cmd, {}).get(exit_code)
+        if semantic_note is not None:
+            return semantic_note
 
     # Shell-level exit codes, which are about the INVOCATION rather than the
     # program (#1452). These are command-agnostic — 127 means the shell never
@@ -305,8 +314,15 @@ def finalize_foreground_result(
             result_dict[key] = value
     # #2242 — nearby-path hint for missing files, including the classified
     # command-not-found path that still names a path in the command/output.
-    from tools.terminal_tool import _nearby_missing_path_hint
-    hint = _nearby_missing_path_hint(command, output)
-    if hint:
-        result_dict["error"] = str(result_dict.get("error") or "") + "\n\n" + hint
+    # #282 — gate on a non-zero exit. This caller used to invoke the hint
+    # unconditionally, so a *successful* command whose output merely contained
+    # a phrase like "not found" (or a nested tool result naming a directory)
+    # had a hard "error" string stapled to a result reporting exit_code 0.
+    # `_apply_classified_enrichments` already scoped the same hint to classified
+    # non-zero exits; the foreground path must agree with it.
+    if returncode is not None and returncode != 0:
+        from tools.terminal_tool import _nearby_missing_path_hint
+        hint = _nearby_missing_path_hint(command, output)
+        if hint:
+            result_dict["error"] = str(result_dict.get("error") or "") + "\n\n" + hint
     return json.dumps(result_dict, ensure_ascii=False)

@@ -1,6 +1,7 @@
 """Tests for agent/prompt_integrity.py — the mind-virus drift registry (#98)."""
 
 import json
+import logging
 
 from agent.prompt_integrity import (
     PROTECTED_FILES,
@@ -136,3 +137,64 @@ def test_store_and_load_roundtrip(tmp_path):
 def test_report_ok_property():
     assert IntegrityReport(drifts=[]).ok is True
     assert IntegrityReport(drifts=["SOUL.md"]).ok is False
+
+
+# ── #271: the drift warning is edge-triggered, not repeated every read ──────
+def _drift_warnings(caplog):
+    return [
+        rec
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING and "integrity drift detected" in rec.getMessage()
+    ]
+
+
+def test_repeated_identical_drift_warns_once(tmp_path, caplog):
+    """98 identical SOUL.md warnings in one window is a retry loop, not an alarm."""
+    _write(tmp_path, "SOUL.md", "baseline")
+    verify_and_log(tmp_path)  # establishes the baseline
+    _write(tmp_path, "SOUL.md", "drifted")
+    with caplog.at_level(logging.WARNING):
+        for _ in range(98):
+            verify_and_log(tmp_path)
+    assert len(_drift_warnings(caplog)) == 1
+
+
+def test_a_new_drift_alarms_again(tmp_path, caplog):
+    """Suppressing repetition must not silence a genuinely new condition."""
+    _write(tmp_path, "SOUL.md", "baseline")
+    verify_and_log(tmp_path)
+    _write(tmp_path, "SOUL.md", "drifted once")
+    with caplog.at_level(logging.WARNING):
+        verify_and_log(tmp_path)
+        _write(tmp_path, "SOUL.md", "drifted twice")
+        verify_and_log(tmp_path)
+    assert len(_drift_warnings(caplog)) == 2
+
+
+def test_drift_that_clears_and_returns_alarms_again(tmp_path, caplog):
+    _write(tmp_path, "SOUL.md", "baseline")
+    baseline = verify_integrity(tmp_path).current["SOUL.md"]
+    verify_and_log(tmp_path)
+    _write(tmp_path, "SOUL.md", "drifted")
+    with caplog.at_level(logging.WARNING):
+        verify_and_log(tmp_path)
+        _write(tmp_path, "SOUL.md", "baseline")
+        assert verify_and_log(tmp_path).ok is True
+        _write(tmp_path, "SOUL.md", "drifted")
+        verify_and_log(tmp_path)
+    assert len(_drift_warnings(caplog)) == 2
+    assert baseline  # registry hash captured by the first run, not re-established
+
+
+def test_suppressed_repeat_still_reports_the_drift(tmp_path, caplog):
+    """Only the log line is deduplicated — the signal keeps reaching callers."""
+    _write(tmp_path, "SOUL.md", "baseline")
+    verify_and_log(tmp_path)
+    _write(tmp_path, "SOUL.md", "drifted")
+    with caplog.at_level(logging.WARNING):
+        first = verify_and_log(tmp_path)
+        second = verify_and_log(tmp_path)
+    assert first.drifts == ["SOUL.md"]
+    assert second.drifts == ["SOUL.md"]
+    assert second.ok is False
+

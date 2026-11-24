@@ -785,13 +785,56 @@ class TestImageApiSurface:
         assert "_retryable" not in result
 
     def test_catalog_models_are_offered_only_by_openrouter(self):
+        """The curated Image API catalog is offered by the OpenRouter picker and by no other
+        backend. Hermetic by design: a third-party rename must never red-screen an unrelated
+        PR, so upstream is served from a local payload, not from openrouter.ai (#345)."""
         from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
 
+        curated = sorted(_IMAGE_API_MODELS)
+
+        def fake_get(url, **kw):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if url.endswith("/images/models"):
+                # Stand-in for upstream: every curated id plus one released after this code
+                # shipped, all with generic names so the curated metadata wins the merge.
+                resp.json.return_value = {"data": [
+                    {"id": model_id, "name": f"upstream {model_id}",
+                     "architecture": {"input_modalities": ["text", "image"],
+                                      "output_modalities": ["image"]}}
+                    for model_id in [*curated, "some-lab/brand-new-image-model"]
+                ]}
+            else:
+                # Chat-completions catalog: image-output rows only; the text-only model and
+                # the router pseudo-model are filtered out.
+                resp.json.return_value = {"data": [
+                    {"id": "openai/gpt-5.4-image-2",
+                     "architecture": {"input_modalities": ["text", "image"],
+                                      "output_modalities": ["image"]}},
+                    {"id": "openai/gpt-5.4",
+                     "architecture": {"input_modalities": ["text"],
+                                      "output_modalities": ["text"]}},
+                    {"id": "openrouter/auto",
+                     "architecture": {"input_modalities": ["text"],
+                                      "output_modalities": ["image", "text"]}},
+                ]}
+            return resp
+
         by_name = {p.name: p for p in _build_providers()}
-        openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
-        nous_ids = {m["id"] for m in by_name["nous"].list_models()}
+        with patch(_RUNTIME, return_value=_runtime_ok()), patch(
+            "requests.get", side_effect=fake_get
+        ):
+            openrouter_rows = by_name["openrouter"].list_models()
+            nous_rows = by_name["nous"].list_models()
+
+        openrouter_ids = {m["id"] for m in openrouter_rows}
+        nous_ids = {m["id"] for m in nous_rows}
         assert set(_IMAGE_API_MODELS) <= openrouter_ids
+        assert "some-lab/brand-new-image-model" in openrouter_ids
         assert not (set(_IMAGE_API_MODELS) & nous_ids)
+        # Curated metadata is not overwritten by the upstream display name.
+        sample = _IMAGE_API_MODELS[curated[0]]["display"]
+        assert next(m for m in openrouter_rows if m["id"] == curated[0])["display"] == sample
 
 
 

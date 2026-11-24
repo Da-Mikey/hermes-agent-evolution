@@ -226,9 +226,20 @@ def _build_persisted_message(preview: str, has_more: bool, original_size: int,
         f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
         f"Full output saved to: {file_path}\n"
         "Use the read_file tool with offset and limit to access specific sections of this output.\n"
-        "Recovery: page through the saved file with read_file (offset/limit) or "
-        "process it with execute_code — do NOT re-request the same data from the "
-        "remote API; the full result is already on disk.\n\n"
+        # #329: this block survives in the transcript for the life of the session,
+        # but the file it names does NOT — cleanup_spillover_cache() prunes
+        # anything older than SPILLOVER_MAX_AGE_HOURS. The old wording promised
+        # the copy was available and told the model not to re-request, so a later
+        # turn that obeyed the pointer hit ENOENT and concluded the data was
+        # unrecoverable. Say when the copy expires and name re-running as the
+        # recovery path, so a pruned file is a documented outcome rather than a
+        # dead end.
+        f"Retention: this saved copy is pruned after {SPILLOVER_MAX_AGE_HOURS} hours "
+        "and may therefore be gone later in this session. If read_file reports the "
+        "file missing, re-run the original command to regenerate the data — that is "
+        "the supported recovery path.\n"
+        "While the file exists, page through it with read_file (offset/limit) or "
+        "process it with execute_code rather than re-requesting the same data.\n\n"
         f"Preview (first {len(preview)} chars):\n"
         + preview + ("\n..." if has_more else "")
         + f"\n{PERSISTED_OUTPUT_CLOSING_TAG}")

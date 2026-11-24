@@ -142,7 +142,9 @@ class TestComputeRealized:
         # 2 confirmed + 3 regressed → 2/5 = 40% < 50%, ≥3 measured → flag fires.
         # Real regressions still count against the rate.
         recs = [_merge(i, "2026-06-01") | _verdict(i, "confirmed") for i in range(1, 3)]
-        recs += [_merge(i, "2026-06-02") | _verdict(i, "regressed") for i in range(10, 13)]
+        recs += [
+            _merge(i, "2026-06-02") | _verdict(i, "regressed") for i in range(10, 13)
+        ]
         h = compute_realized(recs, today="2026-06-30")
         assert h["verified"] == 5
         assert h["confirmed"] == 2
@@ -221,6 +223,7 @@ class TestComputeRealized:
         # When maturity_days is 0, None/corrupt dates still do not count as mature
         h0 = compute_realized(recs, today="2026-06-30", maturity_days=0)
         assert h0["merged_tracked"] == 0
+
 
 class TestFormat:
     def test_format_includes_rate_and_tail(self):
@@ -359,9 +362,25 @@ class TestShouldCloseIssue:
         should, reason = should_close_issue(recs, 1, "2026-06-17")
         assert should is False and "no-signal" in reason
 
-    def test_not_tracked_closes(self):
+    def test_not_tracked_holds_fail_closed(self):
+        # #320: an issue with no ledger line at all must HOLD. "No record of a
+        # merge" is not evidence the fix worked — the old fail-open branch made
+        # check-close return CLOSE for every issue on a host whose only ledger
+        # line was an integration change-record carrying no ``issue`` key.
         should, reason = should_close_issue([_merge(2, "2026-06-01")], 1, "2026-06-17")
-        assert should is True and "not tracked" in reason
+        assert should is False and "no merge record" in reason
+
+    def test_empty_ledger_holds_fail_closed(self):
+        should, reason = should_close_issue([], 1, "2026-06-17")
+        assert should is False and "no merge record" in reason
+
+    def test_verdict_only_record_holds(self):
+        # #320 defect 1: record_verdict writes ``issue`` with NO ``merged_at``.
+        # Keying the gate on issue-presence let a verdict-only line close an
+        # issue that never had a merge recorded at all.
+        recs = [_verdict(1, "confirmed")]
+        should, reason = should_close_issue(recs, 1, "2026-06-17")
+        assert should is False and "no merge record" in reason
 
     def test_recent_unverified_awaits(self):
         recs = [_merge(1, "2026-06-15")]
@@ -399,6 +418,66 @@ class TestCheckCloseCli:
         rc = mod.main([_PROG, "check-close", "42", "2026-06-17"])
         out = capsys.readouterr().out
         assert rc == 0 and "CLOSE" in out and "confirmed" in out
+
+    def test_check_close_untracked_is_unverifiable_not_a_pass(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # #320: the live fail-open. A ledger holding only a non-issue record
+        # (the integration change-record shape) left records == [] and the gate
+        # answered CLOSE for every issue. Now: UNVERIFIABLE + its own exit code,
+        # distinct from HOLD, so the caller does not re-open on absence alone.
+        import evolution_realized_impact as mod
+
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        f = tmp_path / "realized" / "ledger.jsonl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
+            '{"change_id": "evolution/issue-432-mono-tool-spiral-guard", '
+            '"pr_number": 436, "merged_at": "2026-06-21T23:05:00Z"}\n',
+            encoding="utf-8",
+        )
+        rc = mod.main([_PROG, "check-close", "42", "2026-06-17"])
+        out = capsys.readouterr().out
+        assert rc == 3, out
+        assert "UNVERIFIABLE" in out and "CLOSE" not in out
+
+    def test_check_close_flag_is_not_read_as_the_date(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # --current-rate used to land in the ``today`` slot, parsing as 0 days
+        # since merge and reporting a fictional maturity.
+        import evolution_realized_impact as mod
+
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        f = tmp_path / "realized" / "ledger.jsonl"
+        record_merge(f, 42, "2026-06-01", 0.8, "spiral")
+        record_verdict(f, 42, "confirmed", "2026-06-10", "dropped")
+        rc = mod.main([_PROG, "check-close", "42", "--current-rate", "4.0"])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "--current-rate" not in out
+
+    def test_check_close_rejects_a_malformed_date(self, tmp_path, monkeypatch, capsys):
+        import evolution_realized_impact as mod
+
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        f = tmp_path / "realized" / "ledger.jsonl"
+        record_merge(f, 42, "2026-06-01", 0.8, "spiral")
+        rc = mod.main([_PROG, "check-close", "42", "2026-13-45"])
+        assert rc == 2
+
+    def test_check_close_rejects_a_dangling_current_rate(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import evolution_realized_impact as mod
+
+        monkeypatch.setenv("EVOLUTION_PROFILE_DIR", str(tmp_path))
+        f = tmp_path / "realized" / "ledger.jsonl"
+        record_merge(f, 42, "2026-06-01", 0.8, "spiral")
+        rc = mod.main([_PROG, "check-close", "42", "2026-06-17", "--current-rate"])
+        assert rc == 2
+        rc = mod.main([_PROG, "check-close", "42", "2026-06-17", "--current-rate", "x"])
+        assert rc == 2
 
 
 class TestClassifyVerdictByRate:

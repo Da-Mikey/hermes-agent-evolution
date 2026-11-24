@@ -200,17 +200,41 @@ class TraceSummary:
 # (single source of truth, consistent with introspection_extract.py), keeping
 # a small literal fallback so this module stays importable standalone.
 try:  # pragma: no cover - exercised indirectly; import shape varies by tree
-    from agent.loop_guard import _looks_like_failure as _looks_like_failure
+    from agent.loop_guard import (
+        _CONTENT_PAYLOAD_TOOLS as _CONTENT_PAYLOAD_TOOLS,
+        _looks_like_failure as _looks_like_failure,
+    )
 except Exception:  # pragma: no cover
     _FAILURE_MARKERS = (
-        "error:", "failed", "permission denied", "command not found",
-        "no such file", "timed out", "timeout", "traceback (most recent call",
+        "error:",
+        "failed",
+        "permission denied",
+        "command not found",
+        "no such file",
+        "timed out",
+        "timeout",
+        "traceback (most recent call",
     )
+    # Kept in step with agent/loop_guard.py: a content-returning tool's result
+    # IS its payload (#350), so only a result that OPENS with failure wording
+    # is a failure.  Mirrored here so the fallback cannot regress the fix.
+    _CONTENT_PAYLOAD_TOOLS = frozenset({
+        "read_file",
+        "search_files",
+        "repo_map",
+        "skill_view",
+        "web_search",
+        "web_extract",
+    })
+    _CONTENT_FAILURE_HEAD_CHARS = 200
 
-    def _looks_like_failure(content: Any) -> bool:
-        return isinstance(content, str) and any(
-            m in content.lower() for m in _FAILURE_MARKERS
-        )
+    def _looks_like_failure(content: Any, tool_name: Optional[str] = None) -> bool:
+        if not isinstance(content, str) or not content:
+            return False
+        if tool_name in _CONTENT_PAYLOAD_TOOLS:
+            head = content.lstrip()[:_CONTENT_FAILURE_HEAD_CHARS].lower()
+            return any(head.startswith(m) for m in _FAILURE_MARKERS)
+        return any(m in content.lower() for m in _FAILURE_MARKERS)
 
 
 _REFUSAL_RE = re.compile(
@@ -231,6 +255,41 @@ def _tool_name(tool_call: Any) -> str:
     return str(tool_call.get("name") or "unknown")
 
 
+def _call_names(tool_calls: Any) -> Dict[str, str]:
+    """Map ``tool_call_id`` → tool name for one assistant turn."""
+    names: Dict[str, str] = {}
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        call_id = tc.get("id")
+        if isinstance(call_id, str) and call_id:
+            names[call_id] = _tool_name(tc)
+    return names
+
+
+def _result_tool_name(
+    result: Any, call_names: Optional[Dict[str, str]] = None
+) -> Optional[str]:
+    """Name the tool that produced a ``role: "tool"`` result message.
+
+    Transports differ: most carry ``name``/``tool_name`` on the result itself
+    (``tool_dispatch_helpers``, ``agent_runtime_helpers``), but some record only
+    ``tool_call_id`` (the codex projector, MCP sampling).  Fall back to the
+    assistant turn's call ids.  Returns ``None`` when the name cannot be
+    recovered, which keeps the caller's old lenient marker scan (#357).
+    """
+    if not isinstance(result, dict):
+        return None
+    for key in ("tool_name", "name"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    call_id = result.get("tool_call_id")
+    if isinstance(call_id, str) and call_names:
+        return call_names.get(call_id)
+    return None
+
+
 def summarize_trace(messages: Sequence[Dict[str, Any]]) -> TraceSummary:
     """Extract structural signals from a session message list.
 
@@ -242,6 +301,7 @@ def summarize_trace(messages: Sequence[Dict[str, Any]]) -> TraceSummary:
     last_assistant_text = ""
     consecutive_tool = ""
     consecutive_count = 0
+    call_names: Dict[str, str] = {}
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -267,13 +327,16 @@ def summarize_trace(messages: Sequence[Dict[str, Any]]) -> TraceSummary:
                     if consecutive_count == _REPEAT_THRESHOLD:
                         # Count the spiral once, when it crosses the threshold.
                         summary.repeated_tool_runs += 1
+                call_names.update(_call_names(tool_calls))
             elif isinstance(content, str) and content.strip():
                 last_assistant_text = content
                 if _REFUSAL_RE.search(content):
                     summary.refusals += 1
         elif role == "tool":
             summary.tool_results += 1
-            if _looks_like_failure(content):
+            # #357: the tool name decides whether the result is a payload.  A
+            # read_file of a document quoting "error:" is not a failed call.
+            if _looks_like_failure(content, _result_tool_name(msg, call_names)):
                 summary.tool_failures += 1
 
     # A trace "has a final answer" when its last substantive assistant message
@@ -539,17 +602,27 @@ def render_transcript_excerpt(
             if text:
                 line += f"\n  {text}"
         elif role == "tool":
-            body = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            body = (
+                content
+                if isinstance(content, str)
+                else json.dumps(content, ensure_ascii=False)
+            )
             line = f"[tool result] {body}"
         else:
-            body = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            body = (
+                content
+                if isinstance(content, str)
+                else json.dumps(content, ensure_ascii=False)
+            )
             line = f"[{role}] {body}"
         rendered.append(line)
 
     if len(rendered) > max_messages:
         head = rendered[: max_messages // 2]
-        tail = rendered[-(max_messages // 2):]
-        rendered = head + [f"… ({len(rendered) - max_messages} messages elided) …"] + tail
+        tail = rendered[-(max_messages // 2) :]
+        rendered = (
+            head + [f"… ({len(rendered) - max_messages} messages elided) …"] + tail
+        )
 
     excerpt = "\n".join(rendered)
     if len(excerpt) > max_chars:
@@ -688,9 +761,7 @@ class AgentJudge:
             )
             if verdict is not None:
                 return verdict
-        return score_trace_heuristic(
-            session_id, messages, self.rubric, summary=summary
-        )
+        return score_trace_heuristic(session_id, messages, self.rubric, summary=summary)
 
     def score_replay(
         self,
@@ -716,7 +787,9 @@ class AgentJudge:
         return format_report_terminal(verdict, self.rubric)
 
 
-def format_report_terminal(verdict: JudgeVerdict, rubric: Rubric = DEFAULT_RUBRIC) -> str:
+def format_report_terminal(
+    verdict: JudgeVerdict, rubric: Rubric = DEFAULT_RUBRIC
+) -> str:
     """Render a verdict for the terminal (mirrors entropy_eval's formatter)."""
     sid = verdict.session_id
     sid_display = f"{sid[:24]}..." if len(sid) > 24 else sid
@@ -833,15 +906,17 @@ def score_replayed_trace(
     LLM scoring of individual steps is intentionally deferred (kept small +
     independently testable).
     """
-    verdict = AgentJudge(rubric).score(
-        session_id, messages, task=task, use_llm=use_llm
-    )
+    verdict = AgentJudge(rubric).score(session_id, messages, task=task, use_llm=use_llm)
     steps: List[Dict[str, Any]] = []
     for step in replay_trace_steps(messages):
+        call_names = _call_names(step["tool_calls"])
         failures = sum(
             1
             for r in step["tool_results"]
-            if _looks_like_failure(r.get("content") if isinstance(r, dict) else r)
+            if _looks_like_failure(
+                r.get("content") if isinstance(r, dict) else r,
+                _result_tool_name(r, call_names),
+            )
         )
         total = len(step["tool_results"])
         if total == 0:
@@ -850,16 +925,14 @@ def score_replayed_trace(
             step_score = 1.0
         else:
             step_score = 0.0
-        steps.append(
-            {
-                "step": step["step"],
-                "has_final_answer": step["has_final_answer"],
-                "tool_count": len(step["tool_calls"]),
-                "tool_result_count": total,
-                "tool_failure_count": failures,
-                "score": step_score,
-            }
-        )
+        steps.append({
+            "step": step["step"],
+            "has_final_answer": step["has_final_answer"],
+            "tool_count": len(step["tool_calls"]),
+            "tool_result_count": total,
+            "tool_failure_count": failures,
+            "score": step_score,
+        })
     return {
         "session_id": session_id,
         "verdict": verdict.to_dict(),
