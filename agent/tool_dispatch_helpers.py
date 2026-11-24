@@ -405,8 +405,9 @@ def make_tool_result_message(
     effect_disposition: str | None = None,
 ) -> dict:
     """Build a tool-result message: OpenAI ``name`` (wire format) plus internal ``tool_name``
-    (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_*) is
-    wrapped in untrusted-data delimiters — the defense against indirect prompt injection.
+    (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_* and the
+    codex transport's dotted ``mcp.<server>.<tool>``) is wrapped in untrusted-data
+    delimiters — the defense against indirect prompt injection.
     """
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
@@ -464,7 +465,10 @@ def make_tool_result_message(
 
 # Tools whose results carry attacker-controllable content; outputs under 32 chars skip wrapping.
 _UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search"})
-_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_")
+# ``mcp_`` is the native name convention (``mcp__server__tool``); ``mcp.`` is the codex
+# transport's (``mcp.<server>.<tool>``, agent/transports/codex_event_projector.py). Both
+# spellings address a third-party server, so both must be fenced.
+_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_", "mcp.")
 _UNTRUSTED_WRAP_MIN_CHARS = 32
 
 # Case-insensitive so a differently-cased tag can't forge or prematurely close the boundary.

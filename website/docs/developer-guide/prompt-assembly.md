@@ -236,6 +236,18 @@ into long-lived files and persuading the next agent to carry them onward:
 Together: the clause handles *pre-existing* content (treat it as data), and the
 hash registry detects *post-baseline* tampering.
 
+A third boundary applies at runtime rather than at prompt-assembly time. Tool
+results carrying attacker-controllable content are wrapped in
+`<untrusted_tool_result source="...">` by `make_tool_result_message`
+(`agent/tool_dispatch_helpers.py`), and any copy of that tag inside the payload
+is defanged first, so poisoned output cannot close the block early. Coverage is
+by tool-name convention: `web_extract`, `web_search`, `browser_*`, `mcp_*`
+(native `mcp__server__tool`), and the codex transport's dotted
+`mcp.<server>.<tool>`. **Every transport must build its tool-result message
+through that helper** — a transport that assembles the message itself (as
+`agent/transports/codex_event_projector.py` once did) silently opts its results
+out of the fence.
+
 ## How context files are injected
 
 `build_context_files_prompt()` uses a **priority system** — only one project context type is loaded (first match wins):
