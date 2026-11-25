@@ -14,6 +14,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from agent.tool_dispatch_helpers import make_tool_result_message
+
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
     """Stable tool_call id: the codex item id, else a hash so replay keeps prefix caches valid."""
@@ -98,7 +100,11 @@ class CodexEventProjector:
             None,
             tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": _format_tool_args(args)}}],
         )
-        tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
+        # Build the tool message with the canonical constructor, not by hand: it is the single
+        # place that fences attacker-controllable output (``mcp.<server>.<tool>`` results are
+        # third-party data and must arrive inside <untrusted_tool_result>), normalizes the
+        # call id, and stamps the internal ``tool_name`` the session DB expects.
+        tool_msg = make_tool_result_message(name, content, call_id)
         return ProjectionResult(messages=[assistant_msg, tool_msg], is_tool_iteration=True)
 
     @staticmethod

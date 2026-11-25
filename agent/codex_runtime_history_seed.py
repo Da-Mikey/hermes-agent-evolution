@@ -18,6 +18,11 @@ from typing import Any, Dict, List
 # Tail cap on the rendered history; ~8k tokens, resent by codex on every request of the thread.
 MAX_HISTORY_SEED_CHARS = 32_000
 _TOOL_RESULT_PREVIEW_CHARS = 400
+# Must match the delimiters ``_maybe_wrap_untrusted`` in agent/tool_dispatch_helpers.py emits;
+# duplicated as literals because that module is import-heavy and this one is on the start path.
+_FENCE_OPEN = "<untrusted_tool_result"
+_FENCE_CLOSE = "</untrusted_tool_result>"
+_FENCE_PROLOGUE_SEP = "\n\n"
 
 _HEADER = ("Prior conversation from this Hermes session (the thread you are continuing was started fresh; "
            "treat these turns as already having happened):")
@@ -32,6 +37,30 @@ def _text_of(content: Any) -> str:
     return ""
 
 
+def _preview_tool_text(text: str) -> str:
+    """Truncate a tool row to the preview cap, keeping any untrusted fence BALANCED.
+
+    A fenced result cut at the cap loses its closing tag. The seed is rendered newest-last inside
+    ``developerInstructions``, so an orphaned opener would make every later row — including the
+    real request — read as *inside* the untrusted block: the boundary inverts on resume, which is
+    worse than the truncation it was meant to bound. Cut the payload, re-close the block.
+    """
+    if len(text) <= _TOOL_RESULT_PREVIEW_CHARS:
+        return text
+    if not text.startswith(_FENCE_OPEN):
+        return text[:_TOOL_RESULT_PREVIEW_CHARS] + " …"
+    close_at, body_at = text.rfind(_FENCE_CLOSE), text.find(_FENCE_PROLOGUE_SEP)
+    # No prologue or no closing tag: never emit an unbalanced opener, so fall back to plain text.
+    if close_at == -1 or body_at == -1 or body_at > close_at:
+        return text[:_TOOL_RESULT_PREVIEW_CHARS] + " …"
+    body_at += len(_FENCE_PROLOGUE_SEP)
+    tail = " …\n" + _FENCE_CLOSE
+    budget = _TOOL_RESULT_PREVIEW_CHARS - len(tail)
+    if budget <= body_at:  # prologue alone fills the cap: keep it whole and drop the payload
+        return text[:body_at].rstrip() + tail
+    return text[:budget] + tail
+
+
 def _render_row(msg: Dict[str, Any]) -> str:
     role = msg.get("role")
     text = _text_of(msg.get("content")).strip()
@@ -44,8 +73,7 @@ def _render_row(msg: Dict[str, Any]) -> str:
             lines.append("[ASSISTANT called tools: " + ", ".join(c for c in calls if c) + "]")
         return "\n".join(lines)
     if role == "tool":
-        if len(text) > _TOOL_RESULT_PREVIEW_CHARS:
-            text = text[:_TOOL_RESULT_PREVIEW_CHARS] + " …"
+        text = _preview_tool_text(text)
         return f"[TOOL RESULT]\n{text}" if text else ""
     return ""  # system rows are the prompt composition, already sent as developerInstructions
 
