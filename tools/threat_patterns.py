@@ -35,7 +35,11 @@ _PATTERNS: List[Tuple[str, str, str]] = [
         "translate_execute",
         "all",
     ),
-    (rf'do\s+not\s+{_FILLER}tell\s+{_FILLER}the\s+user', "deception_hide", "all"),
+    # ``(tell|inform|mention|reveal)`` mirrors the description-side scanner in
+    # tools/mcp_tool_schema.py, so a concealment sentence is detectable in tool RESULTS too
+    # (issue #442: a hosted MCP server's "do not mention it to the user" yielded no finding).
+    (rf'do\s+not\s+{_FILLER}(?:tell|inform|mention|reveal)\s+{_FILLER}the\s+user',
+     "deception_hide", "all"),
 
     # ── Role-play / identity hijack (scraped web content, poisoned context files) ──
     (rf'you\s+are\s+{_FILLER}now\s+(?:a|an|the)\s+', "role_hijack", "context"),

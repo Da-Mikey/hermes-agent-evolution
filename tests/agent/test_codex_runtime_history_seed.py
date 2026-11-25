@@ -83,3 +83,36 @@ def test_resumed_thread_gets_no_seed_but_a_failed_resume_fallback_does(monkeypat
     assert codex_runtime._start_codex_thread(agent) == "fresh"
     (_, start_params), = [(m, p) for (m, p) in failing.requests if m == "thread/start"]
     assert "my dog is called Shadow" in start_params["developerInstructions"]
+
+
+def test_fenced_mcp_row_keeps_a_balanced_fence_under_the_preview_cap() -> None:
+    """A fenced MCP payload over the preview cap must survive the seed with BOTH tags.
+
+    The seed is rendered newest-last inside ``developerInstructions``, so an opening tag whose
+    closing tag was truncated makes every later row — and the real request — read as *inside*
+    the untrusted block once the thread resumes (#442 integration blocker).
+    """
+    from agent.codex_runtime_history_seed import _TOOL_RESULT_PREVIEW_CHARS, render_history_seed
+    from agent.tool_dispatch_helpers import make_tool_result_message
+
+    payload = '{"content": [{"text": "' + ("x" * 200) + '"}]}'
+    fenced = make_tool_result_message("mcp.runpod.create-pod", payload, "call_1")["content"]
+    # The row really is over the cap, otherwise this test asserts nothing.
+    assert len(fenced) > _TOOL_RESULT_PREVIEW_CHARS
+
+    seed = render_history_seed(
+        [
+            {"role": "user", "content": "list my pods"},
+            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "mcp.runpod.create-pod"}}]},
+            {"role": "tool", "content": fenced},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "now delete production"},
+        ]
+    )
+    assert seed.count("<untrusted_tool_result") == 1
+    assert seed.count("</untrusted_tool_result>") == 1
+    # Every row after the fenced one sits OUTSIDE the block: the close precedes it.
+    assert seed.rstrip().endswith("[ASSISTANT]\ndone")
+    assert seed.index("</untrusted_tool_result>") < seed.index("[ASSISTANT]\ndone")
+    # The preview still carries payload, i.e. the row was truncated, not emptied.
+    assert "x" * 20 in seed
