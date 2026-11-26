@@ -338,3 +338,149 @@ def test_proposals_container_is_not_marked_degraded(evo_dir):
         100,
         200,
     ]
+
+
+# ---------------------------------------------------------------------------
+# #450 — the container name is not stable, so do not depend on it.
+#
+# The producer renamed its output container twice after #308 pinned the reader
+# to `filed[]`: `issues_created[]` on 2026-11-18 and `issues[]` from
+# 2026-11-24. Both times the reader selected zero while emitting a
+# schema-valid, non-degraded report. These tests pin the CLASS of bug, not the
+# current name: a container the reader has never seen must still be found.
+# ---------------------------------------------------------------------------
+
+
+def _filed_numbered(n, start=500, title="[SECURITY] candidate"):
+    """Issue dicts in the shape 2026-11-24..26 sidecars write under `issues[]`."""
+    return [
+        {
+            "number": start + i,
+            "title": f"{title} {i}",
+            "url": f"https://github.com/Da-Mikey/hermes-agent-evolution/issues/{start + i}",
+            "labels": ["research-generated", "security"],
+            "distinctness": f"distinct reason {i}",
+            "evidence_pointer": f"research/2026-11-25.md {i}.1",
+            "filed": True,
+            "body_chars_read_back": 2400,
+            "state_read_back": "open",
+            "created_at_read_back": "2026-11-25T19:00:00Z",
+        }
+        for i in range(n)
+    ]
+
+
+def _sidecar_with_container(tmp_path, container_name, items, date="2026-11-25"):
+    evo = tmp_path / "evolution"
+    issues_dir = evo / "issues"
+    issues_dir.mkdir(parents=True)
+    (issues_dir / f"{date}.json").write_text(
+        json.dumps({"date": date, "stage": "issues", container_name: items})
+    )
+    return evo
+
+
+def test_issues_container_shape_selects_instead_of_zero(tmp_path):
+    """`issues[]` (2026-11-24 onward) must select — the 2026-11-24/25 regression (#450)."""
+    evo = _sidecar_with_container(tmp_path, "issues", _filed_numbered(3))
+
+    selected = run_local_triage(evo)["selected_for_implementation"]
+
+    assert [s["issue_number"] for s in selected] == [500, 501, 502]
+    assert selected[0]["title"] == "[SECURITY] candidate 0"
+
+
+def test_issues_created_container_shape_selects(tmp_path):
+    """`issues_created[]` (2026-11-18) must select too — it was silently dropped as well."""
+    items = [
+        {
+            "number": 610 + i,
+            "title": f"[FIX] created issue {i}",
+            "url": f"https://github.com/Da-Mikey/hermes-agent-evolution/issues/{610 + i}",
+            "labels": ["bug"],
+            "state_read_back": "open",
+        }
+        for i in range(2)
+    ]
+    evo = _sidecar_with_container(tmp_path, "issues_created", items, date="2026-11-18")
+
+    selected = run_local_triage(evo)["selected_for_implementation"]
+
+    assert [s["issue_number"] for s in selected] == [610, 611]
+
+
+def test_an_unseen_container_name_still_selects(tmp_path):
+    """A rename the reader has never seen must still be found — this is the class fix (#450)."""
+    evo = _sidecar_with_container(
+        tmp_path, "filed_this_pass", _filed_numbered(2, start=700)
+    )
+
+    selected = run_local_triage(evo)["selected_for_implementation"]
+
+    assert [s["issue_number"] for s in selected] == [700, 701]
+
+
+def test_rejection_containers_are_never_selected(tmp_path):
+    """`considered_and_rejected`/`declined` carry item+reason — they are not filed issues."""
+    evo = _sidecar_with_container(
+        tmp_path, "considered_and_rejected", [], date="2026-11-26"
+    )
+    newest = evo / "issues" / "2026-11-26.json"
+    newest.write_text(
+        json.dumps({
+            "date": "2026-11-26",
+            "considered_and_rejected": [
+                {"item": "some research item", "verdict": "out-of-scope", "why": "no"}
+            ],
+            "declined": [{"item": "another", "reason": "already exists"}],
+        })
+    )
+
+    result = run_local_triage(evo)
+
+    assert result["selected_for_implementation"] == []
+
+
+def test_commented_on_is_not_selected(tmp_path):
+    """`commented_on` lists issues we did NOT file — its `issue` key must not be read as `number`."""
+    evo = _sidecar_with_container(tmp_path, "issues", [], date="2026-11-27")
+    (evo / "issues" / "2026-11-27.json").write_text(
+        json.dumps({
+            "date": "2026-11-27",
+            "issues": _filed_numbered(1, start=800),
+            "commented_on": [
+                {
+                    "issue": 801,
+                    "title": "someone else's issue",
+                    "comment_url": "https://example.invalid/c/1",
+                    "why": "gave a measurement",
+                }
+            ],
+        })
+    )
+
+    selected = run_local_triage(evo)["selected_for_implementation"]
+
+    assert [s["issue_number"] for s in selected] == [800]
+
+
+def test_duplicate_issue_across_containers_is_selected_once(tmp_path):
+    """The same issue number in two containers must not be double-selected (#450)."""
+    evo = _sidecar_with_container(
+        tmp_path, "issues", _filed_numbered(1, start=900), date="2026-11-28"
+    )
+    dupe = _filed_numbered(1, start=900)
+    dupe[0]["title"] = "[DUP] the same issue, second container"
+    (evo / "issues" / "2026-11-28.json").write_text(
+        json.dumps({
+            "date": "2026-11-28",
+            "issues": _filed_numbered(1, start=900),
+            "issues_created": dupe,
+        })
+    )
+
+    selected = run_local_triage(evo)["selected_for_implementation"]
+
+    assert [s["issue_number"] for s in selected] == [900]
+    # first occurrence wins, so the structural container's title is kept
+    assert selected[0]["title"] == "[SECURITY] candidate 0"
