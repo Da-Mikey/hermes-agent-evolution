@@ -19,6 +19,7 @@ Three contracts are pinned here:
   both dispatch-phase variants stay non-retryable.
 """
 
+import os
 import socket
 
 import pytest
@@ -172,3 +173,99 @@ class TestClassification:
 
         assert result.category is not tfc.ToolFailureCategory.transient_network
         assert result.should_retry is False
+
+
+class TestStartupRaceDiagnostics:
+    """#417 — the bare message carried no pid, no exit status and no reason.
+
+    Eleven rows across eleven sessions in seven days still hit this text, from
+    ``write_file``, ``patch`` and ``read_file`` — three different tools, so the
+    mechanism was never tool-specific. The same sentence is what a code-skew
+    move under a live process produces (the supervisor cannot import its own
+    modules), and without a pid or the supervisor's own words there is nothing
+    on the row to tell that apart from fork/exec pressure.
+    """
+
+    @staticmethod
+    def _dead_owner(monkeypatch, *, pid=4242, returncode=1, stderr_text=b""):
+        """A Popen stand-in whose supervisor already exited, with its last words."""
+        read_fd, write_fd = os.pipe()
+        if stderr_text:
+            os.write(write_fd, stderr_text)
+        os.close(write_fd)
+        stream = os.fdopen(read_fd, "rb", buffering=0)
+
+        class _Owner:
+            stdin = None
+            stdout = None
+
+            def __init__(self):
+                self.pid = pid
+                self.stderr = stream
+
+            def poll(self):
+                return returncode
+
+            def wait(self, timeout=None):
+                return returncode
+
+        owner = _Owner()
+        monkeypatch.setattr(local_process.subprocess, "Popen", lambda *a, **k: owner)
+        return owner
+
+    @staticmethod
+    def _handle():
+        handle = local_process.LocalProcessHandle.__new__(local_process.LocalProcessHandle)
+        handle._buffer = b""
+        handle._closed = False
+        return handle
+
+    def test_dead_owner_is_named_with_pid_status_and_its_last_words(self, monkeypatch):
+        self._dead_owner(
+            monkeypatch,
+            stderr_text=b"ModuleNotFoundError: No module named 'scripts'\n",
+        )
+        with pytest.raises(local_process._OwnerStartupRace) as excinfo:
+            self._handle()._open_once(["true"], {})
+
+        message = str(excinfo.value)
+
+        # The anchor the classifier matches on must survive unchanged.
+        assert message.startswith("Local process owner exited during startup")
+        assert "pid 4242" in message
+        assert "rc=1" in message
+        assert "No module named 'scripts'" in message
+
+    def test_enriched_message_still_classifies_as_the_retryable_race(self, monkeypatch):
+        """The enrichment must not move the row out of the retryable class."""
+        self._dead_owner(monkeypatch, stderr_text=b"boom: fd exhaustion\n")
+        with pytest.raises(local_process._OwnerStartupRace) as excinfo:
+            self._handle()._open_once(["true"], {})
+
+        result = tfc.classify_tool_failure("write_file", str(excinfo.value))
+
+        assert result.category is tfc.ToolFailureCategory.transient_network
+        assert result.should_retry is True
+
+    def test_live_owner_stderr_is_left_undrained(self, monkeypatch):
+        """A still-running supervisor's stderr belongs to the workload."""
+        owner = self._dead_owner(monkeypatch, returncode=None, stderr_text=b"workload output\n")
+        stream = owner.stderr
+        try:
+            handle = self._handle()
+            handle._owner = owner
+
+            assert handle._owner_stderr_tail() == ""
+            assert handle._owner_failure_detail() == (
+                " (owner pid 4242 still running after the handshake failed)"
+            )
+            # Nothing was consumed, so the workload's bytes are still there.
+            assert stream.read() == b"workload output\n"
+        finally:
+            stream.close()
+
+    def test_missing_supervisor_is_stated_not_crashed(self, monkeypatch):
+        handle = self._handle()
+        handle._owner = None
+
+        assert handle._owner_failure_detail() == " (no supervisor process was spawned)"

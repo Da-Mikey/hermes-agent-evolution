@@ -94,14 +94,71 @@ class LocalProcessHandle:
                 raise RuntimeError("Local process owner failed to dispatch command")
             self.command_pid = int(started[1])
             parent.setblocking(False)
-        except BaseException:
+        except BaseException as exc:
             parent.close()  # EOF asks an already-started owner to clean up
             if self._owner is not None:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     self._owner.wait(timeout=3)
+            # #417 — the historical message named no pid, no exit status and no reason, so a
+            # run that hit it had nothing to act on. Enrich it once the supervisor has been
+            # reaped; the classifier matches on the unchanged leading text.
+            if isinstance(exc, _OwnerStartupRace):
+                raise _OwnerStartupRace(
+                    f"{exc}{self._owner_failure_detail()}"
+                ) from None
             raise
         finally:
             child.close()
+
+    def _owner_failure_detail(self) -> str:
+        """Diagnostics for a supervisor that died inside the handshake window (#417).
+
+        The same text is produced two very different ways: real fork/exec pressure (a race
+        worth one replay, #347) and a supervisor that cannot start at all — a code-skew move
+        under a live process leaves it unable to import ``scripts``, and that reads as a
+        transient race until it repeats on every call for the rest of the run. Naming the pid,
+        the exit status and the supervisor's own last words is what tells the two apart.
+        """
+        owner = self._owner
+        if owner is None:
+            return " (no supervisor process was spawned)"
+        returncode = owner.poll()
+        if returncode is None:
+            detail = f" (owner pid {owner.pid} still running after the handshake failed"
+        else:
+            detail = f" (owner pid {owner.pid} exited rc={returncode}"
+        tail = self._owner_stderr_tail()
+        if tail:
+            detail += f"; stderr: {tail}"
+        return detail + ")"
+
+    def _owner_stderr_tail(self, limit: int = 320) -> str:
+        """Best-effort tail of the dead supervisor's stderr; ``""`` when unavailable.
+
+        Read only after the owner has exited: the pipe is then at EOF with its bytes already
+        buffered, so ``os.read`` cannot block on a live writer. A live owner is left alone —
+        draining its stderr would steal the workload's output.
+        """
+        owner = self._owner
+        if owner is None or owner.stderr is None or owner.poll() is None:
+            return ""
+        try:
+            fd = owner.stderr.fileno()
+        except (OSError, ValueError):
+            return ""
+        chunks: list[bytes] = []
+        total = 0
+        while total < limit:
+            try:
+                chunk = os.read(fd, limit - total)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        text = b"".join(chunks).decode("utf-8", "replace")
+        return " ".join(text.split())[:limit]
 
     def _startup_line(self, *, retryable=False):
         """Read the next handshake line from the owner.
