@@ -88,27 +88,71 @@ four issues per run; that is policy, not a guess, so it is the cap used here.
 """
 
 
+def _iter_filed_items(issues_document: dict) -> list[dict]:
+    """Return every filed-issue dict in a sidecar, whatever container holds it (#450).
+
+    The output container has been renamed three times — ``filed[]`` (through
+    2026-11-23), ``issues_created[]`` (2026-11-18) and ``issues[]`` (from
+    2026-11-24) — and each rename made the reader select zero issues while
+    still emitting a schema-valid report. #308 answered one rename by naming
+    one container, and the next rename reintroduced the identical silent-empty
+    bug.
+
+    So discovery here is structural, not by name: any top-level list whose
+    dict entries carry both a ``number`` and a ``title`` is treated as a filed
+    list. The rejection containers (``declined``, ``considered_and_rejected``,
+    ``not_consumed``) carry ``item``/``reason`` and are excluded by
+    construction, as is ``commented_on`` (``issue`` + ``comment_url``, no
+    ``number``) — those are issues we did not file and must not select.
+
+    Duplicates across containers are collapsed on the issue number, first
+    occurrence winning, so a sidecar that lists the same issue twice cannot
+    double-select it.
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+    for value in issues_document.values():
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("number") or not item.get("title"):
+                continue
+            key = str(item.get("number"))
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(item)
+    if found:
+        return found
+
+    # Legacy shape: an old sidecar may record the issue under ``issue`` instead
+    # of ``number``. Preserve #308's original read of ``filed[]`` for it.
+    legacy: list[dict] = []
+    for item in issues_document.get("filed") or []:
+        if isinstance(item, dict) and (item.get("number") or item.get("issue")):
+            legacy.append(item)
+    return legacy
+
+
 def _proposals_from_filed_list(issues_document: dict) -> list[dict]:
-    """Map the top-level ``filed[]`` list that issues passes actually write.
+    """Map the sidecar's filed-issue list to selection candidates.
 
     ``issues_document`` is the parsed sidecar (``_read_sidecar`` wraps it under
-    ``data``). Every issues sidecar under ``evolution/issues/`` stores its
-    output as a top-level ``filed`` array of ``{letter, number, url, title,
-    labels, source, hook, priority_score, why_it_survived}``; none of them
-    carries the ``proposals`` container this module was originally written
-    against (verified against 2026-10-21, 2026-10-25 and 2026-10-26-b). Reading
-    only that container made every fallback cycle select zero issues while still
-    emitting a schema-valid report — the exact silent-empty failure the local
-    pass exists to prevent (#308).
+    ``data``). No sidecar under ``evolution/issues/`` carries the
+    ``proposals`` container this module was originally written against, so
+    this fallback is the only path that ever runs. Container discovery is
+    delegated to :func:`_iter_filed_items`, which finds the list structurally
+    rather than by name — the failure of the named-container approach is what
+    #308 and then #450 fixed.
 
     The mapping is lossless about what the sidecar records: effort is reported
     as unknown rather than invented, and the caller caps unknown-effort
     selections accordingly.
     """
     out = []
-    for item in issues_document.get("filed") or []:
-        if not isinstance(item, dict):
-            continue
+    for item in _iter_filed_items(issues_document):
         number = item.get("number") or item.get("issue")
         if not number:
             continue
@@ -291,15 +335,16 @@ def run_local_triage(evolution_dir: Path, repo_root: Optional[Path] = None) -> d
 
     # #308: make a fallback cycle visible in the artifact. The stage gate cannot
     # tell a lost cycle from a quiet one (confidence 50 / branch `refine` is
-    # emitted on every triage run), so a selection read from `filed[]` says so
-    # here instead of looking like a normal, empty day.
+    # emitted on every triage run), so a selection read from the sidecar's
+    # filed-issue list says so here instead of looking like a normal, empty day.
     if any(p.get("selected_reason") == "local-triage-filed-sidecar" for p in selected):
         output["degraded"] = True
         output["degraded_reason"] = (
             "issues sidecar carried no data.proposals — selection was read from "
-            "the top-level filed[] list; per-issue effort is not recorded there, "
+            "the sidecar's top-level filed-issue list (container found "
+            "structurally, not by name); per-issue effort is not recorded there, "
             f"so selections with unknown effort were capped at "
-            f"{_UNKNOWN_EFFORT_MAX_SELECTION} (#308)"
+            f"{_UNKNOWN_EFFORT_MAX_SELECTION} (#308, #450)"
         )
 
     # Run claim audit on output (#2494)
