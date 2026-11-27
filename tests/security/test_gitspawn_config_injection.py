@@ -49,6 +49,17 @@ class TestHardenGitArgv:
             assert out[0] == sub
             assert out[1:3] == list(NO_DRIVER_DIFF_FLAGS)
 
+    def test_whatchanged_is_hardened(self):
+        # #459: ``whatchanged`` renders patches through the same revision machinery as
+        # ``log -p``, so a repo-named ``textconv``/``diff`` driver runs for it too — and it
+        # accepts both flags, so leaving it out of the set was a gap, not a constraint.
+        out = harden_git_argv(["whatchanged", "-p"])
+        assert out == ["whatchanged", *NO_DRIVER_DIFF_FLAGS, "-p"]
+        # Global options are still skipped before it, like any other diff renderer.
+        assert harden_git_argv(["-C", "/repo", "whatchanged"]) == [
+            "-C", "/repo", "whatchanged", *NO_DRIVER_DIFF_FLAGS,
+        ]
+
     def test_status_is_not_touched(self):
         # status rejects --no-ext-diff (`unknown option`), so it must pass through.
         assert harden_git_argv(["status", "--porcelain=2", "--branch"]) == [

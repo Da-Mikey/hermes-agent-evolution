@@ -45,7 +45,12 @@ NO_DRIVER_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 # Only these subcommands accept ``NO_DRIVER_DIFF_FLAGS`` — ``status`` and friends reject them
 # (``unknown option``), so the helper gates on this set rather than blanket-prepending.
-_DIFF_RENDERING_SUBCOMMANDS = frozenset({"diff", "show", "log", "blame"})
+# ``whatchanged`` belongs here for the same reason as ``log``: it walks the revision machinery and
+# renders patches, so it honours ``.gitattributes`` and runs a repo-named ``textconv``/``diff``
+# driver exactly as ``log -p`` does. It accepts both flags (verified: ``git whatchanged -p
+# --no-textconv --no-ext-diff`` exits 0 on a non-empty repo), so the omission was a gap, not a
+# compatibility constraint (#459).
+_DIFF_RENDERING_SUBCOMMANDS = frozenset({"diff", "show", "log", "blame", "whatchanged"})
 
 # Options that consume the FOLLOWING token, so that value is never mistaken for the subcommand
 # (``-C diff`` is a path; ``-c diff=x`` is a config pair).
