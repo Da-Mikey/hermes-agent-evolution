@@ -156,12 +156,17 @@ def _global_allow_private_urls() -> bool:
 
 def _resolve_allow_private_urls() -> bool:
     """Resolve the effective private-URL toggle from the active config scope."""
+    pinned = _managed_allow_private_urls()
+    if pinned is not None:
+        return pinned  # an administrator's pin outranks the environment variable and the profile's keys
     env_val = os.getenv("HERMES_ALLOW_PRIVATE_URLS", "").strip().lower()
     if env_val in {"true", "1", "yes"}:
         return True
     if env_val in {"false", "0", "no"}:
         return False  # explicit false does not fall through to config
     try:
+        # The profile's own keys, not the managed scope laid over them: it pinned neither spelling
+        # (decided above), and a null there, which pins nothing, would erase the profile's value.
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         for section in ("security", "browser"):  # preferred, then legacy
@@ -171,6 +176,40 @@ def _resolve_allow_private_urls() -> bool:
     except Exception:
         pass  # config unavailable (tests, early import) — keep default
     return False
+
+
+def _managed_allow_private_urls() -> Optional[bool]:
+    """The managed scope's own value for the toggle, or None when it pins neither spelling.
+
+    Read apart from the profile so a pin is resolved before everything the user controls:
+    ``HERMES_ALLOW_PRIVATE_URLS`` (shell or profile ``.env``) and the profile's two keys, either of
+    which opts in. ``security.allow_private_urls`` first, then the legacy
+    ``browser.allow_private_urls``; a null value pins nothing.
+    """
+    try:
+        from hermes_cli.managed_scope import apply_managed_overlay
+    except ImportError:
+        return None  # managed scope unavailable (early import): nothing is pinned
+    managed = apply_managed_overlay({})  # fail-open: {} without a scope or when its file cannot be read
+    for section in ("security", "browser"):  # preferred, then legacy
+        block = managed.get(section)
+        value = block.get("allow_private_urls") if isinstance(block, dict) else None
+        if value is not None:
+            return is_truthy_value(value, default=False)
+    return None
+
+
+def _policy_config() -> dict:
+    """config.yaml with managed scope laid on top, as ``load_config()`` lays it.
+
+    ``read_raw_config()`` alone never sees ``/etc/hermes/config.yaml``, so an operator who pinned
+    ``security.fake_ip_ranges`` or ``security.allow_private_urls`` there got the profile's own
+    value. Raises like ``read_raw_config()``; the callers keep their secure defaults on failure.
+    """
+    from hermes_cli.config import read_raw_config
+    from hermes_cli.managed_scope import apply_managed_overlay
+
+    return apply_managed_overlay(read_raw_config())
 
 
 def _reset_allow_private_cache() -> None:
@@ -190,8 +229,7 @@ def _resolve_fake_ip_ranges() -> tuple:
     declares one, and the sentinel range keeps the ordinary private-address verdict otherwise.
     """
     try:
-        from hermes_cli.config import read_raw_config
-        block = read_raw_config().get("security", {})
+        block = _policy_config().get("security", {})
         raw = block.get("fake_ip_ranges") if isinstance(block, dict) else None
     except Exception:
         return ()  # config unavailable (tests, early import) — keep the secure default

@@ -15,25 +15,13 @@
     "merged_at": "2026-09-29T17:47:15Z",
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
     "checked_at": "2026-10-01",
-    "last_assessed_tag": "v0.23.3",
-    "last_assessed_at": "2026-11-20",
+    "last_assessed_tag": "v0.23.4",
+    "last_assessed_at": "2026-11-25",
     "last_assessed_decision": "defer-full-merge",
-    "last_assessed_conflicting_files": 283,
-    "last_assessed_report": "~/.hermes/evolution/upstream/2026-11-20.md",
-    "open_security_backports": [
-      191,
-      264,
-      276,
-      294,
-      324,
-      362,
-      368,
-      408,
-      413,
-      422,
-      425
-    ],
-    "_assessed_note": "v0.23.3 released 2026-11-20T00:34Z (1,657 non-merge commits / 3,948 files since v0.23.2). Merge trial measured 283 conflicting paths (up from 274 at v0.23.2); divergence 33,649 behind / 1,652 ahead -> full merge deferred, escalate to owner. Marker guard: v0.23.3 ancestor of fork/main = false. Advisory GHSA-p22p-9ph6-gmrh (high, Bot Desktop sandbox env) = NOT AFFECTED: our version 0.21.5 is below the affected floor 0.21.6 and tools/bot_desktop/sandbox_host.py does not exist in our tree. PR #425 shipped the profiles-aware _HERMES_HOME_DIR backport (profile config.yaml edits were ungated). OPEN GAP: five rounds of approval home-fold hardening (tools/approval_home_fold.py) are absent; 9/15 spec cases bypass, needs a spaced home to bite -- separate PR. synced_through_commit NOT advanced (release-track).",
+    "last_assessed_conflicting_files": 326,
+    "last_assessed_report": "~/.hermes/evolution/upstream/2026-11-25.md",
+    "open_security_backports": [],
+    "_assessed_note": "v0.23.4 released 2026-11-24T08:17:06Z (1,143 commits / 1,316 files since v0.23.3). Merge trial in a throwaway worktree off origin/main 549e3496ee measured 326 conflicting paths and 21,726 changed entries (trend: v0.23.2=274, v0.23.3=283, v0.23.3-vs-11-24=303, v0.23.4=326 - rising). Divergence 35,127 behind upstream/main, 1,747 ahead. Marker guard: v0.23.4 ancestor of fork/main = false. Full merge deferred, owner's call. Backport queue DRAINED on 2026-11-24: #191,#264,#276,#294,#324,#362,#368,#369,#408,#413,#422,#425,#426,#431,#435,#438,#441,#443,#444 all merged; zero PRs open at run time. SHIPPED this run (targeted security backport from the release): managed-scope policy reads in tools/url_safety.py, tools/credential_files.py, tools/env_passthrough.py - our tree carried the pre-fix read_raw_config() shape at url_safety.py:165,193 and credential_files.py:132, env_passthrough.py:103, so an operator pin in /etc/hermes/config.yaml was ignored by the tool policy layer and by the SSRF floor (upstream 2fe344ddd9 + a3501a8b4a, verbatim v0.23.4 block incl. admin-pin precedence). No live exposure on this host: /etc/hermes/config.yaml is absent, so this closes a latent bypass, not an active one. NOT carried: 999460cc57/3914bd8890/d5f3b20ffe (protected files in managed credential mounts) - our tree has its own master-store deny-list lineage; carrying it needs a separate measurement. synced_through_commit NOT advanced (release-track).",
     "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin).",
     "dependency_backports": {
       "_note": "Targeted dependency security backports from UNRELEASED upstream main (a release-track merge cannot carry them). Each advisory is measured against our lockfiles, never inferred from upstream's diff.",
@@ -62,6 +50,29 @@
         "opentelemetry-api": "GHSA-mf5v-w3w3-f6cg (medium, affects <= 1.45.1); ours pinned 1.39.1 alongside opentelemetry-instrumentation 0.60b1 \u2014 needs a coordinated instrumentation-family move, not a patch bump"
       },
       "fixed_drift": "uv.lock absorbed pre-existing lock/pyproject drift: the hindsight-client exclude-newer exclusion was never locked, so uv lock --check FAILED on main before this change and passes after it"
+    },
+    "security_backports": {
+      "_note": "Targeted fixes cherry-picked out of a release because the full merge is deferred.",
+      "20261125_managed_scope_tool_reads": {
+        "branch": "fix/security-managed-scope-tool-reads-20261125",
+        "upstream_commits": [
+          "2fe344ddd9",
+          "a3501a8b4a"
+        ],
+        "files": [
+          "tools/url_safety.py",
+          "tools/credential_files.py",
+          "tools/env_passthrough.py"
+        ],
+        "task": "managed-scope policy reads in the tool policy layer and the SSRF floor",
+        "verified": "acceptance test carried verbatim from v0.23.4 (tests/tools/test_url_safety_managed.py): 4 passed on branch, 3 failed on unmodified main - the test has teeth. 56-file regression sweep run on branch AND on clean main: both 11 failed / 1727 passed with identical names, so the 11 are pre-existing suite-order pollution, not this change. ruff clean on all three files.",
+        "instrument_correction": "An earlier read compared a 56-file branch run (11 failed) against a 6-file control run (2 failed) and wrongly attributed 9 regressions to adopting load_user_config_effective(). The file sets differed; the comparison was invalid. Re-measured like-for-like, that version is also clean. Recorded so the error is not repeated.",
+        "not_carried": [
+          "999460cc57 guard protected files in managed credential mounts - our tree has its own deny-list lineage",
+          "3914bd8890 one read-guard decision for both credential mount sources (refactor, rides with full merge)",
+          "d5f3b20ffe test only, belongs to the pair above"
+        ]
+      }
     }
   },
   "release_assessment_20261108": {
