@@ -143,5 +143,35 @@
     "open_pr_state_at_run": "8 PRs open, all mergeable=MERGEABLE with SUCCESS/SKIPPED checks, none merged: #369 (state), #368 (pipe-to-shell launchers), #362 (redaction hardening, 44 commits), #324 (CDP metadata floor), #294 (dependency CVEs), #276 (plugin gate on websockets), #264 (revoked allowlist), #191 (v0.21.6 security). Four are security work with no path to main except an owner merge click - that is the outstanding exposure, not v0.23.1.",
     "report": "~/.hermes/evolution/upstream/2026-11-11.md",
     "_note": "v0.23.1 is NOT merged. integrated_tag deliberately stays v2026.9.24 and synced_through_commit is untouched: release-track assessments are recorded here, not in the incremental cursor."
+  },
+  "release_assessment_20261127": {
+    "latest_release_checked": "v0.23.4",
+    "published_at": "2026-11-24T08:17:06Z",
+    "run_date": "2026-11-27",
+    "marker_guard": "git merge-base --is-ancestor v0.23.4 origin/main -> FALSE (not integrated); git rev-list --count origin/main..v0.23.4 = 34686",
+    "divergence": {
+      "behind_upstream_main": 35773,
+      "ahead_of_upstream_main": 1748,
+      "note": "Growing because the fork has not merged a release since v2026.9.24; the release decision did not change this run."
+    },
+    "release_track_position": "No new published release since v0.23.4 (2026-11-24). Canaries after it are pre-releases and are not release-track inputs. Full-merge decision unchanged from 2026-11-25 (326 conflicted files, measured then; NOT re-measured today).",
+    "published_advisories": {
+      "count": 1,
+      "newest": "GHSA-p22p-9ph6-gmrh / CVE-2026-130164 (high 7.8, published 2026-11-19)",
+      "verdict": "NOT AFFECTED - tools/bot_desktop/sandbox_host.py (the advisory's read boundary) is absent from our tree; 10 bot_desktop files vs 13 at v0.23.4. Re-confirmed 2026-11-27.",
+      "new_since_last_run": 0
+    },
+    "work_done": "Independent path-based sweep of the v0.23.3..v0.23.4 window (1,316 changed files, 451 also in our tree, 16 security-sensitive candidates) - a second route beside the 2026-11-25 keyword triage. Found one live gap the keyword pass had not named, shipped as PR #458.",
+    "shipped": {
+      "pr": 458,
+      "branch": "fix/security-approval-display-hygiene-20261127",
+      "commit": "b4ccac7632",
+      "upstream_commits": ["3f5612cde6", "6dc867eb49"],
+      "summary": "Approval prompts show hidden characters and padding; TUI card now redacts description/path/host/label/risk instead of command only (description carried MCP/vault text unredacted). New module agent/redact_approval_display.py taken verbatim from the v0.23.4 tag.",
+      "evidence": "9 passed on branch; 2 failed with the wiring reverted (teeth); ruff clean; regression sweep 8 failed/681 passed vs 8 failed/676 passed on clean main, identical failing names (pre-existing order-dependent pollution, confirmed by a stashed control sweep)",
+      "deferred_with_it": "API/SSE consent-description egress (gateway.platforms.api_server._approval_request_event absent here) and agent/display + tools/clarify_tool prose display - ride with the full release merge"
+    },
+    "report": "~/.hermes/evolution/upstream/2026-11-27.md",
+    "_note": "v0.23.4 is NOT merged. integrated_tag deliberately stays v2026.9.24; synced_through_commit is not advanced by release-track work. PR #446 (2026-11-25) carries its own release_sync edit - if both merge, release_sync needs a 5-line JSON resolve in favour of the later assessment."
   }
 }
