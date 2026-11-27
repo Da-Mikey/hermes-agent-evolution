@@ -439,6 +439,46 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
         logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
 
 
+def _verify_tool_pins(
+    name: str, tools: List[Any], *, establish_baseline: bool = True
+) -> None:
+    """Check this server's tool definitions against the pinned baseline (#447).
+
+    ``agent/mcp_tool_pinning`` was written for #944 and lost its only call site
+    in the 2026-09-30 split of ``tools/mcp_tool.py``: the module imported
+    cleanly, its tests passed, and no pin had been verified or written for 112
+    days. This is the wiring, restored.
+
+    Trust semantics, deliberately asymmetric:
+
+    * **Live discovery** (``establish_baseline=True``) — the tools came off the
+      wire, so they may establish the baseline on first connect.
+    * **Cache replay** (``establish_baseline=False``) — ``_register_from_cache_sync``
+      registers from a cached manifest with no child process. Pinning that
+      cache as trusted would launder an already-poisoned cache into the
+      baseline, so it only ever *compares* against a baseline a live connect
+      established.
+
+    Best-effort by contract: pinning is a detector, not a gate. Any failure is
+    logged and swallowed so it can never stop a server registering. Whether a
+    changed schema should BLOCK registration is a policy decision nobody has
+    made yet, so this records and warns rather than refusing.
+    """
+    try:
+        from agent.mcp_tool_pinning import load_pins, verify_tools
+
+        if not establish_baseline and load_pins(name) is None:
+            logger.debug(
+                "MCP server '%s' (lazy): no pin baseline yet — cache replay does "
+                "not establish one",
+                name,
+            )
+            return
+        verify_tools(name, tools)
+    except Exception as exc:  # pragma: no cover - pinning must never block registration
+        logger.debug("MCP tool pin verification failed for '%s': %s", name, exc)
+
+
 def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> List[str]:
     """Register a connected server's tools plus utilities (initial discovery and list_changed
     refresh); returns the names. Toolset aliases derive from the live registry, not
@@ -446,6 +486,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     should_register = _make_tool_filter(name, config)
     key = _server_key_for_task(server)
     _record_tool_trust_metadata(name, config, server._tools, key)
+    # #447: the pin check that #944 shipped went missing in a module split.
+    _verify_tool_pins(name, server._tools)
     candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
     candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
     backend = _resolve_durability_backend()
@@ -588,6 +630,9 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     tool_timeout = _resolve_tool_timeout(config)
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
+    # #447: compare against a live-established baseline, but never establish one
+    # from the cache itself — that would pin an already-poisoned manifest.
+    _verify_tool_pins(name, cached_tools, establish_baseline=False)
     candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
     candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
     backend = _resolve_durability_backend()
