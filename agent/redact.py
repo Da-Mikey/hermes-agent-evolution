@@ -15,6 +15,7 @@ from urllib.parse import unquote_plus
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
+from agent.redact_approval_display import sanitize_command_for_display  # re-exported: callers import it from agent.redact
 from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_strings
 
 logger = logging.getLogger(__name__)
@@ -1494,6 +1495,11 @@ def _mask_network_path_userinfo(m) -> str:
     if _is_userinfo_placeholder(m.group(3)):
         return m.group(0)
     return f"{m.group(1)}{m.group(2)}:***@"
+
+
+def redact_approval_display(text: str | None, *, force: bool = False, prose: bool = False) -> str:
+    """Secret redaction plus :func:`sanitize_command_for_display`, for every approval surface."""
+    return sanitize_command_for_display(redact_sensitive_text(str(text or ""), force=force), prose=prose)
 
 
 def _redact_phone(m):
