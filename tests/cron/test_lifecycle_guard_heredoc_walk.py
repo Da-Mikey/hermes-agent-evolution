@@ -117,3 +117,42 @@ def test_unscannable_own_cron_script_raises_named_refusal(tmp_path, shape):
     message = str(excinfo.value)
     assert "could not scan" in message and str(script) in message
     assert "contains a gateway lifecycle command" not in message
+
+
+class TestCodeConsumerBodyVisibleToLifecycleScan:
+    """#127698: a ``python3``/``osascript`` heredoc body is an executable payload, not data. The
+    direct scan must not have it blanked, or an inline gateway command hides in the body while the
+    scanner sees an empty heredoc. Upstream's own spec (v0.23.5); our direct scan passed no
+    ``mask_code_consumers`` flag, so the body was masked and these two commands were ALLOWED."""
+
+    def test_python_body_inline_launchctl_blocks(self, tmp_path):
+        command = (
+            "python3 - <<'PY'\n"
+            "import os\n"
+            'os.system("launchctl bootout gui/$(id -u)/ai.hermes.gateway")\n'
+            "PY"
+        )
+        assert guard(command, cwd=str(tmp_path)) is True
+
+    def test_osascript_do_shell_script_blocks(self, tmp_path):
+        command = (
+            "osascript <<'EOF'\n"
+            'do shell script "launchctl bootout gui/501/ai.hermes.gateway"\n'
+            "EOF"
+        )
+        assert guard(command, cwd=str(tmp_path)) is True
+
+    def test_python_body_plain_data_does_not_block(self, tmp_path):
+        """Visibility cuts both ways but costs nothing: a body that runs no lifecycle and names no
+        path is still allowed (no new false positive from the strict view)."""
+        command = "python3 - <<'PY'\nprint(sum(range(10)))\nPY"
+        assert guard(command, cwd=str(tmp_path)) is False
+
+    def test_cat_body_documentation_still_allowed(self, tmp_path):
+        """#88336 semantics unchanged: a ``cat``-owned body is data written out, never a command."""
+        command = (
+            "cat > /tmp/runbook.txt <<'EOF'\n"
+            "a human can run: hermes gateway restart\n"
+            "EOF"
+        )
+        assert guard(command, cwd=str(tmp_path)) is False

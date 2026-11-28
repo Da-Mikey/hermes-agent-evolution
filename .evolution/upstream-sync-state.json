@@ -15,26 +15,73 @@
     "merged_at": "2026-09-29T17:47:15Z",
     "verified": "git merge-base --is-ancestor v2026.9.24 origin/main -> true; git rev-list --count main..v2026.9.24 = 0",
     "checked_at": "2026-10-01",
-    "last_assessed_tag": "v0.23.3",
-    "last_assessed_at": "2026-11-20",
+    "last_assessed_tag": "v0.23.5",
+    "last_assessed_at": "2026-11-28",
     "last_assessed_decision": "defer-full-merge",
-    "last_assessed_conflicting_files": 283,
-    "last_assessed_report": "~/.hermes/evolution/upstream/2026-11-20.md",
+    "last_assessed_conflicting_files": 326,
+    "last_assessed_conflicts_measured_at": "2026-11-25",
+    "last_assessed_report": "~/.hermes/evolution/upstream/2026-11-28.md",
     "open_security_backports": [
-      191,
-      264,
-      276,
-      294,
-      324,
-      362,
-      368,
-      408,
-      413,
-      422,
-      425
+      446,
+      458
     ],
-    "_assessed_note": "v0.23.3 released 2026-11-20T00:34Z (1,657 non-merge commits / 3,948 files since v0.23.2). Merge trial measured 283 conflicting paths (up from 274 at v0.23.2); divergence 33,649 behind / 1,652 ahead -> full merge deferred, escalate to owner. Marker guard: v0.23.3 ancestor of fork/main = false. Advisory GHSA-p22p-9ph6-gmrh (high, Bot Desktop sandbox env) = NOT AFFECTED: our version 0.21.5 is below the affected floor 0.21.6 and tools/bot_desktop/sandbox_host.py does not exist in our tree. PR #425 shipped the profiles-aware _HERMES_HOME_DIR backport (profile config.yaml edits were ungated). OPEN GAP: five rounds of approval home-fold hardening (tools/approval_home_fold.py) are absent; 9/15 spec cases bypass, needs a spaced home to bite -- separate PR. synced_through_commit NOT advanced (release-track).",
+    "open_security_backports_note": "Corrected 2026-11-28: every id listed here before this run (191, 264, 276, 294, 324, 362, 368, 408, 413, 422, 425) is MERGED, checked one by one with gh pr view. #446 (read-tool policy + SSRF flow) and #458 (approval display hygiene) are open, mergeable and green, waiting on an owner merge. #464 is unrelated tooling work, also open.",
+    "_assessed_note": "Current as of 2026-11-28. v0.23.3 (2026-11-20) assessed: 283 conflicting paths, full merge deferred (marker guard false). Its recorded OPEN GAP -- five rounds of approval home-fold hardening absent from tools/approval_home_fold.py -- is CLOSED: our file is byte-identical to v0.23.3, v0.23.4 and v0.23.5 (193 lines, all 10 helper symbols present), backported in f840f8a991 on 2026-11-24. Advisory GHSA-p22p-9ph6-gmrh remains NOT AFFECTED (version floor 0.21.6; tools/bot_desktop/sandbox_host.py absent). Newest assessment: release_assessment_20261128. synced_through_commit NOT advanced (release-track).",
     "_note": "Release-track merges (upstream RELEASE TAGS merged into a sync/upstream-release-* branch + PR, owner-gated) are recorded HERE, not in synced_through_commit: the incremental 25-commit cursor is not advanced by release merges. Stale catchup_in_progress block removed 2026-10-01 (its PR #1641 merged 2026-08-04 and branch sync/upstream-catchup no longer exists on origin).",
+    "release_assessment_20261128": {
+      "latest_release_checked": "v0.23.5",
+      "release_name": "Hermes Agent v0.23.5",
+      "published_at": "2026-11-28T03:20:13Z",
+      "run_date": "2026-11-28",
+      "marker_guard": "git merge-base --is-ancestor v0.23.5 origin/main -> FALSE (not integrated); git rev-list --count origin/main..v0.23.5 = 35963",
+      "window": {
+        "commits_v0_23_4_to_v0_23_5": 1277,
+        "non_merge_commits": 1262,
+        "changed_files": 1146
+      },
+      "divergence": {
+        "behind_upstream_main": 35978,
+        "ahead_of_upstream_main": 1751
+      },
+      "full_merge": {
+        "decision": "defer-full-merge",
+        "conflicting_files": 326,
+        "measured_at": "2026-11-25",
+        "note": "Not re-measured today: v0.23.5 is the same roll-up shape (1,277 commits, curated notes deferred to v0.24.0) and the fork is unchanged in kind, so the 2026-11-25 trial stands. A real merge --no-commit trial is the only comparable instrument; git merge-tree is not a conflict count."
+      },
+      "advisories": {
+        "published_new": 0,
+        "newest": "GHSA-p22p-9ph6-gmrh (2026-11-19) -- NOT AFFECTED, re-confirmed: version floor 0.21.6, tools/bot_desktop/sandbox_host.py absent from our tree"
+      },
+      "sweep": {
+        "method": "files changed v0.23.4..v0.23.5 intersected with files in our tree (1146 -> 410), then a sensitive-path filter (28 files) and an independent hunk-keyword route (111 files), unioned; 30 commit subjects matched security keywords",
+        "candidates_measured": {
+          "tools/environments/local_env_policy.py": "GEMINI_API_KEY/GEMINI_BASE_URL added upstream. NOT A GAP: measured live -- our _build_provider_env_blocklist() derives them from PROVIDER_REGISTRY[gemini].api_key_env_vars, _is_provider_env_blocklisted() returns True for both, and the real builders (_make_run_env, _sanitize_subprocess_env, hermes_subprocess_env) returned zero GEMINI keys with GEMINI_API_KEY=gemini-key-MEASURE-7f3a9c in os.environ. Upstream's static entry is redundancy their GeminiProfile refactor required (d287905c77).",
+          "OSC7577_TOKEN (same diff)": "irrelevant -- the OSC 7577 resume feature does not exist in our tree",
+          "hermes_cli/dashboard_auth/routes.py (+84/-7, loopback cookie sharing)": "irrelevant -- hermes_cli/dashboard_auth/ holds only audit.py in our tree; the dashboard auth surface postdates our base",
+          "tools/shell_heredoc.py (+69/-44)": "UPSTREAM WIDENS masking (value-only wrappers, pipes to bare text filters). Our fork's variant is strictly MORE conservative, so no bypass rides the other way -- except the mask_code_consumers distinction below, which WAS a real gap",
+          "hermes_cli/_subprocess_compat.py": "hermes_platform.resolver.git architecture; a prerequisite chain, not a fix we can carry alone",
+          "agent/secret_scope.py, tui_gateway/launch_profile_policy.py": "plugin-host template-env feature work, entangled with resolve_home_dotenv(live_names=) which we do not have",
+          "agent/credential_pool*.py, hermes_cli/auth_constants.py": "credential-pool rotation features (spent plan windows), not security fixes",
+          "plugin-catalog pins (aisecuritywarden, vaultwarden-secret-source, secret-drop, ...)": "irrelevant -- our fork does not consume upstream's plugin catalog"
+        }
+      },
+      "shipped": {
+        "pr": null,
+        "branch": "fix/security-lifecycle-heredoc-bypass-20261128",
+        "commit": "f8e513c809",
+        "finding": "cron/lifecycle_guard.py:_direct_lifecycle_scan masked python3/osascript heredoc bodies before scanning, so an inline `os.system(...)` launchctl bootout of the Hermes gateway was invisible to the guard and the command was ALLOWED. Upstream fixed this as #127698 by passing mask_code_consumers=False at exactly that call site (v0.23.5 cron/lifecycle_guard.py:430).",
+        "fix": "tools/shell_heredoc.strip_inert_heredoc_bodies gained mask_code_consumers (default True = unchanged for its other callers; False narrows inert to cat-owned bodies). The direct lifecycle scan passes False. Our only other call site (tools/terminal_tool_guards.py:83) keeps the default, matching upstream's own call there.",
+        "acceptance": "9 passed on branch; 2 failed with the wiring reverted (the two bypass cases) -> teeth proven",
+        "regression": "9 test files found by search over the touched symbols: 718 passed on branch vs 712 passed + the same 6 new failures on clean main; ruff clean"
+      },
+      "known_open_gaps": [
+        "False positives, not bypasses (ours masks less than upstream): python3/osascript heredocs behind value-only wrappers (timeout/nice/nohup/stdbuf) or piped into bare text filters are not masked in our variant, so a >1 MiB data path named in such a body still fails closed as an oversized script. Upstream's v0.23.5 _VALUE_ONLY_WRAPPERS/_PIPE_FILTER_RE fix this; deferred -- it WIDENS masking and wants its own measurement.",
+        "Three-stage view API absent: we have no mask_heredoc_bodies_for_shell_scan/iter_heredoc_bodies, so upstream's TestStripHelpers strict-view cases do not apply to us."
+      ],
+      "stale_pr_warning": "PRs #446 and #458 both carry edits to .evolution/upstream-sync-state.json on unmerged branches; this run edits the same fields (last_assessed_*, open_security_backports) and will conflict textually with whichever lands second. Expect a one-line-resolution merge, not a semantic one.",
+      "_note": "v0.23.5 is NOT merged. integrated_tag deliberately stays v2026.9.24 and synced_through_commit is untouched: release-track assessments are recorded here, not in the incremental cursor."
+    },
     "dependency_backports": {
       "_note": "Targeted dependency security backports from UNRELEASED upstream main (a release-track merge cannot carry them). Each advisory is measured against our lockfiles, never inferred from upstream's diff.",
       "last_run": "2026-11-18",
