@@ -417,7 +417,11 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # restart" inside such a body is documentation, not a command this shell will execute.
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
-    text = strip_inert_heredoc_bodies(text)
+    # mask_code_consumers=False: a ``python3``/``osascript`` body is CODE, not documentation — it can
+    # call ``os.system("launchctl bootout .../ai.hermes.gateway")`` at runtime. Blanking it here hid
+    # exactly that payload from this scan while the shell still ran it (#127698). Only ``cat``-owned
+    # bodies (pure data written out) are masked for a security scan.
+    text = strip_inert_heredoc_bodies(text, mask_code_consumers=False)
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
         return True

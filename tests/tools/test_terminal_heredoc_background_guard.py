@@ -302,3 +302,35 @@ class TestStripHelpers:
         stripped = strip_inert_heredoc_bodies(cmd)
         assert "sleep 7 " + AMP not in stripped
         assert "echo after" in stripped
+
+
+class TestMaskCodeConsumersFlag:
+    """``mask_code_consumers=False`` is the SECURITY view (#127698): a ``python3``/``osascript``
+    body is code that can call ``os.system``/``do shell script``, so a guard must see it. A
+    ``cat``-owned body is data written out and stays masked in both views."""
+
+    def test_default_masks_a_code_consumer_body(self):
+        cmd = "python3 - <<'PY'" + NL + "os.system('hermes gateway restart')" + NL + "PY"
+        assert "gateway restart" not in strip_inert_heredoc_bodies(cmd)
+
+    def test_strict_view_keeps_a_python_body_visible(self):
+        cmd = "python3 - <<'PY'" + NL + "os.system('hermes gateway restart')" + NL + "PY"
+        strict = strip_inert_heredoc_bodies(cmd, mask_code_consumers=False)
+        assert "hermes gateway restart" in strict
+
+    def test_strict_view_keeps_an_osascript_body_visible(self):
+        cmd = "osascript <<'EOF'" + NL + 'do shell script "hermes gateway stop"' + NL + "EOF"
+        strict = strip_inert_heredoc_bodies(cmd, mask_code_consumers=False)
+        assert "hermes gateway stop" in strict
+
+    def test_strict_view_still_masks_a_cat_body(self):
+        cmd = "cat > /tmp/r.txt <<'EOF'" + NL + "a human can run: hermes gateway restart" + NL + "EOF"
+        strict = strip_inert_heredoc_bodies(cmd, mask_code_consumers=False)
+        assert "hermes gateway restart" not in strict
+        assert "cat > /tmp/r.txt" in strict
+
+    def test_strict_view_still_masks_an_unrelated_quoted_body(self):
+        """The flag narrows the consumer list only; every other conservatism is unchanged."""
+        cmd = "python3 - <<PY" + NL + "os.system('hermes gateway restart')" + NL + "PY"
+        # unquoted delimiter is expansion-capable → untouched even in the default view.
+        assert strip_inert_heredoc_bodies(cmd, mask_code_consumers=False) == cmd
